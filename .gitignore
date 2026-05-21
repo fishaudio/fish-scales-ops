@@ -1,0 +1,113 @@
+# ─── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+dist/
+wheelhouse/
+.pytest_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.cython_debug/
+
+# pip / build
+build/
+pip-wheel-metadata/
+.python-version
+pyvenv.cfg
+.venv/
+venv/
+.env
+
+# ─── Editable install metadata ─────────────────────────────────────────────
+*.pth
+
+# ─── PyTorch C++ extension build artifacts ─────────────────────────────────
+python/build/
+python/fish_scales_ops.egg-info/
+python/fish_scales_ops/_C.*.so
+python/fish_scales_ops/_C.*.pyd
+python/fish_scales_ops/_C.*.dylib
+
+# JIT extension cache (torch.utils.cpp_extension.load)
+.torch_extensions/
+
+# ─── CMake / standalone C++ build ──────────────────────────────────────────
+build_blockscale_gemm/
+build_fish_scales_ops/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.cmake.in
+compile_commands.json
+
+# ─── NVCC / CUDA ───────────────────────────────────────────────────────────
+*.cubin
+*.fatbin
+*.ptx
+*.sass
+*.i
+*.ii
+*.gpu
+
+# ─── Bench / test artifacts ────────────────────────────────────────────────
+runs/
+results/
+*.jsonl
+!tests/baselines/**/*.jsonl
+!tests/**/baselines/**/*.jsonl
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+profile_*.json
+
+# ─── IDE / editor ──────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ─── Local-only env, secrets, scratch ──────────────────────────────────────
+.envrc
+.direnv/
+*.local
+scratch/
+.scratch/
+TODO.local
+NOTES.local
+
+# ─── Submodule build outputs (don't shadow the submodule itself) ───────────
+3rdparty/*/build/
+3rdparty/*/CMakeCache.txt
+
+# ─── Logs ──────────────────────────────────────────────────────────────────
+*.log
+!.gitkeep
+
+# ─── Profile / repro tarballs ──────────────────────────────────────────────
+*.tar.gz
+*.tar.xz
+*.zip
+
+# ─── Internal-only (excluded from the open-source repo) ────────────────────
+# Internal design docs (architecture exploration history, decision logs,
+# negative-result write-ups). Public API is documented in README / docs/api.
+docs/design/
+
+# Historical kernel experiments + profiling probes (kept locally as
+# engineering reference / starting point for future sm_120 TMA work,
+# but not part of the public source tree). Production kernels live one
+# level up in csrc/attention/kernels/sm120/.
+csrc/attention/kernels/sm120/experiments/

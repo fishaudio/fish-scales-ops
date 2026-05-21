@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=64", "wheel", "torch>=2.5", "ninja"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fish-scales-ops"
+version = "0.1.0.dev0"
+description = "FP8 block-scaled GEMM + Flash Attention for sm_90 / sm_120."
+requires-python = ">=3.10"
+dependencies = ["torch>=2.5"]
+license = { text = "Apache-2.0" }
+
+[tool.setuptools]
+package-dir = { "" = "." }
+packages = [
+    "fish_scales_ops",
+    "fish_scales_ops.gemm",
+    "fish_scales_ops.attention",
+    "fish_scales_ops.attention.backends",
+]
