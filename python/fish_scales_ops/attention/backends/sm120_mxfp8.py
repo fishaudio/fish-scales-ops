@@ -214,3 +214,4 @@ def pre_quantize_v(v_bf16: torch.Tensor, kv_tile_rows: Optional[int] = None,
     V_t = V_q.reshape(B, D, H, S).contiguous()
     Vs  = sb.permute(0, 2, 1, 3).contiguous()                            # [B,n_t,H,n_k]
     return V_t, Vs
+

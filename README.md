@@ -6,10 +6,18 @@ PyTorch / cuBLAS / FlashInfer on the shapes that matter for LLM serving.
 
 * **GEMM** — FP8 1×128 (act) × 128×128 (wgt) on both archs, plus MXFP8 1×32
   (OCP UE8M0) on sm_120a. CUDA Graph capture-safe. The sm_120a MXFP8 path
-  outperforms `torch.nn.functional.scaled_mm` (cuBLAS / cuBLASLt MXFP8) on
-  **9 of 10** square cubic shapes from 1024³ to 16384³, with a peak-to-peak
-  edge of **+10%**. At LLM decode shapes (M ≤ 128, end-to-end MLP forward)
-  the gap is **2-4×**, driven by FSO's fused C++ quantize + scale-repack.
+  matches or beats `torch.nn.functional.scaled_mm` (cuBLAS / cuBLASLt MXFP8,
+  cu13) on **8 of 10** square cubic shapes from 1024³ to 16384³, by up to **+21%**.
+  In **end-to-end Qwen3-4B SwiGLU MLP forward**, FSO MXFP8 beats raw cuBLAS
+  `scaled_mm` by **1.7-6.2× at every M from 1 to 4096**, and the
+  `torch.compile`-fused cuBLAS reference by **2.1-4.3×** at decode shapes
+  (M ≤ 128) while staying within **±8%** at prefill (M ≥ 512). The lift comes from two fused
+  custom CUDA kernels: one for activation quantize + UE8M0 scale-pack, and
+  one that fuses the SwiGLU prologue directly into the down-GEMM activation
+  quantize — saving an entire BF16 intermediate write+read pass. The 1×128
+  BSFP8 path's quantize kernel was rewritten with the same uint64 LDG.64
+  pipeline; **H200 (sm_90) BSFP8 MLP forward is 15-23% faster at prefill
+  shapes** (M ≥ 512) on top of the cascade fixes.
 * **Attention** — MXFP8 FlashAttention forward on sm_120a: contiguous
   prefill, paged-prefill (extend), and paged decode. Native GQA via
   stride-0 K/V broadcast. **1.4× over torch SDPA prefill**, **7-19× over
@@ -17,33 +25,43 @@ PyTorch / cuBLAS / FlashInfer on the shapes that matter for LLM serving.
 
 ## Headline perf
 
-All numbers are CUDA-Graph capture-and-replay (median of 50 iters × 3 reps).
-The full matrix lives in [`docs/perf.md`](docs/perf.md); reproduce with
-`bench/gemm/python/bench_cubic.py` and `bench/attention/bench_*.py`.
+All numbers are CUDA-Graph capture-and-replay (median of 50 iters × 3 reps),
+measured with the **GPU clock locked to a no-boost frequency** so they
+reproduce run-to-run and across units (boost clocks vary by thermal / power /
+silicon bin). The baseline part is the **RTX PRO 6000 Blackwell Server
+Edition** (sm_120a, 188 SMs) locked to **2400 MHz** (`nvidia-smi -lgc
+2430,2430`), **CUDA 13.0 / torch 2.11+cu130**. The full matrix — plus the
+170-SM Blackwell GPU and H200 (sm_90) tables, all no-boost cu13 — lives in
+[`docs/perf.md`](docs/perf.md). Reproduce: lock the clock, then
+`bench/gemm/python/bench_qwen3_4b_mlp.py --run`.
 
-The cubic / attention tables below are from **RTX PRO 6000 Blackwell Server
-Edition** (sm_120a, 188 SMs, 600 W TDP, default factory clocks). MFU
-denominator = **1007 TF** (the NVIDIA whitepaper dense FP8/MXFP8 spec).
-A separate **170-SM Blackwell** (sm_120a, 575 W TDP) section below
-showcases the MXFP8 vs cuBLAS scaled_mm comparison + Qwen3-4B MLP forward
-end-to-end numbers.
+### GEMM — square M=N=K, MXFP8 vs cuBLAS `scaled_mm` (RTX PRO 6000, 2400 MHz no-boost, cu13)
 
-### GEMM — square M=N=K (peak-shot CUDA-Graph replays)
+Apples-to-apples: same UE8M0 1×32 FP8 numerics + RCEIL, same CUDA-Graph
+harness. `sMM` = `F.scaled_mm` (cuBLAS, `BlockWise1x32` + `SWIZZLE_32_4_4`).
 
-|   M=N=K |  BF16 TF |  BSFP8 TF |   MFU |  MXFP8 TF |     MFU | BS cos | MX cos |
-|    ---: |     ---: |      ---: |  ---: |      ---: |    ---: |   ---: |   ---: |
-|    1024 |      126 |       154 | 15.3% |       153 |   15.2% | 0.9678 | 0.9993 |
-|    2048 |      243 |       277 | 27.5% |       271 |   26.9% | 0.9937 | 0.9993 |
-|    3072 |      310 |       495 | 49.2% |       559 |   55.5% | 0.9945 | 0.9993 |
-|    4096 |      374 |       544 | 54.1% |       624 |   62.0% | 0.9884 | 0.9993 |
-|    8192 |      440 |       636 | 63.2% |       784 |   77.9% | 0.9941 | 0.9993 |
-|   12288 |      439 |       801 | 79.6% |       783 |   77.8% | 0.9959 | 0.9993 |
-| **16384** | **443** |   **826** | **82.0%** | **808** | **80.2%** | 0.9950 | 0.9993 |
+|   M=N=K |  BSFP8 TF |  MXFP8 TF | sMM (cuBLAS) TF | MXFP8 vs cuBLAS | MX cos |
+|    ---: |      ---: |      ---: |            ---: |            ---: |   ---: |
+|    1024 |       149 |       208 |             174 |       **+20%** | 0.9993 |
+|    1536 |       236 |       392 |             392 |             +0% | 0.9993 |
+|    2048 |       281 |       420 |             441 |             −5% | 0.9993 |
+|    2560 |       420 |   **565** |             467 |       **+21%** | 0.9993 |
+|    3072 |       506 |       554 |             533 |             +4% | 0.9993 |
+|    4096 |       569 |       624 |             655 |             −5% | 0.9993 |
+|    6144 |       588 |   **746** |             705 |             +6% | 0.9993 |
+|    8192 |       601 |   **750** |             743 |             +1% | 0.9993 |
+|   12288 |       744 |       726 |             707 |             +3% | 0.9993 |
+| **16384** | **765** | **742** |         **706** |       **+5%** | 0.9993 |
 
-**Peak: 826 TF BSFP8 at 16384³ = 82.0% MFU on the 1007 TF whitepaper spec.**
-Under sustained MMA the card is power-locked to ~2120 MHz vs the 2430 MHz
-boost the spec assumes, giving an effective per-cycle peak of ~877 TF —
-the kernel hits **826 / 877 ≈ 94% of that effective peak**.
+**Peak 750 TF MXFP8 (8192³) / 765 TF BSFP8 (16384³)** — ≈ 81-83% of this
+part's 2400 MHz dense-FP8 ceiling (~923 TF; the 1007 TF whitepaper figure is
+the 2617 MHz boost spec, unreachable at no-boost). **fso MXFP8 matches or
+beats the cu13 cuBLAS `scaled_mm` on 8 of 10 cubic sizes** (7 wins up to
+**+21%** at 2560³, +20% at 1024³, +5% at 16384³; a tie at 1536³); only
+2048³/4096³ trail by ~5% where cuBLAS keeps a hand-tuned tile cluster. cos = 0.9993 across the sweep. *(The same
+MXFP8-vs-cuBLAS comparison on the 170-SM Blackwell GPU — also 2400 MHz no-boost,
+cu13 — is in [`docs/perf.md`](docs/perf.md); fso wins there too, by up to
++20%.)*
 
 **Why BSFP8 cos dips at M=N=K=1024.** On sm_120 the BSFP8 path uses
 **UE8M0** scales (pure 8-bit exponent, 0 mantissa), so every per-block
@@ -59,62 +77,51 @@ group, so pow-2 rounding overhead stays small and cos is flat at
 kernel as 2048/4096 (Stream-K is gated at `K ≥ 9728`), so the dip is
 purely a scale-quantisation artifact, not a different numerical path.
 
-### GEMM — MXFP8 vs `torch.nn.functional.scaled_mm` (cuBLAS)
-
-Measured on a **170-SM Blackwell GPU** (sm_120a, 575 W TDP).
-Apples-to-apples kernel comparison: same FP8 numerics (UE8M0 1×32, RCEIL),
-same CUDA-Graph capture-and-replay timing harness. cuBLAS MXFP8 = `F.scaled_mm`
-with `BlockWise1x32` recipe + `SWIZZLE_32_4_4` blocked scale layout. MFU
-denominator = **838 TF** (5090-class whitepaper spec).
-
-|   M=N=K | FSO MXFP8 TF | sMM (cuBLAS) TF |       Δ |
-|    ---: |          ---: |              ---: |     ---: |
-|    1024 |       **259** |               208 |  **+25%** |
-|    1536 |       **490** |               485 |    +1% |
-|    2048 |           490 |           **517** |    −5% |
-|    2560 |       **652** |               566 |  **+15%** |
-|    3072 |       **649** |               614 |    +6% |
-|    4096 |       **711** |               654 |   **+9%** |
-|    6144 |       **659** |               653 |    +1% |
-|    8192 |       **657** |               642 |    +2% |
-|   12288 |       **662** |               620 |   **+7%** |
-|   16384 |       **661** |               617 |   **+7%** |
-
-**fish-scales-ops MXFP8 beats cuBLAS scaled_mm on 9 of 10 cubic sizes**,
-peak-to-peak edge **+9%** (711 TF at 4096³ vs 654 TF). cos = 0.9993 for
-both paths across the full sweep. Only cubic-2048 loses (−5%) — cuBLAS
-keeps a small lead at exactly that power-of-2 size where it has a
-hand-tuned tile cluster.
-
-### MLP block forward (end-to-end SwiGLU, Qwen3-4B shapes)
+### MLP block forward (end-to-end SwiGLU, Qwen3-4B — RTX PRO 6000, 2400 MHz no-boost, cu13)
 
 Full activation-quantize → `gate_up` → `silu·gate` → activation-quantize →
 `down` closure, captured into one CUDA-Graph and replayed. This is the
-per-token MLP cost a production decode loop actually pays. Same
-170-SM Blackwell GPU.
+per-token MLP cost a production decode loop actually pays. `sMM` = cuBLAS
+`scaled_mm` with the reference `to_mxfp`+`to_blocked` quantize; `sMM-c` = the
+same with the quantize fused by `torch.compile`.
 
-|     M | FSO MXFP8 µs | cuBLAS sMM µs | sMM `torch.compile`d µs | FSO vs sMM | FSO vs sMM-c |
-|  ---: |         ---: |          ---: |                    ---: |       ---: |          ---: |
-|     1 |     **34.9** |         160.0 |                   117.0 |  **4.6×** |    **3.4×** |
-|    16 |     **30.8** |         166.5 |                   117.5 |  **5.4×** |    **3.8×** |
-|    64 |     **38.9** |         149.6 |                    94.4 |  **3.8×** |    **2.4×** |
-|   128 |     **53.9** |         160.1 |                    92.3 |  **3.0×** |    **1.7×** |
-|   512 |        187.7 |         289.8 |               **170.1** |     +54% |       −10% |
-|  1024 |        323.9 |         468.4 |               **289.8** |     +45% |       −12% |
-|  2048 |        662.0 |        1069.8 |               **593.0** |     +62% |       −11% |
-|  4096 |       1385.7 |        2277.9 |              **1227.0** |     +64% |       −11% |
+|     M | FSO MXFP8 µs | cuBLAS sMM µs | sMM-c (compiled) µs | FSO vs sMM | FSO vs sMM-c |
+|  ---: |         ---: |          ---: |                ---: |       ---: |          ---: |
+|     1 |     **36.9** |         200.5 |               139.5 |   **5.4×** |     **3.8×** |
+|    16 |     **32.8** |         204.8 |               139.5 |   **6.2×** |     **4.3×** |
+|    64 |     **39.0** |         182.5 |               113.1 |   **4.7×** |     **2.9×** |
+|   128 |     **52.0** |         189.5 |               108.6 |   **3.6×** |     **2.1×** |
+|   512 |    **179.5** |         342.4 |               180.6 |   **1.9×** |      ≈ tie |
+|  1024 |    **299.2** |         509.9 |               277.7 |   **1.7×** |       −7.2% |
+|  2048 |    **512.5** |         970.1 |               512.3 |   **1.9×** |      ≈ tie |
+|  4096 |   **1041.1** |        2233.2 |              1095.7 |   **2.1×** |     **+5.0%** |
 
-**FSO MXFP8 is 3-5× faster than naive `torch.scaled_mm` MXFP8 at LLM decode
-shapes (M ≤ 128)**, and 45-64% faster at small-prefill shapes (M = 512-4096).
-Even when sMM's reference `to_mxfp`+`to_blocked` quantize is fused via
-`torch.compile(mode="default")` (the `sMM-c` column), FSO still wins at all
-M ≤ 128 by 1.7-3.8×. Above M=512 the compiled cuBLAS path edges ahead by
-~10% — cuBLAS's MXFP8 GEMM kernel itself is slightly faster than ours at
-large M, but the quantize integration is the real moat at decode shapes.
-The gap at small M is because FSO does activation quantize + scale-pack in
-**one fused C++ kernel**, while sMM's reference path runs ~10 small CUDA
-kernels and the `torch.compile`d version still launches more kernels than
-the fused one. cos = 0.9979 for all FP8 paths.
+**FSO MXFP8 beats raw cuBLAS `scaled_mm` 1.7–6.2× at every M from 1 to
+4096.** Against the `torch.compile`-fused cuBLAS (`sMM-c` — `to_mxfp` +
+`to_blocked` fused into one Inductor kernel) FSO is **2.1–4.3× faster at
+decode shapes (M ≤ 128)** and within **±8% at prefill** (sMM-c edges FSO by
+7% only at M=1024; FSO is ahead at M ≥ 2048).
+
+The wins come from two custom CUDA kernels:
+
+* **`fp8bs_quantize_1x32_packed_kernel`** — fused BF16 → FP8 + packed UE8M0
+  int32 scale, replacing the legacy two-step `quantize_1x32` +
+  `repack_mxfp8_scales`. uint64 LDG.64 loads (4 BF16/lane), 8-lane
+  sub-warp amax reductions via `shfl_xor`, direct IEEE-754 bit
+  manipulation for E8M0 RCEIL (skipping `__nv_cvt_float_to_e8m0`).
+  Kernel-level microbench: 0.86-1.00× of Inductor's fused quantize
+  across all shapes — 10-14% faster at M ∈ {1024, 2048}, ties at
+  GDDR7-bandwidth-bound 4096×9728+.
+* **`silu_chunk_mul_quantize_1x32_packed_kernel`** — fused SwiGLU
+  prologue: takes `gu = [gate || up]` (the gate_up GEMM output) and
+  emits FP8 + packed scale directly, **without materialising the BF16
+  `h = silu(gate) * up` intermediate in global memory**. Saves
+  M·INTER·2 bytes of read+write per call — ~160 µs at M=4096
+  INTER=9728. cuBLAS can't replicate this because `torch.scaled_mm`
+  requires pre-quantised inputs, breaking the fusion chain.
+
+cos = 0.9979 for all FP8 paths, bit-equivalent to the unfused
+reference to 6 decimal places.
 
 ### Attention — MXFP8 forward vs torch SDPA (causal prefill)
 

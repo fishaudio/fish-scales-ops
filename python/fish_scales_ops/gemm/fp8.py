@@ -58,6 +58,28 @@ def quantize_1x128_fp8(
     return torch.ops.fish_scales_ops.quantize_1x128(x.contiguous(), use_ue8m0)
 
 
+def quantize_1x128_fp8_packed(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """BF16 [..., K] → FP8 (E4M3) [..., K] + int32-packed UE8M0 1×128 scales.
+
+    Fused single-kernel replacement for
+    ``repack_fp8_act_scales(quantize_1x128_fp8(x, use_ue8m0=True)[1])`` on
+    sm_120 — eliminates the FP32 scale round-trip through global memory and
+    the separate repack-kernel launch.
+
+    Returns:
+        (x_fp8, sx_packed) — packed int32 K-major ``[pad(M,4), K/512]``
+        (4 UE8M0 bytes per int32). Drop this into :func:`linear_fp8`
+        as the activation scale on sm_120.
+
+    Constraints: ``K % 512 == 0`` (4 K-blocks per packed int32).
+
+    Use this on sm_120 instead of ``quantize_1x128_fp8 + repack_fp8_act_scales``.
+    On sm_90 stick with ``quantize_1x128_fp8`` (the deep_gemm path consumes
+    FP32 scales directly).
+    """
+    return torch.ops.fish_scales_ops.quantize_1x128_packed(x.contiguous(), True)
+
+
 def quantize_128x128_fp8(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """BF16 [N, K] weight → FP8 (E4M3) [N, K] + FP32 per-128×128-block dequant scales.
 

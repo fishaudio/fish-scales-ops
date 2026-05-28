@@ -71,6 +71,30 @@ def quantize_1x32_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         NotImplementedError: on sm_90 (this path is sm_120-only).
     """
     _require_sm120()
-    x_fp8, sx_f32 = torch.ops.fish_scales_ops.quantize_1x32(x.contiguous(), True)
-    sx_packed = torch.ops.fish_scales_ops.repack_mxfp8_scales(sx_f32)
-    return x_fp8, sx_packed
+    # Fused quantize + packed-scale write — single CUDA kernel, no FP32 scale
+    # round-trip. Bit-exact with the legacy `quantize_1x32` + `repack_mxfp8_scales`
+    # two-step path.
+    return torch.ops.fish_scales_ops.quantize_1x32_packed(x.contiguous(), True)
+
+
+def silu_chunk_mul_quantize_1x32_fp8(gu: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused SwiGLU prologue + MXFP8 quantize. sm_120 only.
+
+    Takes ``gu`` (bf16 ``[..., 2*INTER]``) where the first INTER cols along
+    the last dim are ``gate`` and the second INTER cols are ``up``. Computes
+    ``h = silu(gate) * up`` and quantizes ``h`` to FP8 + packed UE8M0 scale
+    **without materialising ``h`` in global memory** — saves a M·INTER·2
+    byte intermediate read+write vs the unfused chain
+    (silu·chunk + ``quantize_1x32_fp8``).
+
+    Returns:
+        (x_fp8, sx_packed) — same packed layout as :func:`quantize_1x32_fp8`,
+        ready for :func:`linear_mxfp8` as the activation operand.
+
+    Constraints: ``INTER % 128 == 0``.
+
+    Raises:
+        NotImplementedError: on sm_90.
+    """
+    _require_sm120()
+    return torch.ops.fish_scales_ops.silu_chunk_mul_quantize_1x32(gu.contiguous(), True)

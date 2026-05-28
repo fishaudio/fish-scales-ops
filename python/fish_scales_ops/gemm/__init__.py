@@ -27,14 +27,16 @@ from .fp8 import (
     linear_qx,
     quantize_128x128_fp8,
     quantize_1x128_fp8,
+    quantize_1x128_fp8_packed,
     repack_fp8_act_scales,
     repack_fp8_wgt_scales,
 )
-from .mxfp8 import linear_mxfp8, quantize_1x32_fp8
+from .mxfp8 import linear_mxfp8, quantize_1x32_fp8, silu_chunk_mul_quantize_1x32_fp8
 
 __all__ = [
     # FP8 1×128 / 128×128
     "quantize_1x128_fp8",
+    "quantize_1x128_fp8_packed",
     "quantize_128x128_fp8",
     "linear_fp8",
     "linear_qx",
@@ -42,6 +44,7 @@ __all__ = [
     "repack_fp8_wgt_scales",
     # MXFP8 1×32 (sm_120)
     "quantize_1x32_fp8",
+    "silu_chunk_mul_quantize_1x32_fp8",
     "linear_mxfp8",
     # BF16 wrapper
     "linear_bf16",

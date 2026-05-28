@@ -26,6 +26,8 @@ namespace detail
 // Defined in quant_kernels.cu.
 void fp8bs_quantize_1x128(__nv_fp8_e4m3* x_q, float* scales, __nv_bfloat16 const* x, int M, int K, cudaStream_t stream,
     bool use_ue8m0);
+void fp8bs_quantize_1x128_packed(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
+    __nv_bfloat16 const* x, int M, int K, cudaStream_t stream, bool use_ue8m0);
 void fp8bs_quantize_128x128(
     __nv_fp8_e4m3* w_q, float* scales, __nv_bfloat16 const* w, int N, int K, cudaStream_t stream);
 } // namespace detail
@@ -213,6 +215,37 @@ std::tuple<at::Tensor, at::Tensor> quantize_1x128(at::Tensor x, bool use_ue8m0)
         reinterpret_cast<float*>(scales.data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(x2.data_ptr()), M, K,
         stream, use_ue8m0);
     return {x_q.view(x.sizes()), scales};
+}
+
+
+// quantize_1x128_packed: fused BSFP8 1×128 quantize + scale-pack.
+// Returns (fp8 [..., K], packed int32 [pad(M,4), K/512] K-major).
+// Replaces `quantize_1x128` + `repack_fp8_act_scales` two-step path on
+// sm_120 — eliminates the FP32 scale round-trip through global memory.
+// Requires K % 512 == 0 (4 K-blocks × 128 elements per warp).
+std::tuple<at::Tensor, at::Tensor> quantize_1x128_packed(at::Tensor x, bool use_ue8m0)
+{
+    check_cuda_bf16(x, "x");
+    TORCH_CHECK(x.dim() >= 2, "x must be at least 2D");
+    int const K = x.size(-1);
+    TORCH_CHECK(K % 512 == 0, "K must be a multiple of 512 (4 K-blocks per packed int32)");
+    int const M = x.numel() / K;
+    auto x2 = x.view({M, K});
+
+    auto x_q = at::empty({M, K}, x.options().dtype(at::kFloat8_e4m3fn));
+    int const m_pad = ceil_div(M, 4) * 4;
+    int const k_blocks_out = K / 512;  // packed int32 columns
+    // Allocate as row-major to match `repack_fp8_act_scales`. The kernel still
+    // writes physical layout [k_blocks_out, m_pad] K-major (dst[kp*M_pad+m]);
+    // PyTorch metadata is `at::empty({M_pad, k_blocks_out})` row-major and the
+    // GEMM reads via raw pointer. This is the FSO 1×128 BSFP8 path convention.
+    auto packed = at::empty({m_pad, k_blocks_out}, x.options().dtype(at::kInt));
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    detail::fp8bs_quantize_1x128_packed(reinterpret_cast<__nv_fp8_e4m3*>(x_q.data_ptr()),
+        reinterpret_cast<int32_t*>(packed.data_ptr()),
+        reinterpret_cast<__nv_bfloat16 const*>(x2.data_ptr()), M, K, stream, use_ue8m0);
+    return {x_q.view(x.sizes()), packed};
 }
 
 std::tuple<at::Tensor, at::Tensor> quantize_128x128(at::Tensor w)

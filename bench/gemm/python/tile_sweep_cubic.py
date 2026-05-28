@@ -30,7 +30,7 @@ CONFIGS = [
 # Device-specific FP8 dense whitepaper peaks (must match bench_cubic.py).
 PEAK_TF_BY_DEVICE = {
     "RTX PRO 6000 Blackwell": 1007.0,
-    "RTX 5090":               838.0,
+    "RTX Blackwell 170 SM GPU":               838.0,
 }
 PEAK_TF_DEFAULT = 838.0
 

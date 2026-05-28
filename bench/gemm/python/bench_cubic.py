@@ -27,7 +27,7 @@ import fish_scales_ops as fso
 # Pick the row that matches the device name reported by CUDA.
 SM120_PEAK_TF_BY_DEVICE = {
     "RTX PRO 6000 Blackwell": 1007.0,  # workstation/server (188 SMs, 600W TDP)
-    "RTX 5090":               838.0,   # 170 SMs sm_120a (substring lookup key)
+    "RTX Blackwell 170 SM GPU":               838.0,   # 170 SMs sm_120a (substring lookup key)
 }
 SM120_PEAK_TF_DEFAULT = 838.0           # fallback for unrecognised sm_120a parts
 SM90_FP8_PEAK_TF      = 1979.0          # H200 dense FP8
