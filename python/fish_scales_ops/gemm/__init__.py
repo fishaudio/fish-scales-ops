@@ -31,7 +31,17 @@ from .fp8 import (
     repack_fp8_act_scales,
     repack_fp8_wgt_scales,
 )
-from .mxfp8 import linear_mxfp8, quantize_1x32_fp8, silu_chunk_mul_quantize_1x32_fp8
+from .mxfp8 import (
+    linear_mxfp8,
+    linear_mxfp8_grouped_masked,
+    moe_build_routing,
+    moe_combine,
+    quantize_1x32_fp8,
+    quantize_1x32_grouped_gather_fp8,
+    quantize_moe_weights_1x32_fp8,
+    silu_chunk_mul_quantize_1x32_fp8,
+    silu_chunk_mul_quantize_1x32_grouped_fp8,
+)
 
 __all__ = [
     # FP8 1×128 / 128×128
@@ -46,6 +56,13 @@ __all__ = [
     "quantize_1x32_fp8",
     "silu_chunk_mul_quantize_1x32_fp8",
     "linear_mxfp8",
+    # Grouped MXFP8 MoE, masked layout (sm_120)
+    "linear_mxfp8_grouped_masked",
+    "quantize_1x32_grouped_gather_fp8",
+    "silu_chunk_mul_quantize_1x32_grouped_fp8",
+    "quantize_moe_weights_1x32_fp8",
+    "moe_build_routing",
+    "moe_combine",
     # BF16 wrapper
     "linear_bf16",
 ]

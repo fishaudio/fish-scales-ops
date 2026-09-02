@@ -137,7 +137,7 @@ struct SmemCopyAtomBForTileMN<16, 64>
 };
 
 template <int TileM_ = 32, int TileN_ = 128, int Stages_ = 4, int MinBlocksPerSm_ = 1,
-    int SchedGroup_ = 16,
+    int SchedGroup_ = 16, bool SeparateSmemD_ = false,
     typename PermMmaTileN_ = typename cute::conditional_t<(TileM_ == 16),
         typename PermMmaTileNForTileN_M16<TileN_>::type,
         typename PermMmaTileNForTileN<TileN_>::type>,
@@ -519,6 +519,19 @@ struct SM120MxFP8BlockScaledBuilder
         SharedStorageLoad load;
         SharedStorageStore store;
     };
+
+    // See SM120BlockScaledBuilder::kSeparateSmemD — dedicated epilogue smem
+    // so the persistent loop overlaps tile i's TMA store with tile i+1's
+    // loads/mma instead of serialising on store_empty at every tile.
+    static constexpr bool kSeparateSmemD = SeparateSmemD_;
+
+    struct TensorStorageSeparate
+    {
+        SharedStorageLoad load;
+        SharedStorageStore store;
+    };
+
+    using TensorStorageSel = cute::conditional_t<SeparateSmemD_, TensorStorageSeparate, TensorStorage>;
 
     union TensorStorageMoe
     {

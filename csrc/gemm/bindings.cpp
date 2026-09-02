@@ -34,6 +34,17 @@ std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x32(at::Tensor gu, b
 at::Tensor repack_mxfp8_scales(at::Tensor scales_f32);
 at::Tensor linear_mxfp8_raw(at::Tensor x_fp8, at::Tensor w_fp8,
                             at::Tensor sx_int32, at::Tensor sw_int32);
+// Grouped (MoE, masked layout) MXFP8 — sm_120 only (M1).
+at::Tensor linear_mxfp8_grouped_masked(at::Tensor a_fp8, at::Tensor w_fp8, at::Tensor sa_int32,
+    at::Tensor sw_int32, at::Tensor masked_m, int64_t expected_m);
+std::tuple<at::Tensor, at::Tensor> quantize_1x32_grouped_gather(
+    at::Tensor x, at::Tensor slot_of_flat, int64_t topk, int64_t num_groups,
+    int64_t m_cap, bool use_ue8m0);
+std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x32_grouped(
+    at::Tensor gu, at::Tensor slot_of_flat, bool use_ue8m0);
+std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_build_routing(
+    at::Tensor topk_ids, int64_t num_groups, int64_t m_cap);
+at::Tensor moe_combine(at::Tensor dn, at::Tensor slot_of_flat, at::Tensor topk_w);
 } // namespace blockscale_gemm
 
 TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
@@ -52,6 +63,15 @@ TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
     m.def("repack_mxfp8_scales(Tensor scales_f32) -> Tensor");
     m.def("linear_mxfp8_raw(Tensor x_fp8, Tensor w_fp8, "
                             "Tensor sx_int32, Tensor sw_int32) -> Tensor");
+    m.def("linear_mxfp8_grouped_masked(Tensor a_fp8, Tensor w_fp8, Tensor sa_int32, "
+                                       "Tensor sw_int32, Tensor masked_m, int expected_m) -> Tensor");
+    m.def("quantize_1x32_grouped_gather(Tensor x, Tensor slot_of_flat, int topk, "
+                                        "int num_groups, int m_cap, bool use_ue8m0=True) -> (Tensor, Tensor)");
+    m.def("silu_chunk_mul_quantize_1x32_grouped(Tensor gu, Tensor slot_of_flat, "
+                                                "bool use_ue8m0=True) -> (Tensor, Tensor)");
+    m.def("moe_build_routing(Tensor topk_ids, int num_groups, int m_cap) "
+          "-> (Tensor, Tensor, Tensor)");
+    m.def("moe_combine(Tensor dn, Tensor slot_of_flat, Tensor topk_w) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(fish_scales_ops, CUDA, m)
@@ -69,4 +89,9 @@ TORCH_LIBRARY_IMPL(fish_scales_ops, CUDA, m)
     m.impl("silu_chunk_mul_quantize_1x32", &blockscale_gemm::silu_chunk_mul_quantize_1x32);
     m.impl("repack_mxfp8_scales", &blockscale_gemm::repack_mxfp8_scales);
     m.impl("linear_mxfp8_raw", &blockscale_gemm::linear_mxfp8_raw);
+    m.impl("linear_mxfp8_grouped_masked", &blockscale_gemm::linear_mxfp8_grouped_masked);
+    m.impl("quantize_1x32_grouped_gather", &blockscale_gemm::quantize_1x32_grouped_gather);
+    m.impl("silu_chunk_mul_quantize_1x32_grouped", &blockscale_gemm::silu_chunk_mul_quantize_1x32_grouped);
+    m.impl("moe_build_routing", &blockscale_gemm::moe_build_routing);
+    m.impl("moe_combine", &blockscale_gemm::moe_combine);
 }

@@ -568,6 +568,297 @@ void fp8bs_silu_chunk_mul_quantize_1x32_packed(
     }
 }
 
+// ----- Grouped (MoE, masked layout) MXFP8 quantize variants (M1) -----------
+//
+// Companions of the sm_120 grouped GEMM. Both write the per-group K-major
+// packed-scale layout its SFA TMA descriptor expects:
+//
+//   sf_word(g, m_in, kp) = g * (num_kp * m_cap) + kp * m_cap + m_in
+//
+// with m_cap % 4 == 0. Both index the FLAT ROUTED-PAIR space
+// (i in [0, M*topk), host-static) and derive (g, m_in) from
+// slot_of_flat[i] — iterating the padded G*m_cap space cost a ~94%-dead
+// warp scan at M=512. Rows of the grouped outputs that no pair maps to
+// stay undefined; the GEMM's masked contract already ignores them.
+//
+//   * ..._grouped_gather: fused token-gather + quantize (src row = i/topk).
+//   * silu_chunk_mul_quantize_1x32_packed_grouped: SwiGLU fused quant for
+//     the grouped down-GEMM input (row = slot, in place in the pair space).
+
+namespace
+{
+
+__device__ __forceinline__ int sf_word_index_grouped(int m_in, int kp, int m_cap, int num_kp, int g)
+{
+    return g * (num_kp * m_cap) + kp * m_cap + m_in;
+}
+
+template <bool USE_UE8M0, int K_BLOCKS_PER_WARP>
+__global__ void fp8bs_quantize_1x32_packed_grouped_gather_kernel(
+    __nv_fp8_e4m3* __restrict__ out_fp8, int32_t* __restrict__ out_packed,
+    __nv_bfloat16 const* __restrict__ input, int32_t const* __restrict__ slot_of_flat,
+    int n_pairs, int topk, int m_cap, int K, bool pdl)
+{
+    static_assert(K_BLOCKS_PER_WARP == 4 || K_BLOCKS_PER_WARP == 8,
+        "K_BLOCKS_PER_WARP must be 4 (1 int32/warp) or 8 (2 int32/warp).");
+
+    constexpr int kVec = kMxFp8VecSize;
+    constexpr int kIterKBlocks = 4;
+    constexpr int kNumIters = K_BLOCKS_PER_WARP / kIterKBlocks;
+
+    // PDL: order the slot_of_flat / input reads behind the parent, then
+    // release the dependent's prologue. Armed only for small grids.
+    if (pdl)
+    {
+        cudaGridDependencySynchronize();
+        if (threadIdx.x == 0)
+        {
+            cudaTriggerProgrammaticLaunchCompletion();
+        }
+    }
+    // Flat-pair indexing: one warp per (routed pair, K-chunk). The padded
+    // G*m_cap iteration space this kernel used at first cost a 94%-dead
+    // warp scan at M=512 (65k CTAs, ~27 us of pure early-outs); the pair
+    // space is exactly the valid work and is host-static.
+    int const warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int const lane_id = threadIdx.x & 31;
+    int const k_groups = K / (kVec * K_BLOCKS_PER_WARP);
+    int const i = warp_id / k_groups;   // routed pair index
+    int const kg = warp_id % k_groups;
+    if (i >= n_pairs)
+        return;
+    int const slot = slot_of_flat[i];   // g * m_cap + m_in
+    int const g = slot / m_cap;
+    int const m_in = slot % m_cap;
+    int const src = i / topk;           // source token row
+
+    int const kp_base = kg * (K_BLOCKS_PER_WARP / 4);
+    int const num_kp = K / 128;
+
+    int packed_words[K_BLOCKS_PER_WARP / 4] = {};
+
+#pragma unroll
+    for (int it = 0; it < kNumIters; ++it) {
+        int const kb_base = kg * K_BLOCKS_PER_WARP + it * kIterKBlocks;
+        int const k_base  = kb_base * kVec;
+
+        uint64_t const xword = *reinterpret_cast<uint64_t const*>(
+            &input[static_cast<int64_t>(src) * K + k_base + lane_id * 4]);
+        __nv_bfloat16 const* xv = reinterpret_cast<__nv_bfloat16 const*>(&xword);
+        float const x0 = __bfloat162float(xv[0]);
+        float const x1 = __bfloat162float(xv[1]);
+        float const x2 = __bfloat162float(xv[2]);
+        float const x3 = __bfloat162float(xv[3]);
+
+        float my_ax = fmaxf(fmaxf(fabsf(x0), fabsf(x1)),
+                            fmaxf(fabsf(x2), fabsf(x3)));
+#pragma unroll
+        for (int off = 4; off > 0; off >>= 1) {
+            my_ax = fmaxf(my_ax, __shfl_xor_sync(0xFFFFFFFFu, my_ax, off));
+        }
+        my_ax = fmaxf(my_ax, 1e-10f);
+
+        float qs;
+        uint8_t byte_v;
+        e8m0_from_amax<USE_UE8M0>(my_ax, qs, byte_v);
+
+        uint32_t const fp_word = fp8x4_from_floats(x0 * qs, x1 * qs, x2 * qs, x3 * qs);
+        *reinterpret_cast<uint32_t*>(
+            &out_fp8[static_cast<int64_t>(slot) * K + k_base + lane_id * 4]) = fp_word;
+
+        uint32_t const b0 = byte_v;
+        uint32_t const b1 = __shfl_sync(0xFFFFFFFFu, byte_v, 8);
+        uint32_t const b2 = __shfl_sync(0xFFFFFFFFu, byte_v, 16);
+        uint32_t const b3 = __shfl_sync(0xFFFFFFFFu, byte_v, 24);
+        if (lane_id == 0) {
+            packed_words[it] = static_cast<int>(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+        }
+    }
+
+    if (lane_id == 0) {
+#pragma unroll
+        for (int p = 0; p < K_BLOCKS_PER_WARP / 4; ++p) {
+            out_packed[sf_word_index_grouped(m_in, kp_base + p, m_cap, num_kp, g)] = packed_words[p];
+        }
+    }
+}
+
+template <bool USE_UE8M0, int K_BLOCKS_PER_WARP>
+__global__ void silu_chunk_mul_quantize_1x32_packed_grouped_kernel(
+    __nv_fp8_e4m3* __restrict__ out_fp8, int32_t* __restrict__ out_packed,
+    __nv_bfloat16 const* __restrict__ gu, int32_t const* __restrict__ slot_of_flat,
+    int n_pairs, int m_cap, int K, bool pdl)
+{
+    static_assert(K_BLOCKS_PER_WARP == 4 || K_BLOCKS_PER_WARP == 8,
+        "K_BLOCKS_PER_WARP must be 4 (1 int32/warp) or 8 (2 int32/warp).");
+
+    constexpr int kVec = kMxFp8VecSize;
+    constexpr int kIterKBlocks = 4;
+    constexpr int kNumIters = K_BLOCKS_PER_WARP / kIterKBlocks;
+
+    // PDL entry (see gather kernel above).
+    if (pdl)
+    {
+        cudaGridDependencySynchronize();
+        if (threadIdx.x == 0)
+        {
+            cudaTriggerProgrammaticLaunchCompletion();
+        }
+    }
+    // Flat-pair indexing over the valid routed rows (see gather kernel).
+    int const warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int const lane_id = threadIdx.x & 31;
+    int const k_groups = K / (kVec * K_BLOCKS_PER_WARP);
+    int const i = warp_id / k_groups;
+    int const kg = warp_id % k_groups;
+    if (i >= n_pairs)
+        return;
+    int const slot = slot_of_flat[i];
+    int const g = slot / m_cap;
+    int const m_in = slot % m_cap;
+
+    int const kp_base = kg * (K_BLOCKS_PER_WARP / 4);
+    int const num_kp = K / 128;
+    int64_t const stride_m_gu = 2 * static_cast<int64_t>(K);
+
+    int packed_words[K_BLOCKS_PER_WARP / 4] = {};
+
+#pragma unroll
+    for (int it = 0; it < kNumIters; ++it) {
+        int const kb_base = kg * K_BLOCKS_PER_WARP + it * kIterKBlocks;
+        int const k_base  = kb_base * kVec;
+
+        uint64_t const gate_word = *reinterpret_cast<uint64_t const*>(
+            &gu[slot * stride_m_gu + 0 + k_base + lane_id * 4]);
+        uint64_t const up_word = *reinterpret_cast<uint64_t const*>(
+            &gu[slot * stride_m_gu + K + k_base + lane_id * 4]);
+        __nv_bfloat162 const* gv2 = reinterpret_cast<__nv_bfloat162 const*>(&gate_word);
+        __nv_bfloat162 const* uv2 = reinterpret_cast<__nv_bfloat162 const*>(&up_word);
+
+        float2 const f01 = __bfloat1622float2(silu2_mul(gv2[0], uv2[0]));
+        float2 const f23 = __bfloat1622float2(silu2_mul(gv2[1], uv2[1]));
+        float const h0 = f01.x, h1 = f01.y, h2 = f23.x, h3 = f23.y;
+
+        float my_ax = fmaxf(fmaxf(fabsf(h0), fabsf(h1)), fmaxf(fabsf(h2), fabsf(h3)));
+#pragma unroll
+        for (int off = 4; off > 0; off >>= 1) {
+            my_ax = fmaxf(my_ax, __shfl_xor_sync(0xFFFFFFFFu, my_ax, off));
+        }
+        my_ax = fmaxf(my_ax, 1e-10f);
+
+        float qs;
+        uint8_t byte_v;
+        e8m0_from_amax<USE_UE8M0>(my_ax, qs, byte_v);
+
+        uint32_t const fp_word = fp8x4_from_floats(h0 * qs, h1 * qs, h2 * qs, h3 * qs);
+        *reinterpret_cast<uint32_t*>(
+            &out_fp8[static_cast<int64_t>(slot) * K + k_base + lane_id * 4]) = fp_word;
+
+        uint32_t const b0 = byte_v;
+        uint32_t const b1 = __shfl_sync(0xFFFFFFFFu, byte_v, 8);
+        uint32_t const b2 = __shfl_sync(0xFFFFFFFFu, byte_v, 16);
+        uint32_t const b3 = __shfl_sync(0xFFFFFFFFu, byte_v, 24);
+        if (lane_id == 0) {
+            packed_words[it] = static_cast<int>(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+        }
+    }
+
+    if (lane_id == 0) {
+#pragma unroll
+        for (int p = 0; p < K_BLOCKS_PER_WARP / 4; ++p) {
+            out_packed[sf_word_index_grouped(m_in, kp_base + p, m_cap, num_kp, g)] = packed_words[p];
+        }
+    }
+}
+
+} // anonymous namespace
+
+
+// PDL launch helper for the grouped MoE glue chain: launches with the
+// programmatic-stream-serialization attribute so a downstream kernel's
+// launch/prologue overlaps this one (both sides carry griddepcontrol
+// wait/trigger). FSO_DISABLE_PDL=1 restores plain serialised launches.
+static inline bool fso_pdl_enabled()
+{
+    static bool v = []
+    {
+        char const* e = std::getenv("FSO_DISABLE_PDL");
+        return !(e && e[0] == '1');
+    }();
+    return v;
+}
+
+// Grids beyond this many CTAs launch without PDL: a huge programmatic
+// dependent floods every SM with waiting CTAs and throttles the parent's
+// tail (measured +46 us on the M=512 layer before this gate).
+constexpr unsigned kFsoPdlMaxGridCtas = 4096;
+
+template <typename KernelT, typename... Args>
+static inline void fso_pdl_launch(KernelT kernel, dim3 grid, dim3 block, cudaStream_t stream, bool pdl, Args... args)
+{
+    cudaLaunchConfig_t cfg{};
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = pdl ? 1 : 0;
+    cfg.gridDim = grid;
+    cfg.blockDim = block;
+    cfg.dynamicSmemBytes = 0;
+    cfg.stream = stream;
+    cfg.attrs = attrs;
+    cfg.numAttrs = 1;
+    cudaLaunchKernelEx(&cfg, kernel, args..., pdl);
+}
+
+void fp8bs_quantize_1x32_packed_grouped_gather(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
+    __nv_bfloat16 const* x, int32_t const* slot_of_flat, int n_pairs, int topk,
+    int m_cap, int K, cudaStream_t stream, bool use_ue8m0)
+{
+    constexpr int kThreadsPerBlock = 256;
+    constexpr int kWarpsPerBlock = kThreadsPerBlock / 32;
+
+    auto launch = [&](auto kBlocksPerWarpT, auto ue8m0T) {
+        constexpr int kBlocksPerWarp = decltype(kBlocksPerWarpT)::value;
+        int const k_groups = K / (kMxFp8VecSize * kBlocksPerWarp);
+        int64_t const total_warps = static_cast<int64_t>(n_pairs) * k_groups;
+        int const grid = static_cast<int>((total_warps + kWarpsPerBlock - 1) / kWarpsPerBlock);
+        bool const pdl = fso_pdl_enabled() && static_cast<unsigned>(grid) <= kFsoPdlMaxGridCtas;
+        fso_pdl_launch(fp8bs_quantize_1x32_packed_grouped_gather_kernel<decltype(ue8m0T)::value, kBlocksPerWarp>,
+            dim3(grid), dim3(kThreadsPerBlock), stream, pdl, x_q, packed_scales, x, slot_of_flat,
+            n_pairs, topk, m_cap, K);
+    };
+    auto launch_k = [&](auto ue8m0T) {
+        if (K % 256 == 0) launch(std::integral_constant<int, 8>{}, ue8m0T);
+        else              launch(std::integral_constant<int, 4>{}, ue8m0T);
+    };
+    if (use_ue8m0) launch_k(std::true_type{});
+    else           launch_k(std::false_type{});
+}
+
+void fp8bs_silu_chunk_mul_quantize_1x32_packed_grouped(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
+    __nv_bfloat16 const* gu, int32_t const* slot_of_flat, int n_pairs, int m_cap, int K,
+    cudaStream_t stream, bool use_ue8m0)
+{
+    constexpr int kThreadsPerBlock = 256;
+    constexpr int kWarpsPerBlock = kThreadsPerBlock / 32;
+
+    auto launch = [&](auto kBlocksPerWarpT, auto ue8m0T) {
+        constexpr int kBlocksPerWarp = decltype(kBlocksPerWarpT)::value;
+        int const k_groups = K / (kMxFp8VecSize * kBlocksPerWarp);
+        int64_t const total_warps = static_cast<int64_t>(n_pairs) * k_groups;
+        int const grid = static_cast<int>((total_warps + kWarpsPerBlock - 1) / kWarpsPerBlock);
+        bool const pdl = fso_pdl_enabled() && static_cast<unsigned>(grid) <= kFsoPdlMaxGridCtas;
+        fso_pdl_launch(silu_chunk_mul_quantize_1x32_packed_grouped_kernel<decltype(ue8m0T)::value, kBlocksPerWarp>,
+            dim3(grid), dim3(kThreadsPerBlock), stream, pdl, x_q, packed_scales, gu, slot_of_flat,
+            n_pairs, m_cap, K);
+    };
+    auto launch_k = [&](auto ue8m0T) {
+        if (K % 256 == 0) launch(std::integral_constant<int, 8>{}, ue8m0T);
+        else              launch(std::integral_constant<int, 4>{}, ue8m0T);
+    };
+    if (use_ue8m0) launch_k(std::true_type{});
+    else           launch_k(std::false_type{});
+}
+
 // ----- Fused BSFP8 1×128 quantize (E36, 2026-05-28) ------------------------
 //
 // Drop-in replacement for the legacy `fp8_1x128_cs` (scale_1x128_kernel)

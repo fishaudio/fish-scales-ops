@@ -58,6 +58,7 @@ template <> struct Fp8PermMmaTileNForTileN<64>  { using type = Layout<Shape<_8, 
 // Smem must fit 2 CTAs in 99 KB; verified for (32, 128, 2) ≈ 49 KB; the
 // static_assert below is the compile-time guard.
 template <int TileM_ = 32, int TileN_ = 128, int Stages_ = 4, int MinBlocksPerSm_ = 1,
+    bool SeparateSmemD_ = false,
     typename PermMmaTileN_ = typename Fp8PermMmaTileNForTileN<TileN_>::type>
 struct SM120BlockScaledBuilder
 {
@@ -414,6 +415,24 @@ struct SM120BlockScaledBuilder
         SharedStorageStore store;
     };
 
+    // SeparateSmemD: give the epilogue its own smem instead of aliasing the
+    // A/B region. With the union, every tile's loads must wait for the
+    // previous tile's TMA store to fully drain (store_empty), serialising
+    // the persistent loop tile-by-tile; with a dedicated store buffer the
+    // next tile's loads and mma overlap the previous tile's store, and only
+    // the epilogue r2s write waits on store_empty. Opt-in per instantiation
+    // (costs TileM*TileN*2B of smem) — the grouped MoE cascade enables it
+    // for tiles that fit the 99 KB budget; dense keeps the union.
+    static constexpr bool kSeparateSmemD = SeparateSmemD_;
+
+    struct TensorStorageSeparate
+    {
+        SharedStorageLoad load;
+        SharedStorageStore store;
+    };
+
+    using TensorStorageSel = cute::conditional_t<SeparateSmemD_, TensorStorageSeparate, TensorStorage>;
+
     union TensorStorageMoe
     {
         SharedStorageLoad load;
@@ -449,14 +468,27 @@ struct SM120BlockScaledScheduler
     int32_t num_n_blocks = 0;
     int32_t cur_m_cumsum = 0;
     int32_t* grouped_layout = nullptr;
+    // Grouped fast path: grouped_layout points at the INCLUSIVE per-group
+    // m-block prefix (in shared memory, built once per CTA) instead of the
+    // raw masked counts, and group lookup is a binary search. The legacy
+    // linear walk is a chain of dependent loads (~60 ns per group measured
+    // on 5090: cumsum(g+1) needs load(g)), which at G=128 cost more than
+    // the decode GEMM work itself.
+    bool layout_is_cumsum = false;
+    int32_t total_m_blocks = 0;
 
     __device__ __forceinline__ explicit SM120BlockScaledScheduler(
-        int shape_m, int shape_n, int num_groups_, int* grouped_layout_)
+        int shape_m, int shape_n, int num_groups_, int* grouped_layout_, bool layout_is_cumsum_ = false)
         : num_m_blocks((shape_m + BlockM - 1) / BlockM)
         , num_n_blocks((shape_n + BlockN - 1) / BlockN)
         , num_groups(num_groups_)
         , grouped_layout(grouped_layout_)
+        , layout_is_cumsum(layout_is_cumsum_)
     {
+        if (layout_is_cumsum)
+        {
+            total_m_blocks = grouped_layout[num_groups - 1];
+        }
     }
 
     __device__ __forceinline__ void get_swizzle_block_idx(int block_idx)
@@ -475,6 +507,30 @@ struct SM120BlockScaledScheduler
     {
         auto const& num_sms = gridDim.x;
         auto next_block_idx = ++current_iter * num_sms + blockIdx.x;
+
+        if (layout_is_cumsum)
+        {
+            if (next_block_idx >= total_m_blocks * num_n_blocks)
+            {
+                return false;
+            }
+            // Smallest g with cumsum[g] * num_n_blocks > next_block_idx.
+            // Empty groups (cumsum[g] == cumsum[g-1]) are skipped for free.
+            int lo = 0, hi = num_groups - 1;
+            while (lo < hi)
+            {
+                int const mid = (lo + hi) >> 1;
+                if (grouped_layout[mid] * num_n_blocks > next_block_idx)
+                    hi = mid;
+                else
+                    lo = mid + 1;
+            }
+            current_group_idx = lo;
+            int const cum_before = (lo > 0) ? grouped_layout[lo - 1] : 0;
+            num_m_blocks = grouped_layout[lo] - cum_before;
+            get_swizzle_block_idx(next_block_idx - cum_before * num_n_blocks);
+            return true;
+        }
 
         while (true)
         {

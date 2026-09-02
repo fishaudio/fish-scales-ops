@@ -100,6 +100,7 @@ def _gemm_sources() -> list[str]:
         _rel(base / "ops" / "mxfp8_kernel.cu"),
         _rel(base / "ops" / "mxfp8_sm100_kernel.cu"),
         _rel(base / "ops" / "quant_kernels.cu"),
+        _rel(base / "ops" / "moe_glue.cu"),
         _rel(base / "src" / "runner.cu"),
     ]
 

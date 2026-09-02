@@ -1,0 +1,557 @@
+#!/usr/bin/env python3
+"""MoE grouped-GEMM reference baselines — Qwen3-30B-A3B geometry.
+
+Measures the *reference* kernels the fso MoE (grouped GEMM) project must meet
+or beat, under the standard fso graph-replay protocol (see docs/perf.md):
+per-cell subprocess, 15 eager warmups, side-stream warmup, one
+torch.cuda.graph capture, then 3 reps x 50 replays -> median us.
+
+Geometry (checkpoints/qwen3-30a3 config.json): E=128 experts, topk=8,
+hidden=2048, moe_intermediate=768, 48 layers, gated silu, no shared expert.
+  gate_up : [8M, 2048] x [E, 1536, 2048] -> [8M, 1536]
+  down    : [8M,  768] x [E, 2048,  768] -> [8M, 2048]
+
+Implementations benchmarked (all from the serving venv, no fso code):
+  dg_fp8_cont    deep_gemm m_grouped_fp8_gemm_nt_contiguous  (1x128/128x128)
+  dg_fp8_masked  deep_gemm fp8_m_grouped_gemm_nt_masked      (decode layout)
+  dg_bf16_cont   deep_gemm m_grouped_bf16_gemm_nt_contiguous
+  dg_bf16_masked deep_gemm m_grouped_bf16_gemm_nt_masked
+  triton_bf16    sglang triton fused_experts (BF16)          [whole layer]
+  triton_fp8b    sglang triton fused_experts w8a8 block=[128,128] [whole layer]
+  dg_fp8_layer   production masked pipeline: moe_ep_deepgemm_preprocess ->
+                 masked gemm -> silu_mul_quant -> masked gemm -> post_reorder
+                 (mirrors sglang moe_runner/deep_gemm.py)     [whole layer]
+
+deep_gemm's grouped kernels are the same kernels TensorRT-LLM drives via
+DeepGemmFusedMoE / CutlassFp8BlockScaleGemmRunner::moeGemm on Hopper; the
+triton w8a8-block path is the same family as TRT-LLM's
+fused_moe_triton_fp8_block_scale.py (the sm_120 fallback), so it doubles as
+the RTX 5090 reference where deep_gemm is unavailable.
+
+Run inside the tiny_sglang serving venv (needs deep_gemm + sglang + triton):
+  CUDA_VISIBLE_DEVICES=<idx> <venv>/bin/python bench_moe_qwen3_30a3.py \
+      --run --out /data/bench-runs/<run>/moe_baseline.jsonl
+
+Cell-level fields: us (graph-replay median), cos (vs unquantized bf16
+reference), tflops (useful flops only: 2*8M*N*K, padding excluded), and
+w_gbps (active-expert weight bytes / us — the decode-side roofline metric).
+"""
+
+import argparse
+import json
+import math
+import os
+import statistics
+import subprocess
+import sys
+
+E = 128
+TOPK = 8
+HIDDEN = 2048
+INTER = 768
+LAYERS = 48
+
+# proj -> (N, K)
+PROJ = {"gate_up": (2 * INTER, HIDDEN), "down": (HIDDEN, INTER)}
+
+M_GRID = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+DECODE_M = [m for m in M_GRID if m <= 128]
+
+KERNEL_IMPLS = ("dg_fp8_cont", "dg_bf16_cont", "dg_fp8_masked", "dg_bf16_masked",
+                "fso_mxfp8_grouped")
+LAYER_IMPLS = ("triton_bf16", "triton_fp8b", "dg_fp8_layer", "fso_mxfp8_layer")
+
+# fso masked grouped path: m_cap = pad4(M) slabs fit 32 GB through M=4096
+# (peak ~7 GB at the layer cell); M=8192 still waits on a slab-free entry.
+# 96/256 are off-grid sweep points (dense E33: off-grid mid-M is where
+# cascade bugs hide).
+FSO_M = sorted(set([m for m in M_GRID if m <= 4096] + [96, 256]))
+
+
+def make_cells():
+    cells = []
+    for proj in PROJ:
+        for impl in ("dg_fp8_cont", "dg_bf16_cont"):
+            cells += [dict(impl=impl, proj=proj, M=m) for m in M_GRID]
+        for impl in ("dg_fp8_masked", "dg_bf16_masked"):
+            cells += [dict(impl=impl, proj=proj, M=m) for m in DECODE_M]
+        cells += [dict(impl="fso_mxfp8_grouped", proj=proj, M=m) for m in FSO_M]
+    for impl in ("triton_bf16", "triton_fp8b"):
+        cells += [dict(impl=impl, proj="layer", M=m) for m in M_GRID]
+    cells += [dict(impl="dg_fp8_layer", proj="layer", M=m) for m in DECODE_M]
+    cells += [dict(impl="fso_mxfp8_layer", proj="layer", M=m) for m in FSO_M]
+    return cells
+
+
+def build_fso_routing(topk_ids, topk_w, m_cap):
+    """topk routing -> masked-layout index tensors (capture-safe torch ops).
+
+    NOTE: torch.bincount is NOT capture-safe (it sizes its output from
+    input.max(), a device->host sync); the zeros+scatter_add_ histogram is.
+    """
+    import torch
+    M, topk = topk_ids.shape
+    flat_e = topk_ids.flatten().long()
+    order = torch.argsort(flat_e, stable=True)
+    counts = torch.zeros(E, device="cuda", dtype=torch.int64)
+    counts.scatter_add_(0, flat_e, torch.ones_like(flat_e))
+    cum_excl = torch.cumsum(counts, 0) - counts
+    ranks_sorted = torch.arange(M * topk, device="cuda") - cum_excl[flat_e[order]]
+    slot_sorted = flat_e[order] * m_cap + ranks_sorted
+    row_map = torch.full((E * m_cap,), -1, device="cuda", dtype=torch.int32)
+    row_map[slot_sorted] = (order // topk).int()
+    slot_of_flat = torch.empty(M * topk, device="cuda", dtype=torch.int64)
+    slot_of_flat[order] = slot_sorted
+    return counts.int(), row_map, slot_of_flat
+
+
+# --------------------------------------------------------------------------
+# Worker: one cell in one process
+# --------------------------------------------------------------------------
+
+def busy_warm(ms):
+    import torch
+    if ms <= 0:
+        return
+    a = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+    t0 = torch.cuda.Event(True)
+    t1 = torch.cuda.Event(True)
+    t0.record()
+    while True:
+        for _ in range(8):
+            a = a @ a * 1e-3
+        t1.record()
+        torch.cuda.synchronize()
+        if t0.elapsed_time(t1) >= ms:
+            break
+
+
+def graph_time_us(fn, warmup=15, stream_warm=3, reps=3, iters=50):
+    import torch
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(stream_warm):
+            fn()
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=s):
+        fn()
+    vals = []
+    for _ in range(reps):
+        t0 = torch.cuda.Event(True)
+        t1 = torch.cuda.Event(True)
+        t0.record()
+        for _ in range(iters):
+            g.replay()
+        t1.record()
+        torch.cuda.synchronize()
+        vals.append(t0.elapsed_time(t1) * 1000.0 / iters)
+    return statistics.median(vals)
+
+
+def make_routing(M, seed):
+    """topk_ids [M, TOPK] int32 (no replacement), topk_weights [M, TOPK] fp32."""
+    import torch
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    ids = torch.stack([torch.randperm(E, generator=g)[:TOPK] for _ in range(M)])
+    w = torch.softmax(torch.randn(M, TOPK, generator=g, dtype=torch.float32), dim=-1)
+    return ids.to("cuda", torch.int32), w.cuda()
+
+
+def quant_weights_fp8(w):
+    """[E, N, K] bf16 -> fp8 + [E, N/128, K/128] fp32 block scales."""
+    import torch
+    import deep_gemm as dg
+    Ecnt, N, K = w.shape
+    w_fp8 = torch.empty_like(w, dtype=torch.float8_e4m3fn)
+    w_sf = torch.empty(Ecnt, (N + 127) // 128, (K + 127) // 128,
+                       device=w.device, dtype=torch.float32)
+    for e in range(Ecnt):
+        q, s = dg.per_block_cast_to_fp8(w[e], use_ue8m0=False)
+        w_fp8[e].copy_(q)
+        w_sf[e].copy_(s)
+    return w_fp8, w_sf
+
+
+def grouped_ref(x_rows, w, row_expert):
+    """fp32 reference: out[i] = x_rows[i] @ w[row_expert[i]].T (bf16 operands)."""
+    import torch
+    out = torch.empty(x_rows.shape[0], w.shape[1], device=x_rows.device,
+                      dtype=torch.float32)
+    for e in row_expert.unique().tolist():
+        sel = row_expert == e
+        out[sel] = x_rows[sel].float() @ w[e].float().t()
+    return out
+
+
+def moe_layer_ref(hidden, w13, w2, topk_ids, topk_w):
+    """fp32 whole-layer reference (chunked gate|up, silu, weighted combine)."""
+    import torch
+    M = hidden.shape[0]
+    out = torch.zeros(M, HIDDEN, device=hidden.device, dtype=torch.float32)
+    hf = hidden.float()
+    for e in torch.unique(topk_ids).tolist():
+        tok, slot = (topk_ids == e).nonzero(as_tuple=True)
+        gu = hf[tok] @ w13[e].float().t()
+        act = torch.nn.functional.silu(gu[:, :INTER]) * gu[:, INTER:]
+        out.index_add_(0, tok,
+                       (act @ w2[e].float().t()) * topk_w[tok, slot, None].float())
+    return out
+
+
+def cos_sim(a, b):
+    import torch
+    return torch.nn.functional.cosine_similarity(
+        a.float().flatten(), b.float().flatten(), dim=0).item()
+
+
+def init_sglang_shim():
+    """Minimal global ServerArgs so sglang kernel wrappers are importable."""
+    import dataclasses
+    from sglang.srt.server_args import (ServerArgs,
+                                        set_global_server_args_for_scheduler)
+    sa = ServerArgs.__new__(ServerArgs)  # skip __post_init__ side effects
+    for f in dataclasses.fields(ServerArgs):
+        if f.default is not dataclasses.MISSING:
+            setattr(sa, f.name, f.default)
+        elif f.default_factory is not dataclasses.MISSING:
+            setattr(sa, f.name, f.default_factory())
+        else:
+            setattr(sa, f.name, None)
+    set_global_server_args_for_scheduler(sa)
+
+
+def run_worker(cell):
+    import torch
+    import deep_gemm as dg
+
+    impl, proj, M = cell["impl"], cell["proj"], cell["M"]
+    torch.manual_seed(M * 1009 + len(proj) * 17 + 5)
+    busy_warm(int(os.environ.get("FSO_BENCH_WARM_MS", "0")))
+
+    topk_ids, topk_w = make_routing(M, seed=M * 7919 + 3)
+    counts = torch.bincount(topk_ids.flatten().long(), minlength=E).int()
+    active = int((counts > 0).sum())
+    rows = M * TOPK
+
+    result = dict(cell)
+    result["active_experts"] = active
+
+    if impl in KERNEL_IMPLS:
+        N, K = PROJ[proj]
+        w = torch.randn(E, N, K, device="cuda", dtype=torch.bfloat16) / math.sqrt(K)
+        result["flops"] = 2.0 * rows * N * K
+        wbytes = N * K * (1 if ("fp8" in impl or "mxfp8" in impl) else 2)
+        result["w_bytes_active"] = active * wbytes
+
+        if impl == "fso_mxfp8_grouped":
+            import fish_scales_ops as fso
+            m_cap = (M + 3) // 4 * 4
+            expected_m = max(1, (rows + E - 1) // E)
+            result["m_cap"] = m_cap
+            # layer-style prep: routing kernel + flat-pair gather-quant
+            x_tok = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.1
+            masked_dev, row_map, slot_of_flat = fso.gemm.moe_build_routing(
+                topk_ids, E, m_cap)
+            a_fp8, sa = fso.gemm.quantize_1x32_grouped_gather_fp8(
+                x_tok, slot_of_flat, TOPK, E, m_cap)
+            w_fp8, sw = fso.gemm.quantize_moe_weights_1x32_fp8(w)
+            fn = lambda: fso.gemm.linear_mxfp8_grouped_masked(
+                a_fp8, w_fp8, sa, sw, masked_dev, expected_m)
+            y = fn()
+            torch.cuda.synchronize()
+            cs, n_cs = 0.0, 0
+            rm = row_map.cpu().view(E, m_cap)   # row_map[slot] = source token
+            mm = masked_dev.cpu()
+            for e in range(E):
+                n_e = int(mm[e])
+                if not n_e:
+                    continue
+                src = rm[e, :n_e].long()
+                ref = x_tok[src].float() @ w[e].float().t()
+                cs += cos_sim(y[e, :n_e], ref) * n_e
+                n_cs += n_e
+            result["cos"] = cs / max(n_cs, 1)
+        elif impl.endswith("_cont"):
+            # per-expert segments padded to the 128-row contiguous alignment;
+            # padding rows are zero and point at the same expert (the layout
+            # sglang's contiguous path uses), so they are computed and thrown
+            # away -- the useful-flops tflops field exposes that waste.
+            align = dg.get_mk_alignment_for_contiguous_layout()
+            pad = torch.where(counts > 0, (counts + align - 1) // align * align,
+                              torch.zeros_like(counts))
+            Mc = int(pad.sum())
+            x = torch.zeros(Mc, K, device="cuda", dtype=torch.bfloat16)
+            m_indices = torch.empty(Mc, device="cuda", dtype=torch.int32)
+            row_expert = torch.empty(Mc, device="cuda", dtype=torch.int64)
+            off = 0
+            for e in range(E):
+                if int(pad[e]) == 0:
+                    continue
+                n_e = int(counts[e])
+                x[off:off + n_e] = torch.randn(n_e, K, device="cuda",
+                                               dtype=torch.bfloat16) * 0.1
+                m_indices[off:off + int(pad[e])] = e
+                row_expert[off:off + int(pad[e])] = e
+                off += int(pad[e])
+            d = torch.empty(Mc, N, device="cuda", dtype=torch.bfloat16)
+            result["rows_padded"] = Mc
+            if impl == "dg_fp8_cont":
+                x_fp8, x_sf = dg.per_token_cast_to_fp8(x, use_ue8m0=False)
+                w_fp8, w_sf = quant_weights_fp8(w)
+                fn = lambda: dg.m_grouped_fp8_gemm_nt_contiguous(
+                    (x_fp8, x_sf), (w_fp8, w_sf), d, m_indices)
+            else:
+                fn = lambda: dg.m_grouped_bf16_gemm_nt_contiguous(x, w, d, m_indices)
+            fn()
+            torch.cuda.synchronize()
+            result["cos"] = cos_sim(d, grouped_ref(x, w, row_expert))
+        else:
+            # production masked layout: m_max padded like moe_ep_deepgemm_preprocess
+            m_max = (M // 256 + 1) * 256
+            expected_m = (rows - 1) // E + 1
+            a = torch.zeros(E, m_max, K, device="cuda", dtype=torch.bfloat16)
+            for e in range(E):
+                n_e = int(counts[e])
+                if n_e:
+                    a[e, :n_e] = torch.randn(n_e, K, device="cuda",
+                                             dtype=torch.bfloat16) * 0.1
+            d = torch.empty(E, m_max, N, device="cuda", dtype=torch.bfloat16)
+            result["m_max"] = m_max
+            if impl == "dg_fp8_masked":
+                a_fp8 = torch.empty_like(a, dtype=torch.float8_e4m3fn)
+                a_sf = torch.empty(E, m_max, K // 128, device="cuda",
+                                   dtype=torch.float32)
+                for e in range(E):
+                    q, s = dg.per_token_cast_to_fp8(a[e], use_ue8m0=False)
+                    a_fp8[e].copy_(q)
+                    a_sf[e].copy_(s)
+                w_fp8, w_sf = quant_weights_fp8(w)
+                fn = lambda: dg.fp8_m_grouped_gemm_nt_masked(
+                    (a_fp8, a_sf), (w_fp8, w_sf), d, counts, expected_m)
+            else:
+                fn = lambda: dg.m_grouped_bf16_gemm_nt_masked(
+                    a, w, d, counts, expected_m)
+            fn()
+            torch.cuda.synchronize()
+            cs, n_cs = 0.0, 0
+            for e in range(E):
+                n_e = int(counts[e])
+                if not n_e:
+                    continue
+                ref = a[e, :n_e].float() @ w[e].float().t()
+                cs += cos_sim(d[e, :n_e], ref) * n_e
+                n_cs += n_e
+            result["cos"] = cs / max(n_cs, 1)
+
+    else:  # whole-layer impls
+        init_sglang_shim()
+        hidden = torch.randn(M, HIDDEN, device="cuda", dtype=torch.bfloat16) * 0.1
+        w13 = torch.randn(E, 2 * INTER, HIDDEN, device="cuda",
+                          dtype=torch.bfloat16) / math.sqrt(HIDDEN)
+        w2 = torch.randn(E, HIDDEN, INTER, device="cuda",
+                         dtype=torch.bfloat16) / math.sqrt(INTER)
+        result["flops"] = 2.0 * rows * (2 * INTER * HIDDEN + HIDDEN * INTER)
+        wbytes_e = (2 * INTER * HIDDEN + HIDDEN * INTER)
+        result["w_bytes_active"] = active * wbytes_e * (2 if impl == "triton_bf16" else 1)
+        ref = moe_layer_ref(hidden, w13, w2, topk_ids, topk_w)
+
+        if impl.startswith("triton"):
+            from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+            from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+                fused_experts)
+            from sglang.srt.layers.moe.topk import StandardTopKOutput
+            import dataclasses as _dc
+            cfg_kw = dict(num_experts=E, num_local_experts=E, top_k=TOPK,
+                          hidden_size=HIDDEN,
+                          intermediate_size_per_partition=INTER,
+                          activation="silu", is_gated=True, inplace=False,
+                          gate_up_interleaved=False)  # chunked [gate|up]
+            fields = {f.name for f in _dc.fields(MoeRunnerConfig)}
+            cfg = MoeRunnerConfig(**{k: v for k, v in cfg_kw.items()
+                                     if k in fields})
+            tk = StandardTopKOutput(topk_w, topk_ids,
+                                    torch.empty(M, E, device="cuda"))
+            if impl == "triton_bf16":
+                fn = lambda: fused_experts(hidden, w13, w2, tk, cfg)
+            else:
+                w13_fp8, w13_sf = quant_weights_fp8(w13)
+                w2_fp8, w2_sf = quant_weights_fp8(w2)
+                fn = lambda: fused_experts(
+                    hidden, w13_fp8, w2_fp8, tk, cfg, use_fp8_w8a8=True,
+                    w1_scale=w13_sf, w2_scale=w2_sf, block_shape=[128, 128])
+            out_holder = {}
+            fn0 = fn
+            def fn():
+                out_holder["out"] = fn0()
+            fn()
+            torch.cuda.synchronize()
+            result["cos"] = cos_sim(out_holder["out"], ref)
+        elif impl == "fso_mxfp8_layer":
+            # fso M1 composed layer, 6 kernels total and zero torch-op glue:
+            # moe_build_routing + gather-quant + grouped gate_up +
+            # grouped silu-quant + grouped down + moe_combine. Routing is
+            # derived from topk_ids ON DEVICE inside the timed graph, same
+            # boundary as the triton / dg layer cells.
+            import fish_scales_ops as fso
+            m_cap = (M + 3) // 4 * 4
+            expected_m = max(1, (rows + E - 1) // E)
+            result["m_cap"] = m_cap
+            w13_fp8, sw13 = fso.gemm.quantize_moe_weights_1x32_fp8(w13)
+            w2_fp8, sw2 = fso.gemm.quantize_moe_weights_1x32_fp8(w2)
+
+            def layer_fn():
+                masked_dev, row_map, slot_of_flat = fso.gemm.moe_build_routing(
+                    topk_ids, E, m_cap)
+                hq, sh = fso.gemm.quantize_1x32_grouped_gather_fp8(
+                    hidden, slot_of_flat, TOPK, E, m_cap)
+                gu = fso.gemm.linear_mxfp8_grouped_masked(
+                    hq, w13_fp8, sh, sw13, masked_dev, expected_m)
+                dq, sd = fso.gemm.silu_chunk_mul_quantize_1x32_grouped_fp8(
+                    gu, slot_of_flat)
+                dn = fso.gemm.linear_mxfp8_grouped_masked(
+                    dq, w2_fp8, sd, sw2, masked_dev, expected_m)
+                return fso.gemm.moe_combine(dn, slot_of_flat, topk_w)
+
+            out_holder = {}
+            def fn():
+                out_holder["out"] = layer_fn()
+            fn()
+            torch.cuda.synchronize()
+            result["cos"] = cos_sim(out_holder["out"], ref)
+        else:  # dg_fp8_layer: mirror sglang moe_runner/deep_gemm.py masked path
+            from sglang.srt.layers import deep_gemm_wrapper
+            from sglang.srt.layers.moe.ep_moe.kernels import (
+                moe_ep_deepgemm_preprocess, post_reorder_triton_kernel)
+            from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+                _varlen_deep_gemm_silu_mul_quant)
+            w13_fp8, w13_sf = quant_weights_fp8(w13)
+            w2_fp8, w2_sf = quant_weights_fp8(w2)
+            out = torch.empty(M, HIDDEN, device="cuda", dtype=torch.bfloat16)
+
+            def layer_fn():
+                masked_m, expected_m, src2dst, h_q, h_sf = (
+                    moe_ep_deepgemm_preprocess(
+                        topk_ids, E, hidden, TOPK, [128, 128],
+                        output_dtype=torch.float8_e4m3fn))
+                n_grp, m_max, _ = h_q.shape
+                if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+                    h_sf = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(h_sf)
+                gu = torch.empty(n_grp, m_max, 2 * INTER, device="cuda",
+                                 dtype=torch.bfloat16)
+                deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                    (h_q, h_sf), (w13_fp8, w13_sf), gu, masked_m, expected_m)
+                di, di_sf = _varlen_deep_gemm_silu_mul_quant(
+                    gu, masked_m, group_size=128, topk=TOPK)
+                if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+                    di_sf = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(di_sf)
+                dn = torch.empty(n_grp, m_max, HIDDEN, device="cuda",
+                                 dtype=torch.bfloat16)
+                deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                    (di, di_sf), (w2_fp8, w2_sf), dn, masked_m, expected_m)
+                post_reorder_triton_kernel[(M,)](
+                    dn, out, src2dst, topk_ids, topk_w, TOPK, HIDDEN,
+                    BLOCK_SIZE=512)
+                return out
+
+            fn = layer_fn
+            fn()
+            torch.cuda.synchronize()
+            result["cos"] = cos_sim(out, ref)
+
+    result["us"] = graph_time_us(fn)
+    print("CELL " + json.dumps(result), flush=True)
+
+
+# --------------------------------------------------------------------------
+# Orchestrator
+# --------------------------------------------------------------------------
+
+def derive(row):
+    us = row["us"]
+    row["tflops"] = row["flops"] / (us * 1e-6) / 1e12
+    row["w_gbps"] = row["w_bytes_active"] / (us * 1e-6) / 1e9
+    if row["proj"] == "layer":
+        row["model_ms"] = us * LAYERS / 1e3
+        row["moe_tok_s"] = 1e6 / (us * LAYERS)
+    return row
+
+
+def run_all(args):
+    import torch
+    cells = make_cells()
+    if args.impls:
+        keep = set(args.impls.split(","))
+        cells = [c for c in cells if c["impl"] in keep]
+    if args.Ms:
+        keep_m = {int(m) for m in args.Ms.split(",")}
+        cells = [c for c in cells if c["M"] in keep_m]
+    if args.projs:
+        keep_p = set(args.projs.split(","))
+        cells = [c for c in cells if c["proj"] in keep_p]
+
+    meta = dict(kind="meta", model="qwen3-30a3", E=E, topk=TOPK, hidden=HIDDEN,
+                inter=INTER, layers=LAYERS,
+                device=torch.cuda.get_device_name(0),
+                torch=torch.__version__)
+    rows = [meta]
+    out_f = open(args.out, "w") if args.out else None
+    if out_f:
+        out_f.write(json.dumps(meta) + "\n")
+        out_f.flush()
+
+    for i, cell in enumerate(cells):
+        cmd = [sys.executable, os.path.abspath(__file__), "--worker",
+               "--cell", json.dumps(cell)]
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        line = next((l for l in p.stdout.splitlines() if l.startswith("CELL ")), None)
+        if line is None:
+            err = (p.stderr or "").strip().splitlines()
+            row = dict(cell, error=(err[-1] if err else f"rc={p.returncode}"))
+            print(f"[{i+1}/{len(cells)}] {cell['impl']:14s} {cell['proj']:8s} "
+                  f"M={cell['M']:<5d} FAILED: {row['error'][:120]}")
+        else:
+            row = derive(json.loads(line[5:]))
+            if "Config file not found" in (p.stderr or ""):
+                row["tuned_cfg"] = False
+            extra = f" moe_tok/s={row['moe_tok_s']:8.1f}" if "moe_tok_s" in row else ""
+            print(f"[{i+1}/{len(cells)}] {cell['impl']:14s} {cell['proj']:8s} "
+                  f"M={cell['M']:<5d} {row['us']:9.2f} us  "
+                  f"{row['tflops']:7.1f} TF  {row['w_gbps']:7.0f} GB/s  "
+                  f"cos={row.get('cos', float('nan')):.5f}{extra}")
+        rows.append(row)
+        if out_f:
+            out_f.write(json.dumps(row) + "\n")
+            out_f.flush()
+    if out_f:
+        out_f.close()
+        print(f"\nwrote {args.out}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--run", action="store_true")
+    ap.add_argument("--worker", action="store_true")
+    ap.add_argument("--cell", type=str, default=None)
+    ap.add_argument("--out", type=str, default=None)
+    ap.add_argument("--impls", type=str, default=None,
+                    help="comma list filter, e.g. dg_fp8_masked,triton_bf16")
+    ap.add_argument("--Ms", type=str, default=None,
+                    help="comma list filter, e.g. 1,8,128")
+    ap.add_argument("--projs", type=str, default=None,
+                    help="comma list filter, e.g. gate_up or down,layer")
+    args = ap.parse_args()
+    if args.worker:
+        run_worker(json.loads(args.cell))
+    elif args.run:
+        run_all(args)
+    else:
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()

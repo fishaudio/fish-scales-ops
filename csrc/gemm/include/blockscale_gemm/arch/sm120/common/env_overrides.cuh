@@ -115,5 +115,19 @@ inline bool read_disable_overrides() noexcept
     return s_cache != 0;
 }
 
+
+// FSO_DISABLE_PDL=1 turns off programmatic dependent launch attributes on
+// every fso MoE-chain launch (kernel-side griddepcontrol wait/trigger then
+// degrade to no-ops). Read once per process.
+inline bool fso_pdl_enabled()
+{
+    static bool const v = []
+    {
+        char const* e = std::getenv("FSO_DISABLE_PDL");
+        return !(e && e[0] == '1');
+    }();
+    return v;
+}
+
 } // namespace kernels::blockscale_gemm
 } // namespace tensorrt_llm

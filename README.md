@@ -229,6 +229,7 @@ re-exports.
 |---|---|---|---|
 | FP8 1×128 GEMM | ✓ (NVRTC JIT, DeepGEMM-derived WGMMA) | ✓ (CUTLASS BlockScaled) | — |
 | MXFP8 1×32 GEMM | — | ✓ (CUTLASS BlockScaled mxf8f6f4) | ✓ (CUTLASS tcgen05 BlockScaled) |
+| Grouped GEMM / MoE experts | planned | **in development** (grouped block-scale GEMM + fused MoE layer; reference baselines in `bench/gemm/python/bench_moe_qwen3_30a3.py`) | planned |
 | BF16 FlashAttention | torch SDPA | torch SDPA | torch SDPA |
 | **MXFP8 FlashAttention prefill** | — | ✓ (D ∈ {32, 64, 128, 256}) | — |
 | **MXFP8 paged-prefill (extend)** | — | ✓ (page_size ∈ {32, 64, 128, 256}) | — |

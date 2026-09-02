@@ -135,3 +135,172 @@ def silu_chunk_mul_quantize_1x32_fp8(gu: torch.Tensor) -> tuple[torch.Tensor, to
     """
     _require_mxfp8_arch()
     return torch.ops.fish_scales_ops.silu_chunk_mul_quantize_1x32(gu.contiguous(), True)
+
+
+# ---------------------------------------------------------------------------
+# Grouped (MoE) masked-layout surface — sm_120 only (M1; sm_100/103 in M3).
+#
+# Masked semantics (DeepGEMM-style): G expert groups, each with a fixed row
+# capacity ``m_cap`` and a per-group valid-row count ``masked_m[g]`` that
+# lives ON DEVICE and is read only by the kernels — never on the host — so
+# every op below is CUDA-Graph capture-safe with dynamic routing: replays
+# honour whatever counts the masked_m buffer holds at replay time.
+# Rows at or beyond masked_m[g] hold undefined bytes in every tensor.
+
+
+def _require_sm120_grouped() -> None:
+    if sm_major() != 12:
+        raise NotImplementedError(
+            "the grouped MXFP8 (MoE) path is sm_120/121-only for now; "
+            "sm_100/103 lands with milestone M3, sm_90 with M4."
+        )
+
+
+def linear_mxfp8_grouped_masked(
+    a_fp8: torch.Tensor,
+    w_fp8: torch.Tensor,
+    sa: torch.Tensor,
+    sw: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+) -> torch.Tensor:
+    """Grouped block-scaled MXFP8 GEMM over per-expert weights (masked).
+
+    Args:
+        a_fp8: float8_e4m3fn ``[G, m_cap, K]`` — per-group activation slab
+            from :func:`quantize_1x32_grouped_gather_fp8` (or
+            :func:`silu_chunk_mul_quantize_1x32_grouped_fp8`).
+        w_fp8: float8_e4m3fn ``[G, N, K]`` — per-expert weights (see
+            :func:`quantize_moe_weights_1x32_fp8`).
+        sa: int32 ``[G, K/128, m_cap]`` per-group K-major packed UE8M0.
+        sw: int32 ``[G, K/128, N]`` per-group K-major packed UE8M0.
+        masked_m: int32 ``[G]`` on device — valid rows per group. Caller
+            contract: ``masked_m[g] <= m_cap`` for every g (the kernel does
+            not check; an oversized count silently drops that group's
+            overflow rows at the TMA bounds).
+        expected_m: host-side static hint (``ceil(total_rows / G)``) used
+            only for tile selection; per-call value must be a plain int so
+            graph capture stays shape-static.
+
+    Returns:
+        bfloat16 ``[G, m_cap, N]``; rows ``>= masked_m[g]`` are undefined.
+
+    Constraints: ``K % 128 == 0``, ``N % 128 == 0``, ``m_cap % 4 == 0``.
+    """
+    _require_sm120_grouped()
+    return torch.ops.fish_scales_ops.linear_mxfp8_grouped_masked(
+        a_fp8, w_fp8, sa, sw, masked_m, expected_m
+    )
+
+
+def quantize_1x32_grouped_gather_fp8(
+    x: torch.Tensor,
+    slot_of_flat: torch.Tensor,
+    topk: int,
+    num_groups: int,
+    m_cap: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused token-gather + MXFP8 quantize into the masked grouped layout.
+
+    Indexed over the flat routed-pair space (host-static ``M * topk``): pair
+    ``i`` reads source row ``i // topk`` of ``x`` (bf16 ``[M, K]``) and
+    writes destination slot ``slot_of_flat[i]`` (= ``g * m_cap + m_in``,
+    from :func:`moe_build_routing`). One launch, no dead warps — the
+    original padded ``G * m_cap`` iteration burned ~27 µs of early-outs at
+    M=512.
+
+    Returns:
+        (a_fp8 ``[G, m_cap, K]``, sa int32 ``[G, K/128, m_cap]``) ready for
+        :func:`linear_mxfp8_grouped_masked`. Rows no pair maps to are
+        undefined (the GEMM's masked contract ignores them).
+    """
+    _require_sm120_grouped()
+    return torch.ops.fish_scales_ops.quantize_1x32_grouped_gather(
+        x.contiguous(), slot_of_flat, topk, num_groups, m_cap, True
+    )
+
+
+def silu_chunk_mul_quantize_1x32_grouped_fp8(
+    gu: torch.Tensor,
+    slot_of_flat: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Grouped SwiGLU prologue + MXFP8 quantize over the flat pair space.
+
+    ``gu`` is the grouped gate_up output (bf16 ``[G, m_cap, 2*INTER]``,
+    gate || up chunked). Each routed pair processes its own row
+    (``slot_of_flat[i]``) in place; rows no pair maps to stay undefined.
+
+    Returns:
+        (h_fp8 ``[G, m_cap, INTER]``, sh int32 ``[G, INTER/128, m_cap]``).
+    """
+    _require_sm120_grouped()
+    return torch.ops.fish_scales_ops.silu_chunk_mul_quantize_1x32_grouped(
+        gu, slot_of_flat, True
+    )
+
+
+def moe_build_routing(
+    topk_ids: torch.Tensor,
+    num_groups: int,
+    m_cap: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """topk routing -> masked-layout index tensors, one kernel launch.
+
+    Args:
+        topk_ids: int32 ``[M, topk]``, no-replacement expert ids.
+        num_groups: G (<= 1024).
+        m_cap: per-group row capacity (multiple of 4, >= M).
+
+    Returns:
+        (masked_m ``[G]`` int32, row_map ``[G * m_cap]`` int32 — slot ->
+        source token, slots at or beyond masked_m[g] uninitialised by
+        design, slot_of_flat ``[M * topk]`` int32). Slot order within a
+        group is atomic-arrival order; every consumer goes through these
+        maps consistently.
+    """
+    _require_sm120_grouped()
+    return torch.ops.fish_scales_ops.moe_build_routing(topk_ids, num_groups, m_cap)
+
+
+def moe_combine(
+    dn: torch.Tensor,
+    slot_of_flat: torch.Tensor,
+    topk_w: torch.Tensor,
+) -> torch.Tensor:
+    """Weighted combine of routed expert outputs, one kernel launch.
+
+    ``out[t] = sum_j topk_w[t, j] * dn.view(-1, H)[slot_of_flat[t*topk+j]]``.
+    """
+    _require_sm120_grouped()
+    return torch.ops.fish_scales_ops.moe_combine(dn, slot_of_flat, topk_w)
+
+
+def quantize_moe_weights_1x32_fp8(
+    w: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Offline per-expert weight quantize for the grouped GEMM (sm_120).
+
+    ``w`` is bf16 ``[G, N, K]``. Loops experts through the flat 1×32
+    quantizer and stacks results — offline cost, not a serving-path op.
+
+    Returns:
+        (w_fp8 ``[G, N, K]``, sw int32 ``[G, K/128, N]``).
+
+    Constraints: ``N % 128 == 0`` (so the per-expert pad(N,4) == N),
+    ``K % 128 == 0``.
+    """
+    _require_sm120_grouped()
+    if w.dim() != 3:
+        raise ValueError("w must be [G, N, K]")
+    G, N, K = w.shape
+    if N % 128 != 0 or K % 128 != 0:
+        raise ValueError("N and K must be multiples of 128")
+    w_fp8 = torch.empty(G, N, K, device=w.device, dtype=torch.float8_e4m3fn)
+    sw = torch.empty(G, K // 128, N, device=w.device, dtype=torch.int32)
+    for g in range(G):
+        q, s = torch.ops.fish_scales_ops.quantize_1x32_packed(w[g].contiguous(), True)
+        w_fp8[g].copy_(q)
+        # s is [pad(N,4), K/128] with strides (1, N) — K-major. Its raw byte
+        # order equals the [K/128, N] slab the grouped kernel expects.
+        sw[g].copy_(s.t().view(K // 128, N))
+    return w_fp8, sw

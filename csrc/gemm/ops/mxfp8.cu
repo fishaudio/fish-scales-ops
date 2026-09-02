@@ -37,6 +37,17 @@ void fp8bs_silu_chunk_mul_quantize_1x32_packed(__nv_fp8_e4m3* x_q,
     cudaStream_t stream, bool use_ue8m0, bool sm1xx_sf_layout = false);
 void repack_ue8m0_scales_for_sm120(int32_t* dst, float const* src, int M_pad, int K_blocks_in,
     cudaStream_t stream);
+// Grouped (MoE, masked layout) variants — see quant_kernels.cu and
+// mxfp8_kernel.cu for the layout contracts.
+cudaError_t launch_sm120_mxfp8_grouped_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D,
+    int32_t* SFA, int32_t* SFB, int32_t* masked_m, int num_groups, int m_cap, int N, int K,
+    int expected_m, cudaStream_t stream);
+void fp8bs_quantize_1x32_packed_grouped_gather(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
+    __nv_bfloat16 const* x, int32_t const* slot_of_flat, int n_pairs, int topk,
+    int m_cap, int K, cudaStream_t stream, bool use_ue8m0);
+void fp8bs_silu_chunk_mul_quantize_1x32_packed_grouped(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
+    __nv_bfloat16 const* gu, int32_t const* slot_of_flat, int n_pairs, int m_cap, int K,
+    cudaStream_t stream, bool use_ue8m0);
 } // namespace detail
 
 namespace
@@ -265,6 +276,146 @@ at::Tensor linear_mxfp8_raw(at::Tensor x_fp8, at::Tensor w_fp8, at::Tensor sx_in
         M, N, K, stream);
     TORCH_CHECK(err == cudaSuccess, "sm120 mxfp8 kernel error: ", cudaGetErrorString(err));
     return y;
+}
+
+
+// ---------------------------------------------------------------------------
+// Grouped (MoE, masked layout) surface — sm_120 only (M1).
+//
+// Layout contracts (G = num experts/groups, m_cap = per-group row capacity,
+// m_cap % 4 == 0):
+//   a_fp8    [G, m_cap, K]        rows >= masked_m[g] undefined
+//   w_fp8    [G, N, K]            per-expert weights
+//   sa_int32 [G, K/128, m_cap]    packed UE8M0, K-major per group
+//   sw_int32 [G, K/128, N]        packed UE8M0, K-major per group (N%128==0
+//                                 so pad(N,4) == N)
+//   out      [G, m_cap, N] bf16   rows >= masked_m[g] undefined
+// masked_m is int32 [G] on device and is read ONLY by the kernel — never on
+// the host — so calls are CUDA-Graph capture-safe with dynamic routing.
+// expected_m is a host-side static tile-selection hint (ceil(rows/G)).
+
+at::Tensor linear_mxfp8_grouped_masked(at::Tensor a_fp8, at::Tensor w_fp8, at::Tensor sa_int32,
+    at::Tensor sw_int32, at::Tensor masked_m, int64_t expected_m)
+{
+    TORCH_CHECK(!is_sm100_family(),
+        "linear_mxfp8_grouped_masked is sm_120-only for now (M3 adds the sm_100/103 path)");
+    TORCH_CHECK(a_fp8.is_cuda() && w_fp8.is_cuda(), "a/w must be on CUDA");
+    TORCH_CHECK(a_fp8.dtype() == at::kFloat8_e4m3fn && w_fp8.dtype() == at::kFloat8_e4m3fn,
+        "a_fp8 / w_fp8 must be float8_e4m3fn");
+    TORCH_CHECK(sa_int32.dtype() == at::kInt && sw_int32.dtype() == at::kInt,
+        "sa / sw must be int32 (packed UE8M0)");
+    TORCH_CHECK(masked_m.dtype() == at::kInt && masked_m.is_cuda(), "masked_m must be CUDA int32");
+    TORCH_CHECK(a_fp8.dim() == 3 && w_fp8.dim() == 3, "a_fp8 [G,m_cap,K] / w_fp8 [G,N,K] must be 3D");
+    TORCH_CHECK(a_fp8.is_contiguous() && w_fp8.is_contiguous() && masked_m.is_contiguous(),
+        "a/w/masked_m must be contiguous");
+
+    int const G = a_fp8.size(0);
+    int const m_cap = a_fp8.size(1);
+    int const K = a_fp8.size(2);
+    int const N = w_fp8.size(1);
+    TORCH_CHECK(w_fp8.size(0) == G, "w_fp8.size(0) must equal a_fp8.size(0)");
+    TORCH_CHECK(w_fp8.size(2) == K, "w_fp8.size(2) must match a_fp8.size(2)");
+    TORCH_CHECK(masked_m.numel() == G, "masked_m must have G entries");
+    TORCH_CHECK(K % 128 == 0, "K must be a multiple of 128");
+    TORCH_CHECK(N % 128 == 0, "N must be a multiple of 128 (BlockScaled atom requires it)");
+    TORCH_CHECK(m_cap % 4 == 0, "m_cap must be a multiple of 4 (per-group scale padding)");
+    TORCH_CHECK(expected_m >= 1, "expected_m must be >= 1");
+    int64_t const kp = K / 128;
+    TORCH_CHECK(sa_int32.numel() == static_cast<int64_t>(G) * kp * m_cap,
+        "sa_int32 must be [G, K/128, m_cap] (per-group K-major packed scales)");
+    TORCH_CHECK(sw_int32.numel() == static_cast<int64_t>(G) * kp * N,
+        "sw_int32 must be [G, K/128, N] (per-group K-major packed scales)");
+
+    auto y = at::empty({G, m_cap, N}, a_fp8.options().dtype(at::kBFloat16));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto err = detail::launch_sm120_mxfp8_grouped_dispatch(
+        reinterpret_cast<__nv_fp8_e4m3*>(a_fp8.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3*>(w_fp8.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(y.data_ptr()),
+        reinterpret_cast<int32_t*>(sa_int32.data_ptr()),
+        reinterpret_cast<int32_t*>(sw_int32.data_ptr()),
+        reinterpret_cast<int32_t*>(masked_m.data_ptr()),
+        G, m_cap, N, K, static_cast<int>(expected_m), stream);
+    TORCH_CHECK(err == cudaSuccess, "sm120 mxfp8 grouped kernel error: ", cudaGetErrorString(err));
+    return y;
+}
+
+
+// quantize_1x32_grouped_gather: fused token-gather + MXFP8 quantize into the
+// masked grouped layout, indexed over the flat routed-pair space. x is the
+// flat [M, K] bf16 activation; slot_of_flat (int32 [M * topk], from
+// moe_build_routing) maps pair i -> destination slot g*m_cap + m_in; the
+// source row is i / topk. num_groups is implied by the output shape:
+// pass G explicitly so the scale buffer can be sized without a device read.
+std::tuple<at::Tensor, at::Tensor> quantize_1x32_grouped_gather(
+    at::Tensor x, at::Tensor slot_of_flat, int64_t topk, int64_t num_groups,
+    int64_t m_cap, bool use_ue8m0)
+{
+    TORCH_CHECK(!is_sm100_family(), "quantize_1x32_grouped_gather is sm_120-only for now");
+    TORCH_CHECK(x.is_cuda() && x.dtype() == at::kBFloat16, "x must be CUDA bf16");
+    TORCH_CHECK(x.dim() == 2, "x must be 2D [M, K]");
+    TORCH_CHECK(slot_of_flat.dtype() == at::kInt && slot_of_flat.is_cuda()
+            && slot_of_flat.is_contiguous(),
+        "slot_of_flat must be contiguous CUDA int32");
+    int const M = x.size(0);
+    int const K = x.size(1);
+    int const G = static_cast<int>(num_groups);
+    TORCH_CHECK(K % 128 == 0, "K must be a multiple of 128");
+    TORCH_CHECK(topk >= 1, "topk must be >= 1");
+    TORCH_CHECK(m_cap >= 1 && m_cap % 4 == 0, "m_cap must be a positive multiple of 4");
+    TORCH_CHECK(slot_of_flat.numel() == static_cast<int64_t>(M) * topk,
+        "slot_of_flat must have M * topk entries");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+
+    int const kp = K / 128;
+    auto x_q = at::empty({G, m_cap, K}, x.options().dtype(at::kFloat8_e4m3fn));
+    auto packed = at::empty({G, kp, m_cap}, x.options().dtype(at::kInt));
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    detail::fp8bs_quantize_1x32_packed_grouped_gather(
+        reinterpret_cast<__nv_fp8_e4m3*>(x_q.data_ptr()),
+        reinterpret_cast<int32_t*>(packed.data_ptr()),
+        reinterpret_cast<__nv_bfloat16 const*>(x.data_ptr()),
+        reinterpret_cast<int32_t const*>(slot_of_flat.data_ptr()),
+        static_cast<int>(M * topk), static_cast<int>(topk),
+        static_cast<int>(m_cap), K, stream, use_ue8m0);
+    return {x_q, packed};
+}
+
+
+// silu_chunk_mul_quantize_1x32_grouped: SwiGLU fused quant for the grouped
+// down-GEMM input, indexed over the flat routed-pair space (row = slot).
+// gu is the grouped gate_up output (bf16 [G, m_cap, 2*INTER]).
+std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x32_grouped(
+    at::Tensor gu, at::Tensor slot_of_flat, bool use_ue8m0)
+{
+    TORCH_CHECK(!is_sm100_family(), "silu_chunk_mul_quantize_1x32_grouped is sm_120-only for now");
+    TORCH_CHECK(gu.is_cuda() && gu.dtype() == at::kBFloat16, "gu must be CUDA bf16");
+    TORCH_CHECK(gu.dim() == 3, "gu must be 3D [G, m_cap, 2*INTER]");
+    TORCH_CHECK(gu.is_contiguous(), "gu must be contiguous");
+    TORCH_CHECK(slot_of_flat.dtype() == at::kInt && slot_of_flat.is_cuda()
+            && slot_of_flat.is_contiguous(),
+        "slot_of_flat must be contiguous CUDA int32");
+    int const G = gu.size(0);
+    int const m_cap = gu.size(1);
+    int const TWO_INTER = gu.size(2);
+    TORCH_CHECK(TWO_INTER % 2 == 0, "last dim must be even (gate || up)");
+    int const INTER = TWO_INTER / 2;
+    TORCH_CHECK(INTER % 128 == 0, "INTER must be a multiple of 128");
+    TORCH_CHECK(m_cap % 4 == 0, "m_cap must be a multiple of 4");
+
+    int const kp = INTER / 128;
+    auto x_q = at::empty({G, m_cap, INTER}, gu.options().dtype(at::kFloat8_e4m3fn));
+    auto packed = at::empty({G, kp, m_cap}, gu.options().dtype(at::kInt));
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    detail::fp8bs_silu_chunk_mul_quantize_1x32_packed_grouped(
+        reinterpret_cast<__nv_fp8_e4m3*>(x_q.data_ptr()),
+        reinterpret_cast<int32_t*>(packed.data_ptr()),
+        reinterpret_cast<__nv_bfloat16 const*>(gu.data_ptr()),
+        reinterpret_cast<int32_t const*>(slot_of_flat.data_ptr()),
+        static_cast<int>(slot_of_flat.numel()), m_cap, INTER, stream, use_ue8m0);
+    return {x_q, packed};
 }
 
 } // namespace blockscale_gemm

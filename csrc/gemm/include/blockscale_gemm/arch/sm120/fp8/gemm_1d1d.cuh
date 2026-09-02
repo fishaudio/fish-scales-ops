@@ -123,13 +123,24 @@ struct SM120BlockScaledKernel
         cute::prefetch_tma_descriptor(params.tma_load_sfb.get_tma_descriptor());
     }
 
-    using TensorStorage = typename KT::TensorStorage;
+    using TensorStorage = typename KT::TensorStorageSel;
     using BarrierStorage = typename KT::BarrierStorage;
+
+    // Grouped path: the persistent scheduler re-reads grouped_layout[g] while
+    // walking groups. Left in global memory that walk is a chain of DEPENDENT
+    // global loads (up to L per scheduler pass, ~L2 latency each) executed by
+    // every warp of every CTA — ncu showed it as the dominant
+    // long_scoreboard stall of the decode cells (45% of issue stalls at
+    // G=128, M=1). One cooperative copy into shared memory at kernel start
+    // turns the walk into LDS hits. 2 KB reserve; groups beyond the cap fall
+    // back to the global pointer.
+    static constexpr int kGroupedLayoutSmemCap = 512;
 
     struct SharedStorage
     {
         TensorStorage tensors;
         alignas(16) BarrierStorage barriers;
+        int32_t grouped_layout_smem[kGroupedLayoutSmemCap];
     };
 
     static constexpr int kSmemSize = int(sizeof(SharedStorage));
@@ -198,8 +209,13 @@ struct SM120BlockScaledKernel
         auto& sf_empty_mbar = cute::get<3>(mbarriers);
         auto& store_full_mbar = cute::get<4>(mbarriers);
         auto& store_empty_mbar = cute::get<5>(mbarriers);
-        store_empty_mbar[0].wait(store_phase);
-        store_phase ^= 1;
+        if constexpr (!KT::kSeparateSmemD)
+        {
+            // Union storage: smem_D aliases smem_A/B, so this tile's loads
+            // must wait for the previous tile's TMA store to drain.
+            store_empty_mbar[0].wait(store_phase);
+            store_phase ^= 1;
+        }
 
         for (int32_t sf_tile_idx = 0; sf_tile_idx < sf_tile_count; ++sf_tile_idx)
         {
@@ -218,7 +234,7 @@ struct SM120BlockScaledKernel
 
     template <class BlkCoord>
     CUTE_DEVICE static void load_ab(Params const& params, SharedStorage& shared_storage, BlkCoord const& blk_coord,
-        int32_t sf_tile_count, uint32_t& phase, uint32_t& store_phase)
+        int32_t k_tile_count, uint32_t& phase, uint32_t& store_phase)
     {
         using X = Underscore;
         auto M = cute::get<0>(params.problem_shape);
@@ -264,10 +280,12 @@ struct SM120BlockScaledKernel
         auto& sf_empty_mbar = cute::get<3>(mbarriers);
         auto& store_full_mbar = cute::get<4>(mbarriers);
         auto& store_empty_mbar = cute::get<5>(mbarriers);
-        store_empty_mbar[0].wait(store_phase);
-        store_phase ^= 1;
+        if constexpr (!KT::kSeparateSmemD)
+        {
+            store_empty_mbar[0].wait(store_phase);
+            store_phase ^= 1;
+        }
 
-        int32_t k_tile_count = sf_tile_count * KT::kNumTileKPerSF;
         for (int32_t k_tile_idx = 0; k_tile_idx < k_tile_count; k_tile_idx += KT::AB_Stages)
         {
             cute::for_each(cute::make_int_sequence<KT::AB_Stages>{},
@@ -288,7 +306,8 @@ struct SM120BlockScaledKernel
     }
 
     CUTE_DEVICE
-    static void mma(SharedStorage& shared_storage, int32_t sf_tile_count, uint32_t& sf_phase, uint32_t& ab_phase)
+    static void mma(SharedStorage& shared_storage, int32_t sf_tile_count, int32_t k_tile_count, uint32_t& sf_phase,
+        uint32_t& ab_phase, uint32_t& store_phase)
     {
         [[maybe_unused]] int thread_idx = int(threadIdx.x);
 
@@ -383,28 +402,55 @@ struct SM120BlockScaledKernel
         cute::copy(s2r_copy_SFB, tXsSFB(_, _, _, Int<0>{}), tXrSFB);
         sf_empty_mbar[0].arrive();
 
-        cute::for_each(cute::make_int_sequence<KT::kNumStagePerSF>{},
-            [&](auto iter)
-            {
-                cute::for_each(cute::make_int_sequence<KT::AB_Stages>{},
-                    [&](auto read_stage)
-                    {
-                        ab_full_mbar[read_stage].wait(ab_phase);
-                        cute::copy(s2r_copy_A, tXsA(_, _, _, read_stage), tXrA);
-                        cute::copy(s2r_copy_B, tXsB(_, _, _, read_stage), tXrB);
-                        ab_empty_mbar[read_stage].arrive();
-                        if constexpr (iter == KT::kNumStagePerSF - 1 && read_stage == KT::AB_Stages - 1)
+        // Last SF span. k_tile_count is aligned to AB_Stages (NOT to the
+        // 4-k-tile SF span), so on short-K shapes (e.g. K=768 with
+        // Stages=2: 6 real k-tiles) the final span consumes only
+        // last_batches * AB_Stages of its 4 slices instead of padding to a
+        // full span of zero-fill iterations. Dense shapes (every K a
+        // multiple of 512) always take the full-span branch bit-for-bit.
+        int32_t const last_batches
+            = (k_tile_count - KT::kNumTileKPerSF * (sf_tile_count - 1) + KT::AB_Stages - 1) / KT::AB_Stages;
+        auto run_last_span = [&](auto num_batches)
+        {
+            cute::for_each(cute::make_int_sequence<decltype(num_batches)::value>{},
+                [&](auto iter)
+                {
+                    cute::for_each(cute::make_int_sequence<KT::AB_Stages>{},
+                        [&](auto read_stage)
                         {
-                            cutlass::arch::NamedBarrier::sync(
-                                KT::kNumMathThreads, 0); // wait for all threads to finish loading
-                        }
-                        auto tCrSFA_stage = tCrSFA_frg(_, _, _, iter * KT::AB_Stages + read_stage);
-                        auto tCrSFB_stage = tCrSFB_frg(_, _, _, iter * KT::AB_Stages + read_stage);
-                        cute::gemm(
-                            mma, make_zip_tensor(tCrA, tCrSFA_stage), make_zip_tensor(tCrB, tCrSFB_stage), accum);
-                    });
-                ab_phase ^= 1; // flip phase
-            });
+                            ab_full_mbar[read_stage].wait(ab_phase);
+                            cute::copy(s2r_copy_A, tXsA(_, _, _, read_stage), tXrA);
+                            cute::copy(s2r_copy_B, tXsB(_, _, _, read_stage), tXrB);
+                            ab_empty_mbar[read_stage].arrive();
+                            if constexpr (iter == decltype(num_batches)::value - 1
+                                && read_stage == KT::AB_Stages - 1)
+                            {
+                                cutlass::arch::NamedBarrier::sync(
+                                    KT::kNumMathThreads, 0); // wait for all threads to finish loading
+                            }
+                            auto tCrSFA_stage = tCrSFA_frg(_, _, _, iter * KT::AB_Stages + read_stage);
+                            auto tCrSFB_stage = tCrSFB_frg(_, _, _, iter * KT::AB_Stages + read_stage);
+                            cute::gemm(
+                                mma, make_zip_tensor(tCrA, tCrSFA_stage), make_zip_tensor(tCrB, tCrSFB_stage), accum);
+                        });
+                    ab_phase ^= 1; // flip phase
+                });
+        };
+        if constexpr (KT::kNumStagePerSF == 1)
+        {
+            run_last_span(cute::Int<1>{});
+        }
+        else
+        {
+            if (last_batches == KT::kNumStagePerSF)
+            {
+                run_last_span(cute::Int<KT::kNumStagePerSF>{});
+            }
+            else
+            {
+                run_last_span(cute::Int<1>{});
+            }
+        }
         sf_phase ^= 1;         // flip phase
 
         // epilogue
@@ -427,6 +473,14 @@ struct SM120BlockScaledKernel
         auto tRS_rD = thr_copy_r2s.retile_S(epi);
         auto tRS_sD = thr_copy_r2s.partition_D(sD_epi);
 
+        if constexpr (KT::kSeparateSmemD)
+        {
+            // Dedicated store smem: only this epilogue write must wait for
+            // the previous tile's TMA store to drain — the K-mainloop above
+            // already overlapped it.
+            store_empty_mbar[0].wait(store_phase);
+            store_phase ^= 1;
+        }
         copy(tiled_copy_r2s, tRS_rD, tRS_sD(_, _, _, Int<0>{}));
         cute::tma_store_fence();
         cutlass::arch::NamedBarrier::sync(KT::kNumMathThreads, 0); // sync before epilogue
@@ -526,7 +580,76 @@ struct SM120BlockScaledKernel
         auto N = cute::get<1>(params.problem_shape);
         auto K = cute::get<2>(params.problem_shape);
         auto L = cute::get<3>(params.problem_shape);
-        int32_t sf_tile_count = (K + 511) / 512;
+        // Real k-tiles, padded only to the AB ring width (per-tile constant).
+        // The SF span count follows from the padded k count; the final span
+        // may be partial (see mma). Every dense K is a multiple of 512, so
+        // dense sees identical counts to the old sf-span-aligned padding.
+        int32_t const k_real_tiles = (K + KT::kTileK - 1) / KT::kTileK;
+        int32_t const k_tile_count = (k_real_tiles + KT::AB_Stages - 1) / KT::AB_Stages * KT::AB_Stages;
+        int32_t const sf_tile_count = (k_tile_count + KT::kNumTileKPerSF - 1) / KT::kNumTileKPerSF;
+
+        // Stage grouped_layout into shared memory as an INCLUSIVE per-group
+        // m-block prefix: smem[g] = sum_{g' <= g} ceil(masked_m[g'] / TileM).
+        // The scheduler then binary-searches its group in O(log L) LDS hits
+        // instead of the legacy linear walk, whose per-group dependent load
+        // chain (~60 ns/group on 5090, regardless of global-vs-smem
+        // residence) dominated the whole decode-band kernel at G=128.
+        bool layout_is_cumsum = false;
+        int32_t* grouped_layout = params.grouped_layout;
+        if (grouped_layout != nullptr && L <= kGroupedLayoutSmemCap)
+        {
+            for (int g = threadIdx.x; g < L; g += blockDim.x)
+            {
+                int const cnt = params.grouped_layout[g];
+                shared_storage.grouped_layout_smem[g] = (cnt + KT::kTileM - 1) / KT::kTileM;
+            }
+            __syncthreads();
+            if (warp_idx == 0)
+            {
+                int const lane = threadIdx.x & 31;
+                int carry = 0;
+                for (int base = 0; base < L; base += 32)
+                {
+                    int const g = base + lane;
+                    int v = (g < L) ? shared_storage.grouped_layout_smem[g] : 0;
+#pragma unroll
+                    for (int off = 1; off < 32; off <<= 1)
+                    {
+                        int const n = __shfl_up_sync(0xFFFFFFFFu, v, off);
+                        if (lane >= off)
+                        {
+                            v += n;
+                        }
+                    }
+                    int const chunk_total = __shfl_sync(0xFFFFFFFFu, v, 31);
+                    if (g < L)
+                    {
+                        shared_storage.grouped_layout_smem[g] = v + carry;
+                    }
+                    carry += chunk_total;
+                }
+            }
+            __syncthreads();
+            grouped_layout = shared_storage.grouped_layout_smem;
+            layout_is_cumsum = true;
+        }
+
+        // Programmatic dependent launch (PDL). Everything above — TMA
+        // descriptor prefetch, mbarrier init, the grouped_layout staging +
+        // prefix scan — reads only kernel params and grandparent-or-older
+        // data (each kernel in the fso MoE chain triggers its dependents
+        // only AFTER its own wait returns, so the pre-wait window overlaps
+        // the immediate parent alone). The wait below orders every
+        // subsequent global access (the parent-produced A/SFA operands and
+        // the D output buffer) behind parent completion; the trigger then
+        // lets OUR dependent start its own prologue while we run. Both are
+        // no-ops when the launch chain carries no PDL edges, so dense
+        // callers are unaffected.
+        cudaGridDependencySynchronize();
+        if (threadIdx.x == 0)
+        {
+            cudaTriggerProgrammaticLaunchCompletion();
+        }
 
         using Scheduler = SM120BlockScaledScheduler<KT::kTileM, KT::kTileN, KT::kSchedGroup>;
         if (warp_idx >= KT::kNumMathWarps)
@@ -540,12 +663,12 @@ struct SM120BlockScaledKernel
                 uint32_t store_phase = 1;
                 if (lane_predicate)
                 {
-                    auto scheduler = Scheduler(M, N, L, params.grouped_layout);
+                    auto scheduler = Scheduler(M, N, L, grouped_layout, layout_is_cumsum);
                     while (scheduler.get_next_block())
                     {
                         auto blk_coord = cute::make_coord(
                             scheduler.m_block_idx, scheduler.n_block_idx, scheduler.current_group_idx);
-                        load_ab(params, shared_storage, blk_coord, sf_tile_count, phase, store_phase);
+                        load_ab(params, shared_storage, blk_coord, k_tile_count, phase, store_phase);
                     }
                 }
                 __syncwarp();
@@ -556,7 +679,7 @@ struct SM120BlockScaledKernel
                 uint32_t store_phase = 1;
                 if (lane_predicate)
                 {
-                    auto scheduler = Scheduler(M, N, L, params.grouped_layout);
+                    auto scheduler = Scheduler(M, N, L, grouped_layout, layout_is_cumsum);
                     while (scheduler.get_next_block())
                     {
                         auto blk_coord = cute::make_coord(
@@ -571,7 +694,7 @@ struct SM120BlockScaledKernel
                 uint32_t phase = 0;
                 if (lane_predicate)
                 {
-                    auto scheduler = Scheduler(M, N, L, params.grouped_layout);
+                    auto scheduler = Scheduler(M, N, L, grouped_layout, layout_is_cumsum);
                     while (scheduler.get_next_block())
                     {
                         auto blk_coord = cute::make_coord(
@@ -586,10 +709,11 @@ struct SM120BlockScaledKernel
         {
             uint32_t sf_phase = 0;
             uint32_t ab_phase = 0;
-            auto scheduler = Scheduler(M, N, L, params.grouped_layout);
+            uint32_t store_phase = 1;
+            auto scheduler = Scheduler(M, N, L, grouped_layout, layout_is_cumsum);
             while (scheduler.get_next_block())
             {
-                mma(shared_storage, sf_tile_count, sf_phase, ab_phase);
+                mma(shared_storage, sf_tile_count, k_tile_count, sf_phase, ab_phase, store_phase);
             }
         }
     }

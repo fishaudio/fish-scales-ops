@@ -32,11 +32,13 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels::blockscale_gemm
 {
 
-template <int TileM, int TileN, int NumStages, int MinBlocksPerSm = 1, int SchedGroup = 16>
+template <int TileM, int TileN, int NumStages, int MinBlocksPerSm = 1, int SchedGroup = 16,
+    bool SeparateSmemD = false>
 void launch_sm120_mxfp8_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t stride_a, __nv_fp8_e4m3* mat_b,
     int64_t ld_b, int64_t stride_b, __nv_bfloat16* mat_d, int64_t ld_d, int64_t stride_d, int32_t* scales_a,
     int64_t /*stride_scales_a*/, int32_t* scales_b, int64_t /*stride_scales_b*/, uint32_t num_problems,
-    uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, cudaStream_t stream, int num_device_sms = kNumDeviceSMs)
+    uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, cudaStream_t stream, int num_device_sms = kNumDeviceSMs,
+    int32_t* grouped_layout = nullptr)
 {
     if (num_device_sms < 0)
         num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
@@ -44,7 +46,7 @@ void launch_sm120_mxfp8_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t 
     using ElementInput = cute::float_e4m3_t;
     using ElementOutput = cute::bfloat16_t;
     using ElementBlockScale = int32_t;
-    using KT = sm120_blockscaled_gemm::SM120MxFP8BlockScaledBuilder<TileM, TileN, NumStages, MinBlocksPerSm, SchedGroup>;
+    using KT = sm120_blockscaled_gemm::SM120MxFP8BlockScaledBuilder<TileM, TileN, NumStages, MinBlocksPerSm, SchedGroup, SeparateSmemD>;
     using GemmKernel = sm120_blockscaled_gemm::SM120BlockScaledKernel<KT>;
     using Params = typename GemmKernel::Params;
     using Arguments = typename GemmKernel::Arguments;
@@ -63,7 +65,7 @@ void launch_sm120_mxfp8_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t 
     typename KT::StrideSFB dSFB = KT::deduce_sfb_layout(problem_shape).stride();
     typename KT::StrideD dD = make_stride(ld_d, Int<1>{}, stride_d);
 
-    Arguments args{ptr_A, dA, ptr_B, dB, ptr_SFA, dSFA, ptr_SFB, dSFB, ptr_D, dD};
+    Arguments args{ptr_A, dA, ptr_B, dB, ptr_SFA, dSFA, ptr_SFB, dSFB, ptr_D, dD, grouped_layout};
 
     // E9 (2026-05-10): cache Params (which holds 5 CUtensorMap descriptors) to
     // skip the 5x cuTensorMapEncodeTiled calls inside `to_underlying_arguments`.
@@ -111,6 +113,11 @@ void launch_sm120_mxfp8_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t 
         if (s_params_cache.size() < 64u)
             s_params_cache.emplace(key, kernel_params);
     }
+    // Grouped path: the masked_m buffer address is not part of the cache key
+    // (it may be reallocated between calls while shapes stay identical), and
+    // Params only carries the raw pointer — patch it after every cache
+    // lookup so a cached Params never replays a stale grouped_layout.
+    kernel_params.grouped_layout = grouped_layout;
     auto kernel_ptr = &cutlass::device_kernel<GemmKernel>;
 
     // E8 (2026-05-10): cudaFuncSetAttribute is idempotent per (function, device,
@@ -130,8 +137,13 @@ void launch_sm120_mxfp8_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t 
     cudaLaunchConfig_t launch_config;
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = 1;
-    launch_config.gridDim = dim3(num_device_sms, 1, 1);
+    attrs[0].val.programmaticStreamSerializationAllowed = fso_pdl_enabled() ? 1 : 0;
+    // MinBlocksPerSm > 1 instances co-schedule that many CTAs per SM (the
+    // persistent scheduler strides by gridDim.x, so a larger grid just
+    // partitions the same tile queue). ncu on the grouped decode cells
+    // showed every pipe under 55% SOL at 1 CTA/SM — latency-bound with the
+    // co-residency the 44 KB (16,64,4) instance already fits going unused.
+    launch_config.gridDim = dim3(num_device_sms * KT::MinBlocksPerSm, 1, 1);
     launch_config.blockDim = GemmKernel::get_block_shape();
     launch_config.dynamicSmemBytes = GemmKernel::kSmemSize;
     launch_config.stream = stream;
@@ -880,6 +892,222 @@ inline void gemm_dispatch_sm120_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b
         }
     }
 #undef DISPATCH_TILE_MX
+}
+
+// ---------------------------------------------------------------------------
+// Grouped (MoE) MXFP8 dispatch — masked layout, per-expert weights.
+//
+// Revives the dormant grouped path of SM120BlockScaledKernel: the persistent
+// SM120BlockScaledScheduler already walks (group, m_block, n_block) work items
+// when `grouped_layout != nullptr` (per-group valid-row counts, DeepGEMM
+// masked semantics), and every TMA descriptor carries the group as its L
+// (batch) dimension. This function only supplies the grouped strides:
+//
+//   A   [G, m_cap, K]  fp8   — per-group activation slab, rows beyond
+//                              grouped_layout[g] are never scheduled
+//   B   [G, N, K]      fp8   — per-expert weights
+//   SFA [G, K/128, pad(m_cap,4)]  int32 packed UE8M0, K-major per group
+//   SFB [G, K/128, pad(N,4)]      int32 packed UE8M0, K-major per group
+//   D   [G, m_cap, N]  bf16  — rows beyond grouped_layout[g] are garbage
+//
+// `expected_m` is a host-side static hint (ceil(total_rows / G)) used only
+// for tile selection — never read from device memory, so the launch is
+// CUDA-Graph capture-safe and replays follow whatever masked counts the
+// grouped_layout buffer holds at replay time.
+//
+// v0 cascade: trimmed from the dense (M, tiles_n) cascade with expected_m
+// standing in for M. No Stream-K (per-group tile parallelism G×tiles_n is
+// already ≥ grid size for the MoE shapes this serves); no smallm variant.
+// Retune against a FORCE_TILE sweep on 5090 before freezing (M1 gate).
+inline void gemm_dispatch_sm120_mxfp8_grouped(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bfloat16* mat_d,
+    int32_t* scales_a, int32_t* scales_b, int32_t* grouped_layout, uint32_t num_groups, uint32_t m_cap,
+    uint32_t shape_n, uint32_t shape_k, uint32_t expected_m, cudaStream_t stream,
+    int num_device_sms = kNumDeviceSMs)
+{
+    if (num_device_sms < 0)
+        num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
+
+    int64_t const ld_a = shape_k;
+    int64_t const ld_b = shape_k;
+    int64_t const ld_d = shape_n;
+    int64_t const stride_a = static_cast<int64_t>(m_cap) * shape_k;
+    int64_t const stride_b = static_cast<int64_t>(shape_n) * shape_k;
+    int64_t const stride_d = static_cast<int64_t>(m_cap) * shape_n;
+
+#define DISPATCH_GROUPED_TILE_MX(TM, TN, ST)                                                                           \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        launch_sm120_mxfp8_gemm_kernel<TM, TN, ST, 1, 16, true>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b,           \
+            mat_d, ld_d, stride_d, scales_a, 0, scales_b, 0, num_groups, m_cap, shape_n, shape_k, stream,              \
+            num_device_sms, grouped_layout);                                                                                           \
+        return;                                                                                                        \
+    } while (0)
+
+    // FSO_FORCE_TILE=TM,TN,ST — A/B knob for the grouped tile sweep.
+    // Stream-K / smallm / sched-group force flags are ignored on this path.
+    auto forced = read_force_tile();
+    if (forced.active())
+    {
+        // FSO_FORCE_MIN_BLOCKS=2: co-schedule 2 CTAs/SM (grid doubles via
+        // the launcher). ncu verdict on the decode cells: every pipe < 55%
+        // SOL at 1 CTA/SM (latency-bound, achieved occupancy ~23%); only
+        // the ~44 KB (16,64,x) instances fit 2 CTAs in the 99 KB budget.
+        if (forced.min_blocks_2())
+        {
+            if (forced.tm == 16 && forced.tn == 64 && forced.st == 4)
+            {
+                launch_sm120_mxfp8_gemm_kernel<16, 64, 4, 2, 16, true>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b,
+                    mat_d, ld_d, stride_d, scales_a, 0, scales_b, 0, num_groups, m_cap, shape_n, shape_k,
+                    stream, num_device_sms, grouped_layout);
+                return;
+            }
+            if (forced.tm == 16 && forced.tn == 64 && forced.st == 2)
+            {
+                launch_sm120_mxfp8_gemm_kernel<16, 64, 2, 2, 16, true>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b,
+                    mat_d, ld_d, stride_d, scales_a, 0, scales_b, 0, num_groups, m_cap, shape_n, shape_k,
+                    stream, num_device_sms, grouped_layout);
+                return;
+            }
+            if (forced.tm == 16 && forced.tn == 128 && forced.st == 2)
+            {
+                launch_sm120_mxfp8_gemm_kernel<16, 128, 2, 2, 16, true>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b,
+                    mat_d, ld_d, stride_d, scales_a, 0, scales_b, 0, num_groups, m_cap, shape_n, shape_k,
+                    stream, num_device_sms, grouped_layout);
+                return;
+            }
+            if (forced.tm == 32 && forced.tn == 64 && forced.st == 2)
+            {
+                launch_sm120_mxfp8_gemm_kernel<32, 64, 2, 2, 16, true>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b,
+                    mat_d, ld_d, stride_d, scales_a, 0, scales_b, 0, num_groups, m_cap, shape_n, shape_k,
+                    stream, num_device_sms, grouped_layout);
+                return;
+            }
+            if (forced.tm == 64 && forced.tn == 64 && forced.st == 2)
+            {
+                launch_sm120_mxfp8_gemm_kernel<64, 64, 2, 2, 16, true>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b,
+                    mat_d, ld_d, stride_d, scales_a, 0, scales_b, 0, num_groups, m_cap, shape_n, shape_k,
+                    stream, num_device_sms, grouped_layout);
+                return;
+            }
+            std::fprintf(stderr,
+                "[fso] FSO_FORCE_MIN_BLOCKS=2 grouped: wired for (16,64,x)/(16,128,2)/(32,64,2)/(64,64,2); ignoring\n");
+        }
+        if (forced.tm == 16 && forced.tn == 128 && forced.st == 4) DISPATCH_GROUPED_TILE_MX(16, 128, 4);
+        if (forced.tm == 16 && forced.tn == 64 && forced.st == 4)  DISPATCH_GROUPED_TILE_MX(16, 64, 4);
+        if (forced.tm == 32 && forced.tn == 128 && forced.st == 4) DISPATCH_GROUPED_TILE_MX(32, 128, 4);
+        if (forced.tm == 32 && forced.tn == 64 && forced.st == 4)  DISPATCH_GROUPED_TILE_MX(32, 64, 4);
+        if (forced.tm == 64 && forced.tn == 64 && forced.st == 4)  DISPATCH_GROUPED_TILE_MX(64, 64, 4);
+        if (forced.tm == 64 && forced.tn == 128 && forced.st == 2) DISPATCH_GROUPED_TILE_MX(64, 128, 2);
+        if (forced.tm == 32 && forced.tn == 128 && forced.st == 2) DISPATCH_GROUPED_TILE_MX(32, 128, 2);
+        if (forced.tm == 32 && forced.tn == 64 && forced.st == 2)  DISPATCH_GROUPED_TILE_MX(32, 64, 2);
+        if (forced.tm == 64 && forced.tn == 64 && forced.st == 2)  DISPATCH_GROUPED_TILE_MX(64, 64, 2);
+        if (forced.tm == 96 && forced.tn == 64 && forced.st == 2)  DISPATCH_GROUPED_TILE_MX(96, 64, 2);
+        if (forced.tm == 160 && forced.tn == 128 && forced.st == 2) DISPATCH_GROUPED_TILE_MX(160, 128, 2);
+        if (forced.tm == 96 && forced.tn == 128 && forced.st == 2) DISPATCH_GROUPED_TILE_MX(96, 128, 2);
+        if (forced.tm == 128 && forced.tn == 128 && forced.st == 2) DISPATCH_GROUPED_TILE_MX(128, 128, 2);
+        std::fprintf(stderr,
+            "[fso] FSO_FORCE_TILE=%d,%d,%d not wired on the grouped path; falling through to cascade\n",
+            forced.tm, forced.tn, forced.st);
+    }
+
+    uint32_t const tiles_n = (shape_n + 127) / 128;
+    uint32_t const em = expected_m == 0 ? 1 : expected_m;
+
+#define DISPATCH_GROUPED_TILE_MX_MB2(TM, TN, ST)                                                                       \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        launch_sm120_mxfp8_gemm_kernel<TM, TN, ST, 2, 16, true>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b,           \
+            mat_d, ld_d, stride_d, scales_a, 0, scales_b, 0, num_groups, m_cap, shape_n, shape_k, stream,              \
+            num_device_sms, grouped_layout);                                                                                           \
+        return;                                                                                                        \
+    } while (0)
+
+    // v1 cascade (2026-09-01, FSO_FORCE_TILE sweep on 5090 C1, Qwen3-30B-A3B
+    // narrow-N shapes): the grouped kernel is latency/occupancy-bound at
+    // 1 CTA/SM (ncu: no pipe > 55% SOL at decode, 76% DRAM at streaming);
+    // the 2-CTAs/SM (16,64,4) instance wins or ties every narrow-N cell —
+    // -10.8..-12.5% at em=1 decode, -0.2..-2.7% in the streaming band —
+    // except short-K em>=16 where (32,128,4) takes -4.4% (down M=512).
+    // Known concession: gate_up-like M=4 prefers (16,128,4) by ~4%; kept on
+    // the mb2 route for cascade simplicity.
+    if (tiles_n < 32)
+    {
+        // v4 (2026-09-02, dual-GPU 18-config x 14-M sweep, swM_*): the
+        // grouped narrow-N cascade has TWO axes, mirroring the dense
+        // E30/E31/E33 wave rules:
+        //   * expected_m (rows per group): once em grows past ~32 the small
+        //     decode tiles collapse — TileM must track em or large-M runs
+        //     2-3x slow (gate_up M=4096: (96,128,2) 453.8 us vs the decode
+        //     route's 1363.8; down M=2048: 202.6 vs 331.2).
+        //   * SF-span partiality (K % 512): partial-span shapes take the
+        //     pad-free Stages=2 instances throughout.
+        bool const partial_span = ((shape_k + 127) / 128) % 4 != 0;
+        if (em > 128)
+        {
+            // em=256 sweep point: (96,128,2) beats (64,128,2) by 13%/10.7%
+            // (gate_up/down). Larger em unswept (slab sizes) — stays here.
+            DISPATCH_GROUPED_TILE_MX(96, 128, 2);
+        }
+        if (em > 64)
+            DISPATCH_GROUPED_TILE_MX(64, 128, 2);
+        if (em > 32)
+        {
+            if (partial_span)
+                DISPATCH_GROUPED_TILE_MX(32, 128, 2);
+            DISPATCH_GROUPED_TILE_MX(32, 128, 4);
+        }
+        // em <= 32 decode/mid band: v3 partial-span route, then v2 rules.
+        if (partial_span)
+        {
+            launch_sm120_mxfp8_gemm_kernel<16, 128, 2, 2, 16, true>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b,
+                mat_d, ld_d, stride_d, scales_a, 0, scales_b, 0, num_groups, m_cap, shape_n, shape_k,
+                stream, num_device_sms, grouped_layout);
+            return;
+        }
+        if (em >= 16 && shape_k <= 1024)
+            DISPATCH_GROUPED_TILE_MX(32, 128, 4);
+        // v2 (sweep3, post scheduler fix): at decode row-caps the wider
+        // (16,128,4) single-CTA instance wins big (down M=1 -18.8%, M=4/8
+        // -10/-6.8%, gate_up M=4 -10.9%) because its tile count
+        // (G_active x tiles_n(128)) stays at or under the SM count, so every
+        // CTA runs solo — the K/N partition sweeps measured a ~2x per-k-iter
+        // penalty whenever two active CTAs share an SM. v4 refinement
+        // (swM sweep): only M=1 (m_cap=4) prefers the solo (16,128,4); M=2
+        // (m_cap=8) is +10.9% there and wants the 2-CTA (16,64,4) instead,
+        // so gate the solo route at m_cap<=4.
+        if (m_cap <= 4 && em <= 1)
+            DISPATCH_GROUPED_TILE_MX(16, 128, 4);
+        DISPATCH_GROUPED_TILE_MX_MB2(16, 64, 4);
+    }
+    if (em <= 16)
+    {
+        if (tiles_n >= 48 && shape_k <= 4096)
+            DISPATCH_GROUPED_TILE_MX(16, 128, 4);
+        DISPATCH_GROUPED_TILE_MX(32, 128, 4);
+    }
+    if (em <= 32)
+    {
+        DISPATCH_GROUPED_TILE_MX(32, 128, 4);
+    }
+    if (em <= 64)
+    {
+        if (tiles_n >= 96)
+            DISPATCH_GROUPED_TILE_MX(64, 128, 2);
+        DISPATCH_GROUPED_TILE_MX(64, 64, 4);
+    }
+    if (em <= 96)
+    {
+        if (tiles_n >= 32)
+            DISPATCH_GROUPED_TILE_MX(96, 128, 2);
+        DISPATCH_GROUPED_TILE_MX(64, 128, 2);
+    }
+    if (tiles_n < 32)
+        DISPATCH_GROUPED_TILE_MX(64, 128, 2);
+    if (tiles_n <= 48)
+        DISPATCH_GROUPED_TILE_MX(96, 128, 2);
+    DISPATCH_GROUPED_TILE_MX(128, 128, 2);
+#undef DISPATCH_GROUPED_TILE_MX_MB2
+#undef DISPATCH_GROUPED_TILE_MX
 }
 
 } // namespace kernels::blockscale_gemm
