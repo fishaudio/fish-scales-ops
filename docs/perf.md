@@ -798,3 +798,34 @@ Takeaways:
 - Mid extend (S_q=256, 1024) beats flashinfer by **1.17× – 1.27×**.
 - Long single-batch prefill (S_q=8192) is **+11% over** flashinfer's FA3
   prefill (was −8% pre-v19, +8% pre-bf16x2).
+
+## Grouped MoE — Qwen3-30B-A3B MLP layer (sm_90 · 1830 MHz no-boost · cu13 — NVIDIA H200)
+
+E=128 experts, top-k=8, HIDDEN=2048, INTER=768. Whole-layer graph-replay
+median µs (routing derived from `topk_ids` on device inside the timed
+graph). `fso_bsfp8` = `moe_layer_fp8_sm90`, the expert-sorted contiguous
+path auto-dispatched by M (swap-AB block_n=16 for M<256, non-swap
+block_m=64 above). Baseline `tests/baselines/perf_moe_qwen3_30a3_h200.jsonl`.
+
+| M | triton_bf16 µs | triton_fp8b µs | dg_fp8_layer µs | **fso_bsfp8 µs** | fso cos | fso vs triton_fp8b |
+| ---: | ---: | ---: | ---: | ---: | ---: | :---: |
+| 1 | 32.8 | 24.7 | 89.3 | **19.8** | 0.9979 | -20% |
+| 2 | 50.8 | 39.4 | 97.5 | **35.6** | 0.9979 | -10% |
+| 4 | 78.9 | 52.3 | 115.0 | **50.4** | 0.9981 | -4% |
+| 8 | 121.1 | 79.1 | 140.9 | **74.2** | 0.9980 | -6% |
+| 16 | 195.5 | 113.9 | 183.7 | **115.2** | 0.9979 | +1% |
+| 32 | 251.7 | 141.7 | 232.7 | **142.0** | 0.9978 | +0% |
+| 64 | 294.3 | 163.4 | 257.7 | **165.1** | 0.9978 | +1% |
+| 96 | — | — | — | **169.1** | 0.9979 | — |
+| 128 | 299.9 | 170.3 | 261.3 | **172.1** | 0.9979 | +1% |
+| 256 | 324.7 | 194.1 | — | **202.6** | 0.9979 | +4% |
+| 512 | 334.9 | 206.8 | — | **217.2** | 0.9979 | +5% |
+| 1024 | 384.6 | 257.7 | — | **287.9** | 0.9979 | +12% |
+| 2048 | 502.3 | 392.6 | — | **421.4** | 0.9979 | +7% |
+| 4096 | 823.6 | 695.7 | — | **705.7** | 0.9979 | +1% |
+| 8192 | 1536.6 | 1308.4 | — | **—** | — | — |
+
+fso beats triton_fp8b across decode (M≤8: −4…−20%) and the deep_gemm
+production masked pipeline everywhere (M=1: 19.8 vs 89.3 µs, −78%); it
+ties at small batch (M=16–128, ±1%) and trails at prefill (M≥256, +4…+12%)
+where triton's kernel is stronger. cos vs per-expert BF16 ≈ 0.998.

@@ -174,6 +174,14 @@ public:
             {
                 gemm_type = deep_gemm::GemmType::GroupedWithOffset;
             }
+            else if (gemm_type_str == "GroupedMasked")
+            {
+                gemm_type = deep_gemm::GemmType::GroupedMasked;
+            }
+            else if (gemm_type_str == "GroupedContiguous")
+            {
+                gemm_type = deep_gemm::GemmType::GroupedContiguous;
+            }
             else if (gemm_type_str == "StridedBatched")
             {
                 gemm_type = deep_gemm::GemmType::StridedBatched;

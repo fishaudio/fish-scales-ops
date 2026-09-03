@@ -30,6 +30,26 @@ void fp8bs_quantize_1x128_packed(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
     __nv_bfloat16 const* x, int M, int K, cudaStream_t stream, bool use_ue8m0);
 void fp8bs_quantize_128x128(
     __nv_fp8_e4m3* w_q, float* scales, __nv_bfloat16 const* w, int N, int K, cudaStream_t stream);
+// sm_90 (H200) grouped block-scale FP8 masked — fp8_grouped_sm90_kernel.cu.
+cudaError_t launch_sm90_fp8_grouped_masked_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D,
+    float* SFA, float* SFB, int32_t* masked_m, int num_groups, int m_cap, int N, int K, int expected_m,
+    cudaStream_t stream);
+// H2 layout-native grouped 1x128 FP32-K-major quantizers (quant_kernels.cu).
+void fp8bs_quantize_1x128_fp32_grouped_gather(__nv_fp8_e4m3* x_q, float* sfa, __nv_bfloat16 const* x,
+    int32_t const* slot_of_flat, int n_pairs, int topk, int m_cap, int K, cudaStream_t stream);
+void fp8bs_silu_chunk_mul_quantize_1x128_fp32_grouped(__nv_fp8_e4m3* x_q, float* sfa, __nv_bfloat16 const* gu,
+    int32_t const* slot_of_flat, int n_pairs, int m_cap, int K, cudaStream_t stream);
+// H4 contiguous (sorted-layout) siblings.
+cudaError_t launch_sm90_fp8_grouped_contiguous_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D,
+    float* SFA, float* SFB, int32_t* sorted_expert_ids, int num_groups, int p_max, int N, int K, int block_m,
+    int expected_m, cudaStream_t stream);
+cudaError_t launch_sm90_fp8_grouped_contiguous_swapab_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D,
+    float* SFA, float* SFB, int32_t* sorted_expert_ids, int num_groups, int p_max, int N, int K, int block_n,
+    int expected_m, cudaStream_t stream);
+void fp8bs_quantize_1x128_fp32_sorted_gather(__nv_fp8_e4m3* x_q, float* sfa, __nv_bfloat16 const* x,
+    int32_t const* flat_to_sorted, int n_pairs, int topk, int sfa_ld, int K, cudaStream_t stream);
+void fp8bs_silu_chunk_mul_quantize_1x128_fp32_sorted(__nv_fp8_e4m3* x_q, float* sfa, __nv_bfloat16 const* gu,
+    int32_t const* flat_to_sorted, int n_pairs, int sfa_ld, int K, cudaStream_t stream);
 } // namespace detail
 
 namespace
@@ -351,6 +371,260 @@ at::Tensor linear_qx(at::Tensor x_bf16, at::Tensor w_fp8, at::Tensor sw)
         /*scales_a=*/nullptr, // produced internally
         reinterpret_cast<float const*>(sw.data_ptr()));
     return y;
+}
+
+
+// ---------------------------------------------------------------------------
+// Grouped (MoE, masked) block-scale FP8 on sm_90 (H200). Revives the in-tree
+// DeepGEMM GroupedMasked kernel. Scales are FP32 (sm_90 convention), passed
+// through to the same DeepGEMM WGMMA kernel the dense linear_fp8 uses — so
+// the SFA/SFB layout is exactly what that kernel's TMA descriptors expect
+// (H1: caller prepares them; H2 gives fso a layout-native fused quantizer).
+//   a_fp8 [G, m_cap, K], w_fp8 [G, N, K], out [G, m_cap, N] bf16
+//   sa/sw FP32; masked_m [G] int32 on device (capture-safe).
+at::Tensor linear_fp8_grouped_masked(at::Tensor a_fp8, at::Tensor w_fp8, at::Tensor sa, at::Tensor sw,
+    at::Tensor masked_m, int64_t expected_m)
+{
+    TORCH_CHECK(a_fp8.is_cuda() && a_fp8.dtype() == at::kFloat8_e4m3fn && a_fp8.dim() == 3,
+        "a_fp8 must be CUDA float8_e4m3fn [G, m_cap, K]");
+    TORCH_CHECK(w_fp8.is_cuda() && w_fp8.dtype() == at::kFloat8_e4m3fn && w_fp8.dim() == 3,
+        "w_fp8 must be CUDA float8_e4m3fn [G, N, K]");
+    TORCH_CHECK(sa.is_cuda() && sa.dtype() == at::kFloat, "sa must be CUDA float32");
+    TORCH_CHECK(sw.is_cuda() && sw.dtype() == at::kFloat, "sw must be CUDA float32");
+    TORCH_CHECK(masked_m.is_cuda() && masked_m.dtype() == at::kInt && masked_m.is_contiguous(),
+        "masked_m must be contiguous CUDA int32 [G]");
+    TORCH_CHECK(a_fp8.is_contiguous() && w_fp8.is_contiguous(), "a_fp8 / w_fp8 must be contiguous");
+    int const G = a_fp8.size(0);
+    int const m_cap = a_fp8.size(1);
+    int const K = a_fp8.size(2);
+    int const N = w_fp8.size(1);
+    TORCH_CHECK(w_fp8.size(0) == G && w_fp8.size(2) == K, "w_fp8 shape must match a_fp8");
+    TORCH_CHECK(masked_m.numel() == G, "masked_m must have G entries");
+    TORCH_CHECK(K % 128 == 0 && N % 128 == 0, "N and K must be multiples of 128");
+    TORCH_CHECK(expected_m >= 1, "expected_m must be >= 1");
+
+    auto y = at::empty({G, m_cap, N}, a_fp8.options().dtype(at::kBFloat16));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto err = detail::launch_sm90_fp8_grouped_masked_dispatch(
+        reinterpret_cast<__nv_fp8_e4m3*>(a_fp8.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3*>(w_fp8.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(y.data_ptr()),
+        reinterpret_cast<float*>(sa.data_ptr()),
+        reinterpret_cast<float*>(sw.data_ptr()),
+        reinterpret_cast<int32_t*>(masked_m.data_ptr()),
+        G, m_cap, N, K, static_cast<int>(expected_m), stream);
+    TORCH_CHECK(err == cudaSuccess, "sm90 fp8 grouped masked kernel error: ", cudaGetErrorString(err));
+    return y;
+}
+
+
+// H2 — layout-native grouped 1x128 quantizers for the sm_90 grouped path.
+// Fused token-gather + block-scale FP8 quantize writing the SFA layout the
+// GroupedMasked kernel's TMA descriptor reads directly ([G, K/128, m_cap]
+// FP32 K-major), so the stock deep_gemm per_token_cast + tma_align two-step
+// is gone. slot_of_flat[i] = g*m_cap + m_in (from moe_build_routing); src
+// row = i/topk.
+std::tuple<at::Tensor, at::Tensor> quantize_1x128_grouped_gather_sm90(
+    at::Tensor x, at::Tensor slot_of_flat, int64_t topk, int64_t num_groups, int64_t m_cap)
+{
+    TORCH_CHECK(x.is_cuda() && x.dtype() == at::kBFloat16 && x.dim() == 2 && x.is_contiguous(),
+        "x must be contiguous CUDA bf16 [M, K]");
+    TORCH_CHECK(slot_of_flat.dtype() == at::kInt && slot_of_flat.is_cuda() && slot_of_flat.is_contiguous(),
+        "slot_of_flat must be contiguous CUDA int32");
+    int const M = x.size(0);
+    int const K = x.size(1);
+    int const G = static_cast<int>(num_groups);
+    int const Kb = K / 128;
+    TORCH_CHECK(K % 128 == 0, "K must be a multiple of 128");
+    TORCH_CHECK(m_cap >= 1 && m_cap % 4 == 0, "m_cap must be a positive multiple of 4");
+    TORCH_CHECK(slot_of_flat.numel() == static_cast<int64_t>(M) * topk, "slot_of_flat must be [M*topk]");
+
+    auto x_q = at::empty({G, m_cap, K}, x.options().dtype(at::kFloat8_e4m3fn));
+    auto sfa = at::empty({G, Kb, m_cap}, x.options().dtype(at::kFloat));  // K-major
+    auto stream = at::cuda::getCurrentCUDAStream();
+    detail::fp8bs_quantize_1x128_fp32_grouped_gather(
+        reinterpret_cast<__nv_fp8_e4m3*>(x_q.data_ptr()),
+        reinterpret_cast<float*>(sfa.data_ptr()),
+        reinterpret_cast<__nv_bfloat16 const*>(x.data_ptr()),
+        reinterpret_cast<int32_t const*>(slot_of_flat.data_ptr()),
+        static_cast<int>(M * topk), static_cast<int>(topk), static_cast<int>(m_cap), K, stream);
+    return {x_q, sfa};
+}
+
+std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x128_grouped_sm90(
+    at::Tensor gu, at::Tensor slot_of_flat)
+{
+    TORCH_CHECK(gu.is_cuda() && gu.dtype() == at::kBFloat16 && gu.dim() == 3 && gu.is_contiguous(),
+        "gu must be contiguous CUDA bf16 [G, m_cap, 2*INTER]");
+    TORCH_CHECK(slot_of_flat.dtype() == at::kInt && slot_of_flat.is_cuda() && slot_of_flat.is_contiguous(),
+        "slot_of_flat must be contiguous CUDA int32");
+    int const G = gu.size(0);
+    int const m_cap = gu.size(1);
+    int const TWO_INTER = gu.size(2);
+    TORCH_CHECK(TWO_INTER % 2 == 0, "last dim must be even (gate || up)");
+    int const INTER = TWO_INTER / 2;
+    int const Kb = INTER / 128;
+    TORCH_CHECK(INTER % 128 == 0, "INTER must be a multiple of 128");
+    TORCH_CHECK(m_cap % 4 == 0, "m_cap must be a multiple of 4");
+
+    auto x_q = at::empty({G, m_cap, INTER}, gu.options().dtype(at::kFloat8_e4m3fn));
+    auto sfa = at::empty({G, Kb, m_cap}, gu.options().dtype(at::kFloat));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    detail::fp8bs_silu_chunk_mul_quantize_1x128_fp32_grouped(
+        reinterpret_cast<__nv_fp8_e4m3*>(x_q.data_ptr()),
+        reinterpret_cast<float*>(sfa.data_ptr()),
+        reinterpret_cast<__nv_bfloat16 const*>(gu.data_ptr()),
+        reinterpret_cast<int32_t const*>(slot_of_flat.data_ptr()),
+        static_cast<int>(slot_of_flat.numel()), m_cap, INTER, stream);
+    return {x_q, sfa};
+}
+
+
+// ===== H4 contiguous (triton-style sorted layout) sm_90 grouped ops =========
+
+static inline int align_up4(int x) { return (x + 3) / 4 * 4; }
+
+// linear_fp8_grouped_contiguous: contiguous grouped GEMM on the expert-sorted
+// activation. a_fp8 [P_max, K], w_fp8 [G, N, K], sa = SFA ColMajor
+// [K/128, align(P_max,4)], sw = SFB [G, N/128, K/128],
+// sorted_expert_ids [P_max] (grouped_layout, -1 past the real length).
+// Returns D [P_max, N] bf16 in sorted order.
+at::Tensor linear_fp8_grouped_contiguous(at::Tensor a_fp8, at::Tensor w_fp8, at::Tensor sa, at::Tensor sw,
+    at::Tensor sorted_expert_ids, int64_t block_m, int64_t expected_m)
+{
+    TORCH_CHECK(a_fp8.is_cuda() && a_fp8.dtype() == at::kFloat8_e4m3fn && a_fp8.dim() == 2,
+        "a_fp8 must be CUDA float8_e4m3fn [P_max, K]");
+    TORCH_CHECK(w_fp8.is_cuda() && w_fp8.dtype() == at::kFloat8_e4m3fn && w_fp8.dim() == 3,
+        "w_fp8 must be CUDA float8_e4m3fn [G, N, K]");
+    TORCH_CHECK(sa.is_cuda() && sa.dtype() == at::kFloat, "sa must be CUDA float32");
+    TORCH_CHECK(sw.is_cuda() && sw.dtype() == at::kFloat, "sw must be CUDA float32");
+    TORCH_CHECK(sorted_expert_ids.is_cuda() && sorted_expert_ids.dtype() == at::kInt
+            && sorted_expert_ids.is_contiguous(),
+        "sorted_expert_ids must be contiguous CUDA int32 [P_max]");
+    TORCH_CHECK(a_fp8.is_contiguous() && w_fp8.is_contiguous(), "a_fp8 / w_fp8 must be contiguous");
+    int const P_max = a_fp8.size(0);
+    int const K = a_fp8.size(1);
+    int const G = w_fp8.size(0);
+    int const N = w_fp8.size(1);
+    TORCH_CHECK(w_fp8.size(2) == K, "w_fp8 K must match a_fp8");
+    TORCH_CHECK(sorted_expert_ids.numel() == P_max, "sorted_expert_ids must have P_max entries");
+    TORCH_CHECK(K % 128 == 0 && N % 128 == 0, "N and K must be multiples of 128");
+    TORCH_CHECK(block_m == 64, "H4a supports block_m = 64 only");
+
+    auto y = at::empty({P_max, N}, a_fp8.options().dtype(at::kBFloat16));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto err = detail::launch_sm90_fp8_grouped_contiguous_dispatch(
+        reinterpret_cast<__nv_fp8_e4m3*>(a_fp8.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3*>(w_fp8.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(y.data_ptr()),
+        reinterpret_cast<float*>(sa.data_ptr()),
+        reinterpret_cast<float*>(sw.data_ptr()),
+        reinterpret_cast<int32_t*>(sorted_expert_ids.data_ptr()),
+        G, P_max, N, K, static_cast<int>(block_m), static_cast<int>(expected_m), stream);
+    TORCH_CHECK(err == cudaSuccess, "sm90 fp8 grouped contiguous kernel error: ", cudaGetErrorString(err));
+    return y;
+}
+
+// Swap-AB contiguous grouped GEMM (block_n = 16 activation tiling, for M>=8).
+// Same buffer layouts as linear_fp8_grouped_contiguous; the activation is the
+// swap-AB B matrix and the weight the A matrix. sorted_expert_ids must be built
+// with padding = block_n.
+at::Tensor linear_fp8_grouped_contiguous_swapab(at::Tensor a_fp8, at::Tensor w_fp8, at::Tensor sa, at::Tensor sw,
+    at::Tensor sorted_expert_ids, int64_t block_n, int64_t expected_m)
+{
+    TORCH_CHECK(a_fp8.is_cuda() && a_fp8.dtype() == at::kFloat8_e4m3fn && a_fp8.dim() == 2,
+        "a_fp8 must be CUDA float8_e4m3fn [P_max, K]");
+    TORCH_CHECK(w_fp8.is_cuda() && w_fp8.dtype() == at::kFloat8_e4m3fn && w_fp8.dim() == 3,
+        "w_fp8 must be CUDA float8_e4m3fn [G, N, K]");
+    TORCH_CHECK(sa.is_cuda() && sa.dtype() == at::kFloat, "sa must be CUDA float32");
+    TORCH_CHECK(sw.is_cuda() && sw.dtype() == at::kFloat, "sw must be CUDA float32");
+    TORCH_CHECK(sorted_expert_ids.is_cuda() && sorted_expert_ids.dtype() == at::kInt
+            && sorted_expert_ids.is_contiguous(),
+        "sorted_expert_ids must be contiguous CUDA int32 [P_max]");
+    TORCH_CHECK(a_fp8.is_contiguous() && w_fp8.is_contiguous(), "a_fp8 / w_fp8 must be contiguous");
+    int const P_max = a_fp8.size(0);
+    int const K = a_fp8.size(1);
+    int const G = w_fp8.size(0);
+    int const N = w_fp8.size(1);
+    TORCH_CHECK(w_fp8.size(2) == K, "w_fp8 K must match a_fp8");
+    TORCH_CHECK(sorted_expert_ids.numel() == P_max, "sorted_expert_ids must have P_max entries");
+    TORCH_CHECK(K % 128 == 0 && N % 128 == 0, "N and K must be multiples of 128");
+    TORCH_CHECK(block_n == 16, "H4b swap-AB supports block_n = 16 only");
+
+    auto y = at::empty({P_max, N}, a_fp8.options().dtype(at::kBFloat16));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto err = detail::launch_sm90_fp8_grouped_contiguous_swapab_dispatch(
+        reinterpret_cast<__nv_fp8_e4m3*>(a_fp8.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3*>(w_fp8.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(y.data_ptr()),
+        reinterpret_cast<float*>(sa.data_ptr()),
+        reinterpret_cast<float*>(sw.data_ptr()),
+        reinterpret_cast<int32_t*>(sorted_expert_ids.data_ptr()),
+        G, P_max, N, K, static_cast<int>(block_n), static_cast<int>(expected_m), stream);
+    TORCH_CHECK(err == cudaSuccess, "sm90 fp8 grouped contiguous swapAB kernel error: ", cudaGetErrorString(err));
+    return y;
+}
+
+// Fused token-gather + 1x128 quantize into the contiguous sorted layout. x
+// [M, K] bf16, flat_to_sorted [R] (pair -> sorted row), p_max (output rows).
+// Iterates the R real pairs; padding rows of the output are left uninitialised
+// (the GroupedContiguous GEMM is row-independent and the combine reads only
+// real rows). Returns (x_q [P_max, K] fp8, sfa [K/128, align(P_max,4)] fp32).
+std::tuple<at::Tensor, at::Tensor> quantize_1x128_sorted_gather_sm90(
+    at::Tensor x, at::Tensor flat_to_sorted, int64_t p_max, int64_t topk)
+{
+    TORCH_CHECK(x.is_cuda() && x.dtype() == at::kBFloat16 && x.dim() == 2 && x.is_contiguous(),
+        "x must be contiguous CUDA bf16 [M, K]");
+    TORCH_CHECK(flat_to_sorted.dtype() == at::kInt && flat_to_sorted.is_cuda() && flat_to_sorted.is_contiguous(),
+        "flat_to_sorted must be contiguous CUDA int32");
+    int const K = x.size(1);
+    int const P_max = static_cast<int>(p_max);
+    int const R = flat_to_sorted.numel();
+    int const Kb = K / 128;
+    int const sfa_ld = align_up4(P_max);
+    TORCH_CHECK(K % 128 == 0, "K must be a multiple of 128");
+
+    auto x_q = at::empty({P_max, K}, x.options().dtype(at::kFloat8_e4m3fn));
+    auto sfa = at::empty({Kb, sfa_ld}, x.options().dtype(at::kFloat));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    detail::fp8bs_quantize_1x128_fp32_sorted_gather(
+        reinterpret_cast<__nv_fp8_e4m3*>(x_q.data_ptr()),
+        reinterpret_cast<float*>(sfa.data_ptr()),
+        reinterpret_cast<__nv_bfloat16 const*>(x.data_ptr()),
+        reinterpret_cast<int32_t const*>(flat_to_sorted.data_ptr()),
+        R, static_cast<int>(topk), sfa_ld, K, stream);
+    return {x_q, sfa};
+}
+
+// SwiGLU + 1x128 requantize into the contiguous sorted layout. gu [P_max,
+// 2*INTER] bf16 (gate||up, sorted), flat_to_sorted [R]. Iterates the R real
+// pairs. Returns (x_q [P_max, INTER] fp8, sfa [INTER/128, align(P_max,4)]).
+std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x128_sorted_sm90(
+    at::Tensor gu, at::Tensor flat_to_sorted)
+{
+    TORCH_CHECK(gu.is_cuda() && gu.dtype() == at::kBFloat16 && gu.dim() == 2 && gu.is_contiguous(),
+        "gu must be contiguous CUDA bf16 [P_max, 2*INTER]");
+    TORCH_CHECK(flat_to_sorted.dtype() == at::kInt && flat_to_sorted.is_cuda() && flat_to_sorted.is_contiguous(),
+        "flat_to_sorted must be contiguous CUDA int32");
+    int const P_max = gu.size(0);
+    int const TWO_INTER = gu.size(1);
+    TORCH_CHECK(TWO_INTER % 2 == 0, "last dim must be even (gate || up)");
+    int const INTER = TWO_INTER / 2;
+    int const R = flat_to_sorted.numel();
+    int const Kb = INTER / 128;
+    int const sfa_ld = align_up4(P_max);
+    TORCH_CHECK(INTER % 128 == 0, "INTER must be a multiple of 128");
+
+    auto x_q = at::empty({P_max, INTER}, gu.options().dtype(at::kFloat8_e4m3fn));
+    auto sfa = at::empty({Kb, sfa_ld}, gu.options().dtype(at::kFloat));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    detail::fp8bs_silu_chunk_mul_quantize_1x128_fp32_sorted(
+        reinterpret_cast<__nv_fp8_e4m3*>(x_q.data_ptr()),
+        reinterpret_cast<float*>(sfa.data_ptr()),
+        reinterpret_cast<__nv_bfloat16 const*>(gu.data_ptr()),
+        reinterpret_cast<int32_t const*>(flat_to_sorted.data_ptr()),
+        R, sfa_ld, INTER, stream);
+    return {x_q, sfa};
 }
 
 } // namespace blockscale_gemm

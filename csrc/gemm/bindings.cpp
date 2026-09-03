@@ -21,6 +21,21 @@ namespace blockscale_gemm
 {
 at::Tensor linear_bf16(at::Tensor x, at::Tensor w);
 at::Tensor linear_fp8(at::Tensor x_fp8, at::Tensor w_fp8, at::Tensor sx, at::Tensor sw);
+// Grouped (MoE, masked) block-scale FP8 on sm_90 (H200).
+at::Tensor linear_fp8_grouped_masked(at::Tensor a_fp8, at::Tensor w_fp8, at::Tensor sa,
+    at::Tensor sw, at::Tensor masked_m, int64_t expected_m);
+std::tuple<at::Tensor, at::Tensor> quantize_1x128_grouped_gather_sm90(
+    at::Tensor x, at::Tensor slot_of_flat, int64_t topk, int64_t num_groups, int64_t m_cap);
+std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x128_grouped_sm90(
+    at::Tensor gu, at::Tensor slot_of_flat);
+at::Tensor linear_fp8_grouped_contiguous(at::Tensor a_fp8, at::Tensor w_fp8, at::Tensor sa,
+    at::Tensor sw, at::Tensor sorted_expert_ids, int64_t block_m, int64_t expected_m);
+at::Tensor linear_fp8_grouped_contiguous_swapab(at::Tensor a_fp8, at::Tensor w_fp8, at::Tensor sa,
+    at::Tensor sw, at::Tensor sorted_expert_ids, int64_t block_n, int64_t expected_m);
+std::tuple<at::Tensor, at::Tensor> quantize_1x128_sorted_gather_sm90(
+    at::Tensor x, at::Tensor flat_to_sorted, int64_t p_max, int64_t topk);
+std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x128_sorted_sm90(
+    at::Tensor gu, at::Tensor flat_to_sorted);
 at::Tensor linear_qx(at::Tensor x_bf16, at::Tensor w_fp8, at::Tensor sw);
 std::tuple<at::Tensor, at::Tensor> quantize_1x128(at::Tensor x, bool use_ue8m0);
 std::tuple<at::Tensor, at::Tensor> quantize_1x128_packed(at::Tensor x, bool use_ue8m0);
@@ -45,12 +60,30 @@ std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x32_grouped(
 std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_build_routing(
     at::Tensor topk_ids, int64_t num_groups, int64_t m_cap);
 at::Tensor moe_combine(at::Tensor dn, at::Tensor slot_of_flat, at::Tensor topk_w);
+std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_build_sorted(
+    at::Tensor topk_ids, int64_t num_groups, int64_t block_m);
+at::Tensor moe_combine_sorted(
+    at::Tensor dn, at::Tensor flat_to_sorted, at::Tensor topk_w);
 } // namespace blockscale_gemm
 
 TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
 {
     m.def("linear_bf16(Tensor x, Tensor w) -> Tensor");
     m.def("linear_fp8(Tensor x_fp8, Tensor w_fp8, Tensor sx, Tensor sw) -> Tensor");
+    m.def("linear_fp8_grouped_masked(Tensor a_fp8, Tensor w_fp8, Tensor sa, Tensor sw, "
+                                     "Tensor masked_m, int expected_m) -> Tensor");
+    m.def("quantize_1x128_grouped_gather_sm90(Tensor x, Tensor slot_of_flat, int topk, "
+                                              "int num_groups, int m_cap) -> (Tensor, Tensor)");
+    m.def("silu_chunk_mul_quantize_1x128_grouped_sm90(Tensor gu, Tensor slot_of_flat) "
+          "-> (Tensor, Tensor)");
+    m.def("linear_fp8_grouped_contiguous(Tensor a_fp8, Tensor w_fp8, Tensor sa, Tensor sw, "
+                                         "Tensor sorted_expert_ids, int block_m, int expected_m) -> Tensor");
+    m.def("linear_fp8_grouped_contiguous_swapab(Tensor a_fp8, Tensor w_fp8, Tensor sa, Tensor sw, "
+                                         "Tensor sorted_expert_ids, int block_n, int expected_m) -> Tensor");
+    m.def("quantize_1x128_sorted_gather_sm90(Tensor x, Tensor flat_to_sorted, int p_max, int topk) "
+          "-> (Tensor, Tensor)");
+    m.def("silu_chunk_mul_quantize_1x128_sorted_sm90(Tensor gu, Tensor flat_to_sorted) "
+          "-> (Tensor, Tensor)");
     m.def("linear_qx(Tensor x_bf16, Tensor w_fp8, Tensor sw) -> Tensor");
     m.def("quantize_1x128(Tensor x, bool use_ue8m0=False) -> (Tensor, Tensor)");
     m.def("quantize_1x128_packed(Tensor x, bool use_ue8m0=True) -> (Tensor, Tensor)");
@@ -72,12 +105,22 @@ TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
     m.def("moe_build_routing(Tensor topk_ids, int num_groups, int m_cap) "
           "-> (Tensor, Tensor, Tensor)");
     m.def("moe_combine(Tensor dn, Tensor slot_of_flat, Tensor topk_w) -> Tensor");
+    m.def("moe_build_sorted(Tensor topk_ids, int num_groups, int block_m) "
+          "-> (Tensor, Tensor, Tensor)");
+    m.def("moe_combine_sorted(Tensor dn, Tensor flat_to_sorted, Tensor topk_w) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(fish_scales_ops, CUDA, m)
 {
     m.impl("linear_bf16", &blockscale_gemm::linear_bf16);
     m.impl("linear_fp8", &blockscale_gemm::linear_fp8);
+    m.impl("linear_fp8_grouped_masked", &blockscale_gemm::linear_fp8_grouped_masked);
+    m.impl("quantize_1x128_grouped_gather_sm90", &blockscale_gemm::quantize_1x128_grouped_gather_sm90);
+    m.impl("silu_chunk_mul_quantize_1x128_grouped_sm90", &blockscale_gemm::silu_chunk_mul_quantize_1x128_grouped_sm90);
+    m.impl("linear_fp8_grouped_contiguous", &blockscale_gemm::linear_fp8_grouped_contiguous);
+    m.impl("linear_fp8_grouped_contiguous_swapab", &blockscale_gemm::linear_fp8_grouped_contiguous_swapab);
+    m.impl("quantize_1x128_sorted_gather_sm90", &blockscale_gemm::quantize_1x128_sorted_gather_sm90);
+    m.impl("silu_chunk_mul_quantize_1x128_sorted_sm90", &blockscale_gemm::silu_chunk_mul_quantize_1x128_sorted_sm90);
     m.impl("linear_qx", &blockscale_gemm::linear_qx);
     m.impl("quantize_1x128", &blockscale_gemm::quantize_1x128);
     m.impl("quantize_1x128_packed", &blockscale_gemm::quantize_1x128_packed);
@@ -94,4 +137,6 @@ TORCH_LIBRARY_IMPL(fish_scales_ops, CUDA, m)
     m.impl("silu_chunk_mul_quantize_1x32_grouped", &blockscale_gemm::silu_chunk_mul_quantize_1x32_grouped);
     m.impl("moe_build_routing", &blockscale_gemm::moe_build_routing);
     m.impl("moe_combine", &blockscale_gemm::moe_combine);
+    m.impl("moe_build_sorted", &blockscale_gemm::moe_build_sorted);
+    m.impl("moe_combine_sorted", &blockscale_gemm::moe_combine_sorted);
 }

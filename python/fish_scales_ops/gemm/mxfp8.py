@@ -258,8 +258,34 @@ def moe_build_routing(
         group is atomic-arrival order; every consumer goes through these
         maps consistently.
     """
-    _require_sm120_grouped()
+    # arch-agnostic glue (plain int32/bf16 + PDL, works on sm_90 and sm_120)
     return torch.ops.fish_scales_ops.moe_build_routing(topk_ids, num_groups, m_cap)
+
+
+def moe_build_sorted(
+    topk_ids: torch.Tensor,
+    num_groups: int,
+    block_m: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """topk routing -> contiguous (triton-style) sorted-layout tensors, one
+    kernel launch. The M*topk routed pairs are sorted by expert into one
+    compact list, each active expert's run padded up to ``block_m`` so the
+    DeepGEMM GroupedContiguous scheduler enumerates only active padded blocks.
+
+    Args:
+        topk_ids: int32 ``[M, topk]``, no-replacement expert ids.
+        num_groups: E (<= 1024).
+        block_m: per-expert run padding granularity (= GEMM BLOCK_M).
+
+    Returns:
+        (sorted_expert_ids ``[P_max]`` int32 = the scheduler's grouped_layout
+        (owning expert at each block-start row, -1 past the actual padded
+        length), flat_to_sorted ``[M*topk]`` int32 (routed pair -> sorted row;
+        drives the gather-quant, silu and combine), num_padded_dev ``[1]``
+        int32 (actual padded length, the GEMM's device length gate)). ``P_max``
+        is rounded up to a block_m multiple and fixed for CUDA-graph capture.
+    """
+    return torch.ops.fish_scales_ops.moe_build_sorted(topk_ids, num_groups, block_m)
 
 
 def moe_combine(
@@ -271,8 +297,23 @@ def moe_combine(
 
     ``out[t] = sum_j topk_w[t, j] * dn.view(-1, H)[slot_of_flat[t*topk+j]]``.
     """
-    _require_sm120_grouped()
+    # arch-agnostic glue (works on sm_90 and sm_120)
     return torch.ops.fish_scales_ops.moe_combine(dn, slot_of_flat, topk_w)
+
+
+def moe_combine_sorted(
+    dn: torch.Tensor,
+    flat_to_sorted: torch.Tensor,
+    topk_w: torch.Tensor,
+) -> torch.Tensor:
+    """Weighted combine for the contiguous (triton-style) sorted layout.
+
+    ``out[t] = sum_j topk_w[t, j] * dn[flat_to_sorted[t*topk+j]]`` where dn is
+    the GroupedContiguous GEMM output ``[P_max, H]`` in expert-sorted rows and
+    ``flat_to_sorted`` (from :func:`moe_build_sorted`) maps each routed pair to
+    its sorted row.
+    """
+    return torch.ops.fish_scales_ops.moe_combine_sorted(dn, flat_to_sorted, topk_w)
 
 
 def quantize_moe_weights_1x32_fp8(

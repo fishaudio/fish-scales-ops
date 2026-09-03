@@ -218,3 +218,69 @@ template class CutlassFp8BlockScaleGemmRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv
 } // namespace kernels::blockscale_gemm
 
 TRTLLM_NAMESPACE_END
+
+// C-ABI entry for the sm_90 (H200) grouped block-scale FP8 masked GEMM.
+// Lives here (not a standalone TU) because runner.cu is the single owner of
+// the vendored DeepGEMM JIT symbols — a second TU that includes dispatch.cuh
+// double-defines the JIT's non-inline helpers at link time.
+namespace blockscale_gemm::detail
+{
+cudaError_t launch_sm90_fp8_grouped_masked_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D,
+    float* SFA, float* SFB, int32_t* masked_m, int num_groups, int m_cap, int N, int K, int expected_m,
+    cudaStream_t stream)
+{
+#ifdef COMPILE_HOPPER_TMA_GEMMS
+    tensorrt_llm::kernels::blockscale_gemm::gemm_dispatch_sm90_grouped_masked(
+        reinterpret_cast<void*>(A), reinterpret_cast<void*>(B), reinterpret_cast<void*>(D), SFA, SFB, masked_m,
+        static_cast<uint32_t>(num_groups), static_cast<uint32_t>(m_cap), static_cast<uint32_t>(N),
+        static_cast<uint32_t>(K), static_cast<uint32_t>(expected_m), stream);
+    return cudaGetLastError();
+#else
+    (void) A; (void) B; (void) D; (void) SFA; (void) SFB; (void) masked_m;
+    (void) num_groups; (void) m_cap; (void) N; (void) K; (void) expected_m; (void) stream;
+    return cudaErrorNotSupported;
+#endif
+}
+
+// C-ABI entry for the sm_90 grouped block-scale FP8 contiguous (sorted) GEMM.
+cudaError_t launch_sm90_fp8_grouped_contiguous_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D,
+    float* SFA, float* SFB, int32_t* sorted_expert_ids, int num_groups, int p_max, int N, int K, int block_m,
+    int expected_m, cudaStream_t stream)
+{
+#ifdef COMPILE_HOPPER_TMA_GEMMS
+    tensorrt_llm::kernels::blockscale_gemm::gemm_dispatch_sm90_grouped_contiguous(
+        reinterpret_cast<void*>(A), reinterpret_cast<void*>(B), reinterpret_cast<void*>(D), SFA, SFB,
+        sorted_expert_ids, static_cast<uint32_t>(num_groups), static_cast<uint32_t>(p_max),
+        static_cast<uint32_t>(N), static_cast<uint32_t>(K), static_cast<uint32_t>(block_m),
+        static_cast<uint32_t>(expected_m), stream);
+    return cudaGetLastError();
+#else
+    (void) A; (void) B; (void) D; (void) SFA; (void) SFB; (void) sorted_expert_ids;
+    (void) num_groups; (void) p_max; (void) N; (void) K; (void) block_m; (void) expected_m; (void) stream;
+    return cudaErrorNotSupported;
+#endif
+}
+
+// C-ABI entry for the sm_90 grouped contiguous swap-AB GEMM (block_n=16
+// activation tiling for M>=8). A = activation [P_max,K], B = weights [G,N,K],
+// SFA = activation K-major scales, SFB = weight scales [G,N/128,K/128].
+cudaError_t launch_sm90_fp8_grouped_contiguous_swapab_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D,
+    float* SFA, float* SFB, int32_t* sorted_expert_ids, int num_groups, int p_max, int N, int K, int block_n,
+    int expected_m, cudaStream_t stream)
+{
+#ifdef COMPILE_HOPPER_TMA_GEMMS
+    // Weight is the swap-AB A matrix, activation the B matrix.
+    tensorrt_llm::kernels::blockscale_gemm::gemm_dispatch_sm90_grouped_contiguous_swapab(
+        reinterpret_cast<void*>(B), reinterpret_cast<void*>(A), reinterpret_cast<void*>(D), SFB, SFA,
+        sorted_expert_ids, static_cast<uint32_t>(num_groups), static_cast<uint32_t>(p_max),
+        static_cast<uint32_t>(N), static_cast<uint32_t>(K), static_cast<uint32_t>(block_n),
+        static_cast<uint32_t>(expected_m), stream);
+    return cudaGetLastError();
+#else
+    (void) A; (void) B; (void) D; (void) SFA; (void) SFB; (void) sorted_expert_ids;
+    (void) num_groups; (void) p_max; (void) N; (void) K; (void) block_n; (void) expected_m; (void) stream;
+    return cudaErrorNotSupported;
+#endif
+}
+} // namespace blockscale_gemm::detail
+

@@ -59,7 +59,8 @@ DECODE_M = [m for m in M_GRID if m <= 128]
 
 KERNEL_IMPLS = ("dg_fp8_cont", "dg_bf16_cont", "dg_fp8_masked", "dg_bf16_masked",
                 "fso_mxfp8_grouped")
-LAYER_IMPLS = ("triton_bf16", "triton_fp8b", "dg_fp8_layer", "fso_mxfp8_layer")
+LAYER_IMPLS = ("triton_bf16", "triton_fp8b", "dg_fp8_layer", "fso_mxfp8_layer",
+               "fso_bsfp8_layer")
 
 # fso masked grouped path: m_cap = pad4(M) slabs fit 32 GB through M=4096
 # (peak ~7 GB at the layer cell); M=8192 still waits on a slab-free entry.
@@ -80,6 +81,7 @@ def make_cells():
         cells += [dict(impl=impl, proj="layer", M=m) for m in M_GRID]
     cells += [dict(impl="dg_fp8_layer", proj="layer", M=m) for m in DECODE_M]
     cells += [dict(impl="fso_mxfp8_layer", proj="layer", M=m) for m in FSO_M]
+    cells += [dict(impl="fso_bsfp8_layer", proj="layer", M=m) for m in FSO_M]
     return cells
 
 
@@ -416,6 +418,27 @@ def run_worker(cell):
                 dn = fso.gemm.linear_mxfp8_grouped_masked(
                     dq, w2_fp8, sd, sw2, masked_dev, expected_m)
                 return fso.gemm.moe_combine(dn, slot_of_flat, topk_w)
+
+            out_holder = {}
+            def fn():
+                out_holder["out"] = layer_fn()
+            fn()
+            torch.cuda.synchronize()
+            result["cos"] = cos_sim(out_holder["out"], ref)
+        elif impl == "fso_bsfp8_layer":
+            # fso sm_90 (H200) block-scale FP8 grouped layer via the single
+            # moe_layer_fp8_sm90 dispatch entry: expert-sorted (contiguous)
+            # 6-kernel layer, auto-routed by M (swap-AB block_n=16 for
+            # M < MOE_SWAP_M_MAX, non-swap block_m=64 above). Same timed
+            # boundary (routing derived from topk_ids on device in the graph).
+            import fish_scales_ops as fso
+            w13_fp8, sw13 = fso.gemm.quantize_moe_weights_1x128_fp8_sm90(w13)
+            w2_fp8, sw2 = fso.gemm.quantize_moe_weights_1x128_fp8_sm90(w2)
+            result["swap"] = int(M < fso.gemm.MOE_SWAP_M_MAX)
+
+            def layer_fn():
+                return fso.gemm.moe_layer_fp8_sm90(
+                    hidden, w13_fp8, sw13, w2_fp8, sw2, topk_ids, topk_w)
 
             out_holder = {}
             def fn():

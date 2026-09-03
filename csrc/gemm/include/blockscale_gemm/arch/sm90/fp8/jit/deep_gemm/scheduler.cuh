@@ -80,6 +80,15 @@ struct GroupedContiguousSchedulerInput
     int* grouped_layout;
 };
 
+// Layout-compatible with NormalSchedulerInputSwapAB (which runGemmSwapAB
+// constructs); the contiguous swap-AB scheduler uses grouped_layout for the
+// per-block expert id.
+struct GroupedContiguousSchedulerInputSwapAB
+{
+    uint32_t shape_n;
+    int* grouped_layout;
+};
+
 struct GroupedMaskedSchedulerInput
 {
     uint32_t shape_m;
@@ -288,15 +297,30 @@ struct GroupedContiguousScheduler
 
     __device__ __forceinline__ bool get_next_block(uint32_t& m_block_idx, uint32_t& n_block_idx)
     {
-        ++current_iter;
-        auto const next_block_idx = current_iter * gridDim.x + blockIdx.x;
-        if (next_block_idx >= num_blocks)
+        // Capture-safe length gate. shape_m is a fixed host P_max (so the grid
+        // and num_blocks are capture-stable), but the expert-sorted list is
+        // shorter at decode. moe_build_sorted labels grouped_layout rows past
+        // the actual padded length with expert id -1; skip those slack blocks
+        // so the work tracks the active padded blocks instead of P_max. The
+        // first row of every real block is a valid expert, so reading
+        // grouped_layout at the block's first row gives the exact expert the
+        // compute path uses. This replaces DeepGEMM's masked O(kNumGroups)
+        // group scan with an O(active-blocks) skip — the whole point of H4.
+        while (true)
         {
-            return false;
+            ++current_iter;
+            auto const next_block_idx = current_iter * gridDim.x + blockIdx.x;
+            if (next_block_idx >= num_blocks)
+            {
+                return false;
+            }
+            get_swizzled_block_idx<kNumTMAMulticast, kNumNBlocks, kNumNBlocksPerGroup>(
+                num_aligned_m_blocks, next_block_idx, m_block_idx, n_block_idx);
+            if (__ldg(grouped_layout + m_block_idx * BLOCK_M) >= 0)
+            {
+                return true;
+            }
         }
-        get_swizzled_block_idx<kNumTMAMulticast, kNumNBlocks, kNumNBlocksPerGroup>(
-            num_aligned_m_blocks, next_block_idx, m_block_idx, n_block_idx);
-        return true;
     }
 };
 
@@ -550,6 +574,90 @@ struct GroupedWithOffsetSchedulerSwapAB
     }
 };
 
+// Contiguous (triton-style sorted) grouped GEMM, swap-AB. The activation
+// [P_max, K] is the B matrix, tiled along P_max by BLOCK_N (small, e.g. 16, to
+// cut the per-expert padding at M>=8); the weight [G, N, K] is the A matrix,
+// tiled along N by BLOCK_M. Mirrors NormalSchedulerSwapAB (flat, scan-free) but
+// injects the per-block expert from grouped_layout[n_block*BLOCK_N] into the
+// weight and weight-scale offsets, and gates the block on the -1 slack sentinel
+// (moe_build_sorted with padding = BLOCK_N). shape_n here = P_max.
+template <uint32_t SHAPE_M, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t kNumGroups, uint32_t kNumTMAMulticast,
+    uint32_t kNumMBlocks = ceil_div(SHAPE_M, BLOCK_M), uint32_t kNumMBlocksPerGroup = 16>
+struct GroupedContiguousSchedulerSwapAB
+{
+    static constexpr GemmType gemm_type = GemmType::GroupedContiguous;
+
+    int current_iter = -1;
+    uint32_t num_aligned_n_blocks;
+    uint32_t num_blocks;
+    int* grouped_layout;
+
+    using Input = GroupedContiguousSchedulerInputSwapAB;
+    Input input;
+
+    GroupedContiguousSchedulerSwapAB() {}
+
+    __device__ __forceinline__ GroupedContiguousSchedulerSwapAB(Input& input)
+    {
+        num_aligned_n_blocks = ceil_div(input.shape_n, BLOCK_N);
+        num_blocks = num_aligned_n_blocks * kNumMBlocks;
+        this->grouped_layout = input.grouped_layout;
+    }
+
+    __device__ __forceinline__ int expert_of(uint32_t const& n_block_idx)
+    {
+        return __ldg(grouped_layout + n_block_idx * BLOCK_N);
+    }
+
+    // weight
+    __device__ __forceinline__ uint32_t get_global_m_idx(
+        const uint32_t shape_dim, const uint32_t block_size, uint32_t const& block_idx, uint32_t const& n_block_idx = 0)
+    {
+        return expert_of(n_block_idx) * shape_dim + block_idx * block_size;
+    }
+
+    // act
+    __device__ __forceinline__ uint32_t get_global_n_idx(uint32_t const& block_idx)
+    {
+        return block_idx * BLOCK_N;
+    }
+
+    // act scales
+    __device__ __forceinline__ uint32_t get_global_scales_b_idx(uint32_t const& block_idx)
+    {
+        return block_idx;
+    }
+
+    // weight scales
+    __device__ __forceinline__ uint32_t get_global_scales_a_idx(
+        const uint32_t shape_dim, const uint32_t block_size, uint32_t const& block_idx, uint32_t const& n_block_idx = 0)
+    {
+        return expert_of(n_block_idx) * shape_dim + block_idx * block_size;
+    }
+
+    __device__ __forceinline__ bool get_next_block(uint32_t& m_block_idx, uint32_t& n_block_idx)
+    {
+        // Capture-safe length gate: skip activation-row blocks past the actual
+        // padded length (grouped_layout first row -1), so work tracks active
+        // padded blocks while shape_n stays a fixed host P_max.
+        while (true)
+        {
+            ++current_iter;
+            auto const next_block_idx = current_iter * gridDim.x + blockIdx.x;
+            if (next_block_idx >= num_blocks)
+            {
+                return false;
+            }
+            get_swizzled_block_idx<kNumTMAMulticast, kNumMBlocks, kNumMBlocksPerGroup>(
+                num_aligned_n_blocks, next_block_idx, n_block_idx, m_block_idx);
+            if (__ldg(grouped_layout + n_block_idx * BLOCK_N) >= 0)
+            {
+                return true;
+            }
+        }
+    }
+};
+
 template <uint32_t SHAPE_N, uint32_t SHAPE_K, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K, uint32_t kNumGroups,
     uint32_t kNumTMAMulticast, uint32_t kNumNBlocks = ceil_div(SHAPE_N, BLOCK_N), uint32_t kNumNBlocksPerGroup = 16>
 struct StridedBatchedScheduler
@@ -743,13 +851,17 @@ struct SchedulerSelectorSwapAB
 {
     static constexpr auto select_type()
     {
-        static_assert(GT == GemmType::GroupedWithOffset || GT == GemmType::Normal,
-            "Only GroupedWithOffset and Normal are supported for SwapAB");
+        static_assert(GT == GemmType::GroupedWithOffset || GT == GemmType::Normal
+                || GT == GemmType::GroupedContiguous,
+            "Only GroupedWithOffset, Normal and GroupedContiguous are supported for SwapAB");
         if constexpr (GT == GemmType::Normal)
             return NormalSchedulerSwapAB<SHAPE_M, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast, kNumMBlocks,
                 kNumMBlocksPerGroup>();
         if constexpr (GT == GemmType::GroupedWithOffset)
             return GroupedWithOffsetSchedulerSwapAB<SHAPE_M, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast,
+                kNumMBlocks, kNumMBlocksPerGroup>();
+        if constexpr (GT == GemmType::GroupedContiguous)
+            return GroupedContiguousSchedulerSwapAB<SHAPE_M, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast,
                 kNumMBlocks, kNumMBlocksPerGroup>();
     }
 

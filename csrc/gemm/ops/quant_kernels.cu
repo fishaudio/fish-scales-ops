@@ -568,6 +568,240 @@ void fp8bs_silu_chunk_mul_quantize_1x32_packed(
     }
 }
 
+// ----- Grouped (MoE, masked) BLOCK-SCALE FP8 1x128 FP32-K-major quantize (H2)
+//
+// The sm_90 (H200) layout-native quantizer: fused token-gather + 1x128
+// block-scale FP8 quantize writing FP32 K-major scales DIRECTLY in the
+// GroupedMasked kernel's SFA layout — SFA[(g*Kb + kb)*m_cap + m] = dequant
+// scale (per-token amax/448, matching per_token_cast(use_ue8m0=False)).
+// This is exactly what the revived sm_90 GroupedMasked kernel's TMA
+// descriptor reads (ColMajor [pad(m_cap,4),(K/128)*G]), so it eliminates the
+// stock deep_gemm pipeline's per_token_cast + tma_align_input_scale two-step
+// (that transform is the launch/pass the fso layout-native quant removes).
+// Full-warp amax per 128-K-block (32 lanes x 4 bf16). m_cap must be a
+// multiple of 4 (== pad(m_cap,4)); on sm_90 the masked slab uses m_cap >= 64.
+
+namespace
+{
+
+__global__ void fp8bs_quantize_1x128_fp32_grouped_gather_kernel(
+    __nv_fp8_e4m3* __restrict__ out_fp8, float* __restrict__ out_sfa,
+    __nv_bfloat16 const* __restrict__ input, int32_t const* __restrict__ slot_of_flat,
+    int n_pairs, int topk, int m_cap, int K)
+{
+    int const warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int const lane_id = threadIdx.x & 31;
+    int const Kb = K / 128;
+    int const i = warp_id / Kb;   // routed pair
+    int const kb = warp_id % Kb;  // 128-K-block
+    if (i >= n_pairs)
+        return;
+    int const slot = slot_of_flat[i];
+    int const g = slot / m_cap;
+    int const m_in = slot % m_cap;
+    int const src = i / topk;
+    int const k_base = kb * 128;
+
+    uint64_t const xword = *reinterpret_cast<uint64_t const*>(
+        &input[static_cast<int64_t>(src) * K + k_base + lane_id * 4]);
+    __nv_bfloat16 const* xv = reinterpret_cast<__nv_bfloat16 const*>(&xword);
+    float const x0 = __bfloat162float(xv[0]);
+    float const x1 = __bfloat162float(xv[1]);
+    float const x2 = __bfloat162float(xv[2]);
+    float const x3 = __bfloat162float(xv[3]);
+    float my_ax = fmaxf(fmaxf(fabsf(x0), fabsf(x1)), fmaxf(fabsf(x2), fabsf(x3)));
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        my_ax = fmaxf(my_ax, __shfl_xor_sync(0xFFFFFFFFu, my_ax, off));
+    my_ax = fmaxf(my_ax, 1e-10f);
+    float const qs = 448.f / my_ax;         // quant scale
+    float const dequant = my_ax * (1.f / 448.f);
+    uint32_t const fp_word = fp8x4_from_floats(x0 * qs, x1 * qs, x2 * qs, x3 * qs);
+    *reinterpret_cast<uint32_t*>(
+        &out_fp8[static_cast<int64_t>(slot) * K + k_base + lane_id * 4]) = fp_word;
+    if (lane_id == 0)
+        out_sfa[(static_cast<int64_t>(g) * Kb + kb) * m_cap + m_in] = dequant;
+}
+
+__global__ void silu_chunk_mul_quantize_1x128_fp32_grouped_kernel(
+    __nv_fp8_e4m3* __restrict__ out_fp8, float* __restrict__ out_sfa,
+    __nv_bfloat16 const* __restrict__ gu, int32_t const* __restrict__ slot_of_flat,
+    int n_pairs, int m_cap, int K)
+{
+    int const warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int const lane_id = threadIdx.x & 31;
+    int const Kb = K / 128;
+    int const i = warp_id / Kb;
+    int const kb = warp_id % Kb;
+    if (i >= n_pairs)
+        return;
+    int const slot = slot_of_flat[i];
+    int const g = slot / m_cap;
+    int const m_in = slot % m_cap;
+    int64_t const stride_m_gu = 2 * static_cast<int64_t>(K);
+    int const k_base = kb * 128;
+
+    uint64_t const gate_word = *reinterpret_cast<uint64_t const*>(
+        &gu[slot * stride_m_gu + 0 + k_base + lane_id * 4]);
+    uint64_t const up_word = *reinterpret_cast<uint64_t const*>(
+        &gu[slot * stride_m_gu + K + k_base + lane_id * 4]);
+    __nv_bfloat162 const* gv2 = reinterpret_cast<__nv_bfloat162 const*>(&gate_word);
+    __nv_bfloat162 const* uv2 = reinterpret_cast<__nv_bfloat162 const*>(&up_word);
+    float2 const f01 = __bfloat1622float2(silu2_mul(gv2[0], uv2[0]));
+    float2 const f23 = __bfloat1622float2(silu2_mul(gv2[1], uv2[1]));
+    float const h0 = f01.x, h1 = f01.y, h2 = f23.x, h3 = f23.y;
+    float my_ax = fmaxf(fmaxf(fabsf(h0), fabsf(h1)), fmaxf(fabsf(h2), fabsf(h3)));
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        my_ax = fmaxf(my_ax, __shfl_xor_sync(0xFFFFFFFFu, my_ax, off));
+    my_ax = fmaxf(my_ax, 1e-10f);
+    float const qs = 448.f / my_ax;
+    float const dequant = my_ax * (1.f / 448.f);
+    uint32_t const fp_word = fp8x4_from_floats(h0 * qs, h1 * qs, h2 * qs, h3 * qs);
+    *reinterpret_cast<uint32_t*>(
+        &out_fp8[static_cast<int64_t>(slot) * K + k_base + lane_id * 4]) = fp_word;
+    if (lane_id == 0)
+        out_sfa[(static_cast<int64_t>(g) * Kb + kb) * m_cap + m_in] = dequant;
+}
+
+// ----- Contiguous (triton-style sorted layout) 1x128 quant variants (H4) ----
+//
+// Companions of the sm_90 GroupedContiguous GEMM. The activation is a flat
+// expert-sorted matrix [P_max, K] and the scale is the DENSE K-major layout the
+// contiguous SFA TMA descriptor expects: ColMajor [align(P_max,4), K/128], i.e.
+//   sfa(r, kb) = kb * sfa_ld + r,  sfa_ld = align(P_max, 4).
+// Both iterate the R real routed pairs (i in [0, M*topk)) and place each at its
+// sorted row via flat_to_sorted[i] — so the work scales with R, not P_max, and
+// there is no O(P_max) memset. Padding rows of the output are left untouched:
+// the GroupedContiguous GEMM is row-independent, so a padding row only produces
+// a padding output row, which the combine drops (it reads only real rows via
+// flat_to_sorted). Each warp owns one (pair i, 128-K-block kb).
+__global__ void fp8bs_quantize_1x128_fp32_sorted_gather_kernel(
+    __nv_fp8_e4m3* __restrict__ out_fp8,  // [P_max, K]
+    float* __restrict__ out_sfa,          // [K/128, sfa_ld] = ColMajor[sfa_ld, K/128]
+    __nv_bfloat16 const* __restrict__ input,   // [M, K]
+    int32_t const* __restrict__ flat_to_sorted, // [R]: pair -> sorted row
+    int n_pairs, int topk, int sfa_ld, int K)
+{
+    int const warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int const lane_id = threadIdx.x & 31;
+    int const Kb = K / 128;
+    int const i = warp_id / Kb;   // routed pair
+    int const kb = warp_id % Kb;  // 128-K-block
+    if (i >= n_pairs)
+        return;
+    int const r = flat_to_sorted[i]; // sorted row
+    int const k_base = kb * 128;
+    int const token = i / topk;
+    uint64_t const xword = *reinterpret_cast<uint64_t const*>(
+        &input[static_cast<int64_t>(token) * K + k_base + lane_id * 4]);
+    __nv_bfloat16 const* xv = reinterpret_cast<__nv_bfloat16 const*>(&xword);
+    float const x0 = __bfloat162float(xv[0]);
+    float const x1 = __bfloat162float(xv[1]);
+    float const x2 = __bfloat162float(xv[2]);
+    float const x3 = __bfloat162float(xv[3]);
+    float my_ax = fmaxf(fmaxf(fabsf(x0), fabsf(x1)), fmaxf(fabsf(x2), fabsf(x3)));
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        my_ax = fmaxf(my_ax, __shfl_xor_sync(0xFFFFFFFFu, my_ax, off));
+    my_ax = fmaxf(my_ax, 1e-10f);
+    float const qs = 448.f / my_ax;
+    float const dequant = my_ax * (1.f / 448.f);
+    uint32_t const fp_word = fp8x4_from_floats(x0 * qs, x1 * qs, x2 * qs, x3 * qs);
+    *reinterpret_cast<uint32_t*>(&out_fp8[static_cast<int64_t>(r) * K + k_base + lane_id * 4]) = fp_word;
+    if (lane_id == 0)
+        out_sfa[static_cast<int64_t>(kb) * sfa_ld + r] = dequant;
+}
+
+__global__ void silu_chunk_mul_quantize_1x128_fp32_sorted_kernel(
+    __nv_fp8_e4m3* __restrict__ out_fp8,  // [P_max, K] (K = INTER)
+    float* __restrict__ out_sfa,          // ColMajor[sfa_ld, K/128]
+    __nv_bfloat16 const* __restrict__ gu, // [P_max, 2*K] gate_up output, sorted
+    int32_t const* __restrict__ flat_to_sorted, // [R]: pair -> sorted row
+    int n_pairs, int sfa_ld, int K)
+{
+    int const warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int const lane_id = threadIdx.x & 31;
+    int const Kb = K / 128;
+    int const i = warp_id / Kb;
+    int const kb = warp_id % Kb;
+    if (i >= n_pairs)
+        return;
+    int const r = flat_to_sorted[i];
+    int const k_base = kb * 128;
+    int64_t const stride_m_gu = 2 * static_cast<int64_t>(K);
+    uint64_t const gate_word = *reinterpret_cast<uint64_t const*>(
+        &gu[static_cast<int64_t>(r) * stride_m_gu + 0 + k_base + lane_id * 4]);
+    uint64_t const up_word = *reinterpret_cast<uint64_t const*>(
+        &gu[static_cast<int64_t>(r) * stride_m_gu + K + k_base + lane_id * 4]);
+    __nv_bfloat162 const* gv2 = reinterpret_cast<__nv_bfloat162 const*>(&gate_word);
+    __nv_bfloat162 const* uv2 = reinterpret_cast<__nv_bfloat162 const*>(&up_word);
+    float2 const f01 = __bfloat1622float2(silu2_mul(gv2[0], uv2[0]));
+    float2 const f23 = __bfloat1622float2(silu2_mul(gv2[1], uv2[1]));
+    float const h0 = f01.x, h1 = f01.y, h2 = f23.x, h3 = f23.y;
+    float my_ax = fmaxf(fmaxf(fabsf(h0), fabsf(h1)), fmaxf(fabsf(h2), fabsf(h3)));
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        my_ax = fmaxf(my_ax, __shfl_xor_sync(0xFFFFFFFFu, my_ax, off));
+    my_ax = fmaxf(my_ax, 1e-10f);
+    float const qs = 448.f / my_ax;
+    float const dequant = my_ax * (1.f / 448.f);
+    uint32_t const fp_word = fp8x4_from_floats(h0 * qs, h1 * qs, h2 * qs, h3 * qs);
+    *reinterpret_cast<uint32_t*>(&out_fp8[static_cast<int64_t>(r) * K + k_base + lane_id * 4]) = fp_word;
+    if (lane_id == 0)
+        out_sfa[static_cast<int64_t>(kb) * sfa_ld + r] = dequant;
+}
+
+} // anonymous namespace
+
+void fp8bs_quantize_1x128_fp32_sorted_gather(__nv_fp8_e4m3* x_q, float* sfa,
+    __nv_bfloat16 const* x, int32_t const* flat_to_sorted, int n_pairs, int topk,
+    int sfa_ld, int K, cudaStream_t stream)
+{
+    constexpr int kThreads = 256, kWarps = kThreads / 32;
+    int const Kb = K / 128;
+    int64_t const total_warps = static_cast<int64_t>(n_pairs) * Kb;
+    int const grid = static_cast<int>((total_warps + kWarps - 1) / kWarps);
+    fp8bs_quantize_1x128_fp32_sorted_gather_kernel<<<grid, kThreads, 0, stream>>>(
+        x_q, sfa, x, flat_to_sorted, n_pairs, topk, sfa_ld, K);
+}
+
+void fp8bs_silu_chunk_mul_quantize_1x128_fp32_sorted(__nv_fp8_e4m3* x_q, float* sfa,
+    __nv_bfloat16 const* gu, int32_t const* flat_to_sorted, int n_pairs, int sfa_ld, int K,
+    cudaStream_t stream)
+{
+    constexpr int kThreads = 256, kWarps = kThreads / 32;
+    int const Kb = K / 128;
+    int64_t const total_warps = static_cast<int64_t>(n_pairs) * Kb;
+    int const grid = static_cast<int>((total_warps + kWarps - 1) / kWarps);
+    silu_chunk_mul_quantize_1x128_fp32_sorted_kernel<<<grid, kThreads, 0, stream>>>(
+        x_q, sfa, gu, flat_to_sorted, n_pairs, sfa_ld, K);
+}
+
+void fp8bs_quantize_1x128_fp32_grouped_gather(__nv_fp8_e4m3* x_q, float* sfa,
+    __nv_bfloat16 const* x, int32_t const* slot_of_flat, int n_pairs, int topk,
+    int m_cap, int K, cudaStream_t stream)
+{
+    constexpr int kThreads = 256, kWarps = kThreads / 32;
+    int const Kb = K / 128;
+    int64_t const total_warps = static_cast<int64_t>(n_pairs) * Kb;
+    int const grid = static_cast<int>((total_warps + kWarps - 1) / kWarps);
+    fp8bs_quantize_1x128_fp32_grouped_gather_kernel<<<grid, kThreads, 0, stream>>>(
+        x_q, sfa, x, slot_of_flat, n_pairs, topk, m_cap, K);
+}
+
+void fp8bs_silu_chunk_mul_quantize_1x128_fp32_grouped(__nv_fp8_e4m3* x_q, float* sfa,
+    __nv_bfloat16 const* gu, int32_t const* slot_of_flat, int n_pairs, int m_cap, int K,
+    cudaStream_t stream)
+{
+    constexpr int kThreads = 256, kWarps = kThreads / 32;
+    int const Kb = K / 128;
+    int64_t const total_warps = static_cast<int64_t>(n_pairs) * Kb;
+    int const grid = static_cast<int>((total_warps + kWarps - 1) / kWarps);
+    silu_chunk_mul_quantize_1x128_fp32_grouped_kernel<<<grid, kThreads, 0, stream>>>(
+        x_q, sfa, gu, slot_of_flat, n_pairs, m_cap, K);
+}
+
 // ----- Grouped (MoE, masked layout) MXFP8 quantize variants (M1) -----------
 //
 // Companions of the sm_120 grouped GEMM. Both write the per-group K-major
