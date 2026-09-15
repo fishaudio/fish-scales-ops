@@ -2,7 +2,7 @@
 """MoE grouped-GEMM reference baselines — Qwen3-30B-A3B geometry.
 
 Measures the *reference* kernels the fso MoE (grouped GEMM) project must meet
-or beat, under the standard fso graph-replay protocol (see docs/perf.md):
+or beat, under the standard fso graph-replay protocol (see docs/perf/README.md):
 per-cell subprocess, 15 eager warmups, side-stream warmup, one
 torch.cuda.graph capture, then 3 reps x 50 replays -> median us.
 
@@ -45,28 +45,50 @@ import statistics
 import subprocess
 import sys
 
-E = 128
-TOPK = 8
-HIDDEN = 2048
-INTER = 768
-LAYERS = 48
+# Routed-expert geometry per model (docs/perf/README.md §3). Shared experts
+# (Qwen3.5) are dense GEMMs on every token and are benched by
+# bench_qwen3_4b_mlp.py --family, not here.
+MODELS = {
+    # SHARED_INTER: intermediate size of the always-on shared expert (0 = none).
+    # The `*_layer_shared` impls add it to the routed layer inside the same
+    # CUDA graph (routed + shared dense MLP + residual add) — Family C's whole
+    # MoE block (docs/perf/layer/README.md).
+    "qwen3-30a3":   dict(E=128, TOPK=8, HIDDEN=2048, INTER=768, LAYERS=48, SHARED_INTER=0),    # Family B
+    "qwen3.5-35a3": dict(E=256, TOPK=8, HIDDEN=2048, INTER=512, LAYERS=40, SHARED_INTER=512),  # Family C
+}
+MODEL = "qwen3-30a3"
+E = TOPK = HIDDEN = INTER = LAYERS = None
+SHARED_INTER = 0
+PROJ = {}   # proj -> (N, K)
 
-# proj -> (N, K)
-PROJ = {"gate_up": (2 * INTER, HIDDEN), "down": (HIDDEN, INTER)}
 
-M_GRID = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+def set_model(name):
+    global MODEL, E, TOPK, HIDDEN, INTER, LAYERS, PROJ, SHARED_INTER
+    g = MODELS[name]
+    MODEL = name
+    E, TOPK, HIDDEN, INTER, LAYERS = g["E"], g["TOPK"], g["HIDDEN"], g["INTER"], g["LAYERS"]
+    SHARED_INTER = g.get("SHARED_INTER", 0)
+    PROJ = {"gate_up": (2 * INTER, HIDDEN), "down": (HIDDEN, INTER)}
+
+
+set_model(MODEL)
+
+M_GRID = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]  # docs/perf/README.md §4; off-grid points via --Ms
 DECODE_M = [m for m in M_GRID if m <= 128]
 
 KERNEL_IMPLS = ("dg_fp8_cont", "dg_bf16_cont", "dg_fp8_masked", "dg_bf16_masked",
                 "fso_mxfp8_grouped")
 LAYER_IMPLS = ("triton_bf16", "triton_fp8b", "dg_fp8_layer", "fso_mxfp8_layer",
-               "fso_bsfp8_layer")
+               "fso_bsfp8_layer", "fso_mxfp8_layer_shared", "fso_bsfp8_layer_shared")
 
 # fso masked grouped path: m_cap = pad4(M) slabs fit 32 GB through M=4096
 # (peak ~7 GB at the layer cell); M=8192 still waits on a slab-free entry.
 # 96/256 are off-grid sweep points (dense E33: off-grid mid-M is where
 # cascade bugs hide).
 FSO_M = sorted(set([m for m in M_GRID if m <= 4096] + [96, 256]))
+# sm_90 expert-sorted contiguous layer (moe_layer_fp8_sm90): no slab, the full
+# grid incl. M=8192 fits.
+FSO_SM90_M = sorted(set(M_GRID + [96, 256]))
 
 
 def make_cells():
@@ -81,7 +103,10 @@ def make_cells():
         cells += [dict(impl=impl, proj="layer", M=m) for m in M_GRID]
     cells += [dict(impl="dg_fp8_layer", proj="layer", M=m) for m in DECODE_M]
     cells += [dict(impl="fso_mxfp8_layer", proj="layer", M=m) for m in FSO_M]
-    cells += [dict(impl="fso_bsfp8_layer", proj="layer", M=m) for m in FSO_M]
+    cells += [dict(impl="fso_bsfp8_layer", proj="layer", M=m) for m in FSO_SM90_M]
+    if SHARED_INTER:
+        cells += [dict(impl="fso_mxfp8_layer_shared", proj="layer", M=m) for m in FSO_M]
+        cells += [dict(impl="fso_bsfp8_layer_shared", proj="layer", M=m) for m in FSO_SM90_M]
     return cells
 
 
@@ -229,7 +254,10 @@ def init_sglang_shim():
 
 def run_worker(cell):
     import torch
-    import deep_gemm as dg
+    try:
+        import deep_gemm as dg   # reference impls only; fso_* cells run without it
+    except ImportError:
+        dg = None
 
     impl, proj, M = cell["impl"], cell["proj"], cell["M"]
     torch.manual_seed(M * 1009 + len(proj) * 17 + 5)
@@ -351,7 +379,8 @@ def run_worker(cell):
             result["cos"] = cs / max(n_cs, 1)
 
     else:  # whole-layer impls
-        init_sglang_shim()
+        if impl.startswith("triton") or impl == "dg_fp8_layer":
+            init_sglang_shim()   # sglang wrappers; the fso layers need neither sglang nor deep_gemm
         hidden = torch.randn(M, HIDDEN, device="cuda", dtype=torch.bfloat16) * 0.1
         w13 = torch.randn(E, 2 * INTER, HIDDEN, device="cuda",
                           dtype=torch.bfloat16) / math.sqrt(HIDDEN)
@@ -361,6 +390,49 @@ def run_worker(cell):
         wbytes_e = (2 * INTER * HIDDEN + HIDDEN * INTER)
         result["w_bytes_active"] = active * wbytes_e * (2 if impl == "triton_bf16" else 1)
         ref = moe_layer_ref(hidden, w13, w2, topk_ids, topk_w)
+
+        # `*_layer_shared`: whole MoE block = routed layer + the always-on shared
+        # expert (dense SwiGLU MLP on every token, same FP8 path as the family's
+        # dense GEMMs) + residual add, all inside the one captured graph.
+        shared = impl.endswith("_shared")
+        base_impl = impl[: -len("_shared")] if shared else impl
+        shared_fn = None
+        if shared:
+            import torch.nn.functional as F
+            import fish_scales_ops as fso
+            assert SHARED_INTER, f"{MODEL} has no shared expert"
+            Is = SHARED_INTER
+            w13s = torch.randn(2 * Is, HIDDEN, device="cuda", dtype=torch.bfloat16) / math.sqrt(HIDDEN)
+            w2s = torch.randn(HIDDEN, Is, device="cuda", dtype=torch.bfloat16) / math.sqrt(Is)
+            result["flops"] += 2.0 * M * (2 * Is * HIDDEN + HIDDEN * Is)
+            result["w_bytes_active"] += (2 * Is * HIDDEN + HIDDEN * Is)
+            result["shared_inter"] = Is
+            gus = hidden.float() @ w13s.float().t()
+            ref = ref + (F.silu(gus[:, :Is]) * gus[:, Is:]) @ w2s.float().t()
+            if base_impl == "fso_mxfp8_layer":
+                w13s_q, s13s = fso.gemm.quantize_1x32_fp8(w13s)
+                w2s_q, s2s = fso.gemm.quantize_1x32_fp8(w2s)
+
+                def shared_fn(x):
+                    xq, sx = fso.gemm.quantize_1x32_fp8(x)
+                    gu = fso.gemm.linear_mxfp8(xq, w13s_q, sx, s13s)
+                    hq, sh = fso.gemm.silu_chunk_mul_quantize_1x32_fp8(gu)
+                    return fso.gemm.linear_mxfp8(hq, w2s_q, sh, s2s)
+            else:  # sm_90 block-FP8: same closure as bench_qwen3_4b_mlp_forward's BSFP8 path
+                w13s_q, s13s = fso.gemm.quantize_128x128_fp8(w13s)
+                w2s_q, s2s = fso.gemm.quantize_128x128_fp8(w2s)
+
+                @torch.compile(mode="default", dynamic=False)
+                def _silu_chunk_mul(gu):
+                    g_, u_ = gu.chunk(2, dim=-1)
+                    return F.silu(g_) * u_
+
+                def shared_fn(x):
+                    xq, sx = fso.gemm.quantize_1x128_fp8(x, use_ue8m0=False)
+                    gu = fso.gemm.linear_fp8(xq, w13s_q, sx, s13s)
+                    h = _silu_chunk_mul(gu)
+                    hq, sh = fso.gemm.quantize_1x128_fp8(h, use_ue8m0=False)
+                    return fso.gemm.linear_fp8(hq, w2s_q, sh, s2s)
 
         if impl.startswith("triton"):
             from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -393,7 +465,7 @@ def run_worker(cell):
             fn()
             torch.cuda.synchronize()
             result["cos"] = cos_sim(out_holder["out"], ref)
-        elif impl == "fso_mxfp8_layer":
+        elif base_impl == "fso_mxfp8_layer":
             # fso M1 composed layer, 6 kernels total and zero torch-op glue:
             # moe_build_routing + gather-quant + grouped gate_up +
             # grouped silu-quant + grouped down + moe_combine. Routing is
@@ -420,12 +492,17 @@ def run_worker(cell):
                 return fso.gemm.moe_combine(dn, slot_of_flat, topk_w)
 
             out_holder = {}
+            if shared_fn is not None:
+                routed_fn = layer_fn
+
+                def layer_fn():
+                    return routed_fn() + shared_fn(hidden)
             def fn():
                 out_holder["out"] = layer_fn()
             fn()
             torch.cuda.synchronize()
             result["cos"] = cos_sim(out_holder["out"], ref)
-        elif impl == "fso_bsfp8_layer":
+        elif base_impl == "fso_bsfp8_layer":
             # fso sm_90 (H200) block-scale FP8 grouped layer via the single
             # moe_layer_fp8_sm90 dispatch entry: expert-sorted (contiguous)
             # 6-kernel layer, auto-routed by M (swap-AB block_n=16 for
@@ -441,6 +518,11 @@ def run_worker(cell):
                     hidden, w13_fp8, sw13, w2_fp8, sw2, topk_ids, topk_w)
 
             out_holder = {}
+            if shared_fn is not None:
+                routed_fn = layer_fn
+
+                def layer_fn():
+                    return routed_fn() + shared_fn(hidden)
             def fn():
                 out_holder["out"] = layer_fn()
             fn()
@@ -517,7 +599,7 @@ def run_all(args):
         keep_p = set(args.projs.split(","))
         cells = [c for c in cells if c["proj"] in keep_p]
 
-    meta = dict(kind="meta", model="qwen3-30a3", E=E, topk=TOPK, hidden=HIDDEN,
+    meta = dict(kind="meta", model=MODEL, E=E, topk=TOPK, hidden=HIDDEN,
                 inter=INTER, layers=LAYERS,
                 device=torch.cuda.get_device_name(0),
                 torch=torch.__version__)
@@ -529,7 +611,7 @@ def run_all(args):
 
     for i, cell in enumerate(cells):
         cmd = [sys.executable, os.path.abspath(__file__), "--worker",
-               "--cell", json.dumps(cell)]
+               "--model", MODEL, "--cell", json.dumps(cell)]
         p = subprocess.run(cmd, capture_output=True, text=True)
         line = next((l for l in p.stdout.splitlines() if l.startswith("CELL ")), None)
         if line is None:
@@ -567,7 +649,11 @@ def main():
                     help="comma list filter, e.g. 1,8,128")
     ap.add_argument("--projs", type=str, default=None,
                     help="comma list filter, e.g. gate_up or down,layer")
+    ap.add_argument("--model", choices=sorted(MODELS), default="qwen3-30a3",
+                    help="routed-expert geometry (docs/perf/README.md §3): "
+                         "qwen3-30a3 = Family B, qwen3.5-35a3 = Family C")
     args = ap.parse_args()
+    set_model(args.model)
     if args.worker:
         run_worker(json.loads(args.cell))
     elif args.run:

@@ -45,9 +45,12 @@ namespace detail
 {
 
 // Per-row pack: src shape [outer_pad, K/128] K-major FP32.
-// Out shape [outer_pad, K/512] K-major int32. (4 K-consecutive bytes packed.)
+// Out shape [outer_pad, ceil(K/512)] K-major int32 (4 K-consecutive bytes
+// packed). When K/128 is not a multiple of 4 the last word's missing bytes
+// are zero (UE8M0 0 = 2^-127); the kernel never consumes them because its K
+// loop stops at the real k-tile count (partial final round, 2026-09-05).
 __global__ inline void sm120_repack_ue8m0_per_row_kernel(
-    int32_t* __restrict__ dst, float const* __restrict__ src, int outer_pad, int K_blocks_out)
+    int32_t* __restrict__ dst, float const* __restrict__ src, int outer_pad, int K_blocks_in, int K_blocks_out)
 {
     int const o = blockIdx.x * blockDim.x + threadIdx.x;
     int const kp = blockIdx.y * blockDim.y + threadIdx.y;
@@ -58,22 +61,25 @@ __global__ inline void sm120_repack_ue8m0_per_row_kernel(
     for (int i = 0; i < 4; ++i)
     {
         int const kb = kp * 4 + i;
-        float const s = src[kb * stride_outer + o];
-        uint32_t const fbits = __float_as_uint(s);
-        uint32_t const e8m0 = (fbits >> 23) & 0xFFu;
-        packed |= (e8m0 << (i * 8));
+        if (kb < K_blocks_in)
+        {
+            float const s = src[kb * stride_outer + o];
+            uint32_t const fbits = __float_as_uint(s);
+            uint32_t const e8m0 = (fbits >> 23) & 0xFFu;
+            packed |= (e8m0 << (i * 8));
+        }
     }
     dst[kp * stride_outer + o] = static_cast<int32_t>(packed);
 }
 
 // SFB expand-and-pack: src shape [N/128, K/128] FP32 row-major.
-// Out shape [N_pad, K/512] int32 K-major.
+// Out shape [N_pad, ceil(K/512)] int32 K-major (tail bytes zero, see above).
 __global__ inline void sm120_repack_ue8m0_expand_n_kernel(
     int32_t* __restrict__ dst, float const* __restrict__ src, int N_pad, int N_blocks_in, int K_blocks_in_per_row)
 {
     int const n = blockIdx.x * blockDim.x + threadIdx.x;
     int const kp = blockIdx.y * blockDim.y + threadIdx.y;
-    int const K_blocks_out = K_blocks_in_per_row / 4;
+    int const K_blocks_out = (K_blocks_in_per_row + 3) / 4;
     if (n >= N_pad || kp >= K_blocks_out) return;
     int const nb = n / 128;
     uint32_t packed = 0;
@@ -83,6 +89,8 @@ __global__ inline void sm120_repack_ue8m0_expand_n_kernel(
         for (int i = 0; i < 4; ++i)
         {
             int const kb = kp * 4 + i;
+            if (kb >= K_blocks_in_per_row)
+                break;
             float const s = src[nb * K_blocks_in_per_row + kb];
             uint32_t const fbits = __float_as_uint(s);
             uint32_t const e8m0 = (fbits >> 23) & 0xFFu;
@@ -100,16 +108,16 @@ __global__ inline void sm120_repack_ue8m0_expand_n_kernel(
 inline void sm120_repack_sfa(
     int32_t* dst, float const* src, int M_pad, int K_blocks_in, cudaStream_t stream)
 {
-    int const K_blocks_out = K_blocks_in / 4;
+    int const K_blocks_out = (K_blocks_in + 3) / 4;
     dim3 const block(32, 4, 1);
     dim3 const grid((M_pad + block.x - 1) / block.x, (K_blocks_out + block.y - 1) / block.y, 1);
-    detail::sm120_repack_ue8m0_per_row_kernel<<<grid, block, 0, stream>>>(dst, src, M_pad, K_blocks_out);
+    detail::sm120_repack_ue8m0_per_row_kernel<<<grid, block, 0, stream>>>(dst, src, M_pad, K_blocks_in, K_blocks_out);
 }
 
 inline void sm120_repack_sfb(
     int32_t* dst, float const* src, int N_pad, int N_blocks_in, int K_blocks_in_per_row, cudaStream_t stream)
 {
-    int const K_blocks_out = K_blocks_in_per_row / 4;
+    int const K_blocks_out = (K_blocks_in_per_row + 3) / 4;
     dim3 const block(32, 4, 1);
     dim3 const grid((N_pad + block.x - 1) / block.x, (K_blocks_out + block.y - 1) / block.y, 1);
     detail::sm120_repack_ue8m0_expand_n_kernel<<<grid, block, 0, stream>>>(

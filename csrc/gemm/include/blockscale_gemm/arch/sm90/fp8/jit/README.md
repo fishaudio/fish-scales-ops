@@ -20,20 +20,24 @@ takes `SHAPE_N` and `SHAPE_K` as **compile-time constants** (used for
 SMEM layout sizing, loop unroll bounds, and `if constexpr` fast-paths
 on `SHAPE_K % kFullKOfAllStages == 0`). To AOT this, every supported
 production `(N, K)` pair would need an explicit instantiation in the
-.so — feasible, but a separate refactor sub-plan. See REORG_PLAN.md
-phase 5 (D2.c) and the discussion in
-`docs/skills/blockscale-gemm-tuning/references/v15a-transfer-plans.md`.
+.so — feasible, but a separate refactor. It was scoped as a follow-up when
+the library was extracted from blockscale_gemm and has not been started; the
+JIT remains the only sm_90 path, and the NVRTC build the process binds is
+therefore part of the measured kernel (see `docs/perf/README.md` §8).
 
 ## Lint contract
 
 AOT code (anything outside this directory) must **not** include
 `<deep_gemm/...>` or any `arch/sm90/fp8/jit/...` header except for
 `arch/sm90/fp8/dispatch.cuh`, which is the dedicated sm_90 entry
-point. (The companion `moe_dispatch.cuh` was removed 2026-05-21 with
-the rest of the MoE path.) Verify with:
+point. (A companion `moe_dispatch.cuh` existed until 2026-05-21; the sm_90
+grouped MoE path revived in 2026-09 — the grouped and strided-batched
+schedulers under `deep_gemm/` — is reached through the same `dispatch.cuh`
+entry, so the contract is unchanged.) Verify with
+`bash tests/gemm/unit/lint_jit_isolation.sh` from the repository root, or:
 
 ```bash
-grep -rn 'deep_gemm/\|arch/sm90/fp8/jit/' include/ src/ pytorch/csrc/ \
+grep -rn '#include.*\(deep_gemm/\|arch/sm90/fp8/jit/\)' csrc/ \
   | grep -v 'arch/sm90/fp8/jit/' \
   | grep -v 'arch/sm90/fp8/dispatch.cuh'
 ```

@@ -36,11 +36,11 @@ void fp8bs_quantize_1x128(__nv_fp8_e4m3* x_q, float* scales, __nv_bfloat16 const
 }
 
 void fp8bs_quantize_128x128(
-    __nv_fp8_e4m3* w_q, float* scales, __nv_bfloat16 const* w, int N, int K, cudaStream_t stream)
+    __nv_fp8_e4m3* w_q, float* scales, __nv_bfloat16 const* w, int N, int K, cudaStream_t stream, bool use_ue8m0)
 {
     // The runner-internal weight quant path. NOT fp8_128x128_cs, which is a
     // cast-only placeholder that fills scales with 1.0.
-    tensorrt_llm::kernels::blockscale_gemm::fp8_128x128_quant(w_q, scales, w, K, N, stream);
+    tensorrt_llm::kernels::blockscale_gemm::fp8_128x128_quant(w_q, scales, w, K, N, stream, use_ue8m0);
 }
 
 // MXFP8 1×32 quantize — restored 2026-05-21 for the fish-scales-ops MXFP8
@@ -1111,7 +1111,15 @@ void fp8bs_silu_chunk_mul_quantize_1x32_packed_grouped(__nv_fp8_e4m3* x_q, int32
 //   * Eliminates: (a) the FP32 → packed scale round-trip on sm_120, (b) the
 //     persistent-kernel grid-stride loop overhead of the legacy launcher.
 
-enum class BSFp8ScaleFormat { FP32_KMAJOR, PACKED_INT32_KMAJOR };
+// PACKED_INT32_SM1XX_ATOM (2026-09-05, B200/B300 block-FP8): the sm_100/sm_103
+// tcgen05 BlockScaled collective consumes one UE8M0 byte per 32 K-elements in
+// the Sm1xxBlockScaledConfig<32> atom layout (see MxSfLayout::SM1XX_ATOM). A
+// 1x128 scale is expressed by writing the same byte into the 4 consecutive
+// 32-element slots of its K-block, i.e. one int32 word `byte * 0x01010101`
+// per (row, K-block) at sf_word_index<SM1XX_ATOM>(m, kb, M_pad, K/128). The
+// GEMM then runs unchanged through the MXFP8 tiers — same trick the sm_120
+// builder uses (kSFVecSize=128 is a software aggregation of the VS=32 atom).
+enum class BSFp8ScaleFormat { FP32_KMAJOR, PACKED_INT32_KMAJOR, PACKED_INT32_SM1XX_ATOM };
 
 namespace
 {
@@ -1134,11 +1142,19 @@ __global__ void fp8bs_quantize_1x128_packed_kernel(
     int const m  = warp_id / k_groups;
     int const kg = warp_id % k_groups;
 
+    int const num_kp = K / kBlockSize;  // words per row in the SM1XX atom layout (one per K-block)
+
     // Padded M rows: write zero (packed) or skip (fp32).
     if (m >= M) {
         if (lane_id == 0) {
             if constexpr (OUT_FMT == BSFp8ScaleFormat::PACKED_INT32_KMAJOR) {
                 static_cast<int32_t*>(out_scale)[kg * M_pad + m] = 0;
+            } else if constexpr (OUT_FMT == BSFp8ScaleFormat::PACKED_INT32_SM1XX_ATOM) {
+#pragma unroll
+                for (int p = 0; p < K_BLOCKS_PER_WARP; ++p) {
+                    static_cast<int32_t*>(out_scale)[sf_word_index<MxSfLayout::SM1XX_ATOM>(
+                        m, kg * K_BLOCKS_PER_WARP + p, M_pad, num_kp)] = 0;
+                }
             } else {
 #pragma unroll
                 for (int p = 0; p < K_BLOCKS_PER_WARP; ++p) {
@@ -1187,6 +1203,12 @@ __global__ void fp8bs_quantize_1x128_packed_kernel(
             if (lane_id == 0) {
                 packed |= static_cast<uint32_t>(byte_v) << (it * 8);
             }
+        } else if constexpr (OUT_FMT == BSFp8ScaleFormat::PACKED_INT32_SM1XX_ATOM) {
+            if (lane_id == 0) {
+                // 1x128 block scale replicated into the 4 VS=32 slots of this K-block.
+                static_cast<int32_t*>(out_scale)[sf_word_index<MxSfLayout::SM1XX_ATOM>(m, kb, M_pad, num_kp)]
+                    = static_cast<int32_t>(static_cast<uint32_t>(byte_v) * 0x01010101u);
+            }
         } else {
             // FP32 path: write dequant scale at K-major position (kb, m).
             if (lane_id == 0) {
@@ -1213,9 +1235,10 @@ __global__ void fp8bs_quantize_1x128_packed_kernel(
 } // anonymous namespace
 
 void fp8bs_quantize_1x128_packed(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
-    __nv_bfloat16 const* x, int M, int K, cudaStream_t stream, bool use_ue8m0)
+    __nv_bfloat16 const* x, int M, int K, cudaStream_t stream, bool use_ue8m0, bool sm1xx_sf_layout)
 {
-    int const m_pad = ((M + 3) / 4) * 4;
+    // sm_120: K-major words, rows padded to 4; sm_100/103: Sm1xx atom layout, rows padded to 128.
+    int const m_pad = sm1xx_sf_layout ? ((M + 127) / 128) * 128 : ((M + 3) / 4) * 4;
     constexpr int kBlockSize = 128;
     constexpr int kBlocksPerWarp = 4;
     int const k_groups = K / (kBlockSize * kBlocksPerWarp);
@@ -1224,6 +1247,16 @@ void fp8bs_quantize_1x128_packed(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
     constexpr int kWarpsPerBlock = kThreadsPerBlock / 32;
     int const grid = (total_warps + kWarpsPerBlock - 1) / kWarpsPerBlock;
 
+    if (sm1xx_sf_layout) {
+        if (use_ue8m0) {
+            fp8bs_quantize_1x128_packed_kernel<true, BSFp8ScaleFormat::PACKED_INT32_SM1XX_ATOM>
+                <<<grid, kThreadsPerBlock, 0, stream>>>(x_q, packed_scales, x, M, K, m_pad);
+        } else {
+            fp8bs_quantize_1x128_packed_kernel<false, BSFp8ScaleFormat::PACKED_INT32_SM1XX_ATOM>
+                <<<grid, kThreadsPerBlock, 0, stream>>>(x_q, packed_scales, x, M, K, m_pad);
+        }
+        return;
+    }
     if (use_ue8m0) {
         fp8bs_quantize_1x128_packed_kernel<true, BSFp8ScaleFormat::PACKED_INT32_KMAJOR>
             <<<grid, kThreadsPerBlock, 0, stream>>>(x_q, packed_scales, x, M, K, m_pad);
@@ -1267,9 +1300,12 @@ void fp8bs_quantize_1x128_fp32_fast(__nv_fp8_e4m3* x_q, float* fp32_scales,
 //      We repack with an EXPANSION: each output row n reads from
 //      input row (n / 128) and packs 4 K-blocks of that scale.
 
-// Mode 1: per-row pack. src shape [outer_pad, K/128] K-major FP32.
+// Mode 1: per-row pack. src shape [outer_pad, K/128] K-major FP32; out
+// [outer_pad, ceil(K/512)]. A K/128 count that is not a multiple of 4 leaves
+// the last word's missing bytes zero (never consumed: the sm_120 kernel's K
+// loop stops at the real k-tile count, 2026-09-05).
 __global__ void repack_ue8m0_per_row_kernel(int32_t* __restrict__ dst,
-    float const* __restrict__ src, int outer_pad, int K_blocks_out)
+    float const* __restrict__ src, int outer_pad, int K_blocks_in, int K_blocks_out)
 {
     int const o = blockIdx.x * blockDim.x + threadIdx.x;
     int const kp = blockIdx.y * blockDim.y + threadIdx.y;
@@ -1280,10 +1316,13 @@ __global__ void repack_ue8m0_per_row_kernel(int32_t* __restrict__ dst,
     for (int i = 0; i < 4; ++i)
     {
         int const kb = kp * 4 + i;
-        float const s = src[kb * stride_outer + o];
-        uint32_t const fbits = __float_as_uint(s);
-        uint32_t const e8m0 = (fbits >> 23) & 0xFFu;
-        packed |= (e8m0 << (i * 8));
+        if (kb < K_blocks_in)
+        {
+            float const s = src[kb * stride_outer + o];
+            uint32_t const fbits = __float_as_uint(s);
+            uint32_t const e8m0 = (fbits >> 23) & 0xFFu;
+            packed |= (e8m0 << (i * 8));
+        }
     }
     dst[kp * stride_outer + o] = static_cast<int32_t>(packed);
 }
@@ -1297,7 +1336,7 @@ __global__ void repack_ue8m0_expand_n_kernel(int32_t* __restrict__ dst,
 {
     int const n = blockIdx.x * blockDim.x + threadIdx.x;
     int const kp = blockIdx.y * blockDim.y + threadIdx.y;
-    int const K_blocks_out = K_blocks_in_per_row / 4;
+    int const K_blocks_out = (K_blocks_in_per_row + 3) / 4;
     if (n >= N_pad || kp >= K_blocks_out) return;
     int const nb = n / 128;
     uint32_t packed = 0;
@@ -1307,6 +1346,8 @@ __global__ void repack_ue8m0_expand_n_kernel(int32_t* __restrict__ dst,
         for (int i = 0; i < 4; ++i)
         {
             int const kb = kp * 4 + i;
+            if (kb >= K_blocks_in_per_row)
+                break;
             // src is row-major: data[nb * K_blocks_in_per_row + kb]
             float const s = src[nb * K_blocks_in_per_row + kb];
             uint32_t const fbits = __float_as_uint(s);
@@ -1318,20 +1359,76 @@ __global__ void repack_ue8m0_expand_n_kernel(int32_t* __restrict__ dst,
     dst[kp * stride_n + n] = static_cast<int32_t>(packed);
 }
 
+// ---- sm_100 / sm_103 block-FP8 (1x128 / 128x128) scale repack into the Sm1xx atom layout --------
+// One int32 word per (row, K-block) = the UE8M0 exponent byte replicated into the 4 VS=32 slots.
+// Rows are padded to 128 (zero words) as the tcgen05 collective's SF tile expects.
+
+// SFA: src is the 1x128 FP32 scale tensor [pad(M,4), K/128] with K-major physical layout
+// (data[kb * M_pad4 + m]); dst is the 1-D atom buffer [pad(M,128) * K/128] int32.
+__global__ void repack_ue8m0_1x128_atom_kernel(int32_t* __restrict__ dst, float const* __restrict__ src,
+    int M, int M_pad4, int M_pad128, int K_blocks)
+{
+    int const m = blockIdx.x * blockDim.x + threadIdx.x;
+    int const kb = blockIdx.y * blockDim.y + threadIdx.y;
+    if (m >= M_pad128 || kb >= K_blocks) return;
+    uint32_t word = 0;
+    if (m < M)
+    {
+        uint32_t const fbits = __float_as_uint(src[kb * M_pad4 + m]);
+        word = ((fbits >> 23) & 0xFFu) * 0x01010101u;
+    }
+    dst[sf_word_index<MxSfLayout::SM1XX_ATOM>(m, kb, M_pad128, K_blocks)] = static_cast<int32_t>(word);
+}
+
+// SFB: src is the 128x128 FP32 scale tensor [N/128, K/128] row-major; dst is the per-N-row atom
+// buffer [pad(N,128) * K/128] int32 (all 128 rows of an N-block share the block's scale).
+__global__ void repack_ue8m0_128x128_atom_kernel(int32_t* __restrict__ dst, float const* __restrict__ src,
+    int N, int N_blocks, int N_pad128, int K_blocks)
+{
+    int const n = blockIdx.x * blockDim.x + threadIdx.x;
+    int const kb = blockIdx.y * blockDim.y + threadIdx.y;
+    if (n >= N_pad128 || kb >= K_blocks) return;
+    uint32_t word = 0;
+    if (n < N && n / 128 < N_blocks)
+    {
+        uint32_t const fbits = __float_as_uint(src[(n / 128) * K_blocks + kb]);
+        word = ((fbits >> 23) & 0xFFu) * 0x01010101u;
+    }
+    dst[sf_word_index<MxSfLayout::SM1XX_ATOM>(n, kb, N_pad128, K_blocks)] = static_cast<int32_t>(word);
+}
+
+void repack_ue8m0_scales_1x128_for_sm1xx(int32_t* dst, float const* src, int M, int M_pad4, int K_blocks,
+    cudaStream_t stream)
+{
+    int const M_pad128 = (M + 127) / 128 * 128;
+    dim3 const block(32, 4, 1);
+    dim3 const grid((M_pad128 + block.x - 1) / block.x, (K_blocks + block.y - 1) / block.y, 1);
+    repack_ue8m0_1x128_atom_kernel<<<grid, block, 0, stream>>>(dst, src, M, M_pad4, M_pad128, K_blocks);
+}
+
+void repack_ue8m0_scales_128x128_for_sm1xx(int32_t* dst, float const* src, int N, int N_blocks, int K_blocks,
+    cudaStream_t stream)
+{
+    int const N_pad128 = (N + 127) / 128 * 128;
+    dim3 const block(32, 4, 1);
+    dim3 const grid((N_pad128 + block.x - 1) / block.x, (K_blocks + block.y - 1) / block.y, 1);
+    repack_ue8m0_128x128_atom_kernel<<<grid, block, 0, stream>>>(dst, src, N, N_blocks, N_pad128, K_blocks);
+}
+
 void repack_ue8m0_scales_for_sm120(int32_t* dst, float const* src, int M_pad, int K_blocks_in,
     cudaStream_t stream)
 {
-    int const K_blocks_out = K_blocks_in / 4;
+    int const K_blocks_out = (K_blocks_in + 3) / 4;
     dim3 const block(32, 4, 1);
     dim3 const grid((M_pad + block.x - 1) / block.x,
                     (K_blocks_out + block.y - 1) / block.y, 1);
-    repack_ue8m0_per_row_kernel<<<grid, block, 0, stream>>>(dst, src, M_pad, K_blocks_out);
+    repack_ue8m0_per_row_kernel<<<grid, block, 0, stream>>>(dst, src, M_pad, K_blocks_in, K_blocks_out);
 }
 
 void repack_ue8m0_scales_sfb_for_sm120(int32_t* dst, float const* src, int N_pad,
     int N_blocks_in, int K_blocks_in_per_row, cudaStream_t stream)
 {
-    int const K_blocks_out = K_blocks_in_per_row / 4;
+    int const K_blocks_out = (K_blocks_in_per_row + 3) / 4;
     dim3 const block(32, 4, 1);
     dim3 const grid((N_pad + block.x - 1) / block.x,
                     (K_blocks_out + block.y - 1) / block.y, 1);

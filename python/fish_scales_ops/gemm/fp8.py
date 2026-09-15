@@ -1,7 +1,9 @@
 """1×128 / 128×128 FP8 ops — quantize, GEMM, scale repack, and the
 internal-quantize ``linear_qx`` variant.
 
-Auto-dispatches sm_90 deep_gemm vs sm_120 CUTLASS BlockScaledKernel.
+Auto-dispatches sm_90 deep_gemm, sm_120 CUTLASS BlockScaledKernel and, since
+2026-09-05, sm_100 / sm_103 through the MXFP8 tcgen05 tiers with replicated
+scales.
 """
 from __future__ import annotations
 
@@ -14,22 +16,37 @@ def linear_fp8(
     sx: torch.Tensor,
     sw: torch.Tensor,
 ) -> torch.Tensor:
-    """Block-scaled FP8 (E4M3) GEMM. Auto-dispatches sm_90 / sm_120.
+    """Block-scaled FP8 (E4M3) GEMM. Auto-dispatches sm_90 / sm_100 / sm_120.
 
-    On sm_120 (Blackwell sm_120a) you must produce scales
-    via ``quantize_*_fp8(..., use_ue8m0=True)`` — the wrapper repacks
-    them to the int32-packed UE8M0 layout the CUTLASS kernel expects.
-    On sm_90 (Hopper / H200) ``use_ue8m0=False`` (the default) is fine.
+    On sm_120 (Blackwell sm_120a) and sm_100 / sm_103 (B200 / B300) the
+    scales must be UE8M0: ``quantize_1x128_fp8(..., use_ue8m0=True)`` and the
+    weight quantizer's default there. Pass them as FP32 (packed per call) or
+    pre-packed int32 from ``repack_fp8_{act,wgt}_scales`` /
+    ``quantize_1x128_fp8_packed``. On sm_100 / sm_103 the GEMM runs on the
+    MXFP8 tcgen05 tiers with each 1×128 scale byte replicated into its four
+    32-wide slots (added 2026-09-05). On sm_90 (Hopper / H200)
+    ``use_ue8m0=False`` (the default) is fine.
 
     Args:
         x_fp8: float8_e4m3fn [M, K], contiguous.
         w_fp8: float8_e4m3fn [N, K], contiguous.
-        sx:    float32 dequant scales for x (see quantize helper output).
-        sw:    float32 dequant scales for w.
+        sx:    float32 dequant scales for x (see quantize helper output), or
+               the pre-packed int32 form.
+        sw:    float32 dequant scales for w, or the pre-packed int32 form.
 
     Returns:
         bfloat16 [M, N].
     """
+    from .._arch import sm_major
+    if sm_major() == 10:
+        # sm_100 / sm_103: expand 1x128 scales to the atom layout, then take the
+        # MXFP8 tiers (cuBLAS scaled_mm / cuDNN / CuTe DSL / C++ cascade).
+        if sx.dtype == torch.float32:
+            sx = repack_fp8_act_scales(sx)
+        if sw.dtype == torch.float32:
+            sw = repack_fp8_wgt_scales(sw)
+        from .mxfp8 import linear_mxfp8
+        return linear_mxfp8(x_fp8.contiguous(), w_fp8.contiguous(), sx, sw)
     return torch.ops.fish_scales_ops.linear_fp8(
         x_fp8.contiguous(),
         w_fp8.contiguous(),
@@ -67,11 +84,13 @@ def quantize_1x128_fp8_packed(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
     the separate repack-kernel launch.
 
     Returns:
-        (x_fp8, sx_packed) — packed int32 K-major ``[pad(M,4), K/512]``
+        (x_fp8, sx_packed) — packed int32 K-major ``[pad(M,4), ceil(K/512)]``
         (4 UE8M0 bytes per int32). Drop this into :func:`linear_fp8`
         as the activation scale on sm_120.
 
-    Constraints: ``K % 512 == 0`` (4 K-blocks per packed int32).
+    Constraints: ``K % 128 == 0``. The fused kernel covers ``K % 512 == 0``;
+    other K take the two-step path (FP32 quantize + repack) inside the op, with
+    the last packed word's unused bytes zero (never read by the GEMM).
 
     Use this on sm_120 instead of ``quantize_1x128_fp8 + repack_fp8_act_scales``.
     On sm_90 stick with ``quantize_1x128_fp8`` (the deep_gemm path consumes
@@ -80,19 +99,35 @@ def quantize_1x128_fp8_packed(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
     return torch.ops.fish_scales_ops.quantize_1x128_packed(x.contiguous(), True)
 
 
-def quantize_128x128_fp8(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def quantize_128x128_fp8(
+    w: torch.Tensor,
+    use_ue8m0: bool | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """BF16 [N, K] weight → FP8 (E4M3) [N, K] + FP32 per-128×128-block dequant scales.
+
+    Args:
+        w: bf16 [N, K].
+        use_ue8m0: round each block scale up to a power of two (UE8M0-exact
+            FP32). ``None`` (default) resolves to ``True`` on sm_100 / sm_103
+            and sm_120, ``False`` on sm_90. The Blackwell GEMMs consume scales as UE8M0
+            exponent bytes, so a plain ``amax/448`` scale would be truncated
+            to the power of two below it and the block dequantised 0.5–1.0×
+            too small (silent accuracy loss, fixed 2026-09-05). The sm_90
+            deep_gemm path takes FP32 scales as they are.
 
     Returns:
         (w_fp8, sw) where sw is float32 [ceil(N,128), ceil(K,128)].
     """
-    return torch.ops.fish_scales_ops.quantize_128x128(w.contiguous())
+    if use_ue8m0 is None:
+        from .._arch import sm_major
+        use_ue8m0 = sm_major() >= 10
+    return torch.ops.fish_scales_ops.quantize_128x128(w.contiguous(), use_ue8m0)
 
 
 def repack_fp8_act_scales(sx_f32: torch.Tensor) -> torch.Tensor:
-    """FP32 1×128 act scales [pad(M,4), K/128] → int32 K-major [pad(M,4), K/512].
+    """FP32 1×128 act scales [pad(M,4), K/128] → int32 K-major [pad(M,4), ceil(K/512)].
 
-    **sm_120 only.** Pre-pack activation scales once when reusing across
+    **sm_120 and sm_100 / sm_103.** Pre-pack activation scales once when reusing across
     calls and pass the int32 result to ``linear_fp8``; the wrapper takes
     the fast path and skips the ~9 μs per-call repack. On sm_90 the
     deep_gemm kernel consumes the FP32 scales directly — do NOT call
@@ -103,7 +138,7 @@ def repack_fp8_act_scales(sx_f32: torch.Tensor) -> torch.Tensor:
 
 
 def repack_fp8_wgt_scales(sw_f32: torch.Tensor) -> torch.Tensor:
-    """FP32 128×128 wgt scales [N/128, K/128] → int32 K-major [pad(N,4), K/512].
+    """FP32 128×128 wgt scales [N/128, K/128] → int32 K-major [pad(N,4), ceil(K/512)].
 
     **sm_120 only.** Pre-pack weight scales once per cached weight
     tensor; the 128×128 block scales get row-expanded across 128 N rows
@@ -316,7 +351,7 @@ def quantize_moe_weights_1x128_fp8_sm90(w):
     w_fp8 = torch.empty(G, N, K, device=w.device, dtype=torch.float8_e4m3fn)
     sw = torch.empty(G, N // 128, K // 128, device=w.device, dtype=torch.float32)
     for g in range(G):
-        q, s = torch.ops.fish_scales_ops.quantize_128x128(w[g].contiguous())
+        q, s = torch.ops.fish_scales_ops.quantize_128x128(w[g].contiguous(), False)  # sm_90: FP32 scales
         w_fp8[g].copy_(q)
         sw[g].copy_(s)
     return w_fp8, sw

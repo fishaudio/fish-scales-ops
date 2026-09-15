@@ -46,7 +46,7 @@ import torch.nn.functional as F
 # Qwen3-4B
 HIDDEN = 2560
 INTERMEDIATE = 9728
-M_GRID = [1, 2, 4, 8, 16, 32, 64, 128, 512, 1024, 2048, 4096]
+M_GRID = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]  # docs/perf/README.md §4
 
 
 def _make_bf16_weights(device="cuda"):
@@ -85,12 +85,12 @@ def _build_mlp_fn(dtype, sm_major):
     if dtype == "bsfp8":
         wgu_q, sgu = fso.gemm.quantize_128x128_fp8(w_gate_up_bf)
         wd_q, sd = fso.gemm.quantize_128x128_fp8(w_down_bf)
-        if sm_major >= 12:
+        if sm_major >= 10:
             sgu = fso.gemm.repack_fp8_wgt_scales(sgu)
             sd = fso.gemm.repack_fp8_wgt_scales(sd)
 
-        if sm_major >= 12:
-            # sm_120: use the fused single-kernel `quantize_1x128_fp8_packed`
+        if sm_major >= 10:
+            # sm_120 / sm_100: use the fused single-kernel `quantize_1x128_fp8_packed`
             # which emits the int32-packed UE8M0 K-major scale layout directly,
             # skipping the separate `repack_fp8_act_scales` pass.
             def fn(x_bf):

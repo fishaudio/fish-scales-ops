@@ -122,7 +122,7 @@ inline void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* sc
     // because the deeper NS=4 pipeline beats the occupancy lift the smem
     // budget already grants. See cuobjdump-baseline.md "P3 negative result".
     auto forced = read_force_tile();
-    if (forced.active())
+    if (force_tile_applies(forced, shape_k))
     {
         int const k_split = forced.stream_k() ? forced.ks : 1;
         bool handled = false;

@@ -51,6 +51,7 @@ def main() -> None:
         (128, 4096, 4096),
         (1024, 4096, 4096),
         (4096, 4096, 4096),
+        (256, 2048, 768),   # K % 512 != 0: sm_120 partial final round + zero-padded scale word
         (2048, 8192, 8192) if not args.quick else (1024, 4096, 4096),
     ):
         test_linear(M, N, K)

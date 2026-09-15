@@ -39,7 +39,7 @@ std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x128_sorted_sm90(
 at::Tensor linear_qx(at::Tensor x_bf16, at::Tensor w_fp8, at::Tensor sw);
 std::tuple<at::Tensor, at::Tensor> quantize_1x128(at::Tensor x, bool use_ue8m0);
 std::tuple<at::Tensor, at::Tensor> quantize_1x128_packed(at::Tensor x, bool use_ue8m0);
-std::tuple<at::Tensor, at::Tensor> quantize_128x128(at::Tensor w);
+std::tuple<at::Tensor, at::Tensor> quantize_128x128(at::Tensor w, bool use_ue8m0);
 at::Tensor repack_fp8_act_scales(at::Tensor sx_f32);
 at::Tensor repack_fp8_wgt_scales(at::Tensor sw_f32);
 // MXFP8 1×32 (sm_120 only).
@@ -87,7 +87,7 @@ TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
     m.def("linear_qx(Tensor x_bf16, Tensor w_fp8, Tensor sw) -> Tensor");
     m.def("quantize_1x128(Tensor x, bool use_ue8m0=False) -> (Tensor, Tensor)");
     m.def("quantize_1x128_packed(Tensor x, bool use_ue8m0=True) -> (Tensor, Tensor)");
-    m.def("quantize_128x128(Tensor w) -> (Tensor, Tensor)");
+    m.def("quantize_128x128(Tensor w, bool use_ue8m0=False) -> (Tensor, Tensor)");
     m.def("repack_fp8_act_scales(Tensor sx_f32) -> Tensor");
     m.def("repack_fp8_wgt_scales(Tensor sw_f32) -> Tensor");
     m.def("quantize_1x32(Tensor x, bool use_ue8m0=True) -> (Tensor, Tensor)");

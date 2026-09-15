@@ -137,7 +137,7 @@ struct SmemCopyAtomBForTileMN<16, 64>
 };
 
 template <int TileM_ = 32, int TileN_ = 128, int Stages_ = 4, int MinBlocksPerSm_ = 1,
-    int SchedGroup_ = 16, bool SeparateSmemD_ = false,
+    int SchedGroup_ = 16, bool SeparateSmemD_ = false, bool GroupedLayoutSmem_ = false,
     typename PermMmaTileN_ = typename cute::conditional_t<(TileM_ == 16),
         typename PermMmaTileNForTileN_M16<TileN_>::type,
         typename PermMmaTileNForTileN<TileN_>::type>,
@@ -158,6 +158,10 @@ struct SM120MxFP8BlockScaledBuilder
     static constexpr int kTileM = TileM_;
     static constexpr int kTileN = TileN_;
     static constexpr int MinBlocksPerSm = MinBlocksPerSm_;
+    // GroupedLayoutSmem: reserve the 2 KB grouped_layout prefix array in the
+    // kernel's SharedStorage (grouped MoE instantiations only; dense keeps
+    // the July smem sizes — see the fp8 builder note).
+    static constexpr bool kGroupedLayoutSmem = GroupedLayoutSmem_;
     // E29: persistent-scheduler swizzle group size. Default 16 matches
     // the historical value baked into SM120BlockScaledScheduler. Forced-
     // only T4 experiment tests values 8 and 32 to see if a different

@@ -304,13 +304,21 @@ inline void fp8_128x128_cs(
 // Proper per-block-scaled BF16 -> FP8 quantize (the one the runner uses
 // internally for weights). Computes amax per 128x128 block, scales to E4M3,
 // writes dequant scales to `scales`.
-inline void fp8_128x128_quant(
-    __nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_y, cudaStream_t stream)
+// `use_ue8m0` rounds each block scale up to a power of two (UE8M0-exact FP32),
+// which the sm_120 path requires: its scale repack keeps only the exponent byte,
+// so a plain amax/448 scale would be silently truncated to the power of two
+// below it and every block dequantised 0.5-1.0x too small (2026-09-05 fix).
+inline void fp8_128x128_quant(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x,
+    int shape_y, cudaStream_t stream, bool use_ue8m0 = false)
 {
     if (kNumDeviceSMs < 0)
         kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
-    scale_128x128_kernel<__nv_bfloat16, __nv_fp8_e4m3, float>
-        <<<kNumDeviceSMs, 256, 0, stream>>>(mat_quant, scales, mat, shape_x, shape_y);
+    if (use_ue8m0)
+        scale_128x128_kernel<__nv_bfloat16, __nv_fp8_e4m3, float, /*USE_UE8M0=*/true>
+            <<<kNumDeviceSMs, 256, 0, stream>>>(mat_quant, scales, mat, shape_x, shape_y);
+    else
+        scale_128x128_kernel<__nv_bfloat16, __nv_fp8_e4m3, float, /*USE_UE8M0=*/false>
+            <<<kNumDeviceSMs, 256, 0, stream>>>(mat_quant, scales, mat, shape_x, shape_y);
 }
 
 } // namespace kernels::blockscale_gemm

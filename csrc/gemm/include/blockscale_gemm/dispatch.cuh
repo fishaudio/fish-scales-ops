@@ -172,8 +172,9 @@ inline void fp8_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, i
         int const N_pad = static_cast<int>(div_up(shape_n, 4) * 4);
         int const K_blocks = static_cast<int>(div_up(shape_k, 128));
         int const N_blocks = static_cast<int>(div_up(shape_n, 128));
-        std::size_t const sfa_bytes = static_cast<std::size_t>(M_pad) * (K_blocks / 4) * sizeof(int32_t);
-        std::size_t const sfb_bytes = static_cast<std::size_t>(N_pad) * (K_blocks / 4) * sizeof(int32_t);
+        int const K_words = static_cast<int>(div_up(K_blocks, 4)); // ceil(K/512) packed words per row
+        std::size_t const sfa_bytes = static_cast<std::size_t>(M_pad) * K_words * sizeof(int32_t);
+        std::size_t const sfb_bytes = static_cast<std::size_t>(N_pad) * K_words * sizeof(int32_t);
         int32_t* packed_sfa = detail::Sm120BfPackPool::instance().ensure_sfa(sfa_bytes);
         int32_t* packed_sfb = detail::Sm120BfPackPool::instance().ensure_sfb(sfb_bytes);
         sm120_repack_sfa(packed_sfa, scales_a, M_pad, K_blocks, stream);

@@ -136,12 +136,25 @@ struct SM120BlockScaledKernel
     // back to the global pointer.
     static constexpr int kGroupedLayoutSmemCap = 512;
 
-    struct SharedStorage
+    // The 2 KB prefix array is reserved only when the builder opts in
+    // (KT::kGroupedLayoutSmem, grouped MoE instantiations). Dense
+    // instantiations keep the smaller layout: with the array, the dense
+    // BSFP8 (64,128,4) instance is 102400 B and exceeds the sm_120 per-block
+    // limit of 101376 B, so it could not launch (2026-09-03 re-baseline).
+    struct SharedStorageDense
+    {
+        TensorStorage tensors;
+        alignas(16) BarrierStorage barriers;
+    };
+
+    struct SharedStorageGrouped
     {
         TensorStorage tensors;
         alignas(16) BarrierStorage barriers;
         int32_t grouped_layout_smem[kGroupedLayoutSmemCap];
     };
+
+    using SharedStorage = cute::conditional_t<KT::kGroupedLayoutSmem, SharedStorageGrouped, SharedStorageDense>;
 
     static constexpr int kSmemSize = int(sizeof(SharedStorage));
 
@@ -584,6 +597,17 @@ struct SM120BlockScaledKernel
         // The SF span count follows from the padded k count; the final span
         // may be partial (see mma). Every dense K is a multiple of 512, so
         // dense sees identical counts to the old sf-span-aligned padding.
+        // K % 128 shapes that are not a multiple of the ring width (K=768 on
+        // a Stages=4 instance: 6 real tiles, 8 issued) are correct as they
+        // are: the padded k-tiles read out-of-bounds coordinates that TMA
+        // zero-fills, and their scale bytes are zero-padded by the repack, so
+        // they add nothing. A pad-free variant (partial final round, skipping
+        // those TMA loads and MMAs) was tried 2026-09-05 and reverted: it gave
+        // no layer-level gain on the K=768 MoE shapes and its extra code path
+        // in the mainloop cost the large dense MXFP8 tiles 30-100 % at large M,
+        // even though dense shapes never took the new branch. Do not retry
+        // without re-running the dense tables on every arch that instantiates
+        // this template.
         int32_t const k_real_tiles = (K + KT::kTileK - 1) / KT::kTileK;
         int32_t const k_tile_count = (k_real_tiles + KT::AB_Stages - 1) / KT::AB_Stages * KT::AB_Stages;
         int32_t const sf_tile_count = (k_tile_count + KT::kNumTileKPerSF - 1) / KT::kNumTileKPerSF;
@@ -596,6 +620,10 @@ struct SM120BlockScaledKernel
         // residence) dominated the whole decode-band kernel at G=128.
         bool layout_is_cumsum = false;
         int32_t* grouped_layout = params.grouped_layout;
+        // Instantiations without the smem array (dense) fall through to the
+        // legacy global-memory walk, which they never exercise
+        // (grouped_layout == nullptr on the dense path).
+        if constexpr (KT::kGroupedLayoutSmem)
         if (grouped_layout != nullptr && L <= kGroupedLayoutSmemCap)
         {
             for (int g = threadIdx.x; g < L; g += blockDim.x)

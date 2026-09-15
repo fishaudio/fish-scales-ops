@@ -22,7 +22,7 @@
 //
 // Cascade status: bring-up heuristic only (C1). The (M, tiles_n) rules
 // below are placeholders pending the b300 tile sweep (FSO_FORCE_TILE grid
-// + cudagraph-µs bench per docs/perf.md methodology). Retune before
+// + cudagraph-µs bench per docs/perf/README.md methodology). Retune before
 // trusting any cell.
 //
 // Env overrides: FSO_FORCE_TILE=TM,TN,ST reuses the sm_120 wire format so

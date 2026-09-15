@@ -58,10 +58,16 @@ template <> struct Fp8PermMmaTileNForTileN<64>  { using type = Layout<Shape<_8, 
 // Smem must fit 2 CTAs in 99 KB; verified for (32, 128, 2) ≈ 49 KB; the
 // static_assert below is the compile-time guard.
 template <int TileM_ = 32, int TileN_ = 128, int Stages_ = 4, int MinBlocksPerSm_ = 1,
-    bool SeparateSmemD_ = false,
+    bool SeparateSmemD_ = false, bool GroupedLayoutSmem_ = false,
     typename PermMmaTileN_ = typename Fp8PermMmaTileNForTileN<TileN_>::type>
 struct SM120BlockScaledBuilder
 {
+    // GroupedLayoutSmem: reserve the 2 KB grouped_layout prefix array in the
+    // kernel's SharedStorage. Only grouped (MoE) instantiations need it; the
+    // dense instantiations must not pay for it — (64,128,4) sits 1 KB under
+    // the sm_120 per-block limit (101376 B) and cannot launch with it
+    // (2026-09-03 sm_120 re-baseline regression).
+    static constexpr bool kGroupedLayoutSmem = GroupedLayoutSmem_;
 
     using ElementA = cute::float_e4m3_t;
     using ElementB = cute::float_e4m3_t;

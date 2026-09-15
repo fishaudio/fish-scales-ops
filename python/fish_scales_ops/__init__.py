@@ -13,7 +13,7 @@ namespace so domain ops never collide:
     # Attention (forward-only)
     o = fso.attention.flash_attn_fwd(q, k, v, causal=True)
 
-See ``docs/api/`` for the per-domain contracts and ``docs/perf.md`` for
+See ``docs/api/`` for the per-domain contracts and ``docs/perf/`` for
 frozen reference numbers.
 """
 from __future__ import annotations

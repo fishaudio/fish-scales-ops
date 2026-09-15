@@ -33,7 +33,7 @@ namespace kernels::blockscale_gemm
 {
 
 template <int TileM, int TileN, int NumStages, int MinBlocksPerSm = 1, int SchedGroup = 16,
-    bool SeparateSmemD = false>
+    bool SeparateSmemD = false, bool GroupedLayoutSmem = false>
 void launch_sm120_mxfp8_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t stride_a, __nv_fp8_e4m3* mat_b,
     int64_t ld_b, int64_t stride_b, __nv_bfloat16* mat_d, int64_t ld_d, int64_t stride_d, int32_t* scales_a,
     int64_t /*stride_scales_a*/, int32_t* scales_b, int64_t /*stride_scales_b*/, uint32_t num_problems,
@@ -46,7 +46,7 @@ void launch_sm120_mxfp8_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t 
     using ElementInput = cute::float_e4m3_t;
     using ElementOutput = cute::bfloat16_t;
     using ElementBlockScale = int32_t;
-    using KT = sm120_blockscaled_gemm::SM120MxFP8BlockScaledBuilder<TileM, TileN, NumStages, MinBlocksPerSm, SchedGroup, SeparateSmemD>;
+    using KT = sm120_blockscaled_gemm::SM120MxFP8BlockScaledBuilder<TileM, TileN, NumStages, MinBlocksPerSm, SchedGroup, SeparateSmemD, GroupedLayoutSmem>;
     using GemmKernel = sm120_blockscaled_gemm::SM120BlockScaledKernel<KT>;
     using Params = typename GemmKernel::Params;
     using Arguments = typename GemmKernel::Arguments;
@@ -305,7 +305,7 @@ inline void gemm_dispatch_sm120_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b
     // TileM=64; the FP8 path uses NS=4 there but kSFVecSize=32 + Stages=4
     // would exceed the 99 KB SMEM budget).
     auto forced = read_force_tile();
-    if (forced.active())
+    if (force_tile_applies(forced, shape_k))
     {
         int const k_split = forced.stream_k() ? forced.ks : 1;
         bool handled = false;
@@ -937,7 +937,7 @@ inline void gemm_dispatch_sm120_mxfp8_grouped(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m
 #define DISPATCH_GROUPED_TILE_MX(TM, TN, ST)                                                                           \
     do                                                                                                                 \
     {                                                                                                                  \
-        launch_sm120_mxfp8_gemm_kernel<TM, TN, ST, 1, 16, true>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b,           \
+        launch_sm120_mxfp8_gemm_kernel<TM, TN, ST, 1, 16, true, true>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b,           \
             mat_d, ld_d, stride_d, scales_a, 0, scales_b, 0, num_groups, m_cap, shape_n, shape_k, stream,              \
             num_device_sms, grouped_layout);                                                                                           \
         return;                                                                                                        \
@@ -946,7 +946,7 @@ inline void gemm_dispatch_sm120_mxfp8_grouped(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m
     // FSO_FORCE_TILE=TM,TN,ST — A/B knob for the grouped tile sweep.
     // Stream-K / smallm / sched-group force flags are ignored on this path.
     auto forced = read_force_tile();
-    if (forced.active())
+    if (force_tile_applies(forced, shape_k))
     {
         // FSO_FORCE_MIN_BLOCKS=2: co-schedule 2 CTAs/SM (grid doubles via
         // the launcher). ncu verdict on the decode cells: every pipe < 55%
@@ -956,35 +956,35 @@ inline void gemm_dispatch_sm120_mxfp8_grouped(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m
         {
             if (forced.tm == 16 && forced.tn == 64 && forced.st == 4)
             {
-                launch_sm120_mxfp8_gemm_kernel<16, 64, 4, 2, 16, true>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b,
+                launch_sm120_mxfp8_gemm_kernel<16, 64, 4, 2, 16, true, true>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b,
                     mat_d, ld_d, stride_d, scales_a, 0, scales_b, 0, num_groups, m_cap, shape_n, shape_k,
                     stream, num_device_sms, grouped_layout);
                 return;
             }
             if (forced.tm == 16 && forced.tn == 64 && forced.st == 2)
             {
-                launch_sm120_mxfp8_gemm_kernel<16, 64, 2, 2, 16, true>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b,
+                launch_sm120_mxfp8_gemm_kernel<16, 64, 2, 2, 16, true, true>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b,
                     mat_d, ld_d, stride_d, scales_a, 0, scales_b, 0, num_groups, m_cap, shape_n, shape_k,
                     stream, num_device_sms, grouped_layout);
                 return;
             }
             if (forced.tm == 16 && forced.tn == 128 && forced.st == 2)
             {
-                launch_sm120_mxfp8_gemm_kernel<16, 128, 2, 2, 16, true>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b,
+                launch_sm120_mxfp8_gemm_kernel<16, 128, 2, 2, 16, true, true>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b,
                     mat_d, ld_d, stride_d, scales_a, 0, scales_b, 0, num_groups, m_cap, shape_n, shape_k,
                     stream, num_device_sms, grouped_layout);
                 return;
             }
             if (forced.tm == 32 && forced.tn == 64 && forced.st == 2)
             {
-                launch_sm120_mxfp8_gemm_kernel<32, 64, 2, 2, 16, true>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b,
+                launch_sm120_mxfp8_gemm_kernel<32, 64, 2, 2, 16, true, true>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b,
                     mat_d, ld_d, stride_d, scales_a, 0, scales_b, 0, num_groups, m_cap, shape_n, shape_k,
                     stream, num_device_sms, grouped_layout);
                 return;
             }
             if (forced.tm == 64 && forced.tn == 64 && forced.st == 2)
             {
-                launch_sm120_mxfp8_gemm_kernel<64, 64, 2, 2, 16, true>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b,
+                launch_sm120_mxfp8_gemm_kernel<64, 64, 2, 2, 16, true, true>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b,
                     mat_d, ld_d, stride_d, scales_a, 0, scales_b, 0, num_groups, m_cap, shape_n, shape_k,
                     stream, num_device_sms, grouped_layout);
                 return;
@@ -1016,7 +1016,7 @@ inline void gemm_dispatch_sm120_mxfp8_grouped(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m
 #define DISPATCH_GROUPED_TILE_MX_MB2(TM, TN, ST)                                                                       \
     do                                                                                                                 \
     {                                                                                                                  \
-        launch_sm120_mxfp8_gemm_kernel<TM, TN, ST, 2, 16, true>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b,           \
+        launch_sm120_mxfp8_gemm_kernel<TM, TN, ST, 2, 16, true, true>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b,           \
             mat_d, ld_d, stride_d, scales_a, 0, scales_b, 0, num_groups, m_cap, shape_n, shape_k, stream,              \
             num_device_sms, grouped_layout);                                                                                           \
         return;                                                                                                        \
@@ -1042,6 +1042,30 @@ inline void gemm_dispatch_sm120_mxfp8_grouped(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m
         //   * SF-span partiality (K % 512): partial-span shapes take the
         //     pad-free Stages=2 instances throughout.
         bool const partial_span = ((shape_k + 127) / 128) % 4 != 0;
+        // v5 (2026-09-04, Family C / Qwen3.5-35B-A3B, 5090 C1,
+        // `sweep_sm120_20260904/`): very short K — one SF span, <= 4 k-tiles
+        // (moe.down N=2048 K=512) — at em 16..24 takes the 2-CTA/SM (16,64,4)
+        // instance instead of the (32,128,4) the em>=16 short-K rule below
+        // picks. Decided on the ROUTED LAYER cell (down forced via
+        // FSO_FORCE_TILE + FSO_FORCE_TILE_K=512, gate_up on its cascade pick,
+        // 2 passes, µs graph median):
+        //   em=16 (M=512):  layer 585.3 vs (32,128,4) 607.7   -3.7%   block+shared 618.0 vs 627.0  -1.4%
+        //   em=20 (M=640):  layer 606.4 vs (32,128,4) 615.4   -1.5%
+        //   em=24 (M=768):  layer 618.3 vs (32,128,4) 618.0    tie
+        //   em=28 (M=896):  layer 632.0 vs (32,128,4) 632.1    tie   -> old pick kept
+        //   em=32 (M=1024): layer 657.1 vs (32,128,4) 653.0   +0.6%  -> old pick kept
+        // The isolated kernel cell (fso_mxfp8_grouped) ranks tiles
+        // differently — it had (16,64,4) at -6.5% for em=32 and (16,128,4) at
+        // -7.4% for em=64, yet in the layer those picks cost +2.8% and +0.5%
+        // ((16,64,4) at em=64 is +16% in the layer) — so this rule and any
+        // future grouped tile change is accepted on the layer cell only (see
+        // docs/perf/README.md section 8). em=64: (32,64,4) is 0.4% better than the
+        // (32,128,4) pick in the layer, inside the noise floor, unchanged.
+        // gate_up (K=2048) and the Family B down (K=768, 6 k-tiles) are outside
+        // the gate.
+        bool const very_short_k = ((shape_k + 127) / 128) <= 4;
+        if (very_short_k && em >= 16 && em <= 24)
+            DISPATCH_GROUPED_TILE_MX_MB2(16, 64, 4);
         if (em > 128)
         {
             // em=256 sweep point: (96,128,2) beats (64,128,2) by 13%/10.7%
@@ -1059,7 +1083,7 @@ inline void gemm_dispatch_sm120_mxfp8_grouped(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m
         // em <= 32 decode/mid band: v3 partial-span route, then v2 rules.
         if (partial_span)
         {
-            launch_sm120_mxfp8_gemm_kernel<16, 128, 2, 2, 16, true>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b,
+            launch_sm120_mxfp8_gemm_kernel<16, 128, 2, 2, 16, true, true>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b,
                 mat_d, ld_d, stride_d, scales_a, 0, scales_b, 0, num_groups, m_cap, shape_n, shape_k,
                 stream, num_device_sms, grouped_layout);
             return;

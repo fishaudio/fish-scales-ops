@@ -12,6 +12,10 @@
 // SMEM budget). What IS shared between the two paths is the env-var contract:
 //
 //   FSO_FORCE_TILE="TM,TN,ST"      e.g. "32,128,4"
+//   FSO_FORCE_TILE_K="K"           optional: apply FSO_FORCE_TILE only to GEMMs
+//                                  whose K equals this value, so a layer-level
+//                                  sweep can vary one projection's tile while
+//                                  the others keep their cascade picks
 //   FSO_FORCE_KSPLIT="N"           Stream-K split, optional
 //   FSO_DISABLE_OVERRIDES=1        skip K-aware single-launch overrides
 //
@@ -20,6 +24,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 
@@ -100,6 +105,22 @@ inline ForcedTile read_force_tile() noexcept
         s_sg = (sg_env && *sg_env) ? std::atoi(sg_env) : -1;
     }
     return ForcedTile{s_tm, s_tn, s_st, s_ks, s_mb, s_sm, s_sg};
+}
+
+// FSO_FORCE_TILE_K: when set (> 0), FSO_FORCE_TILE applies only to GEMMs whose
+// K equals this value. Lets a layer-level sweep force one projection's tile
+// (e.g. moe.down, K=512) while the other GEMMs in the captured graph keep
+// their cascade picks. Added 2026-09-04 after the Family C sweep showed that
+// kernel-bench tile rankings do not transfer to the layer for the grouped
+// down GEMM (see docs/perf/README.md section 8). Read once per process.
+inline bool force_tile_applies(ForcedTile const& forced, uint32_t shape_k) noexcept
+{
+    static int const s_k = []
+    {
+        char const* e = std::getenv("FSO_FORCE_TILE_K");
+        return (e && *e) ? std::atoi(e) : 0;
+    }();
+    return forced.active() && (s_k <= 0 || s_k == static_cast<int>(shape_k));
 }
 
 // Reads FSO_DISABLE_OVERRIDES once. Returns true when the dispatcher
