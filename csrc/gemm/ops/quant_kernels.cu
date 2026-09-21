@@ -802,12 +802,16 @@ void fp8bs_silu_chunk_mul_quantize_1x128_fp32_grouped(__nv_fp8_e4m3* x_q, float*
         x_q, sfa, gu, slot_of_flat, n_pairs, m_cap, K);
 }
 
-// ----- Grouped (MoE, masked layout) MXFP8 quantize variants (M1) -----------
+// ----- Grouped (MoE, masked layout) MXFP8 quantize variants (M1, M3) -------
 //
-// Companions of the sm_120 grouped GEMM. Both write the per-group K-major
-// packed-scale layout its SFA TMA descriptor expects:
+// Companions of the grouped GEMMs. Each writes the per-group packed-scale
+// layout the target architecture's SFA TMA descriptor expects, selected by the
+// `sm1xx_sf_layout` argument:
 //
-//   sf_word(g, m_in, kp) = g * (num_kp * m_cap) + kp * m_cap + m_in
+//   sm_120/121 (M1): per-group K-major words,
+//     sf_word(g, m_in, kp) = g * (num_kp * m_cap) + kp * m_cap + m_in
+//   sm_100/103 (M3): per-group CUTLASS Sm1xx atom slab of
+//     pad(m_cap,128) * num_kp words — see sf_word_index_grouped_atom below.
 //
 // with m_cap % 4 == 0. Both index the FLAT ROUTED-PAIR space
 // (i in [0, M*topk), host-static) and derive (g, m_in) from
@@ -827,7 +831,29 @@ __device__ __forceinline__ int sf_word_index_grouped(int m_in, int kp, int m_cap
     return g * (num_kp * m_cap) + kp * m_cap + m_in;
 }
 
-template <bool USE_UE8M0, int K_BLOCKS_PER_WARP>
+// sm_100 / sm_103 grouped scale-factor addressing.
+//
+// Each group owns a slab in the CUTLASS Sm1xxBlockScaledConfig<32> atom layout
+// (see MxSfLayout::SM1XX_ATOM above) describing a (pad(m_cap,128), K) tensor:
+// per 128-row x 128-K block there is one 512-byte scale-factor block, and a
+// row's 4 consecutive K-block bytes stay contiguous, so each (m_in, kp) is
+// still exactly one int32 word. Group slabs are laid end to end, so group g's
+// words start at g * pad(m_cap,128) * (K/128).
+//
+// Rows of a group between masked_m[g] and pad(m_cap,128) are never written
+// here and never read by the GEMM: the grouped launcher sets group g's problem
+// shape to (masked_m[g], N, K), so the scale-factor TMA descriptor's row
+// extent stops at masked_m[g] and every row past it is an out-of-bounds read
+// that the TMA replaces with zero.
+__device__ __forceinline__ int64_t sf_word_index_grouped_atom(int m_in, int kp, int m_cap, int num_kp, int g)
+{
+    int const m_pad = (m_cap + 127) / 128 * 128;
+    int const r = m_in % 128;
+    return static_cast<int64_t>(g) * (static_cast<int64_t>(num_kp) * m_pad)
+        + (static_cast<int64_t>(m_in / 128) * num_kp + kp) * 128 + (r % 32) * 4 + r / 32;
+}
+
+template <bool USE_UE8M0, int K_BLOCKS_PER_WARP, bool SM1XX_SF = false>
 __global__ void fp8bs_quantize_1x32_packed_grouped_gather_kernel(
     __nv_fp8_e4m3* __restrict__ out_fp8, int32_t* __restrict__ out_packed,
     __nv_bfloat16 const* __restrict__ input, int32_t const* __restrict__ slot_of_flat,
@@ -912,12 +938,16 @@ __global__ void fp8bs_quantize_1x32_packed_grouped_gather_kernel(
     if (lane_id == 0) {
 #pragma unroll
         for (int p = 0; p < K_BLOCKS_PER_WARP / 4; ++p) {
-            out_packed[sf_word_index_grouped(m_in, kp_base + p, m_cap, num_kp, g)] = packed_words[p];
+            if constexpr (SM1XX_SF) {
+                out_packed[sf_word_index_grouped_atom(m_in, kp_base + p, m_cap, num_kp, g)] = packed_words[p];
+            } else {
+                out_packed[sf_word_index_grouped(m_in, kp_base + p, m_cap, num_kp, g)] = packed_words[p];
+            }
         }
     }
 }
 
-template <bool USE_UE8M0, int K_BLOCKS_PER_WARP>
+template <bool USE_UE8M0, int K_BLOCKS_PER_WARP, bool SM1XX_SF = false>
 __global__ void silu_chunk_mul_quantize_1x32_packed_grouped_kernel(
     __nv_fp8_e4m3* __restrict__ out_fp8, int32_t* __restrict__ out_packed,
     __nv_bfloat16 const* __restrict__ gu, int32_t const* __restrict__ slot_of_flat,
@@ -1000,7 +1030,11 @@ __global__ void silu_chunk_mul_quantize_1x32_packed_grouped_kernel(
     if (lane_id == 0) {
 #pragma unroll
         for (int p = 0; p < K_BLOCKS_PER_WARP / 4; ++p) {
-            out_packed[sf_word_index_grouped(m_in, kp_base + p, m_cap, num_kp, g)] = packed_words[p];
+            if constexpr (SM1XX_SF) {
+                out_packed[sf_word_index_grouped_atom(m_in, kp_base + p, m_cap, num_kp, g)] = packed_words[p];
+            } else {
+                out_packed[sf_word_index_grouped(m_in, kp_base + p, m_cap, num_kp, g)] = packed_words[p];
+            }
         }
     }
 }
@@ -1043,54 +1077,68 @@ static inline void fso_pdl_launch(KernelT kernel, dim3 grid, dim3 block, cudaStr
     cudaLaunchKernelEx(&cfg, kernel, args..., pdl);
 }
 
+// `sm1xx_sf_layout` picks the sm_100/sm_103 per-group Sm1xx atom slab instead
+// of the sm_120 per-group K-major slab. The sm_120 instantiations are
+// unchanged (SM1XX_SF defaults to false and the generated store is the same
+// expression it always was), so sm_120 output stays byte-identical.
 void fp8bs_quantize_1x32_packed_grouped_gather(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
     __nv_bfloat16 const* x, int32_t const* slot_of_flat, int n_pairs, int topk,
-    int m_cap, int K, cudaStream_t stream, bool use_ue8m0)
+    int m_cap, int K, cudaStream_t stream, bool use_ue8m0, bool sm1xx_sf_layout)
 {
     constexpr int kThreadsPerBlock = 256;
     constexpr int kWarpsPerBlock = kThreadsPerBlock / 32;
 
-    auto launch = [&](auto kBlocksPerWarpT, auto ue8m0T) {
+    auto launch = [&](auto kBlocksPerWarpT, auto ue8m0T, auto sfAtomT) {
         constexpr int kBlocksPerWarp = decltype(kBlocksPerWarpT)::value;
         int const k_groups = K / (kMxFp8VecSize * kBlocksPerWarp);
         int64_t const total_warps = static_cast<int64_t>(n_pairs) * k_groups;
         int const grid = static_cast<int>((total_warps + kWarpsPerBlock - 1) / kWarpsPerBlock);
         bool const pdl = fso_pdl_enabled() && static_cast<unsigned>(grid) <= kFsoPdlMaxGridCtas;
-        fso_pdl_launch(fp8bs_quantize_1x32_packed_grouped_gather_kernel<decltype(ue8m0T)::value, kBlocksPerWarp>,
+        fso_pdl_launch(fp8bs_quantize_1x32_packed_grouped_gather_kernel<decltype(ue8m0T)::value, kBlocksPerWarp,
+                           decltype(sfAtomT)::value>,
             dim3(grid), dim3(kThreadsPerBlock), stream, pdl, x_q, packed_scales, x, slot_of_flat,
             n_pairs, topk, m_cap, K);
     };
-    auto launch_k = [&](auto ue8m0T) {
-        if (K % 256 == 0) launch(std::integral_constant<int, 8>{}, ue8m0T);
-        else              launch(std::integral_constant<int, 4>{}, ue8m0T);
+    auto launch_k = [&](auto ue8m0T, auto sfAtomT) {
+        if (K % 256 == 0) launch(std::integral_constant<int, 8>{}, ue8m0T, sfAtomT);
+        else              launch(std::integral_constant<int, 4>{}, ue8m0T, sfAtomT);
     };
-    if (use_ue8m0) launch_k(std::true_type{});
-    else           launch_k(std::false_type{});
+    auto launch_sf = [&](auto ue8m0T) {
+        if (sm1xx_sf_layout) launch_k(ue8m0T, std::true_type{});
+        else                 launch_k(ue8m0T, std::false_type{});
+    };
+    if (use_ue8m0) launch_sf(std::true_type{});
+    else           launch_sf(std::false_type{});
 }
 
 void fp8bs_silu_chunk_mul_quantize_1x32_packed_grouped(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
     __nv_bfloat16 const* gu, int32_t const* slot_of_flat, int n_pairs, int m_cap, int K,
-    cudaStream_t stream, bool use_ue8m0)
+    cudaStream_t stream, bool use_ue8m0, bool sm1xx_sf_layout)
 {
     constexpr int kThreadsPerBlock = 256;
     constexpr int kWarpsPerBlock = kThreadsPerBlock / 32;
 
-    auto launch = [&](auto kBlocksPerWarpT, auto ue8m0T) {
+    auto launch = [&](auto kBlocksPerWarpT, auto ue8m0T, auto sfAtomT) {
         constexpr int kBlocksPerWarp = decltype(kBlocksPerWarpT)::value;
         int const k_groups = K / (kMxFp8VecSize * kBlocksPerWarp);
         int64_t const total_warps = static_cast<int64_t>(n_pairs) * k_groups;
         int const grid = static_cast<int>((total_warps + kWarpsPerBlock - 1) / kWarpsPerBlock);
         bool const pdl = fso_pdl_enabled() && static_cast<unsigned>(grid) <= kFsoPdlMaxGridCtas;
-        fso_pdl_launch(silu_chunk_mul_quantize_1x32_packed_grouped_kernel<decltype(ue8m0T)::value, kBlocksPerWarp>,
+        fso_pdl_launch(silu_chunk_mul_quantize_1x32_packed_grouped_kernel<decltype(ue8m0T)::value, kBlocksPerWarp,
+                           decltype(sfAtomT)::value>,
             dim3(grid), dim3(kThreadsPerBlock), stream, pdl, x_q, packed_scales, gu, slot_of_flat,
             n_pairs, m_cap, K);
     };
-    auto launch_k = [&](auto ue8m0T) {
-        if (K % 256 == 0) launch(std::integral_constant<int, 8>{}, ue8m0T);
-        else              launch(std::integral_constant<int, 4>{}, ue8m0T);
+    auto launch_k = [&](auto ue8m0T, auto sfAtomT) {
+        if (K % 256 == 0) launch(std::integral_constant<int, 8>{}, ue8m0T, sfAtomT);
+        else              launch(std::integral_constant<int, 4>{}, ue8m0T, sfAtomT);
     };
-    if (use_ue8m0) launch_k(std::true_type{});
-    else           launch_k(std::false_type{});
+    auto launch_sf = [&](auto ue8m0T) {
+        if (sm1xx_sf_layout) launch_k(ue8m0T, std::true_type{});
+        else                 launch_k(ue8m0T, std::false_type{});
+    };
+    if (use_ue8m0) launch_sf(std::true_type{});
+    else           launch_sf(std::false_type{});
 }
 
 // ----- Fused BSFP8 1×128 quantize (E36, 2026-05-28) ------------------------

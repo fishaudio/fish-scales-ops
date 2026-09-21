@@ -30,6 +30,10 @@
 #include <torch/torch.h>
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <unordered_map>
+
 #include <cuda_bf16.h>
 
 namespace blockscale_gemm
@@ -167,6 +171,112 @@ __global__ void moe_combine_kernel(
     *reinterpret_cast<float4*>(&out[static_cast<int64_t>(t) * H + h])
         = *reinterpret_cast<float4 const*>(&packed[0]);
 }
+
+// -----------------------------------------------------------------------
+// Multi-CTA routing builder — sm_100 mid / prefill band (T5, 2026-09-17).
+//
+// Why a second kernel exists. `moe_build_routing_kernel` above is a single
+// CTA, which is the right shape at decode: the work is a few hundred routed
+// pairs and the cost is the launch, not the arithmetic. From roughly M = 256
+// upwards it is the wrong shape: at Family B M = 1024 the kernel has to read
+// 8192 routed pairs, write 8192 scattered `row_map` entries and 8192
+// sequential `slot_of_flat` entries, and it does all of that from ONE
+// streaming multiprocessor out of 148, which measured 10.7 us on the B300 —
+// more than the whole SwiGLU-quantize kernel next to it.
+//
+// What this kernel does differently. The pairs are split over many CTAs and
+// the per-expert rank assignment is done in two steps so that the number of
+// GLOBAL atomics is one per (CTA, expert) instead of one per routed pair:
+//
+//   phase 1  each CTA histograms its own chunk into shared memory;
+//   phase 2  each CTA reserves a contiguous block of rows for every expert it
+//            saw, with one atomicAdd on the global counter per expert, and
+//            keeps the returned offset as that expert's base;
+//   phase 3  each CTA re-reads its chunk and assigns each pair a row inside
+//            its own reserved block using shared-memory atomics;
+//   phase 4  the CTA that arrives last (a global arrival counter plus a
+//            threadfence) publishes `masked_m` from the global counters and
+//            re-zeroes both scratch arrays for the next call.
+//
+// Slot order inside a group therefore changes from single-CTA arrival order to
+// (CTA, arrival) order. That is the same kind of permutation the single-CTA
+// kernel already documents as semantically free: every consumer addresses rows
+// through `row_map` / `slot_of_flat`, the GEMM treats the rows of a group
+// independently, and `moe_combine` sums over the token's topk slots in the
+// same order as before, so the layer output is unchanged.
+//
+// Capture safety. The two scratch arrays are owned by a process-wide pool that
+// allocates and zeroes them on the first (eager) call and never again; the
+// kernel restores them to zero before it exits, so a captured graph that
+// replays this kernel any number of times always finds them zero. A first call
+// made inside a capture is refused with a message, exactly as the grouped
+// GEMM's argument pool does.
+__global__ void moe_build_routing_multi_kernel(
+    int32_t const* __restrict__ topk_ids, // [M * topk]
+    int32_t* __restrict__ masked_m,       // [G]
+    int32_t* __restrict__ row_map,        // [G * m_cap] (valid slots only)
+    int32_t* __restrict__ slot_of_flat,   // [M * topk]
+    int32_t* __restrict__ gcnt,           // [G]  scratch, zero in, zero out
+    int32_t* __restrict__ gdone,          // [1]  scratch, zero in, zero out
+    int num_pairs, int topk, int num_groups, int m_cap, bool pdl)
+{
+    if (pdl)
+    {
+        cudaGridDependencySynchronize();
+        if (threadIdx.x == 0)
+        {
+            cudaTriggerProgrammaticLaunchCompletion();
+        }
+    }
+
+    __shared__ int32_t cnt[kMaxGroups];
+    __shared__ int32_t base[kMaxGroups];
+    __shared__ int32_t fill[kMaxGroups];
+    __shared__ int32_t s_last;
+
+    for (int g = threadIdx.x; g < num_groups; g += blockDim.x)
+    {
+        cnt[g] = 0;
+        fill[g] = 0;
+    }
+    __syncthreads();
+
+    int const stride = gridDim.x * blockDim.x;
+    int const start = blockIdx.x * blockDim.x + threadIdx.x;
+
+    for (int i = start; i < num_pairs; i += stride)
+        atomicAdd(&cnt[topk_ids[i]], 1);
+    __syncthreads();
+
+    for (int g = threadIdx.x; g < num_groups; g += blockDim.x)
+        base[g] = (cnt[g] > 0) ? atomicAdd(&gcnt[g], cnt[g]) : 0;
+    __syncthreads();
+
+    for (int i = start; i < num_pairs; i += stride)
+    {
+        int const e = topk_ids[i];
+        int const slot = e * m_cap + base[e] + atomicAdd(&fill[e], 1);
+        row_map[slot] = i / topk;
+        slot_of_flat[i] = slot;
+    }
+
+    __threadfence();
+    if (threadIdx.x == 0)
+        s_last = (atomicAdd(gdone, 1) == gridDim.x - 1) ? 1 : 0;
+    __syncthreads();
+    if (s_last)
+    {
+        for (int g = threadIdx.x; g < num_groups; g += blockDim.x)
+        {
+            masked_m[g] = gcnt[g];
+            gcnt[g] = 0;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0)
+            *gdone = 0;
+    }
+}
+
 
 // -----------------------------------------------------------------------
 // Contiguous (triton-style) sorted layout builder — H4a.
@@ -323,6 +433,150 @@ static inline void fso_pdl_launch(KernelT kernel, dim3 grid, dim3 block, cudaStr
 }
 
 
+// Current device's SM major version (10 = sm_100 B200 / sm_103 B300), cached.
+// Mirrors the helper in mxfp8.cu; the multi-CTA routing builder is selected on
+// this device family only, so sm_120 and sm_90 keep the single-CTA kernel and
+// its exact behaviour.
+static bool moe_glue_is_sm100_family()
+{
+    static bool const v = []
+    {
+        auto const* prop = at::cuda::getCurrentDeviceProperties();
+        return prop->major == 10;
+    }();
+    return v;
+}
+
+// Scratch for moe_build_routing_multi_kernel: per expert-group global counters
+// plus one arrival counter, zero on entry and zero again on exit because the
+// last CTA restores them.
+//
+// What the buffer has to guarantee, and what that implies
+// ------------------------------------------------------
+// The kernel's contract is that between the instant one launch reads a buffer
+// and the instant the same launch restores it to zero, no other launch may
+// touch it. Two launches that are ordered with respect to each other can
+// therefore share a buffer; two launches that may execute concurrently must
+// not. The pool below hands out one buffer per key, where the key is
+//
+//   * while the stream is capturing, the capture sequence id (every capture
+//     gets its own id, so two graphs captured on the SAME stream - which is
+//     what `torch.cuda.graph` does by default, since it reuses one class-level
+//     capture stream - still get different buffers and may be replayed
+//     concurrently on different streams);
+//   * otherwise the stream handle (two launches on one stream are serialised
+//     by stream ordering, so one buffer is enough for all of them, including
+//     the 48 calls a many-layer model makes inside one captured graph).
+//
+// The map itself is `thread_local`, so two host threads never share a buffer
+// and never race on the first-call allocation. Within a thread the map is
+// only ever read and written from that thread.
+//
+// The one case this does not cover is the same captured `cudaGraph_t`
+// instantiated twice into two `cudaGraphExec_t` and replayed concurrently;
+// CUDA orders repeated launches of a single graphExec, but not two execs built
+// from one graph. PyTorch instantiates once per `torch.cuda.CUDAGraph`, so the
+// case does not arise through the supported API.
+//
+// Capture safety is unchanged from the previous single-buffer form: the whole
+// ring is allocated and zeroed once, on the first eager call, and a first call
+// that happens inside a capture aborts with the same message rather than
+// allocating. A capture on a stream the pool has not seen before needs no
+// allocation - it takes an already-zeroed slot - so the eager warm-up contract
+// is no stricter than the grouped GEMM's ArgPool: one eager call per thread.
+// If a thread runs out of slots the caller falls back to the single-CTA
+// builder, which needs no scratch and is always correct.
+struct RoutingScratch
+{
+    static constexpr int kSlots = 16;
+    static constexpr std::size_t kWords = static_cast<std::size_t>(kMaxGroups) + 1;
+
+    int32_t* base = nullptr;                          // kSlots * kWords int32
+    int used = 0;                                     // slots handed out
+    std::unordered_map<unsigned long long, int32_t*> by_key;
+    bool warned = false;
+
+    static RoutingScratch& instance()
+    {
+        static thread_local RoutingScratch s;
+        return s;
+    }
+
+    int32_t* acquire(cudaStream_t stream)
+    {
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        unsigned long long cap_id = 0;
+        if (cudaStreamGetCaptureInfo(stream, &cap, &cap_id) != cudaSuccess)
+        {
+            cap = cudaStreamCaptureStatusNone;
+            cap_id = 0;
+        }
+        // Capture ids and stream handles live in different key spaces; the top
+        // bit separates them so a capture id can never alias a stream handle.
+        unsigned long long const key = (cap == cudaStreamCaptureStatusActive)
+            ? (cap_id | (1ULL << 63))
+            : static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(stream));
+
+        auto it = by_key.find(key);
+        if (it != by_key.end())
+            return it->second;
+
+        if (base == nullptr)
+        {
+            if (cap == cudaStreamCaptureStatusActive)
+            {
+                std::fprintf(stderr,
+                    "[fish_scales_ops] moe_build_routing: the routing scratch pool is empty during stream capture. "
+                    "Call moe_build_routing once eagerly before capturing.\n");
+                std::abort();
+            }
+            std::size_t const bytes = sizeof(int32_t) * kWords * kSlots;
+            if (cudaMalloc(&base, bytes) != cudaSuccess)
+            {
+                base = nullptr;
+                return nullptr;
+            }
+            // Synchronous zeroing, once per thread and never inside a capture:
+            // a later capture on a different stream takes an already-zeroed
+            // slot, and stream ordering alone would not order that eager
+            // memset before the captured kernel.
+            if (cudaMemsetAsync(base, 0, bytes, stream) != cudaSuccess)
+                return nullptr;
+            if (cudaStreamSynchronize(stream) != cudaSuccess)
+                return nullptr;
+        }
+
+        if (used >= kSlots)
+        {
+            if (!warned)
+            {
+                warned = true;
+                std::fprintf(stderr,
+                    "[fish_scales_ops] moe_build_routing: more than %d distinct streams/captures on one host "
+                    "thread; falling back to the single-CTA routing builder for the rest. Results are unaffected.\n",
+                    kSlots);
+            }
+            return nullptr;
+        }
+        int32_t* const p = base + static_cast<std::size_t>(used) * kWords;
+        ++used;
+        by_key.emplace(key, p);
+        return p;
+    }
+};
+
+// Routed-pair count from which the multi-CTA builder wins on sm_100. Below it
+// the single CTA is the faster shape because the kernel is launch-bound, and
+// the crossover was measured on the layer cell: at 2048 routed pairs (Family B
+// and Family C at M = 256, top-8) the multi-CTA form is 0.2 us SLOWER because
+// it only gets two CTAs and pays an extra pass over the pairs, while from 4096
+// pairs (M = 512) on it is faster and the gap grows with M.
+constexpr int kRoutingMultiMinPairs = 4096;
+constexpr int kRoutingMultiThreads = 256;
+constexpr int kRoutingMultiPairsPerCta = 256;
+constexpr int kRoutingMultiMaxCtas = 132;
+
+
 // moe_build_routing: topk_ids [M, topk] int32 -> (masked_m [G] int32,
 // row_map [G * m_cap] int32, slot_of_flat [M * topk] int32), one launch.
 std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_build_routing(
@@ -347,12 +601,32 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_build_routing(
     auto slot_of_flat = at::empty({static_cast<int64_t>(M) * topk}, opts);
 
     auto stream = at::cuda::getCurrentCUDAStream();
+    int const n_pairs = M * topk;
+    if (moe_glue_is_sm100_family() && n_pairs >= kRoutingMultiMinPairs)
+    {
+        int32_t* scratch = RoutingScratch::instance().acquire(stream);
+        if (scratch != nullptr)
+        {
+            int blocks = (n_pairs + kRoutingMultiPairsPerCta - 1) / kRoutingMultiPairsPerCta;
+            if (blocks > kRoutingMultiMaxCtas)
+                blocks = kRoutingMultiMaxCtas;
+            if (blocks < 1)
+                blocks = 1;
+            fso_pdl_launch(moe_build_routing_multi_kernel, dim3(blocks), dim3(kRoutingMultiThreads), stream,
+                fso_pdl_enabled(), reinterpret_cast<int32_t const*>(topk_ids.data_ptr()),
+                reinterpret_cast<int32_t*>(masked_m.data_ptr()),
+                reinterpret_cast<int32_t*>(row_map.data_ptr()),
+                reinterpret_cast<int32_t*>(slot_of_flat.data_ptr()), scratch, scratch + kMaxGroups, n_pairs, topk,
+                static_cast<int>(num_groups), static_cast<int>(m_cap));
+            return {masked_m, row_map, slot_of_flat};
+        }
+    }
     fso_pdl_launch(moe_build_routing_kernel, dim3(1), dim3(kRoutingThreads), stream, fso_pdl_enabled(),
         reinterpret_cast<int32_t const*>(topk_ids.data_ptr()),
         reinterpret_cast<int32_t*>(masked_m.data_ptr()),
         reinterpret_cast<int32_t*>(row_map.data_ptr()),
         reinterpret_cast<int32_t*>(slot_of_flat.data_ptr()),
-        M * topk, topk, static_cast<int>(num_groups), static_cast<int>(m_cap));
+        n_pairs, topk, static_cast<int>(num_groups), static_cast<int>(m_cap));
     return {masked_m, row_map, slot_of_flat};
 }
 

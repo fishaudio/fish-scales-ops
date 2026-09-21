@@ -138,7 +138,7 @@ def silu_chunk_mul_quantize_1x32_fp8(gu: torch.Tensor) -> tuple[torch.Tensor, to
 
 
 # ---------------------------------------------------------------------------
-# Grouped (MoE) masked-layout surface — sm_120 only (M1; sm_100/103 in M3).
+# Grouped (MoE) masked-layout surface — sm_120/121 (M1) and sm_100/103 (M3).
 #
 # Masked semantics (DeepGEMM-style): G expert groups, each with a fixed row
 # capacity ``m_cap`` and a per-group valid-row count ``masked_m[g]`` that
@@ -146,14 +146,25 @@ def silu_chunk_mul_quantize_1x32_fp8(gu: torch.Tensor) -> tuple[torch.Tensor, to
 # every op below is CUDA-Graph capture-safe with dynamic routing: replays
 # honour whatever counts the masked_m buffer holds at replay time.
 # Rows at or beyond masked_m[g] hold undefined bytes in every tensor.
+#
+# The activation/weight scale tensors are opaque handles whose per-group byte
+# layout differs by architecture (sm_120 packs int32 words K-major per group;
+# sm_100/103 writes one CUTLASS Sm1xx atom slab per group). Produce them with
+# the grouped quantize ops on the same device the GEMM will run on.
 
 
-def _require_sm120_grouped() -> None:
-    if sm_major() != 12:
+def _require_grouped_arch() -> None:
+    if sm_major() not in (10, 12):
         raise NotImplementedError(
-            "the grouped MXFP8 (MoE) path is sm_120/121-only for now; "
-            "sm_100/103 lands with milestone M3, sm_90 with M4."
+            "the grouped MXFP8 (MoE) path needs sm_100/sm_103 (B200/B300) or "
+            "sm_120/121 (RTX 5090 / RTX PRO 6000). On sm_90 (Hopper) use the "
+            "block-FP8 grouped surface (linear_fp8_grouped_masked / "
+            "moe_layer_fp8_sm90) — Hopper has no MXFP8 hardware."
         )
+
+
+# Backwards-compat alias (the M1-era name).
+_require_sm120_grouped = _require_grouped_arch
 
 
 def linear_mxfp8_grouped_masked(
@@ -172,8 +183,11 @@ def linear_mxfp8_grouped_masked(
             :func:`silu_chunk_mul_quantize_1x32_grouped_fp8`).
         w_fp8: float8_e4m3fn ``[G, N, K]`` — per-expert weights (see
             :func:`quantize_moe_weights_1x32_fp8`).
-        sa: int32 ``[G, K/128, m_cap]`` per-group K-major packed UE8M0.
-        sw: int32 ``[G, K/128, N]`` per-group K-major packed UE8M0.
+        sa: opaque int32 per-group UE8M0 scales from the grouped quantize
+            ops on this arch (sm_120: ``[G, K/128, m_cap]`` K-major;
+            sm_100/103: ``[G, pad(m_cap,128) * K/128]`` Sm1xx atom slabs).
+        sw: opaque int32 per-group UE8M0 weight scales (sm_120:
+            ``[G, K/128, N]``; sm_100/103: ``[G, N * K/128]``).
         masked_m: int32 ``[G]`` on device — valid rows per group. Caller
             contract: ``masked_m[g] <= m_cap`` for every g (the kernel does
             not check; an oversized count silently drops that group's
@@ -187,7 +201,7 @@ def linear_mxfp8_grouped_masked(
 
     Constraints: ``K % 128 == 0``, ``N % 128 == 0``, ``m_cap % 4 == 0``.
     """
-    _require_sm120_grouped()
+    _require_grouped_arch()
     return torch.ops.fish_scales_ops.linear_mxfp8_grouped_masked(
         a_fp8, w_fp8, sa, sw, masked_m, expected_m
     )
@@ -210,11 +224,12 @@ def quantize_1x32_grouped_gather_fp8(
     M=512.
 
     Returns:
-        (a_fp8 ``[G, m_cap, K]``, sa int32 ``[G, K/128, m_cap]``) ready for
-        :func:`linear_mxfp8_grouped_masked`. Rows no pair maps to are
-        undefined (the GEMM's masked contract ignores them).
+        (a_fp8 ``[G, m_cap, K]``, sa int32 opaque per-group scales — sm_120
+        ``[G, K/128, m_cap]``, sm_100/103 ``[G, pad(m_cap,128) * K/128]``)
+        ready for :func:`linear_mxfp8_grouped_masked`. Rows no pair maps to
+        are undefined (the GEMM's masked contract ignores them).
     """
-    _require_sm120_grouped()
+    _require_grouped_arch()
     return torch.ops.fish_scales_ops.quantize_1x32_grouped_gather(
         x.contiguous(), slot_of_flat, topk, num_groups, m_cap, True
     )
@@ -231,9 +246,11 @@ def silu_chunk_mul_quantize_1x32_grouped_fp8(
     (``slot_of_flat[i]``) in place; rows no pair maps to stay undefined.
 
     Returns:
-        (h_fp8 ``[G, m_cap, INTER]``, sh int32 ``[G, INTER/128, m_cap]``).
+        (h_fp8 ``[G, m_cap, INTER]``, sh int32 opaque per-group scales — the
+        same arch-native layout :func:`quantize_1x32_grouped_gather_fp8`
+        produces, with INTER in place of K).
     """
-    _require_sm120_grouped()
+    _require_grouped_arch()
     return torch.ops.fish_scales_ops.silu_chunk_mul_quantize_1x32_grouped(
         gu, slot_of_flat, True
     )
@@ -319,29 +336,45 @@ def moe_combine_sorted(
 def quantize_moe_weights_1x32_fp8(
     w: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Offline per-expert weight quantize for the grouped GEMM (sm_120).
+    """Offline per-expert weight quantize for the grouped GEMM.
 
     ``w`` is bf16 ``[G, N, K]``. Loops experts through the flat 1×32
     quantizer and stacks results — offline cost, not a serving-path op.
 
     Returns:
-        (w_fp8 ``[G, N, K]``, sw int32 ``[G, K/128, N]``).
+        (w_fp8 ``[G, N, K]``, sw int32). ``sw`` is ``[G, K/128, N]``
+        K-major words on sm_120/121 and ``[G, N * K/128]`` Sm1xx atom slabs
+        on sm_100/103; in both cases it is exactly the per-expert output of
+        ``quantize_1x32_fp8`` restacked, so no layout knowledge lives here
+        beyond the reshape.
 
-    Constraints: ``N % 128 == 0`` (so the per-expert pad(N,4) == N),
-    ``K % 128 == 0``.
+    Constraints: ``N % 128 == 0`` (so the per-expert pad(N,4) == N on sm_120
+    and pad(N,128) == N on sm_100/103), ``K % 128 == 0``.
     """
-    _require_sm120_grouped()
+    _require_grouped_arch()
     if w.dim() != 3:
         raise ValueError("w must be [G, N, K]")
     G, N, K = w.shape
     if N % 128 != 0 or K % 128 != 0:
         raise ValueError("N and K must be multiples of 128")
+    kp = K // 128
     w_fp8 = torch.empty(G, N, K, device=w.device, dtype=torch.float8_e4m3fn)
-    sw = torch.empty(G, K // 128, N, device=w.device, dtype=torch.int32)
+    if sm_major() == 10:
+        # sm_100/103: the flat quantizer already emits the Sm1xx atom slab for
+        # an (pad(N,128), K) tensor as a 1-D int32 buffer; N % 128 == 0 makes
+        # that exactly N * K/128 words, so the per-expert slab is copied
+        # verbatim.
+        sw = torch.empty(G, N * kp, device=w.device, dtype=torch.int32)
+        for g in range(G):
+            q, s = torch.ops.fish_scales_ops.quantize_1x32_packed(w[g].contiguous(), True)
+            w_fp8[g].copy_(q)
+            sw[g].copy_(s)
+        return w_fp8, sw
+    sw = torch.empty(G, kp, N, device=w.device, dtype=torch.int32)
     for g in range(G):
         q, s = torch.ops.fish_scales_ops.quantize_1x32_packed(w[g].contiguous(), True)
         w_fp8[g].copy_(q)
         # s is [pad(N,4), K/128] with strides (1, N) — K-major. Its raw byte
         # order equals the [K/128, N] slab the grouped kernel expects.
-        sw[g].copy_(s.t().view(K // 128, N))
+        sw[g].copy_(s.t().view(kp, N))
     return w_fp8, sw

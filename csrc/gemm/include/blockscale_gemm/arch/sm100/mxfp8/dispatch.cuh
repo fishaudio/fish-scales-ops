@@ -37,6 +37,33 @@
 //          else auto pick_splits) — (128,128) only
 //   ST=10 → 1SM cluster(2,2) K128 (TMA multicast ×2 on both A and B — the
 //           nvjet mid-band shape; ncu F3)      ST=11 → 2SM cluster(2,2) K256
+//
+// Narrow / 192-wide N tiles (added 2026-09-17). Codes 1..11 above bake a
+// particular epilogue choice into each row, which is fine for the tiles the
+// cascade already ships but useless for sweeping a new tile, where the
+// epilogue is one of the things being decided. Codes 20..25 therefore name
+// the (SM-count, TileK, cluster) variant AND the epilogue explicitly, and
+// accept any TileN the kernel supports (64, 128, 192, 256):
+//   ST=20 → 1SM cluster(1,1) K128, NoSmem (direct-store) epilogue
+//   ST=21 → 1SM cluster(1,1) K128, TMA (smem-staged) epilogue
+//   ST=22 → 1SM cluster(1,1) K256, NoSmem epilogue
+//   ST=23 → 1SM cluster(1,1) K256, TMA epilogue
+//   ST=24 → 2SM cluster(2,1) K128, NoSmem epilogue
+//   ST=25 → 2SM cluster(2,1) K128, TMA epilogue
+// Instantiated TileN per code (the set the 2026-09-17 sweep needed; adding
+// one costs a full CUTLASS kernel's compile time, so the list is explicit):
+//   ST=20/21: TileN 64, 128, 192      ST=22/23: TileN 64
+//   ST=24/25: TileN 64, 192
+//
+// FSO_PRINT_TILE_INFO=1 makes every instantiation print, once, the mainloop
+// stage count StageCountAutoCarveout derived for it and its shared-memory
+// footprint — the quantity that decides whether a narrower TileN bought
+// pipeline depth or only CTAs.
+//
+// FSO_FORCE_TILE_K=<K> restricts the override to GEMMs with that K, so a
+// layer-level A/B can move one projection's tile while the others keep their
+// cascade picks (same contract as the sm_120 dispatchers).
+//
 // Unknown combos fall through to the cascade (same behavior as sm_120).
 
 #pragma once
@@ -75,6 +102,117 @@ inline int read_force_swizzle() noexcept
         s_cache = (env && *env) ? std::atoi(env) : 0;
     }
     return s_cache;
+}
+
+// FSO_PRINT_TILE_INFO: print, once per kernel instantiation, the mainloop
+// stage count the CollectiveBuilder's StageCountAutoCarveout derived and the
+// shared memory the kernel ends up asking for. Host-side, read once, and off
+// unless the variable is set, so it costs one int compare on the hot path.
+inline bool read_print_tile_info() noexcept
+{
+    static int s_cache = -1;
+    if (s_cache < 0)
+    {
+        char const* env = std::getenv("FSO_PRINT_TILE_INFO");
+        s_cache = (env && *env && env[0] != '0') ? 1 : 0;
+    }
+    return s_cache != 0;
+}
+
+// Multiprocessor count of the current device, read once. The rule below is
+// written against the count the driver reports rather than the 148 of a whole
+// B300, so a MIG slice gets its own answer.
+inline int sm_count() noexcept
+{
+    static int s_sms = 0;
+    if (s_sms == 0)
+    {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&s_sms, cudaDevAttrMultiProcessorCount, dev);
+        if (s_sms <= 0)
+            s_sms = 148;
+    }
+    return s_sms;
+}
+
+// CTAs a (cluster row count, CTAs per cluster, TileN) choice launches for an
+// (M, N) problem. A 1-SM tile covers 128 rows with one CTA; a 2-SM tile covers
+// 256 rows with a two-CTA cluster.
+inline int grid_ctas(int M, int N, int cluster_rows, int ctas_per_cluster, int tile_n) noexcept
+{
+    return ((M + cluster_rows - 1) / cluster_rows) * ((N + tile_n - 1) / tile_n) * ctas_per_cluster;
+}
+
+// N-tile chosen by wave arithmetic. Returns TileM * 1000 + TileN, or 0 when
+// this (M, N) is not a cell the rule owns.
+//
+// Why the CTA count is the quantity that decides: the block-scaled mainloop
+// stages 200-230 KB of shared memory per CTA (printed per instantiation by
+// FSO_PRINT_TILE_INFO), more than half of the SM's shared memory, so exactly
+// one CTA is resident per SM. The CTA count is therefore the number of SMs
+// that do any work at all, and in the decode band -- where the problem is one
+// or two 128-row M-tiles -- it is decided by the N tile alone. Halving TileN
+// doubles the CTA count and costs about 1.47x in per-SM work rate (ncu fit,
+// 2026-09-17), a net 1.36x, but only while SMs are idle: past one wave the
+// extra CTAs queue behind the first and the narrower tile is pure loss. So:
+// take the tile that puts the most CTAs on the machine without spilling into a
+// second wave.
+//
+// Four bounds, each from a measured counter-example rather than from the model:
+//   * M >= 64. Below it the A-operand tile is almost entirely out-of-bounds
+//     fill and every extra CTA repeats that fill, so the same kernel gets
+//     slower the more CTAs it launches (gate_up M = 1, isolated GEMM: 14.46 us
+//     on 76 CTAs, 14.85 on 102, 24.63 on 304), and at M = 32 the wave-picked
+//     tile is 25 % slower than tier 1 on wqkv and 18 % on gate_up.
+//   * At least half the SMs must end up busy. Every measured win puts 80 to
+//     144 CTAs on the machine; the very narrow Family C projections
+//     (N = 1024, N = 2048) would get a 32- or 64-CTA grid, outside the range
+//     this rule was calibrated on.
+//   * TileN = 64 only while the problem is a single 128-row M-tile (M <= 128).
+//     At M = 256 the 64-wide tile is a tie with tier 1 on the isolated GEMM
+//     (`wo` 8.27 against 8.26, `down` 14.39 against 14.40) and 3.5 % SLOWER on
+//     the Family A MLP layer cell, where `down` runs straight after the SwiGLU
+//     quantize. At M = 512 with N = 2048 it doubles the CTA count to 128 and is
+//     still 10 % slower than tier 1, so the rate penalty of the narrow atom is
+//     not always repaid. The 192-wide tile has no such counter-example up to
+//     M = 1024.
+//   * The 2-SM 192-wide form is not shipped. The only cells where it is the
+//     CTA-maximising pick are Family C `gdn.in_proj` (N = 12288) at M = 64 and
+//     M = 128, and there it measured 1.3x SLOWER than tier 1 even though it
+//     puts 128 CTAs on the machine against cuBLAS's 96; every 192-wide win in
+//     the sweep came from the 1-SM form.
+//
+// Ties (the same CTA count from a 1-SM and a 2-SM tile) go to the 1-SM tile.
+// The two forms agree to within the replay tick where both were measured
+// (`wo` and `down` at M = 1024: 12.40 / 22.57 us for 1-SM against
+// 12.37 / 22.55 for 2-SM) and the 1-SM form does not pad a 256-row tile.
+inline int pick_wave_tile(int M, int N) noexcept
+{
+    if (M < 64 || M > 1024)
+        return 0;
+    int const sms = sm_count();
+    int const cand_n[4] = {256, 192, 128, 64};
+    int best_m = 0, best_n = 0, best_ctas = 0;
+    for (int i = 0; i < 4; ++i)
+    {
+        int const ctas = grid_ctas(M, N, 128, 1, cand_n[i]);
+        if (ctas <= sms && ctas > best_ctas) { best_ctas = ctas; best_m = 128; best_n = cand_n[i]; }
+    }
+    for (int i = 0; i < 4; ++i)
+    {
+        int const ctas = grid_ctas(M, N, 256, 2, cand_n[i]);
+        if (ctas <= sms && ctas > best_ctas) { best_ctas = ctas; best_m = 256; best_n = cand_n[i]; }
+    }
+    if (best_n != 64 && best_n != 192)
+        return 0;                 // the pick is a tile the cascade already had
+    if (2 * best_ctas < sms)
+        return 0;                 // narrowing would still leave the machine half idle
+    if (best_n == 64 && M > 128)
+        return 0;                 // tie at M = 256, loses at M = 512
+    if (best_m == 256 && best_n == 192)
+        return 0;                 // measured counter-example at gdn.in_proj M = 64 / 128
+    return best_m * 1000 + best_n;
 }
 
 // Thread-local CUTLASS workspace pool. Expected to stay empty (dense
@@ -139,6 +277,21 @@ cudaError_t launch_sm100_mxfp8_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, 
     using GemmKernel = typename Config::GemmKernel;
     using Args = typename Gemm::Arguments;
     using Params = typename Gemm::Params;
+
+    if (detail::read_print_tile_info())
+    {
+        static bool s_info_printed = false;
+        if (!s_info_printed)
+        {
+            s_info_printed = true;
+            std::fprintf(stderr,
+                "[fso sm100 tile] %dx%dx%d cluster=(%d,%d) streamk=%d nosmem=%d "
+                "stages=%d smem_bytes=%d epi_smem_bytes=%d\n",
+                TileM, TileN, TileK, ClusterM, ClusterN, static_cast<int>(UseStreamK),
+                static_cast<int>(NoSmemEpi), Config::kStages, Config::kSmemBytes,
+                Config::kEpiSmemBytes);
+        }
+    }
 
     auto ptr_A = reinterpret_cast<cutlass::float_e4m3_t const*>(mat_a);
     auto ptr_B = reinterpret_cast<cutlass::float_e4m3_t const*>(mat_b);
@@ -321,9 +474,53 @@ cudaError_t launch_sm100_mxfp8_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, 
 //   * batch (L) stride   = 512 * (K/(128*S))  = the DEFAULT M-block-row stride
 // so the fix is: stride(Mrest) *= S; stride(L) = old stride(Mrest).
 
-static __global__ void sm100_mxfp8_splitk_reduce_kernel(
-    float4 const* __restrict__ partials, ushort4* __restrict__ out, int splits, long mn4)
+// Programmatic dependent launch (PDL) for the two-kernel split-K pair.
+//
+// The reduce kernel below reads the FP32 partials the batched split-K GEMM
+// writes, so it must not touch them before that GEMM has finished. Without
+// PDL the driver enforces that by serialising the two launches outright: the
+// reduce's CTAs are only created after the GEMM's last CTA retires, so the
+// reduce's entire launch and prologue latency sits exposed between the two
+// kernels. cuBLAS's own split-K pair does not pay that cost -- its reduce is
+// observed starting while its GEMM is still running.
+//
+// With `cudaLaunchAttributeProgrammaticStreamSerialization` set on the reduce
+// launch the driver may create and schedule the reduce's CTAs while the GEMM's
+// tail is still draining, and `cudaGridDependencySynchronize()` inside the
+// kernel then holds every CTA until the GEMM has actually completed. The
+// ordering the data dependency requires is therefore unchanged; only the
+// launch and the prologue overlap.
+//
+// The producer is a CUTLASS kernel we do not modify, so its completion signal
+// is the implicit one at kernel exit. That is the safe case: fso does not
+// build CUTLASS with CUTLASS_ENABLE_GDC_FOR_SM100, so the
+// `cutlass::arch::launch_dependent_grids()` call that sits between the CUTLASS
+// mainloop and its epilogue stores compiles to nothing and cannot release the
+// reduce before the partials have landed.
+//
+// The reduce deliberately does not call cudaTriggerProgrammaticLaunchCompletion():
+// it writes the caller's D buffer throughout its own execution, so there is no
+// earlier point at which it could safely signal a future dependent.
+//
+// FSO_DISABLE_PDL=1 restores the plain serialised launch (the same variable
+// the sm_120 MoE chain reads, so one knob disables PDL everywhere).
+__device__ __forceinline__ void sm100_pdl_wait(bool pdl)
 {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    if (pdl)
+        cudaGridDependencySynchronize();
+#else
+    // griddepcontrol needs sm_90 or newer. This header only compiles under
+    // CUTLASS_ARCH_MMA_SM100_SUPPORTED so the branch is unreachable today; it
+    // keeps the file compilable if that guard is ever widened to an older arch.
+    (void) pdl;
+#endif
+}
+
+static __global__ void sm100_mxfp8_splitk_reduce_kernel(
+    float4 const* __restrict__ partials, ushort4* __restrict__ out, int splits, long mn4, bool pdl)
+{
+    sm100_pdl_wait(pdl);
     long const stride = static_cast<long>(gridDim.x) * blockDim.x;
     for (long i = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x; i < mn4; i += stride)
     {
@@ -382,6 +579,19 @@ cudaError_t launch_sm100_mxfp8_gemm_splitk(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* 
     using GemmKernel = typename Config::GemmKernel;
     using Args = typename Gemm::Arguments;
     using Params = typename Gemm::Params;
+
+    if (detail::read_print_tile_info())
+    {
+        static bool s_info_printed = false;
+        if (!s_info_printed)
+        {
+            s_info_printed = true;
+            std::fprintf(stderr,
+                "[fso sm100 tile] splitk %dx%dx128 cluster=(1,1) fp32-partials "
+                "stages=%d smem_bytes=%d epi_smem_bytes=%d\n",
+                TileM, TileN, Config::kStages, Config::kSmemBytes, Config::kEpiSmemBytes);
+        }
+    }
 
     auto ptr_A = reinterpret_cast<cutlass::float_e4m3_t const*>(mat_a);
     auto ptr_B = reinterpret_cast<cutlass::float_e4m3_t const*>(mat_b);
@@ -505,8 +715,30 @@ cudaError_t launch_sm100_mxfp8_gemm_splitk(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* 
     int const blocks = static_cast<int>((mn4 + threads - 1) / threads) < 1024
         ? static_cast<int>((mn4 + threads - 1) / threads)
         : 1024;
-    sm100_mxfp8_splitk_reduce_kernel<<<blocks, threads, 0, stream>>>(
-        reinterpret_cast<float4 const*>(partials), reinterpret_cast<ushort4*>(mat_d), splits, mn4);
+    // PDL on the reduce only (see the comment above the reduce kernel): the
+    // GEMM keeps its ordinary launch, the reduce becomes its programmatic
+    // dependent and waits on the implicit end-of-kernel trigger.
+    bool const pdl = tensorrt_llm::kernels::blockscale_gemm::fso_pdl_enabled();
+    if (pdl)
+    {
+        cudaLaunchConfig_t cfg{};
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = 1;
+        cfg.gridDim = dim3(blocks);
+        cfg.blockDim = dim3(threads);
+        cfg.dynamicSmemBytes = 0;
+        cfg.stream = stream;
+        cfg.attrs = attrs;
+        cfg.numAttrs = 1;
+        cudaLaunchKernelEx(&cfg, sm100_mxfp8_splitk_reduce_kernel,
+            reinterpret_cast<float4 const*>(partials), reinterpret_cast<ushort4*>(mat_d), splits, mn4, true);
+    }
+    else
+    {
+        sm100_mxfp8_splitk_reduce_kernel<<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<float4 const*>(partials), reinterpret_cast<ushort4*>(mat_d), splits, mn4, false);
+    }
     return cudaGetLastError();
 }
 
@@ -538,11 +770,42 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3
     launch_sm100_mxfp8_gemm<TM_, TN_, CM_, CN_, TK_, SK_, true>(mat_a, mat_b, mat_d, scales_a, scales_b, M, N, K, stream, SW_)
 
     // FSO_FORCE_TILE=TM,TN,ST — ST picks the variant (see header comment).
-    // Valid tiles: TileM/TileN ∈ {128, 256} only (SF Blk_MN=128 granularity).
+    // Valid tiles: TileM ∈ {128, 256} (SF Blk_MN=128 granularity on the M
+    // axis); TileN ∈ {64, 128, 192, 256} (CUTLASS pads the SF block up on the
+    // N axis), but only the (TileM, TileN, ST) rows written out below are
+    // actually instantiated.
     auto forced = tensorrt_llm::kernels::blockscale_gemm::read_force_tile();
-    if (forced.active() && forced.tm > 0)
+    if (forced.active() && forced.tm > 0
+        && tensorrt_llm::kernels::blockscale_gemm::force_tile_applies(
+            forced, static_cast<uint32_t>(K)))
     {
         int const tm = forced.tm, tn = forced.tn, st = forced.st;
+        // Codes 20..25: explicit (SM count, TileK, cluster, epilogue) with a
+        // free TileN — the sweep surface for the 64- and 192-wide tiles.
+        if (st == 20 && tm == 128)
+        {
+            if (tn == 64) return DISPATCH_SM100_MX_NOSMEM(128, 64, 1, 1, 128, false);
+            if (tn == 128) return DISPATCH_SM100_MX_NOSMEM(128, 128, 1, 1, 128, false);
+            if (tn == 192) return DISPATCH_SM100_MX_NOSMEM(128, 192, 1, 1, 128, false);
+        }
+        if (st == 21 && tm == 128)
+        {
+            if (tn == 64) return DISPATCH_SM100_MX(128, 64, 1, 1, 128, false);
+            if (tn == 128) return DISPATCH_SM100_MX(128, 128, 1, 1, 128, false);
+            if (tn == 192) return DISPATCH_SM100_MX(128, 192, 1, 1, 128, false);
+        }
+        if (st == 22 && tm == 128 && tn == 64) return DISPATCH_SM100_MX_NOSMEM(128, 64, 1, 1, 256, false);
+        if (st == 23 && tm == 128 && tn == 64) return DISPATCH_SM100_MX(128, 64, 1, 1, 256, false);
+        if (st == 24 && tm == 256)
+        {
+            if (tn == 64) return DISPATCH_SM100_MX_NOSMEM(256, 64, 2, 1, 128, false);
+            if (tn == 192) return DISPATCH_SM100_MX_NOSMEM(256, 192, 2, 1, 128, false);
+        }
+        if (st == 25 && tm == 256)
+        {
+            if (tn == 64) return DISPATCH_SM100_MX(256, 64, 2, 1, 128, false);
+            if (tn == 192) return DISPATCH_SM100_MX(256, 192, 2, 1, 128, false);
+        }
         // 1SM rows (TileM=128) — K128 rows carry the cascade's NOSMEM binding
         // so FSO_FORCE_TILE sweeps exercise the production instantiation.
         if (tm == 128 && tn == 128 && st == 1) return DISPATCH_SM100_MX_NOSMEM(128, 128, 1, 1, 128, false);
@@ -618,6 +881,23 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3
         if (ks > 1)
             return launch_sm100_mxfp8_gemm_splitk<128, 128>(
                 mat_a, mat_b, mat_d, scales_a, scales_b, M, N, K, ks, stream);
+    }
+
+    // --- N-tile chosen by wave arithmetic (2026-09-17) -----------------
+    // detail::pick_wave_tile carries the rule and its measured bounds; it
+    // returns 0 for every cell this round did not measure a win on, and those
+    // fall through to the rules distilled in b300_mlp_tune_20260915 unchanged.
+    // The parallel split-K branch above keeps precedence, so the narrow-N
+    // long-K decode cells it owns are untouched.
+    {
+        int const wave_tile = detail::pick_wave_tile(M, N);
+        switch (wave_tile)
+        {
+        case 128 * 1000 + 64:  return DISPATCH_SM100_MX(128, 64, 1, 1, 128, false);
+        case 128 * 1000 + 192: return DISPATCH_SM100_MX(128, 192, 1, 1, 128, false);
+        case 256 * 1000 + 64:  return DISPATCH_SM100_MX(256, 64, 2, 1, 128, false);
+        default: break;
+        }
     }
 
     if (M <= 8)

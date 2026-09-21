@@ -42,12 +42,17 @@ void repack_ue8m0_scales_for_sm120(int32_t* dst, float const* src, int M_pad, in
 cudaError_t launch_sm120_mxfp8_grouped_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D,
     int32_t* SFA, int32_t* SFB, int32_t* masked_m, int num_groups, int m_cap, int N, int K,
     int expected_m, cudaStream_t stream);
+// In mxfp8_sm100_grouped_kernel.cu (sm_100/sm_103 tcgen05 pointer-array path).
+cudaError_t launch_sm100_mxfp8_grouped_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D,
+    int32_t* SFA, int32_t* SFB, int32_t* masked_m, int num_groups, int m_cap, int N, int K,
+    int expected_m, cudaStream_t stream);
+bool sm100_mxfp8_grouped_compiled();
 void fp8bs_quantize_1x32_packed_grouped_gather(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
     __nv_bfloat16 const* x, int32_t const* slot_of_flat, int n_pairs, int topk,
-    int m_cap, int K, cudaStream_t stream, bool use_ue8m0);
+    int m_cap, int K, cudaStream_t stream, bool use_ue8m0, bool sm1xx_sf_layout = false);
 void fp8bs_silu_chunk_mul_quantize_1x32_packed_grouped(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
     __nv_bfloat16 const* gu, int32_t const* slot_of_flat, int n_pairs, int m_cap, int K,
-    cudaStream_t stream, bool use_ue8m0);
+    cudaStream_t stream, bool use_ue8m0, bool sm1xx_sf_layout = false);
 } // namespace detail
 
 namespace
@@ -280,16 +285,24 @@ at::Tensor linear_mxfp8_raw(at::Tensor x_fp8, at::Tensor w_fp8, at::Tensor sx_in
 
 
 // ---------------------------------------------------------------------------
-// Grouped (MoE, masked layout) surface — sm_120 only (M1).
+// Grouped (MoE, masked layout) surface — sm_120/121 (M1) and sm_100/103 (M3).
 //
 // Layout contracts (G = num experts/groups, m_cap = per-group row capacity,
 // m_cap % 4 == 0):
 //   a_fp8    [G, m_cap, K]        rows >= masked_m[g] undefined
 //   w_fp8    [G, N, K]            per-expert weights
-//   sa_int32 [G, K/128, m_cap]    packed UE8M0, K-major per group
-//   sw_int32 [G, K/128, N]        packed UE8M0, K-major per group (N%128==0
-//                                 so pad(N,4) == N)
 //   out      [G, m_cap, N] bf16   rows >= masked_m[g] undefined
+// The two scale tensors are opaque per-group slabs whose byte layout differs
+// by architecture, because the two GEMM engines read scale factors through
+// different descriptors:
+//   sm_120/121: sa [G, K/128, m_cap], sw [G, K/128, N] — int32 K-major words
+//               per group (N % 128 == 0, so pad(N,4) == N).
+//   sm_100/103: sa [G, pad(m_cap,128) * K/128], sw [G, N * K/128] — per group
+//               one CUTLASS Sm1xxBlockScaledConfig<32> atom slab, the same
+//               layout the dense sm_100 path uses, applied per group.
+// Always produce them with the grouped quantize ops on the device the GEMM
+// will run on; the layouts are not interchangeable.
+//
 // masked_m is int32 [G] on device and is read ONLY by the kernel — never on
 // the host — so calls are CUDA-Graph capture-safe with dynamic routing.
 // expected_m is a host-side static tile-selection hint (ceil(rows/G)).
@@ -297,8 +310,6 @@ at::Tensor linear_mxfp8_raw(at::Tensor x_fp8, at::Tensor w_fp8, at::Tensor sx_in
 at::Tensor linear_mxfp8_grouped_masked(at::Tensor a_fp8, at::Tensor w_fp8, at::Tensor sa_int32,
     at::Tensor sw_int32, at::Tensor masked_m, int64_t expected_m)
 {
-    TORCH_CHECK(!is_sm100_family(),
-        "linear_mxfp8_grouped_masked is sm_120-only for now (M3 adds the sm_100/103 path)");
     TORCH_CHECK(a_fp8.is_cuda() && w_fp8.is_cuda(), "a/w must be on CUDA");
     TORCH_CHECK(a_fp8.dtype() == at::kFloat8_e4m3fn && w_fp8.dtype() == at::kFloat8_e4m3fn,
         "a_fp8 / w_fp8 must be float8_e4m3fn");
@@ -321,14 +332,41 @@ at::Tensor linear_mxfp8_grouped_masked(at::Tensor a_fp8, at::Tensor w_fp8, at::T
     TORCH_CHECK(m_cap % 4 == 0, "m_cap must be a multiple of 4 (per-group scale padding)");
     TORCH_CHECK(expected_m >= 1, "expected_m must be >= 1");
     int64_t const kp = K / 128;
-    TORCH_CHECK(sa_int32.numel() == static_cast<int64_t>(G) * kp * m_cap,
-        "sa_int32 must be [G, K/128, m_cap] (per-group K-major packed scales)");
+    bool const sm1xx = is_sm100_family();
+    int64_t const sa_words = sm1xx ? (static_cast<int64_t>((m_cap + 127) / 128 * 128) * kp)
+                                   : (static_cast<int64_t>(m_cap) * kp);
+    TORCH_CHECK(sa_int32.numel() == static_cast<int64_t>(G) * sa_words,
+        sm1xx ? "sa_int32 must be [G, pad(m_cap,128) * K/128] (per-group Sm1xx atom slab)"
+              : "sa_int32 must be [G, K/128, m_cap] (per-group K-major packed scales)");
     TORCH_CHECK(sw_int32.numel() == static_cast<int64_t>(G) * kp * N,
-        "sw_int32 must be [G, K/128, N] (per-group K-major packed scales)");
+        sm1xx ? "sw_int32 must be [G, N * K/128] (per-group Sm1xx atom slab)"
+              : "sw_int32 must be [G, K/128, N] (per-group K-major packed scales)");
+    TORCH_CHECK(sa_int32.is_contiguous() && sw_int32.is_contiguous(), "sa/sw must be contiguous");
 
     auto y = at::empty({G, m_cap, N}, a_fp8.options().dtype(at::kBFloat16));
     auto stream = at::cuda::getCurrentCUDAStream();
-    auto err = detail::launch_sm120_mxfp8_grouped_dispatch(
+    cudaError_t err;
+    if (sm1xx)
+    {
+        TORCH_CHECK(detail::sm100_mxfp8_grouped_compiled(),
+            "linear_mxfp8_grouped_masked on sm_100/sm_103 requires the extension to be built with CUDA >= 12.8 "
+            "and TORCH_CUDA_ARCH_LIST including 10.0f (family target for B200 + B300).");
+        // The sm_100 launcher builds its per-group CUTLASS argument arrays in a
+        // pool sized once for this many groups (same bound moe_build_routing
+        // enforces), so refuse anything larger rather than overrun it.
+        TORCH_CHECK(G <= 1024, "sm_100/sm_103 grouped MXFP8 supports at most 1024 experts, got ", G);
+        err = detail::launch_sm100_mxfp8_grouped_dispatch(
+            reinterpret_cast<__nv_fp8_e4m3*>(a_fp8.data_ptr()),
+            reinterpret_cast<__nv_fp8_e4m3*>(w_fp8.data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(y.data_ptr()),
+            reinterpret_cast<int32_t*>(sa_int32.data_ptr()),
+            reinterpret_cast<int32_t*>(sw_int32.data_ptr()),
+            reinterpret_cast<int32_t*>(masked_m.data_ptr()),
+            G, m_cap, N, K, static_cast<int>(expected_m), stream);
+        TORCH_CHECK(err == cudaSuccess, "sm100 mxfp8 grouped kernel error: ", cudaGetErrorString(err));
+        return y;
+    }
+    err = detail::launch_sm120_mxfp8_grouped_dispatch(
         reinterpret_cast<__nv_fp8_e4m3*>(a_fp8.data_ptr()),
         reinterpret_cast<__nv_fp8_e4m3*>(w_fp8.data_ptr()),
         reinterpret_cast<__nv_bfloat16*>(y.data_ptr()),
@@ -351,7 +389,6 @@ std::tuple<at::Tensor, at::Tensor> quantize_1x32_grouped_gather(
     at::Tensor x, at::Tensor slot_of_flat, int64_t topk, int64_t num_groups,
     int64_t m_cap, bool use_ue8m0)
 {
-    TORCH_CHECK(!is_sm100_family(), "quantize_1x32_grouped_gather is sm_120-only for now");
     TORCH_CHECK(x.is_cuda() && x.dtype() == at::kBFloat16, "x must be CUDA bf16");
     TORCH_CHECK(x.dim() == 2, "x must be 2D [M, K]");
     TORCH_CHECK(slot_of_flat.dtype() == at::kInt && slot_of_flat.is_cuda()
@@ -368,8 +405,13 @@ std::tuple<at::Tensor, at::Tensor> quantize_1x32_grouped_gather(
     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
 
     int const kp = K / 128;
+    bool const sm1xx = is_sm100_family();
     auto x_q = at::empty({G, m_cap, K}, x.options().dtype(at::kFloat8_e4m3fn));
-    auto packed = at::empty({G, kp, m_cap}, x.options().dtype(at::kInt));
+    // sm_120: per-group K-major [K/128, m_cap]. sm_100/103: one opaque Sm1xx
+    // atom slab per group, sized for pad(m_cap,128) rows.
+    auto packed = sm1xx
+        ? at::empty({G, static_cast<int64_t>((m_cap + 127) / 128 * 128) * kp}, x.options().dtype(at::kInt))
+        : at::empty({G, kp, static_cast<int64_t>(m_cap)}, x.options().dtype(at::kInt));
 
     auto stream = at::cuda::getCurrentCUDAStream();
     detail::fp8bs_quantize_1x32_packed_grouped_gather(
@@ -378,7 +420,7 @@ std::tuple<at::Tensor, at::Tensor> quantize_1x32_grouped_gather(
         reinterpret_cast<__nv_bfloat16 const*>(x.data_ptr()),
         reinterpret_cast<int32_t const*>(slot_of_flat.data_ptr()),
         static_cast<int>(M * topk), static_cast<int>(topk),
-        static_cast<int>(m_cap), K, stream, use_ue8m0);
+        static_cast<int>(m_cap), K, stream, use_ue8m0, sm1xx);
     return {x_q, packed};
 }
 
@@ -389,7 +431,6 @@ std::tuple<at::Tensor, at::Tensor> quantize_1x32_grouped_gather(
 std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x32_grouped(
     at::Tensor gu, at::Tensor slot_of_flat, bool use_ue8m0)
 {
-    TORCH_CHECK(!is_sm100_family(), "silu_chunk_mul_quantize_1x32_grouped is sm_120-only for now");
     TORCH_CHECK(gu.is_cuda() && gu.dtype() == at::kBFloat16, "gu must be CUDA bf16");
     TORCH_CHECK(gu.dim() == 3, "gu must be 3D [G, m_cap, 2*INTER]");
     TORCH_CHECK(gu.is_contiguous(), "gu must be contiguous");
@@ -405,8 +446,11 @@ std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x32_grouped(
     TORCH_CHECK(m_cap % 4 == 0, "m_cap must be a multiple of 4");
 
     int const kp = INTER / 128;
+    bool const sm1xx = is_sm100_family();
     auto x_q = at::empty({G, m_cap, INTER}, gu.options().dtype(at::kFloat8_e4m3fn));
-    auto packed = at::empty({G, kp, m_cap}, gu.options().dtype(at::kInt));
+    auto packed = sm1xx
+        ? at::empty({G, static_cast<int64_t>((m_cap + 127) / 128 * 128) * kp}, gu.options().dtype(at::kInt))
+        : at::empty({G, kp, static_cast<int64_t>(m_cap)}, gu.options().dtype(at::kInt));
 
     auto stream = at::cuda::getCurrentCUDAStream();
     detail::fp8bs_silu_chunk_mul_quantize_1x32_packed_grouped(
@@ -414,7 +458,7 @@ std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x32_grouped(
         reinterpret_cast<int32_t*>(packed.data_ptr()),
         reinterpret_cast<__nv_bfloat16 const*>(gu.data_ptr()),
         reinterpret_cast<int32_t const*>(slot_of_flat.data_ptr()),
-        static_cast<int>(slot_of_flat.numel()), m_cap, INTER, stream, use_ue8m0);
+        static_cast<int>(slot_of_flat.numel()), m_cap, INTER, stream, use_ue8m0, sm1xx);
     return {x_q, packed};
 }
 

@@ -205,16 +205,46 @@ def pick_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
 
     # ---- Narrow-N band (tiles_n ≤ 32): wo / down / other narrow shapes --
     if tiles_n <= 32:
-        # Long-K narrow (K ≥ 4096) — DSL c(2,2) or c(4,1) wins from M=1024.
-        if k >= 4096 and m >= 2048:
-            return (256, 128), (2, 2), None, 1
-        if k >= 8192 and m == 1024:
-            return (256, 256), (4, 1), None, 1
-        if k >= 4096 and m == 4096 and n <= 2560:
-            return (256, 128), (2, 2), None, 1
+        # The DSL tier declines this whole class.
+        #
+        # A narrow-N shape gives the persistent scheduler at most 32 N-tiles
+        # (20 for the Family A `down` shape), and every configuration the DSL
+        # kernel can be built with turns that into a grid that either gives up
+        # SMs or quantises badly. With a 4-CTA cluster the driver reports 33
+        # max active clusters on a 148-SM part, so the grid is 132 CTAs and a
+        # tenth of the machine is idle for the whole kernel. With a 2-CTA
+        # cluster the grid fills the machine but the tile count divides into
+        # 74-cluster waves, and on a 10- or 20-tile-wide problem the remainder
+        # is a large fraction of the last wave. Neither lever removes the
+        # other's cost.
+        #
+        # Measured over six M values on three narrow-N shapes (see the sweep
+        # in the B300 run b300_mlp_tune_20260915): no DSL
+        # configuration was the fastest engine on any narrow-N cell above
+        # M = 1024 — cuBLAS wins the low-wave and short-K cells and the C++
+        # cascade wins the long-K deep-grid cells, and `_sm100_smm.should_route`
+        # now encodes that split. Three rows were removed here:
+        #   * `k >= 4096 and m >= 2048` -> (256,128) c(2,2): loses to cuBLAS
+        #     up to M = 3072 and to the C++ cascade above it.
+        #   * `k >= 4096 and m == 4096 and n <= 2560` -> same configuration,
+        #     same verdict (it only restated the row above).
+        #   * `k >= 8192 and m == 1024` -> (256,256) c(4,1): dead code, since
+        #     `should_route` accepts narrow-N at 128 < m <= 1024 and takes the
+        #     cell for cuBLAS first. Timed directly for this decision, it ties
+        #     cuBLAS and the C++ cascade at that cell, so nothing was lost by
+        #     its being unreachable and nothing would be gained by reviving it.
         return None
 
     # ---- Wide-N band (tiles_n > 32): wqkv / gate / gate_up ---------------
+    # NOTE: since the 2026-09-15 routing round `_sm100_smm.should_route`
+    # accepts every wide-N shape at every M, so these rows are now only
+    # reached when tier 1 is unavailable — K not a multiple of 128, or
+    # `torch.nn.functional.scaled_mm` missing, or FSO_DISABLE_SMM=1. They are
+    # kept as that fall-back, not as the production pick. The sweep behind the
+    # change measured cuBLAS ahead of the best DSL configuration on wide-N
+    # shapes at every M from 1536 to 8192, with the gap narrowing as M grows;
+    # if a future device or CUTLASS release reverses that, re-measure here
+    # rather than restoring the old M <= 1024 cap in should_route.
     # Widened: gate_up M=256 and M=512 now go DSL (256,128)c(2,1) — sweep
     # says 15.68 / 23.01 vs C++ 12.33 (M=256 stays C++) / 24.65.
     # gate_up M=256 stays C++ — DSL loses (15.68 vs C++ 12.33).

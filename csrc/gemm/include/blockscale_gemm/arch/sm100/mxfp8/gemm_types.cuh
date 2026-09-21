@@ -53,13 +53,27 @@ using namespace cute;
 // One kernel instantiation per (TileM, TileN, ClusterM, ClusterN, TileK,
 // UseStreamK).
 //
-// TileM/TileN are constrained to {128, 256}: the block-scaled SF TMEM
-// UTCCP atom works on Blk_MN=128 row/col blocks, and the builder computes
-// MMA_M / Blk_MN (integer division) — TileM=64 yields 0 and the SFA smem
-// layout degenerates (verified: compile blows up inside
+// TileM is constrained to {128, 256}: the block-scaled SF TMEM UTCCP atom
+// works on Blk_MN=128 row blocks, and the builder computes MMA_M / Blk_MN
+// (integer division) — TileM=64 yields 0 and the SFA smem layout
+// degenerates (verified: compile blows up inside
 // sm100_blockscaled_mma_warpspecialized.hpp mma_init with Shape<_32,C<0>>).
 // Small-M decode shapes therefore run a 128-row tile; that waste is the
 // hardware granularity of tcgen05.mma.blockscaled, not a dispatch choice.
+//
+// TileN ∈ {64, 128, 192, 256}. The N axis is NOT subject to the same floor:
+// CUTLASS rounds the scale-factor block UP on that axis
+// (`CTA_N_SF = ceil_div(CtaN, Blk_MN) * Blk_MN`,
+// sm100_blockscaled_mma_warpspecialized.hpp:132-139, matching
+// sm100_blockscaled_layout.hpp:180), and both the builder
+// (builders/sm100_common.inl:837) and the collective enumerate
+// N ∈ {64, 128, 192, 256}; the UMMA atom itself accepts N ≥ 8. Narrower N
+// tiles exist for one reason: on this part the mainloop needs ~220 KB of
+// shared memory per CTA, so exactly one CTA is resident per SM and the CTA
+// count *is* the number of SMs that do any work. A decode-band shape whose
+// tile grid is far below 148 CTAs leaves most of the machine idle for the
+// whole kernel, and halving TileN doubles the CTA count. TileN 32 and 8 do
+// NOT compile on this path (they fail the builder's enumeration).
 //
 // TileK ∈ {128, 256}: 128 maximizes pipeline depth (StageCountAutoCarveout),
 // 256 halves the mainloop iteration count + SF transactions — the shape
@@ -94,7 +108,8 @@ template <int TileM, int TileN, int ClusterM, int ClusterN, int TileK = 128, boo
 struct Sm100MxFP8GemmConfig
 {
     static_assert(TileM == 128 || TileM == 256, "blockscaled UMMA: TileM must be 128 (1SM) or 256 (2SM)");
-    static_assert(TileN == 128 || TileN == 256, "blockscaled UMMA: TileN must be 128 or 256 (SF Blk_MN=128)");
+    static_assert(TileN == 64 || TileN == 128 || TileN == 192 || TileN == 256,
+        "blockscaled UMMA: TileN must be 64, 128, 192 or 256 (CUTLASS pads the SF block up to Blk_MN=128)");
     static_assert(TileK == 128 || TileK == 256, "TileK must be 128 or 256 (K-major mxf8f6f4 TMA constraint)");
     static constexpr bool kIs2Sm = (TileM == 256);
     static_assert(!kIs2Sm || (ClusterM % 2 == 0), "2SM MMA (TileM=256) requires even ClusterM");
@@ -160,6 +175,16 @@ struct Sm100MxFP8GemmConfig
     using Sm1xxBlkScaledConfig = typename GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
     using LayoutSFA = typename GemmKernel::CollectiveMainloop::LayoutSFA;
     using LayoutSFB = typename GemmKernel::CollectiveMainloop::LayoutSFB;
+
+    // Mainloop depth that StageCountAutoCarveout derived for this tile after
+    // the epilogue's shared storage was subtracted, plus the resulting
+    // per-CTA shared-memory footprint. A narrower TileN stages fewer bytes
+    // per mainloop buffer, so the carve-out can fit more buffers; these two
+    // constants make that visible to the launcher's FSO_PRINT_TILE_INFO
+    // probe instead of leaving it to be guessed.
+    static constexpr int kStages = CollectiveMainloop::DispatchPolicy::Stages;
+    static constexpr int kSmemBytes = static_cast<int>(GemmKernel::SharedStorageSize);
+    static constexpr int kEpiSmemBytes = static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage));
 };
 
 } // namespace sm100_blockscaled_gemm

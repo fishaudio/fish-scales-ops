@@ -1,12 +1,17 @@
-"""Grouped (MoE, masked layout) MXFP8 correctness — sm_120 only (M1).
+"""Grouped (MoE, masked layout) MXFP8 correctness — sm_120 (M1) and sm_100/103 (M3).
 
 Layered like test_mxfp8_correctness.py:
 
-1. **Gather-quant round-trip**: decode the per-group K-major packed UE8M0
-   buffer with a pure-Python layout mirror, dequantize and compare against
-   the gathered BF16 source rows. Catches grouped SF addressing bugs.
-2. **Grouped GEMM**: linear_mxfp8_grouped_masked vs a per-expert BF16 loop
-   reference over the valid rows of every group.
+1. **Gather-quant round-trip**: decode the per-group packed UE8M0 buffer with
+   a pure-Python mirror of whichever layout the device's architecture uses,
+   dequantize and compare against the gathered BF16 source rows. Catches
+   grouped scale-factor addressing bugs.
+2. **Grouped GEMM**: linear_mxfp8_grouped_masked against two references over
+   the valid rows of every group — the per-expert FP32 reference computed
+   from the original BF16 inputs (which mixes quantization error into the
+   comparison) and, tighter, the reference computed from the *dequantized*
+   FP8 operands. The second one has no quantization error left in it, so a
+   scale-layout bug cannot hide behind the first one's slack.
 3. **Grouped silu quant**: fused SwiGLU + quantize on the grouped layout.
 4. **Full MoE layer** (Qwen3-30B-A3B geometry, E=128 topk=8 hidden=2048
    inter=768): routing -> gather-quant -> grouped gate_up -> silu-quant ->
@@ -16,6 +21,12 @@ Layered like test_mxfp8_correctness.py:
    replay must match the new routing's BF16 reference. This is the grouped
    path's core graph property: masked_m / row_map are read on device at
    replay time, so one capture serves dynamic routing.
+
+Scale layouts decoded here (both are opaque to callers; see docs/api/gemm.md):
+  sm_120/121  per group, int32 words K-major: word (m, kp) at kp * rows + m.
+  sm_100/103  per group, one CUTLASS Sm1xxBlockScaledConfig<32> atom slab of
+              pad(rows,128) * K/128 words: word (m, kp) at
+              ((m // 128) * K/128 + kp) * 128 + (m % 32) * 4 + (m % 128) // 32.
 """
 from __future__ import annotations
 
@@ -28,24 +39,45 @@ import fish_scales_ops as fso
 
 COS_GEMM = 0.999
 COS_ROUNDTRIP = 0.999
+COS_DEQUANT = 0.9995  # GEMM vs the dequantized-operand reference: no quantization
+                      # error left, so this is a pure layout / accumulation check
 COS_LAYER = 0.997  # two chained 1x32 quantized GEMMs + quantized intermediate;
                    # same accuracy class as the triton fp8-block baseline (~0.9980)
+
+
+def _sm_major() -> int:
+    return torch.cuda.get_device_capability()[0]
 
 
 def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
     return F.cosine_similarity(a.double().flatten(), b.double().flatten(), dim=0).item()
 
 
-def _decode_scales_grouped(packed: torch.Tensor, m_cap: int, K: int) -> torch.Tensor:
-    """[G, K/128, m_cap] int32 -> FP32 dequant scales [G, m_cap, K/32]."""
-    G, num_kp, m_cap_ = packed.shape
-    assert m_cap_ == m_cap and num_kp == K // 128
-    words = packed.cpu().to(torch.int64) & 0xFFFFFFFF  # [G, kp, m]
-    out = torch.empty(G, m_cap, num_kp * 4, dtype=torch.float64)
+def _decode_scales_grouped(packed: torch.Tensor, rows: int, K: int) -> torch.Tensor:
+    """Per-group opaque UE8M0 slab -> FP32 dequant scales [G, rows, K/32].
+
+    `rows` is the leading extent the slab was written for: m_cap for an
+    activation slab, N for a weight slab.
+    """
+    num_kp = K // 128
+    G = packed.shape[0]
+    if _sm_major() == 10:
+        words = packed.reshape(G, -1).cpu().to(torch.int64) & 0xFFFFFFFF
+        m_pad = (rows + 127) // 128 * 128
+        assert words.shape[1] == m_pad * num_kp, (words.shape, m_pad, num_kp)
+        m = torch.arange(rows)
+        r = m % 128
+        base = (m // 128) * (num_kp * 128) + (r % 32) * 4 + (r // 32)   # [rows]
+        idx = base[:, None] + torch.arange(num_kp)[None, :] * 128       # [rows, kp]
+        sel = words[:, idx.reshape(-1)].reshape(G, rows, num_kp)
+    else:
+        assert packed.shape[1:] == (num_kp, rows), packed.shape
+        sel = (packed.cpu().to(torch.int64) & 0xFFFFFFFF).permute(0, 2, 1)  # [G, rows, kp]
+    out = torch.empty(G, rows, num_kp * 4, dtype=torch.float64)
     for b in range(4):
-        byte = (words >> (8 * b)) & 0xFF                # [G, kp, m]
-        out[:, :, b::4] = torch.pow(2.0, byte.double() - 127.0).permute(0, 2, 1)
-    return out  # [G, m_cap, K/32]
+        byte = (sel >> (8 * b)) & 0xFF                  # [G, rows, kp]
+        out[:, :, b::4] = torch.pow(2.0, byte.double() - 127.0)
+    return out  # [G, rows, K/32]
 
 
 def build_routing(M: int, G: int, topk: int, m_cap: int, seed: int):
@@ -117,10 +149,18 @@ def test_grouped_gemm(M: int, G: int, topk: int, N: int, K: int) -> None:
     y = fso.gemm.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, expected_m)
     torch.cuda.synchronize()
 
+    # Dequantized operands: exactly what the GEMM should be multiplying. Any
+    # mistake in the per-group scale-factor addressing shows up here even
+    # though the quantization error itself has been divided out.
+    sa_f = _decode_scales_grouped(sa, m_cap, K).repeat_interleave(32, dim=2)   # [G, m_cap, K]
+    sw_f = _decode_scales_grouped(sw, N, K).repeat_interleave(32, dim=2)       # [G, N, K]
+    a_deq = a_fp8.float().cpu().double() * sa_f
+    w_deq = w_fp8.float().cpu().double() * sw_f
+
     mm = masked_m.cpu()
     rm = row_map.cpu().view(G, m_cap)
     worst, checked = 1.0, 0
-    ys, refs = [], []
+    ys, refs, deq_refs = [], [], []
     for gi in range(G):
         n = int(mm[gi])
         if n == 0:
@@ -132,19 +172,25 @@ def test_grouped_gemm(M: int, G: int, topk: int, N: int, K: int) -> None:
         checked += n
         ys.append(y[gi, :n].float().flatten())
         refs.append(ref.flatten())
+        deq_refs.append((a_deq[gi, :n].float() @ w_deq[gi].float().t()).flatten())
         assert torch.isfinite(y[gi, :n]).all(), f"group {gi}: NaN/Inf in valid rows"
     assert checked == M * topk
     # Global cos carries the accuracy bar (matches the dense test's whole-
     # tensor statistic); the per-group floor is a layout tripwire — an SF
     # addressing bug sends a group to ~0.5-0.9, while small-sample UE8M0
     # noise on a 2-row group can legitimately dip a hair under 0.999.
-    g_cos = _cos(torch.cat(ys), torch.cat(refs))
+    ys_cat = torch.cat(ys)
+    g_cos = _cos(ys_cat, torch.cat(refs))
+    d_cos = _cos(ys_cat.cpu(), torch.cat(deq_refs))
     assert g_cos >= COS_GEMM, \
         f"grouped gemm M={M} N={N} K={K}: global cos={g_cos:.6f}"
     assert worst >= 0.997, \
         f"grouped gemm M={M} N={N} K={K}: worst per-group cos={worst:.6f} (layout bug?)"
+    assert d_cos >= COS_DEQUANT, \
+        f"grouped gemm M={M} N={N} K={K}: cos vs dequantized operands={d_cos:.6f} " \
+        f"< {COS_DEQUANT} (scale-layout bug?)"
     print(f"  grouped-gemm M={M:>5} G={G:>4} N={N:>5} K={K:>5}  "
-          f"cos={g_cos:.6f} worst-grp={worst:.6f}  OK")
+          f"cos={g_cos:.6f} worst-grp={worst:.6f} cos_vs_dequant={d_cos:.6f}  OK")
 
 
 def test_silu_grouped(G: int, m_cap: int, inter: int) -> None:
@@ -267,26 +313,36 @@ def main() -> int:
         print("CUDA unavailable; skip")
         return 0
     major, _ = torch.cuda.get_device_capability()
-    if major != 12:
-        print(f"sm_{major}x device: grouped MXFP8 is sm_120-only for now; skip")
+    if major not in (10, 12):
+        print(f"sm_{major}x device: grouped MXFP8 needs sm_100/103 or sm_120/121; skip")
         return 0
+    print(f"device: sm_{major}x  ({torch.cuda.get_device_name()})")
 
     print("== grouped gather-quant round-trip ==")
     test_gather_quant_roundtrip(M=8, G=16, topk=4, K=256)
     test_gather_quant_roundtrip(M=64, G=128, topk=8, K=2048)
+    test_gather_quant_roundtrip(M=96, G=8, topk=4, K=768)      # m_cap=96 < 128
+    test_gather_quant_roundtrip(M=256, G=256, topk=8, K=512)   # m_cap=256 > 128
 
     print("== grouped GEMM ==")
-    test_grouped_gemm(M=8, G=16, topk=4, N=256, K=256)
-    test_grouped_gemm(M=1, G=128, topk=8, N=1536, K=2048)   # gate_up decode
-    test_grouped_gemm(M=64, G=128, topk=8, N=1536, K=2048)  # gate_up mid
-    test_grouped_gemm(M=64, G=128, topk=8, N=2048, K=768)   # down mid
-    test_grouped_gemm(M=512, G=128, topk=8, N=2048, K=768)  # down large
-    test_grouped_gemm(M=1024, G=128, topk=8, N=1536, K=2048)  # gate_up prefill
-    test_grouped_gemm(M=2048, G=128, topk=8, N=2048, K=768)   # down prefill
+    # Coverage sweep: G in {8, 128, 256}, m_cap in {4, 96, 256, 1024},
+    # K in {512, 768, 2048}, N in {1024, 1536, 2048, 4096}. The m_cap values
+    # straddle the 128-row scale-factor block the sm_100 atom layout is built
+    # from (4 and 96 are below it, 256 and 1024 are multiples of it).
+    test_grouped_gemm(M=8, G=16, topk=4, N=256, K=256)          # tiny smoke
+    test_grouped_gemm(M=4, G=8, topk=4, N=1024, K=512)          # m_cap=4, small G
+    test_grouped_gemm(M=4, G=128, topk=8, N=1536, K=2048)       # gate_up decode
+    test_grouped_gemm(M=96, G=128, topk=8, N=2048, K=768)       # down, m_cap=96
+    test_grouped_gemm(M=96, G=8, topk=4, N=4096, K=2048)        # wide N
+    test_grouped_gemm(M=256, G=256, topk=8, N=1024, K=2048)     # Family C gate_up
+    test_grouped_gemm(M=256, G=256, topk=8, N=2048, K=512)      # Family C down
+    test_grouped_gemm(M=1024, G=128, topk=8, N=1536, K=2048)    # gate_up prefill
+    test_grouped_gemm(M=1024, G=128, topk=8, N=2048, K=768)     # down prefill
 
     print("== grouped silu quant ==")
     test_silu_grouped(G=16, m_cap=32, inter=256)
     test_silu_grouped(G=128, m_cap=64, inter=768)
+    test_silu_grouped(G=8, m_cap=256, inter=512)
 
     print("== full MoE layer (Qwen3-30B-A3B geometry) + CUDA graph ==")
     for M in (1, 8, 64, 512):

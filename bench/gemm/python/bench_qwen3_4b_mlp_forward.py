@@ -173,7 +173,27 @@ def _build_mlp_fn(dtype, sm_major):
     raise ValueError(f"unknown dtype {dtype!r}")
 
 
+def _busy_warm():
+    """Optional DVFS settle before a cell's timing (same knob as
+    bench_qwen3_4b_mlp.py / bench_moe_*.py): on machines without a clock
+    lock (B300: idles at 120 MHz between subprocess cells, ramps to the
+    flat 2032 MHz max under load) the 15-iteration eager warmup of a
+    small-M cell is a few hundred µs of GPU work and does not finish the
+    ramp. FSO_BENCH_WARM_MS=<ms> spins a dummy matmul for that long first.
+    Default 0 → protocol identical to the locked-clock machines."""
+    import time
+    ms = int(os.environ.get("FSO_BENCH_WARM_MS", "0"))
+    if ms <= 0:
+        return
+    a = torch.randn(4096, 4096, dtype=torch.bfloat16, device="cuda")
+    t0 = time.monotonic()
+    while (time.monotonic() - t0) * 1000.0 < ms:
+        a = a @ a * 1e-3  # keep values bounded; result reused to defeat DCE
+    torch.cuda.synchronize()
+
+
 def _time_graph(call, iters=50, warmup=15, repeats=3):
+    _busy_warm()
     # Eager warmup (sets static cudaFuncSetAttribute guards, Params cache,
     # Stream-K pool — all must be hot before stream capture starts).
     for _ in range(warmup):

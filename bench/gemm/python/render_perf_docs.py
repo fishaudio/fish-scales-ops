@@ -4,8 +4,10 @@
 Targets (only the first table after each known heading is rewritten; prose is left alone):
   docs/perf/gemm/sm90.md    Family A / B / C dense sections
   docs/perf/gemm/sm120.md   Family A / B / C dense sections, Family B / C grouped kernel tables
+  docs/perf/gemm/sm100.md   same structure as sm120.md, from the B300 baselines
   docs/perf/layer/sm90.md   Family A MLP block, Family B MoE layer, Family C MoE block (+ comparators)
   docs/perf/layer/sm120.md  same for the RTX 5090
+  docs/perf/layer/sm100.md  same for the B300 (torch scaled_grouped_mm / _grouped_mm comparators)
   README.md                 the two hot-shape tables (sm_90, sm_120) — no comparisons, by policy
 
 usage: python bench/gemm/python/render_perf_docs.py [--check]
@@ -26,10 +28,28 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")
 BASE = os.path.join(ROOT, "tests", "baselines")
 DASH = "—"
 
+# Per SM version: the suffix the MoE baseline files carry, and a substring every baseline of that
+# device records in its meta row. sm_100 and sm_103 share one target (the B300 is sm_103, built
+# for the 10.0f family target), so 100 is used as the key for both.
+SFX = {90: "h200", 100: "b300", 120: "5090"}
+DEVICE = {90: "H200", 100: "B300", 120: "RTX 5090"}
+
 
 def load(name):
     with open(os.path.join(BASE, name)) as f:
         return [json.loads(l) for l in f if l.strip()]
+
+
+def check_device(sm, *names):
+    """Fail loudly if a baseline file is wired to the wrong SM's document."""
+    for n in names:
+        path = os.path.join(BASE, n)
+        if not os.path.exists(path):
+            continue
+        meta = load(n)[0]
+        got = meta.get("_device") or meta.get("device") or ""
+        if got and DEVICE[sm] not in got:
+            raise SystemExit(f"{n}: device {got!r} is not the sm_{sm} device ({DEVICE[sm]})")
 
 
 def dense_rows(name):
@@ -73,7 +93,8 @@ def f4(x):
 
 
 # ----------------------------------------------------------------------------- dense tables
-def dense_table_sm120(rows, N, K, op=None):
+def dense_table_3dtype(rows, N, K, op=None):
+    """BF16 / BSFP8 / MXFP8 columns — sm_120 and sm_100/103."""
     hdr = ["| M | BF16 µs | BSFP8 µs | BSFP8 TFLOPS | BSFP8 cos | MXFP8 µs | MXFP8 TFLOPS | MXFP8 cos |",
            "|---:|---:|---:|---:|---:|---:|---:|---:|"]
     if op is not None:
@@ -89,7 +110,8 @@ def dense_table_sm120(rows, N, K, op=None):
     return hdr, body
 
 
-def dense_table_sm90(rows, N, K, op=None):
+def dense_table_2dtype(rows, N, K, op=None):
+    """BF16 / BSFP8 columns — sm_90 (no MXFP8 path on that arch)."""
     hdr = ["| M | BF16 µs | BSFP8 µs | BSFP8 TFLOPS | cos |", "|---:|---:|---:|---:|---:|"]
     if op is not None:
         hdr = ["| op | M | BF16 µs | BSFP8 µs | BSFP8 TFLOPS | cos |", "|---|---:|---:|---:|---:|---:|"]
@@ -122,7 +144,7 @@ def grouped_kernel_table(name):
 # ----------------------------------------------------------------------------- layer tables
 def mlp_table(name, sm):
     rows = {r["M"]: r for r in load(name) if "M" in r}
-    if sm == 120:
+    if sm != 90:
         hdr = ["| M | BF16 (torch) µs | BSFP8 µs | BSFP8 TFLOPS | BSFP8 cos | model ms | MXFP8 µs | MXFP8 TFLOPS | MXFP8 cos | model ms | "
                "cuBLAS scaled_mm MXFP8 + reference quantize µs | cuBLAS scaled_mm MXFP8 + torch.compile quantize µs |",
                "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
@@ -135,7 +157,7 @@ def mlp_table(name, sm):
         fl = 2.0 * M * (2 * I * H + H * I)
         b, s = r["bf16"], r["bsfp8"]
         line = f"| {M} | {f2(b['graph_us'])} | {f2(s['graph_us'])} | {f0(fl / s['graph_us'] / 1e6)} | {f4(s['cos'])} | {f2(s['graph_us'] * 36 / 1000)} |"
-        if sm == 120:
+        if sm != 90:
             x, c, cf = r["mxfp8"], r["smm"], r["smm_fast"]
             line += (f" {f2(x['graph_us'])} | {f0(fl / x['graph_us'] / 1e6)} | {f4(x['cos'])} | {f2(x['graph_us'] * 36 / 1000)} | "
                      f"{f2(c['graph_us'])} | {f2(cf['graph_us'])} |")
@@ -180,11 +202,15 @@ def cmp_rows_keys(cmp):
     return [k for k in _CMP_ROWS if k[0] in {c for c, _ in cmp}]
 
 
-def moe_block_table(fso, routed_impl, shared_impl, cmp):
-    """Family C: routed / routed + shared / comparators (routed-only)."""
+def moe_block_table(fso, routed_impl, shared_impl, cmp, cmp_suffix=" (routed)"):
+    """Family C: routed / routed + shared / comparators.
+
+    `cmp_suffix` is appended to every comparator column title; pass "" when the caller's titles
+    already say which block each comparator ran (the B300 has both routed and routed + shared).
+    """
     Ms = sorted({M for (impl, M) in list(fso) + list(cmp_rows_keys(cmp))})
     hdr = ["| M | active experts | fso routed µs | fso routed + shared µs | shared expert µs | TFLOPS (block) | weight GB/s (block) | cos (block) | model ms (block) | "
-           + " | ".join(f"{t} (routed)" for _, t in cmp) + " |",
+           + " | ".join(f"{t}{cmp_suffix}" for _, t in cmp) + " |",
            "|---:|---:|---:|---:|---:|---:|---:|---:|---:|" + "---:|" * len(cmp)]
     body = []
     for M in Ms:
@@ -215,81 +241,107 @@ def starts(prefix):
     return lambda s, p=prefix: s.startswith(p)
 
 
-def render_gemm_sm120(lines):
-    A = dense_rows("gemm_sm120_qwen3_4b.jsonl")
-    B = dense_rows("gemm_sm120_qwen3_30a3_dense.jsonl")
-    C = dense_rows("gemm_sm120_qwen3_35a3_dense.jsonl")
+def render_gemm_3dtype(lines, sm):
+    """gemm/sm120.md and gemm/sm100.md — identical section structure, different baselines."""
+    sfx = SFX[sm]
+    check_device(sm, f"gemm_sm{sm}_qwen3_4b.jsonl", f"gemm_sm{sm}_qwen3_30a3_dense.jsonl",
+                 f"gemm_sm{sm}_qwen3_35a3_dense.jsonl", f"perf_moe_qwen3_30a3_{sfx}.jsonl",
+                 f"perf_moe_qwen3_35a3_{sfx}.jsonl")
+    A = dense_rows(f"gemm_sm{sm}_qwen3_4b.jsonl")
+    B = dense_rows(f"gemm_sm{sm}_qwen3_30a3_dense.jsonl")
+    C = dense_rows(f"gemm_sm{sm}_qwen3_35a3_dense.jsonl")
     pos = 0
     for tag in ("wqkv", "wo", "gate_up", "down"):
         N, K = dims(A[tag])
-        h, b = dense_table_sm120({m: r for m, r in A[tag].items() if m <= 8192}, N, K)
+        h, b = dense_table_3dtype({m: r for m, r in A[tag].items() if m <= 8192}, N, K)
         pos = replace_table_after(lines, starts(f"### `{tag}` (N="), h + b, pos)
     body = []
     for tag in ("wqkv", "wo"):
         N, K = dims(B[tag])
-        body += dense_table_sm120(B[tag], N, K, op=tag)[1]
-    h, _ = dense_table_sm120({}, 0, 0, op="x")
+        body += dense_table_3dtype(B[tag], N, K, op=tag)[1]
+    h, _ = dense_table_3dtype({}, 0, 0, op="x")
     pos = replace_table_after(lines, starts("### Dense projections `wqkv` (N=5120, K=2048), `wo` (N=2048, K=4096)"), h + body, pos)
-    hB, bB = grouped_kernel_table("perf_moe_qwen3_30a3_5090.jsonl")
+    hB, bB = grouped_kernel_table(f"perf_moe_qwen3_30a3_{sfx}.jsonl")
     pos = replace_table_after(lines, starts("### Grouped GEMM kernels `moe.gate_up` (N=1536, K=2048), `moe.down` (N=2048, K=768)"), hB + bB, pos)
     for tag, head in (("wqkv_gated", "#### `wqkv_gated`"), ("wo", "#### `wo`"), ("gdn_in_proj", "#### `gdn.in_proj`"), ("gdn_out_proj", "#### `gdn.out_proj`")):
         N, K = dims(C[tag])
-        h, b = dense_table_sm120(C[tag], N, K)
+        h, b = dense_table_3dtype(C[tag], N, K)
         pos = replace_table_after(lines, starts(head), h + b, pos)
-    hC, bC = grouped_kernel_table("perf_moe_qwen3_35a3_5090.jsonl")
+    hC, bC = grouped_kernel_table(f"perf_moe_qwen3_35a3_{sfx}.jsonl")
     pos = replace_table_after(lines, starts("### Grouped GEMM kernels `moe.gate_up` (N=1024, K=2048), `moe.down` (N=2048, K=512)"), hC + bC, pos)
     for tag, head in (("shared_gate_up", "#### `shared.gate_up`"), ("shared_down", "#### `shared.down`")):
         N, K = dims(C[tag])
-        h, b = dense_table_sm120(C[tag], N, K)
+        h, b = dense_table_3dtype(C[tag], N, K)
         pos = replace_table_after(lines, starts(head), h + b, pos)
 
 
 def render_gemm_sm90(lines):
+    check_device(90, "gemm_sm90_qwen3_4b.jsonl", "gemm_sm90_qwen3_30a3_dense.jsonl", "gemm_sm90_qwen3_35a3_dense.jsonl")
     A = dense_rows("gemm_sm90_qwen3_4b.jsonl")
     B = dense_rows("gemm_sm90_qwen3_30a3_dense.jsonl")
     C = dense_rows("gemm_sm90_qwen3_35a3_dense.jsonl")
     pos = 0
     for tag in ("wqkv", "wo", "gate_up", "down"):
         N, K = dims(A[tag])
-        h, b = dense_table_sm90({m: r for m, r in A[tag].items() if m <= 8192}, N, K)
+        h, b = dense_table_2dtype({m: r for m, r in A[tag].items() if m <= 8192}, N, K)
         pos = replace_table_after(lines, starts(f"### `{tag}` (N="), h + b, pos)
     body = []
     for tag in ("wqkv", "wo"):
         N, K = dims(B[tag])
-        body += dense_table_sm90(B[tag], N, K, op=tag)[1]
-    h, _ = dense_table_sm90({}, 0, 0, op="x")
+        body += dense_table_2dtype(B[tag], N, K, op=tag)[1]
+    h, _ = dense_table_2dtype({}, 0, 0, op="x")
     pos = replace_table_after(lines, starts("### Dense projections `wqkv` (N=5120, K=2048), `wo` (N=2048, K=4096)"), h + body, pos)
     for tag, head in (("wqkv_gated", "#### `wqkv_gated`"), ("wo", "#### `wo`"), ("gdn_in_proj", "#### `gdn.in_proj`"), ("gdn_out_proj", "#### `gdn.out_proj`"),
                       ("shared_gate_up", "#### `shared.gate_up`"), ("shared_down", "#### `shared.down`")):
         N, K = dims(C[tag])
-        h, b = dense_table_sm90(C[tag], N, K)
+        h, b = dense_table_2dtype(C[tag], N, K)
         pos = replace_table_after(lines, starts(head), h + b, pos)
 
 
+# Comparator columns per SM, allowed only in docs/perf/layer/ (docs/README.md rule 2). The sm_90 and
+# sm_120 hosts have sglang (and deep_gemm on sm_90); the B300 pod has neither, so its comparators are
+# the two grouped entry points torch 2.11 itself provides.
+def layer_comparators(sm, shared=False):
+    if sm == 100:
+        sfxs = "_shared" if shared else ""
+        where = " (routed + shared)" if shared else " (routed)"
+        return [(f"torch_smm_mxfp8_layer{sfxs}", f"torch scaled_grouped_mm MXFP8 µs{where}"),
+                (f"torch_grouped_bf16_layer{sfxs}", f"torch _grouped_mm BF16 µs{where}")]
+    cmp = [("triton_bf16", "sglang triton BF16 µs"), ("triton_fp8b", "sglang triton FP8 w8a8-block µs")]
+    if sm == 90:
+        cmp.append(("dg_fp8_layer", "deep_gemm masked pipeline FP8 µs"))
+    return cmp
+
+
 def render_layer(lines, sm):
-    sfx = "5090" if sm == 120 else "h200"
-    dt = "mxfp8" if sm == 120 else "bsfp8"
+    sfx = SFX[sm]
+    dt = "bsfp8" if sm == 90 else "mxfp8"
+    check_device(sm, f"gemm_sm{sm}_qwen3_4b_mlp_fwd.jsonl", f"perf_moe_qwen3_30a3_{sfx}.jsonl",
+                 f"ref_moe_qwen3_30a3_{sfx}.jsonl", f"perf_moe_qwen3_35a3_{sfx}.jsonl",
+                 f"perf_moe_qwen3_35a3_shared_{sfx}.jsonl", f"ref_moe_qwen3_35a3_{sfx}.jsonl",
+                 f"ref_moe_qwen3_35a3_shared_{sfx}.jsonl")
     h, b = mlp_table(f"gemm_sm{sm}_qwen3_4b_mlp_fwd.jsonl", sm)
     pos = replace_table_after(lines, starts("## Family A — Qwen3-4B dense MLP block"), h + b)
     fsoB = moe_rows(f"perf_moe_qwen3_30a3_{sfx}.jsonl")
     set_cmp_rows({**moe_rows(f"perf_moe_qwen3_30a3_{sfx}.jsonl"), **moe_rows(f"ref_moe_qwen3_30a3_{sfx}.jsonl")})
-    cmpB = [("triton_bf16", "sglang triton BF16 µs"), ("triton_fp8b", "sglang triton FP8 w8a8-block µs")]
-    if sm == 90:
-        cmpB.append(("dg_fp8_layer", "deep_gemm masked pipeline FP8 µs"))
+    cmpB = layer_comparators(sm)
     h, b = moe_layer_table(fsoB, cmpB, f"fso_{dt}_layer", sm)
     pos = replace_table_after(lines, starts("## Family B — Qwen3-30B-A3B routed MoE layer"), h + b, pos)
     fsoC = moe_rows(f"perf_moe_qwen3_35a3_{sfx}.jsonl", f"perf_moe_qwen3_35a3_shared_{sfx}.jsonl")
-    set_cmp_rows(moe_rows(f"ref_moe_qwen3_35a3_{sfx}.jsonl"))
-    cmpC = [("triton_bf16", "sglang triton BF16 µs"), ("triton_fp8b", "sglang triton FP8 w8a8-block µs")]
-    if sm == 90:
-        cmpC.append(("dg_fp8_layer", "deep_gemm masked pipeline FP8 µs"))
-    h, b = moe_block_table(fsoC, f"fso_{dt}_layer", f"fso_{dt}_layer_shared", cmpC)
+    # The B300 comparator run measured the shared-expert block as well; sm_90 / sm_120 have no such
+    # file, and moe_rows() skips the ones that do not exist.
+    set_cmp_rows(moe_rows(f"ref_moe_qwen3_35a3_{sfx}.jsonl", f"ref_moe_qwen3_35a3_shared_{sfx}.jsonl"))
+    if sm == 100:
+        cmpC = layer_comparators(sm) + layer_comparators(sm, shared=True)
+        h, b = moe_block_table(fsoC, f"fso_{dt}_layer", f"fso_{dt}_layer_shared", cmpC, cmp_suffix="")
+    else:
+        h, b = moe_block_table(fsoC, f"fso_{dt}_layer", f"fso_{dt}_layer_shared", layer_comparators(sm))
     replace_table_after(lines, starts("## Family C — Qwen3.5-35B-A3B MoE block"), h + b, pos)
 
 
 # ----------------------------------------------------------------------------- README hot rows (no comparisons)
 def readme_rows(sm):
-    sfx = "5090" if sm == 120 else "h200"
+    sfx = SFX[sm]
     A = dense_rows(f"gemm_sm{sm}_qwen3_4b.jsonl")["gate_up"]
     N, K = dims(A)
     rows = []
@@ -323,10 +375,12 @@ def render_readme(lines):
 
 
 TARGETS = {
-    "docs/perf/gemm/sm120.md": render_gemm_sm120,
+    "docs/perf/gemm/sm120.md": lambda L: render_gemm_3dtype(L, 120),
     "docs/perf/gemm/sm90.md": render_gemm_sm90,
+    "docs/perf/gemm/sm100.md": lambda L: render_gemm_3dtype(L, 100),
     "docs/perf/layer/sm120.md": lambda L: render_layer(L, 120),
     "docs/perf/layer/sm90.md": lambda L: render_layer(L, 90),
+    "docs/perf/layer/sm100.md": lambda L: render_layer(L, 100),
     "README.md": render_readme,
 }
 

@@ -49,6 +49,14 @@ def route(x_fp8: torch.Tensor, w_fp8: torch.Tensor,
         if y is not None:
             return y
 
+    # The C++ cascade's wave rule owns the cells where narrowing its N tile
+    # fills the machine (see ``_sm100_smm.wave_tile_owns``). Tier 2's kernel is
+    # persistent and built on a fixed 128- or 256-wide N tile, so on those cells
+    # it leaves the same SMs idle that tier 1 does; without this guard its
+    # wide-N rows would swallow the cell before the cascade ever sees it.
+    if _sm100_smm.wave_tile_owns(m, n):
+        return None
+
     # Tier 2: CuTe DSL kernel for mid-band + peak.
     from . import _sm100_dsl
     cfg = _sm100_dsl.pick_config(m, n, k)

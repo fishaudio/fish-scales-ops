@@ -17,7 +17,7 @@ sm_103 for MXFP8 GEMM). PyTorch extension plus a standalone C++ library.
 |---|---|---|---|
 | sm_90 | H200 | BF16, block-FP8 1×128 (dense + grouped MoE) | torch SDPA fallback |
 | sm_120 | RTX 5090 | BF16, block-FP8 1×128, MXFP8 1×32 (dense + grouped MoE) | MXFP8 prefill / paged decode / paged prefill |
-| sm_100 / sm_103 | B300 | BF16, MXFP8 1×32, block-FP8 1×128 (dense; runs on the MXFP8 tcgen05 tiers with replicated scales, added 2026-09-05, perf table pending) | torch SDPA fallback |
+| sm_100 / sm_103 | B300 | BF16, MXFP8 1×32 (dense + grouped MoE since 2026-09-15), block-FP8 1×128 (dense; runs on the MXFP8 tcgen05 tiers with replicated scales, added 2026-09-05) | torch SDPA fallback |
 
 ## Performance
 
@@ -137,9 +137,9 @@ contracts, scale layouts and constraints of every op are in
 
 | path | Hopper sm_90 | Blackwell sm_120 | Blackwell datacenter sm_100 / sm_103 |
 |---|---|---|---|
-| block-FP8 1×128 GEMM | ✓ deep_gemm WGMMA, NVRTC JIT, FP32 scales | ✓ CUTLASS `Sm120BlockScaledKernel`, UE8M0 scales | ✓ since 2026-09-05, on the MXFP8 tcgen05 path with replicated scales (perf table pending) |
+| block-FP8 1×128 GEMM | ✓ deep_gemm WGMMA, NVRTC JIT, FP32 scales | ✓ CUTLASS `Sm120BlockScaledKernel`, UE8M0 scales | ✓ since 2026-09-05, on the MXFP8 tcgen05 path with replicated scales |
 | MXFP8 1×32 GEMM | — | ✓ CUTLASS block-scaled | ✓ three tiers: cuBLAS `scaled_mm`, CuTe DSL, C++ cascade |
-| grouped MoE layer | ✓ expert-sorted contiguous layout with swap-AB decode path (`moe_layer_fp8_sm90`) | ✓ masked slab layout, MXFP8, six ops | not implemented (milestone M3) |
+| grouped MoE layer | ✓ expert-sorted contiguous layout with swap-AB decode path (`moe_layer_fp8_sm90`) | ✓ masked slab layout, MXFP8, six ops | ✓ since 2026-09-15 (milestone M3): masked slab layout, MXFP8, CUTLASS pointer-array kernel |
 | BF16 attention | torch SDPA | torch SDPA | torch SDPA |
 | MXFP8 attention prefill | — | ✓ D ∈ {32, 64, 128, 256}, native GQA | — |
 | MXFP8 paged prefill (extend) | — | ✓ page_size a multiple of 32 | — |
@@ -157,7 +157,10 @@ Constraints worth knowing up front:
   (the MXFP8 scale vector), matching sglang's `--page-size 32`; the decode
   kernel caps `H_q / H_kv` at 64.
 - B200 / B300 builds use `ARCH="10.0f"`; the B300 has no clock lock, so its
-  numbers are measured unlocked (`docs/perf/README.md` §5).
+  numbers are measured unlocked and are published only in
+  [`docs/perf/gemm/sm100.md`](docs/perf/gemm/sm100.md) and
+  [`docs/perf/layer/sm100.md`](docs/perf/layer/sm100.md), never in the section
+  above (`docs/perf/README.md` §5 and §8).
 - Performance work follows [`docs/perf/README.md`](docs/perf/README.md): same
   device, locked clock, CUDA-graph replay median, every cell traceable to a
   baseline jsonl, and a change is accepted only if every affected cell is
@@ -193,6 +196,7 @@ python tests/gemm/unit/test_correctness.py
 python tests/gemm/unit/test_mxfp8_correctness.py
 python tests/gemm/unit/test_fp8_k128_sm120.py          # sm_100 / sm_120
 python tests/gemm/unit/test_mxfp8_grouped.py           # sm_120
+python tests/gemm/unit/test_moe_routing_threads.py     # sm_100 / sm_103: multi-CTA routing builder under two threads / two streams
 python tests/gemm/unit/test_fp8_grouped_sm90.py tests/gemm/unit/test_moe_layer_dispatch_sm90.py   # H200
 python tests/gemm/unit/test_cuda_graph.py
 # Attention (sm_120)
@@ -215,8 +219,8 @@ rule for a performance change are in
 
 Debugging and A/B environment variables (`FSO_FORCE_TILE`,
 `FSO_FORCE_TILE_K`, `FSO_FORCE_KSPLIT`, `FSO_DISABLE_STREAMK`,
-`FSO_DISABLE_PDL`, the sm_100 tier switches, the deep_gemm JIT diagnostics
-and the rest) are listed with their scope in
+`FSO_DISABLE_PDL`, `FSO_PRINT_TILE_INFO`, the sm_100 tier switches, the
+deep_gemm JIT diagnostics and the rest) are listed with their scope in
 [`docs/api/gemm.md`](docs/api/gemm.md#env-var-overrides-debugging--a-b-only).
 All are read once per process and none is part of the production contract.
 

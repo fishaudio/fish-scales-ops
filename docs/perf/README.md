@@ -8,16 +8,21 @@ are split by domain, then by SM version:
 |---|---|---|
 | `gemm/sm90.md` | NVIDIA H200 (sm_90) | Family A / B / C GEMM tables |
 | `gemm/sm120.md` | NVIDIA RTX 5090 (sm_120); RTX PRO 6000 optional | Family A / B / C GEMM tables |
-| `gemm/sm100.md` | NVIDIA B300 (sm_103) | Family A / B / C GEMM tables — status pending |
+| `gemm/sm100.md` | NVIDIA B300 (sm_103) | Family A / B / C GEMM tables (unlocked clocks) |
 | `layer/sm90.md` | NVIDIA H200 (sm_90) | whole MLP / MoE block per family (A dense MLP, B routed MoE, C routed + shared expert) — definitions in `layer/README.md` |
 | `layer/sm120.md` | NVIDIA RTX 5090 (sm_120) | whole-block tables |
-| `layer/sm100.md` | — | n/a — pending decision |
+| `layer/sm100.md` | NVIDIA B300 (sm_103) | whole-block tables (unlocked clocks) |
 | `attention/sm90.md` | — | n/a (no native sm_90 attention kernel) |
 | `attention/sm120.md` | NVIDIA RTX 5090 (sm_120) | prefill / paged decode / paged prefill |
 | `attention/sm100.md` | — | n/a (no native sm_100 attention kernel) |
 
-Status (2026-09-15): structure frozen; every sm_90 and sm_120 table is
-generated from `tests/baselines/`. The old single `perf.md` is archived
+Status (2026-09-17): structure frozen; every sm_90, sm_120 and sm_103 table
+is generated from `tests/baselines/`. The B300 (sm_103) GEMM and layer tables
+were first filled on 2026-09-15 and were re-measured in full on 2026-09-17,
+from the run in `/data/bench-runs/b300_final2_20260917/`; that run was taken on
+a different card of the same pod than the 2026-09-15 one, so it replaced those
+tables rather than being merged with them. They are unlocked-clock numbers and
+labelled as such. The old single `perf.md` is archived
 outside the repository (`../fso-doc_review-backup-20260915/repo/docs/perf.md`).
 Rows marked `TBD` have no accepted baseline yet.
 
@@ -164,7 +169,7 @@ that runs are comparable across days and commits. CUDA 13 toolchain everywhere.
 | sm_90 | NVIDIA H200 | 132 | `nvidia-smi -lgc 1980` | 1830 MHz | |
 | sm_120 | NVIDIA GeForce RTX 5090 | 170 | `nvidia-smi -lgc 2407` | 2400 MHz | primary sm_120 device |
 | sm_120 | NVIDIA RTX PRO 6000 Blackwell | 188 | `nvidia-smi -lgc 2430` | 2400 MHz | optional section |
-| sm_103 | NVIDIA B300 | — | no lock available | ~2032 MHz flat under load | needs `FSO_BENCH_WARM_MS=300`; label rows "unlocked" |
+| sm_103 | NVIDIA B300 | 148 | no lock available | ~2032 MHz flat under load | needs `FSO_BENCH_WARM_MS=300` — the dense bench, the MLP-layer forward bench (`bench_qwen3_4b_mlp_forward.py`, knob added 2026-09-15) and the MoE bench all honour it; label rows "unlocked" and read them with §8's B300 caveats |
 
 Verify the lock took effect (`clocks.sm` reads the locked value under load)
 before every run; record driver, CUDA, torch and the fso commit in the file's
@@ -176,13 +181,14 @@ environment block.
 |---|---|---|---|---|
 | sm_90 | reference column | ✓ deep_gemm JIT (dense + grouped) | — | K % 128 |
 | sm_120 | reference column | ✓ CUTLASS block-scaled (dense; K % 128, UE8M0 activation and weight scales) | ✓ dense + grouped | Family B/C MoE rows are MXFP8; block-FP8 required K % 512 and had an FP32-weight-scale bug until 2026-09-05 (section 8) |
-| sm_103 | reference column | ✓ since 2026-09-05: 1×128 scales expanded ×4 onto the MXFP8 tcgen05 tiers (same kernels and bytes as MXFP8; K % 128, N % 128); table pending B300 access | ✓ dense | grouped MoE not implemented on sm_100/103 (M3) |
+| sm_103 | reference column | ✓ since 2026-09-05: 1×128 scales expanded ×4 onto the MXFP8 tcgen05 tiers (same kernels and bytes as MXFP8; K % 128, N % 128); tables published 2026-09-15, re-measured 2026-09-17 | ✓ dense + grouped since 2026-09-15 | grouped MoE (M3) landed 2026-09-15: CUTLASS pointer-array block-scaled kernel on the masked slab layout, eight kernels in the captured layer; cascade v2 and the programmatic dependent launch on the prep kernel and the grouped GEMM since 2026-09-17, and the dense path gained the wave-tile rule with its 64- and 192-wide N tiles on the same day |
 
 ## 7. Regeneration
 
 Tables are generated, never hand-edited. `bench/gemm/python/render_perf_docs.py`
 rewrites every GEMM and layer table in `gemm/sm90.md`, `gemm/sm120.md`,
-`layer/sm90.md`, `layer/sm120.md` and the two README hot tables from
+`gemm/sm100.md`, `layer/sm90.md`, `layer/sm120.md`, `layer/sm100.md` and the
+two README hot tables from
 `tests/baselines/*.jsonl`; `--check` exits non-zero if any table has drifted
 from the baselines (run it before committing a baseline change). Prose around
 the tables (provenance, readings) is edited by hand in the same commit.
@@ -217,8 +223,8 @@ only what a reader of the tables needs.
   for such sweeps.
 - **Small-M graph-replay cells are L2-resident.** Replay re-runs one cell's
   kernels with the same weights and the bench does not flush L2, so at
-  M ≤ 128 the active weights (10–50 MB) stay in the RTX 5090's 96 MB or the
-  H200's 60 MB L2 and the µs undercut the DRAM floor. A `weight GB/s` above the
+  M ≤ 128 the active weights (10–50 MB) stay in the RTX 5090's 96 MB, the
+  H200's 60 MB or the B300's 126.5 MiB L2 and the µs undercut the DRAM floor. A `weight GB/s` above the
   device's DRAM bandwidth means the cell is L2-fed. These rows bound the
   kernel, not the serving cost, which rotates every layer's weights through
   DRAM.
@@ -228,6 +234,40 @@ only what a reader of the tables needs.
   up to ±5 % on isolated cells, which is why acceptance is judged on every
   affected cell against the ±1 % band and a single outlier is re-run, not
   accepted or rejected on its own.
+- **The B300 rows are unlocked-clock numbers, with three consequences.** That
+  pod cannot set a clock lock, so `gemm/sm100.md` and `layer/sm100.md` rely on
+  the `FSO_BENCH_WARM_MS=300` warm-up and on labelling instead (section 5).
+  First, cells at M ≥ 4096 swing by about ±3 % rather than ±1 %: the MLP
+  block's BF16 cell at M = 4096 was measured nine times on identical code on
+  2026-09-15 and spanned 555.1 to 586.0 µs. Second, sustained replay of the
+  longest cells droops the clock — the M = 8192 MLP graph falls from 2032 MHz
+  to 1822–1980 MHz over twelve blocks of 50 replays while board power rises
+  from 228 W to 538 W, while the same test at M = 1024 holds 2032 MHz
+  throughout. Third, every dense reading below about 17 µs lands on a ~2.05 µs
+  grid (4.16 / 6.20 / 8.24 / 10.29 …), so a one-step flip reads as a 20–25 %
+  change and is not one. A B300 comparison that is not larger than these
+  effects is not a result.
+- **The B300's graph-replay median comes in whole ticks of about 2.05 µs.**
+  That quantisation is not an approximation. On 2026-09-17 a least-squares fit
+  over the eighteen distinct replay medians of one dense run put every one of
+  them on an integer multiple of 2.0604 µs, with a worst residual of 0.135 µs
+  (0.65 %). Two rules for reading a small B300 cell follow. A kernel that gets
+  faster by less than one tick does not move its cell at all, so an unchanged
+  reading is not evidence that a change did nothing. And when a cell does move,
+  it moves by a whole tick, which on a 6–10 µs cell is a 20–25 % step; a single
+  cell moving one tick is therefore timer granularity rather than a result, and
+  what counts as a signal is a run of consecutive M cells of the same shape
+  moving together. This is a B300 property: the RTX 5090 has its own, coarser
+  step (the bullet above), and the H200 rows are not on a visible grid.
+- **The M = 8192 cells of the B300 MLP block scatter by 4–8 %, including the
+  pure-cuBLAS column.** Twelve independent worker processes measured that one
+  cell on 2026-09-17, alternating between two library builds. The fso BSFP8
+  column spanned 587.6 to 613.8 µs and the two builds' medians differed by
+  0.1 %; the cuBLAS `scaled_mm` comparator column measured in the same passes,
+  which contains no fso kernel and cannot move with a library change, spanned
+  586.4 to 607.5 µs. The M = 8192 row of `layer/sm100.md` is therefore a
+  published number and not an acceptance unit: a difference read off it is
+  inside the cell's own noise unless it is larger than about 8 %.
 - **The NVRTC build the process binds is part of the sm_90 kernel.** The sm_90
   block-FP8 kernels are compiled at first call by whichever `libnvrtc.so.13`
   torch already loaded (13.0.88 bundled with the cu130 wheel, 13.2.78 from the

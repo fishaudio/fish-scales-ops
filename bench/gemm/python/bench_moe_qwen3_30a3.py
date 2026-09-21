@@ -21,6 +21,12 @@ Implementations benchmarked (all from the serving venv, no fso code):
   dg_fp8_layer   production masked pipeline: moe_ep_deepgemm_preprocess ->
                  masked gemm -> silu_mul_quant -> masked gemm -> post_reorder
                  (mirrors sglang moe_runner/deep_gemm.py)     [whole layer]
+  torch_smm_mxfp8_layer   torch 2.11 F.scaled_grouped_mm, MXFP8 1x32 blocked
+                 scales, expert-sorted contiguous rows        [whole layer]
+  torch_grouped_bf16_layer  torch 2.11 torch._grouped_mm, bf16, no quantize
+                 (unquantized reference speed)                [whole layer]
+  *_layer_shared  the two above plus Family C's dense shared expert
+                 (F.scaled_mm / F.linear) and the residual add
 
 deep_gemm's grouped kernels are the same kernels TensorRT-LLM drives via
 DeepGemmFusedMoE / CutlassFp8BlockScaleGemmRunner::moeGemm on Hopper; the
@@ -79,7 +85,42 @@ DECODE_M = [m for m in M_GRID if m <= 128]
 KERNEL_IMPLS = ("dg_fp8_cont", "dg_bf16_cont", "dg_fp8_masked", "dg_bf16_masked",
                 "fso_mxfp8_grouped")
 LAYER_IMPLS = ("triton_bf16", "triton_fp8b", "dg_fp8_layer", "fso_mxfp8_layer",
-               "fso_bsfp8_layer", "fso_mxfp8_layer_shared", "fso_bsfp8_layer_shared")
+               "fso_bsfp8_layer", "fso_mxfp8_layer_shared", "fso_bsfp8_layer_shared",
+               "torch_smm_mxfp8_layer", "torch_grouped_bf16_layer",
+               "torch_smm_mxfp8_layer_shared", "torch_grouped_bf16_layer_shared")
+# torch-native layer baselines (torch >= 2.11): `torch.nn.functional.
+# scaled_grouped_mm` (MXFP8 1x32, blocked scales) and `torch._grouped_mm`
+# (bf16). Neither needs deep_gemm, sglang or fso. They are the same-device
+# comparator for an fso grouped path where fso has none.
+TORCH_IMPLS = ("torch_smm_mxfp8_layer", "torch_grouped_bf16_layer")
+# Minimum compute-capability major version per torch-native impl.
+# `torch._grouped_mm` (bf16) runs from sm_90 onwards, so Families B and C get
+# a BF16 reference row on the H200 as well. The MXFP8 form of
+# `scaled_grouped_mm` needs the Blackwell block-scaled grouped kernels, i.e.
+# sm_100 or newer.
+TORCH_IMPL_MIN_MAJOR = {"torch_smm_mxfp8_layer": 10,
+                        "torch_grouped_bf16_layer": 9}
+
+
+def torch_impls_for_device():
+    """Which torch-native impls this device can run, without launching a kernel.
+
+    Reads the compute capability of device 0 (a property query, not a kernel)
+    and filters `TORCH_IMPLS` by `TORCH_IMPL_MIN_MAJOR`. Gating here keeps an
+    unfiltered `--run` on sm_90 or sm_120 from spawning worker subprocesses
+    that could only record `n/a`. `probe_torch_grouped` inside the worker
+    stays as the second line of defence: a device that passes this gate but
+    whose torch build lacks the operator still records the cell as
+    `n/a: ...` instead of failing the run. If the capability cannot be read
+    at all (no CUDA device visible) no torch-native cell is generated, since
+    no cell could run anyway.
+    """
+    try:
+        import torch
+        major = torch.cuda.get_device_capability(0)[0]
+    except Exception:
+        return ()
+    return tuple(i for i in TORCH_IMPLS if major >= TORCH_IMPL_MIN_MAJOR[i])
 
 # fso masked grouped path: m_cap = pad4(M) slabs fit 32 GB through M=4096
 # (peak ~7 GB at the layer cell); M=8192 still waits on a slab-free entry.
@@ -104,9 +145,14 @@ def make_cells():
     cells += [dict(impl="dg_fp8_layer", proj="layer", M=m) for m in DECODE_M]
     cells += [dict(impl="fso_mxfp8_layer", proj="layer", M=m) for m in FSO_M]
     cells += [dict(impl="fso_bsfp8_layer", proj="layer", M=m) for m in FSO_SM90_M]
+    torch_impls = torch_impls_for_device()
+    for impl in torch_impls:
+        cells += [dict(impl=impl, proj="layer", M=m) for m in M_GRID]
     if SHARED_INTER:
         cells += [dict(impl="fso_mxfp8_layer_shared", proj="layer", M=m) for m in FSO_M]
         cells += [dict(impl="fso_bsfp8_layer_shared", proj="layer", M=m) for m in FSO_SM90_M]
+        for impl in torch_impls:
+            cells += [dict(impl=impl + "_shared", proj="layer", M=m) for m in M_GRID]
     return cells
 
 
@@ -130,6 +176,248 @@ def build_fso_routing(topk_ids, topk_w, m_cap):
     slot_of_flat = torch.empty(M * topk, device="cuda", dtype=torch.int64)
     slot_of_flat[order] = slot_sorted
     return counts.int(), row_map, slot_of_flat
+
+
+# --------------------------------------------------------------------------
+# torch-native grouped-MoE baselines (no fso, no deep_gemm, no sglang)
+# --------------------------------------------------------------------------
+#
+# torch 2.11 exposes two grouped GEMMs that take a device-side `offs` tensor
+# holding the exclusive-end row offset of every group, so the group sizes may
+# be data dependent and the whole layer stays capturable:
+#
+#   torch._grouped_mm(mat_a[R,K], mat_b[G,K,N], offs=offs)            -> bf16
+#   F.scaled_grouped_mm(mat_a, mat_b, scale_a, recipe, scale_b, ...)  -> MXFP8
+#
+# For the MXFP8 form the activation rows themselves need no padding, but the
+# activation *scales* do: the kernel reads group g's scales from a cuBLAS
+# 128x4 "blocked" tile array whose base element is
+#     sum_{h<g} round_up(count_h, 128) * round_up(K/32, 4),
+# i.e. every group's scale block is rounded up to 128 rows. Verified on the
+# B300 against an FP32 per-expert reference for group sizes 128-aligned,
+# 32-aligned and completely unaligned ([10, 30, 50, 70]) as well as for empty
+# groups; a single un-grouped `to_blocked` over all rows is only correct when
+# every group count happens to be a multiple of 128.
+#
+# The layer therefore lays the sorted rows out densely (no row padding, so the
+# GEMM does exactly M*topk rows of useful work) and lays the scales out into a
+# 128-row-per-group padded buffer whose capacity is the worst case
+# `rows + 127 * n_active_experts`. `to_blocked` over that buffer then produces
+# exactly the concatenation of the per-group blocked blocks.
+SCALE_ROW_ALIGN = 128   # rows per group in the blocked activation-scale array
+
+
+def scale_rows_cap(rows, n_groups):
+    """Worst case of sum_g round_up(count_g, 128) for `rows` rows over `n_groups`."""
+    n_active = min(n_groups, max(rows, 1))
+    cap = rows + (SCALE_ROW_ALIGN - 1) * n_active
+    return (cap + SCALE_ROW_ALIGN - 1) // SCALE_ROW_ALIGN * SCALE_ROW_ALIGN
+
+
+def silu_chunk_mul(gu):
+    """SwiGLU on a chunked [gate|up] tensor (compiled by the callers)."""
+    import torch.nn.functional as F
+    g_, u_ = gu.chunk(2, dim=-1)
+    return F.silu(g_) * u_
+
+
+def probe_torch_grouped(kind):
+    """Tiny grouped-GEMM call so an unsupported arch/build is a recorded cell.
+
+    Raises RuntimeError('n/a: ...') which the orchestrator stores in the row's
+    `error` field, the same way any other failing cell is recorded.
+    """
+    import torch
+    import torch.nn.functional as F
+    try:
+        G, K, N = 2, 128, 128
+        w = torch.randn(G, N, K, device="cuda", dtype=torch.bfloat16) / 16.0
+        a = torch.randn(4, K, device="cuda", dtype=torch.bfloat16) * 0.1
+        offs = torch.tensor([2, 4], device="cuda", dtype=torch.int32)
+        if kind == "bf16":
+            torch._grouped_mm(a, w.transpose(-2, -1), offs=offs,
+                              out_dtype=torch.bfloat16)
+        else:
+            from torch.testing._internal.common_quantized import to_mxfp, to_blocked
+            from torch._C import _ScalingType as ST, _SwizzleType as SW
+            ws, wq = to_mxfp(w, 32, "mxfp8")
+            wsb = torch.stack([to_blocked(ws[g]) for g in range(G)])
+            asc, aq = to_mxfp(a.contiguous(), 32, "mxfp8")
+            sp = torch.zeros(2 * SCALE_ROW_ALIGN, K // 32, device="cuda",
+                             dtype=torch.uint8)
+            sp[:2] = asc[:2].view(torch.uint8)
+            sp[SCALE_ROW_ALIGN:SCALE_ROW_ALIGN + 2] = asc[2:].view(torch.uint8)
+            sab = to_blocked(sp).view(2 * SCALE_ROW_ALIGN, K // 32).view(
+                torch.float8_e8m0fnu)
+            F.scaled_grouped_mm(aq, wq.transpose(-2, -1), sab, ST.BlockWise1x32,
+                                wsb, ST.BlockWise1x32,
+                                swizzle_a=SW.SWIZZLE_32_4_4,
+                                swizzle_b=SW.SWIZZLE_32_4_4, offs=offs,
+                                output_dtype=torch.bfloat16)
+        torch.cuda.synchronize()
+    except Exception as e:                       # noqa: BLE001 - reported as a cell
+        raise RuntimeError(
+            f"n/a: torch {kind} grouped mm unsupported on this device/build "
+            f"({type(e).__name__}: {str(e)[:160]})")
+
+
+def build_torch_moe_layer(kind, M, hidden, w13, w2, topk_ids, topk_w):
+    """Whole routed MoE layer with torch ops only; returns (fn, info).
+
+    kind == "mxfp8": F.scaled_grouped_mm with 1x32 block scales.
+    kind == "bf16" : torch._grouped_mm, unquantized reference speed.
+
+    Expert weights are quantized here, i.e. outside the timed graph, exactly
+    like every other layer impl. Everything the returned closure does —
+    routing from `topk_ids`, gather, activation quantize, both grouped GEMMs,
+    SwiGLU, the weighted combine — happens inside the capture, so the timed
+    boundary is the same as `fso_*_layer` and the triton / dg layer cells.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    probe_torch_grouped(kind)
+    rows = M * TOPK
+    row_ix = torch.arange(rows, device="cuda")
+    ones = torch.ones(rows, device="cuda", dtype=torch.int64)
+    w_bf = topk_w.to(torch.bfloat16).unsqueeze(-1).contiguous()   # [M, topk, 1]
+    silu = torch.compile(silu_chunk_mul, mode="default", dynamic=False)
+    info = {}
+
+    def combine_fn(dn, order):
+        """expert-sorted rows -> per-token weighted sum, [M, HIDDEN] bf16.
+
+        `order[i]` is the flat (token*topk + slot) index of sorted row i, so
+        scattering the rows back and reducing over the topk axis is the same
+        combine an `index_add_` would do. It is written this way because
+        `index_add_` on the [M*topk, HIDDEN] source is a bf16 atomic scatter
+        and measured 1348 us at M = 8192 against 217 us for this form
+        (scratch/combine_probe2.py in this run directory); it is also more
+        accurate, since the reduction accumulates in FP32 instead of
+        round-tripping every partial sum through bf16.
+        """
+        t = torch.empty_like(dn)
+        t.index_copy_(0, order, dn)
+        return (t.view(M, TOPK, HIDDEN) * w_bf).sum(1, dtype=torch.float32).to(
+            torch.bfloat16)
+
+    combine = torch.compile(combine_fn, mode="default", dynamic=False)
+
+    def route():
+        """topk_ids -> (expert-sorted row order, per-expert counts, sorted expert id).
+
+        `counts` is built with zeros+scatter_add_ rather than torch.bincount
+        because bincount sizes its output from input.max(), a device->host
+        sync that cannot be captured.
+        """
+        flat_e = topk_ids.flatten().long()
+        order = torch.argsort(flat_e, stable=True)
+        counts = torch.zeros(E, device="cuda", dtype=torch.int64)
+        counts.scatter_add_(0, flat_e, ones)
+        return order, counts, flat_e.index_select(0, order)
+
+    if kind == "bf16":
+        b13 = w13.transpose(-2, -1)      # [E, K, N], column major in last 2 dims
+        b2 = w2.transpose(-2, -1)
+
+        def layer_fn():
+            order, counts, _ = route()
+            offs = torch.cumsum(counts, 0).to(torch.int32)
+            src = order // TOPK
+            xg = hidden.index_select(0, src)
+            gu = torch._grouped_mm(xg, b13, offs=offs, out_dtype=torch.bfloat16)
+            dn = torch._grouped_mm(silu(gu), b2, offs=offs,
+                                   out_dtype=torch.bfloat16)
+            return combine(dn, order)
+
+        return layer_fn, info
+
+    from torch.testing._internal.common_quantized import to_mxfp, to_blocked
+    from torch._C import _ScalingType as ST, _SwizzleType as SW
+
+    sw13, q13 = to_mxfp(w13.contiguous(), 32, "mxfp8")
+    sw2, q2 = to_mxfp(w2.contiguous(), 32, "mxfp8")
+    sb13 = torch.stack([to_blocked(sw13[e]) for e in range(E)])
+    sb2 = torch.stack([to_blocked(sw2[e]) for e in range(E)])
+    b13, b2 = q13.transpose(-2, -1), q2.transpose(-2, -1)
+    cap = scale_rows_cap(rows, E)
+    k32_gu, k32_dn = HIDDEN // 32, INTER // 32
+    info["scale_rows_cap"] = cap
+
+    def quant_blocked(t, dest, k32):
+        s, q = to_mxfp(t.contiguous(), 32, "mxfp8")
+        s_pad = torch.zeros(cap, k32, device="cuda", dtype=torch.uint8)
+        s_pad.index_copy_(0, dest, s.view(torch.uint8))
+        return q, to_blocked(s_pad).view(cap, k32).view(torch.float8_e8m0fnu)
+
+    qb = torch.compile(quant_blocked, mode="default", dynamic=False)
+
+    def layer_fn():
+        order, counts, e_sorted = route()
+        csum = torch.cumsum(counts, 0)
+        offs = csum.to(torch.int32)
+        start = csum - counts
+        padded = (counts + (SCALE_ROW_ALIGN - 1)) // SCALE_ROW_ALIGN * SCALE_ROW_ALIGN
+        base = torch.cumsum(padded, 0) - padded
+        dest = (base.index_select(0, e_sorted) + row_ix
+                - start.index_select(0, e_sorted))
+        src = order // TOPK
+        xq, xs = qb(hidden.index_select(0, src), dest, k32_gu)
+        gu = F.scaled_grouped_mm(xq, b13, xs, ST.BlockWise1x32,
+                                 sb13, ST.BlockWise1x32,
+                                 swizzle_a=SW.SWIZZLE_32_4_4,
+                                 swizzle_b=SW.SWIZZLE_32_4_4,
+                                 offs=offs, output_dtype=torch.bfloat16)
+        hq, hs = qb(silu(gu), dest, k32_dn)
+        dn = F.scaled_grouped_mm(hq, b2, hs, ST.BlockWise1x32,
+                                 sb2, ST.BlockWise1x32,
+                                 swizzle_a=SW.SWIZZLE_32_4_4,
+                                 swizzle_b=SW.SWIZZLE_32_4_4,
+                                 offs=offs, output_dtype=torch.bfloat16)
+        return combine(dn, order)
+
+    return layer_fn, info
+
+
+def build_torch_shared_expert(kind, w13s, w2s):
+    """Dense SwiGLU shared expert (Family C), torch ops only.
+
+    MXFP8 uses `F.scaled_mm` with the same `to_mxfp` + `to_blocked` quantize
+    the dense MLP bench drives as `smm_fast`; bf16 uses `F.linear`.
+    """
+    import torch
+    import torch.nn.functional as F
+    silu = torch.compile(silu_chunk_mul, mode="default", dynamic=False)
+
+    if kind == "bf16":
+        def shared_fn(x):
+            return F.linear(silu(F.linear(x, w13s)), w2s)
+        return shared_fn
+
+    from torch.testing._internal.common_quantized import to_mxfp, to_blocked
+    from torch._C import _ScalingType as ST, _SwizzleType as SW
+    s13s, q13s = to_mxfp(w13s.contiguous(), 32, "mxfp8")
+    s2s, q2s = to_mxfp(w2s.contiguous(), 32, "mxfp8")
+    s13s_b, s2s_b = to_blocked(s13s), to_blocked(s2s)
+    w13s_t, w2s_t = q13s.t(), q2s.t()
+
+    def quant_blocked(t):
+        s, q = to_mxfp(t.contiguous(), 32, "mxfp8")
+        return q, to_blocked(s)
+
+    qb = torch.compile(quant_blocked, mode="default", dynamic=False)
+
+    def shared_fn(x):
+        xq, sx = qb(x)
+        gu = F.scaled_mm(xq, w13s_t, sx, ST.BlockWise1x32, s13s_b,
+                         ST.BlockWise1x32, swizzle_a=SW.SWIZZLE_32_4_4,
+                         swizzle_b=SW.SWIZZLE_32_4_4, output_dtype=torch.bfloat16)
+        hq, sh = qb(silu(gu))
+        return F.scaled_mm(hq, w2s_t, sh, ST.BlockWise1x32, s2s_b,
+                           ST.BlockWise1x32, swizzle_a=SW.SWIZZLE_32_4_4,
+                           swizzle_b=SW.SWIZZLE_32_4_4, output_dtype=torch.bfloat16)
+
+    return shared_fn
 
 
 # --------------------------------------------------------------------------
@@ -388,7 +676,9 @@ def run_worker(cell):
                          dtype=torch.bfloat16) / math.sqrt(INTER)
         result["flops"] = 2.0 * rows * (2 * INTER * HIDDEN + HIDDEN * INTER)
         wbytes_e = (2 * INTER * HIDDEN + HIDDEN * INTER)
-        result["w_bytes_active"] = active * wbytes_e * (2 if impl == "triton_bf16" else 1)
+        bf16_weights = impl in ("triton_bf16", "torch_grouped_bf16_layer",
+                                "torch_grouped_bf16_layer_shared")
+        result["w_bytes_active"] = active * wbytes_e * (2 if bf16_weights else 1)
         ref = moe_layer_ref(hidden, w13, w2, topk_ids, topk_w)
 
         # `*_layer_shared`: whole MoE block = routed layer + the always-on shared
@@ -399,17 +689,22 @@ def run_worker(cell):
         shared_fn = None
         if shared:
             import torch.nn.functional as F
-            import fish_scales_ops as fso
+            if base_impl.startswith("fso_"):
+                import fish_scales_ops as fso
             assert SHARED_INTER, f"{MODEL} has no shared expert"
             Is = SHARED_INTER
             w13s = torch.randn(2 * Is, HIDDEN, device="cuda", dtype=torch.bfloat16) / math.sqrt(HIDDEN)
             w2s = torch.randn(HIDDEN, Is, device="cuda", dtype=torch.bfloat16) / math.sqrt(Is)
             result["flops"] += 2.0 * M * (2 * Is * HIDDEN + HIDDEN * Is)
-            result["w_bytes_active"] += (2 * Is * HIDDEN + HIDDEN * Is)
+            result["w_bytes_active"] += (2 * Is * HIDDEN + HIDDEN * Is) * (2 if bf16_weights else 1)
             result["shared_inter"] = Is
             gus = hidden.float() @ w13s.float().t()
             ref = ref + (F.silu(gus[:, :Is]) * gus[:, Is:]) @ w2s.float().t()
-            if base_impl == "fso_mxfp8_layer":
+            if base_impl in TORCH_IMPLS:
+                shared_fn = build_torch_shared_expert(
+                    "bf16" if base_impl == "torch_grouped_bf16_layer" else "mxfp8",
+                    w13s, w2s)
+            elif base_impl == "fso_mxfp8_layer":
                 w13s_q, s13s = fso.gemm.quantize_1x32_fp8(w13s)
                 w2s_q, s2s = fso.gemm.quantize_1x32_fp8(w2s)
 
@@ -462,6 +757,34 @@ def run_worker(cell):
             fn0 = fn
             def fn():
                 out_holder["out"] = fn0()
+            fn()
+            torch.cuda.synchronize()
+            result["cos"] = cos_sim(out_holder["out"], ref)
+        elif base_impl in TORCH_IMPLS:
+            # torch-only layer: routing (argsort of topk_ids + histogram) ->
+            # gather -> [quantize to MXFP8 + blocked scales] -> grouped gate_up
+            # -> SwiGLU -> [quantize] -> grouped down -> weighted combine, all
+            # inside the captured graph. Same timed boundary as the fso and
+            # triton / dg layer cells: only the expert weights are prepared
+            # outside.
+            layer_fn, info = build_torch_moe_layer(
+                "bf16" if base_impl == "torch_grouped_bf16_layer" else "mxfp8",
+                M, hidden, w13, w2, topk_ids, topk_w)
+            result.update(info)
+            if "scale_rows_cap" in info:
+                # what the 128-row-per-group blocked scale layout actually
+                # occupies at this routing, vs the worst-case allocation
+                counts_padded = ((counts.long() + SCALE_ROW_ALIGN - 1)
+                                 // SCALE_ROW_ALIGN * SCALE_ROW_ALIGN)
+                result["scale_rows_used"] = int(counts_padded.sum())
+            out_holder = {}
+            if shared_fn is not None:
+                routed_fn = layer_fn
+
+                def layer_fn():
+                    return routed_fn() + shared_fn(hidden)
+            def fn():
+                out_holder["out"] = layer_fn()
             fn()
             torch.cuda.synchronize()
             result["cos"] = cos_sim(out_holder["out"], ref)
