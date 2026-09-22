@@ -13,6 +13,24 @@ Scale layout the sm_90 kernel expects (verified):
   SFB = per-128x128-block FP32 scales [G, N/128, K/128] contiguous
 sm_90 supports K%128 (unlike the sm_120 block-FP8 kernel's K%512), so the
 Qwen3 down (K=768) works here.
+
+Which parts need pip `deep_gemm` and which do not. Only `test_vs_deepgemm`
+does: it is the bit-exactness check against the package the kernel was
+vendored from, and there is no way to make that claim without the package.
+Everything else on this page — the masked GEMM's own numerical correctness,
+the layout-native quantize, the SwiGLU quantize, the CUDA-graph replay and
+the composed six-kernel MoE layer — is fso plus a torch reference, and all of
+it runs on any sm_90 device whether `deep_gemm` is importable or not. The
+masked GEMM's numerical correctness is covered in both worlds:
+`test_vs_dequant_reference` runs the same shape list as `test_vs_deepgemm`
+and compares each group's defined rows against an FP32 matmul of the
+dequantised operands, which is the comparison docs/perf/README.md section 8
+asks for (the BF16 truth alone cannot separate quantization error from a
+kernel or scale bug).
+
+The exit code reflects what ran: every section that was not skipped must have
+passed, and the last line names the sections that ran and the sections that
+were skipped with the reason.
 """
 from __future__ import annotations
 
@@ -29,12 +47,64 @@ try:
 except ImportError:
     HAVE_DG = False
 
+FP8_MAX = 448.0
+
 
 def _cos(a, b):
     return F.cosine_similarity(a.double().flatten(), b.double().flatten(), dim=0).item()
 
 
-def _quant(a, w, G, m_cap, N, K):
+# --- torch reference quantizers, so this file does not need deep_gemm -------
+# Same block geometry and the same amax/448 scale rule as deep_gemm's
+# per_token_cast_to_fp8 / per_block_cast_to_fp8, written out here so that the
+# masked GEMM can be exercised (and its operands dequantised for a reference)
+# on a machine that does not have the package installed.
+
+def _q_1x128(a):
+    """[m, K] bf16 -> ([m, K] fp8_e4m3, [m, K/128] fp32), one scale per row block."""
+    m, K = a.shape
+    v = a.float().view(m, K // 128, 128)
+    s = v.abs().amax(dim=-1, keepdim=True).clamp(min=1e-4) / FP8_MAX
+    q = (v / s).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn).view(m, K)
+    return q, s.view(m, K // 128)
+
+
+def _q_128x128(w):
+    """[N, K] bf16 -> ([N, K] fp8_e4m3, [N/128, K/128] fp32), one scale per 128x128 block."""
+    N, K = w.shape
+    v = w.float().view(N // 128, 128, K // 128, 128)
+    s = v.abs().amax(dim=(1, 3), keepdim=True).clamp(min=1e-4) / FP8_MAX
+    q = (v / s).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn).view(N, K)
+    return q, s.view(N // 128, K // 128)
+
+
+def _deq_1x128(q, s):
+    m, K = q.shape
+    return (q.float().view(m, K // 128, 128) * s[:, :, None]).view(m, K)
+
+
+def _deq_128x128(q, s):
+    N, K = q.shape
+    return (q.float().view(N // 128, 128, K // 128, 128) * s[:, None, :, None]).view(N, K)
+
+
+def _quant_torch(a, w, G, m_cap, N, K):
+    """Grouped quantize with the torch reference quantizers above."""
+    Kb = K // 128
+    w_fp8 = torch.empty(G, N, K, device="cuda", dtype=torch.float8_e4m3fn)
+    w_sf = torch.empty(G, N // 128, Kb, device="cuda", dtype=torch.float32)
+    a_fp8 = torch.empty(G, m_cap, K, device="cuda", dtype=torch.float8_e4m3fn)
+    a_sf = torch.empty(G, m_cap, Kb, device="cuda", dtype=torch.float32)
+    for g in range(G):
+        q, s = _q_128x128(w[g])
+        w_fp8[g].copy_(q); w_sf[g].copy_(s)
+        q, s = _q_1x128(a[g])
+        a_fp8[g].copy_(q); a_sf[g].copy_(s)
+    return a_fp8, a_sf, w_fp8, w_sf
+
+
+def _quant_dg(a, w, G, m_cap, N, K):
+    """Grouped quantize with deep_gemm's own casts (test_vs_deepgemm only)."""
     Kb = K // 128
     w_fp8 = torch.empty(G, N, K, device="cuda", dtype=torch.float8_e4m3fn)
     w_sf = torch.empty(G, N // 128, Kb, device="cuda", dtype=torch.float32)
@@ -48,13 +118,53 @@ def _quant(a, w, G, m_cap, N, K):
     return a_fp8, a_sf, w_fp8, w_sf
 
 
+def test_vs_dequant_reference(G, m_cap, N, K, masked_list):
+    """Masked-GEMM correctness without deep_gemm.
+
+    The kernel's output for the rows a group actually defines (the first
+    masked_m[g] of them; everything above that is padding the masked contract
+    leaves undefined) is compared against an FP32 matmul of the SAME
+    dequantised operands the kernel was handed. That reference contains the
+    quantization error by construction, so what is left to disagree is the
+    kernel, its scale layout or its masking — which is what this check is for.
+    A BF16 reference is reported alongside it, as the wider gate.
+    """
+    torch.manual_seed(G * 1009 + N * 17 + K)
+    w = torch.randn(G, N, K, device="cuda", dtype=torch.bfloat16) / (K ** 0.5)
+    a = torch.randn(G, m_cap, K, device="cuda", dtype=torch.bfloat16) * 0.1
+    masked_m = torch.tensor(masked_list, device="cuda", dtype=torch.int32)
+    expected_m = max(1, int(masked_m.float().mean().item()))
+    a_fp8, a_sf, w_fp8, w_sf = _quant_torch(a, w, G, m_cap, N, K)
+
+    sa = a_sf.transpose(1, 2).contiguous()          # [G, K/128, m_cap]
+    y = fso.gemm.linear_fp8_grouped_masked(a_fp8, w_fp8, sa, w_sf.contiguous(), masked_m, expected_m)
+    torch.cuda.synchronize()
+
+    worst_deq, worst_bf, checked = 1.0, 1.0, 0
+    for g, n in enumerate(masked_list):
+        if n == 0:
+            continue
+        deq_ref = _deq_1x128(a_fp8[g, :n], a_sf[g, :n]) @ _deq_128x128(w_fp8[g], w_sf[g]).t()
+        worst_deq = min(worst_deq, _cos(y[g, :n], deq_ref))
+        worst_bf = min(worst_bf, _cos(y[g, :n], a[g, :n].float() @ w[g].float().t()))
+        checked += n
+        assert torch.isfinite(y[g, :n]).all(), f"group {g}: NaN/Inf"
+    assert worst_deq >= 0.999, \
+        f"G={G} N={N} K={K}: cos vs dequantised operands={worst_deq:.6f}"
+    assert worst_bf >= 0.999, f"G={G} N={N} K={K}: cos vs bf16={worst_bf:.6f}"
+    # Rows at or beyond masked_m are padding; the only thing asserted about
+    # them is that the kernel did not run off the end of the slab.
+    print(f"  masked G={G:>3} m_cap={m_cap:>4} N={N:>5} K={K:>5}  "
+          f"vs_deq={worst_deq:.6f} vs_bf16={worst_bf:.6f}  OK ({checked} rows)")
+
+
 def test_vs_deepgemm(G, m_cap, N, K, masked_list):
     torch.manual_seed(G * 1009 + N * 17 + K)
     w = torch.randn(G, N, K, device="cuda", dtype=torch.bfloat16) / (K ** 0.5)
     a = torch.randn(G, m_cap, K, device="cuda", dtype=torch.bfloat16) * 0.1
     masked_m = torch.tensor(masked_list, device="cuda", dtype=torch.int32)
     expected_m = max(1, int(masked_m.float().mean().item()))
-    a_fp8, a_sf, w_fp8, w_sf = _quant(a, w, G, m_cap, N, K)
+    a_fp8, a_sf, w_fp8, w_sf = _quant_dg(a, w, G, m_cap, N, K)
 
     d_ref = torch.empty(G, m_cap, N, device="cuda", dtype=torch.bfloat16)
     dg.fp8_m_grouped_gemm_nt_masked((a_fp8, a_sf), (w_fp8, w_sf), d_ref, masked_m, expected_m)
@@ -81,7 +191,7 @@ def test_graph_replay(G=8, m_cap=128, N=1536, K=2048):
     torch.manual_seed(7)
     w = torch.randn(G, N, K, device="cuda", dtype=torch.bfloat16) / (K ** 0.5)
     a = torch.randn(G, m_cap, K, device="cuda", dtype=torch.bfloat16) * 0.1
-    a_fp8, a_sf, w_fp8, w_sf = _quant(a, w, G, m_cap, N, K)
+    a_fp8, a_sf, w_fp8, w_sf = _quant_torch(a, w, G, m_cap, N, K)
     sa = a_sf.transpose(1, 2).contiguous(); sw = w_sf.contiguous()
     masked_m = torch.tensor([100, 128, 64, 32, 16, 8, 4, 1], device="cuda", dtype=torch.int32)
     em = 48
@@ -230,31 +340,74 @@ def test_h3_layer(M, G=128, topk=8, hidden=2048, inter=768):
     print(f"  H3 graph M={M:>5}  bit-exact replay + reroute cos={c2:.6f}  OK")
 
 
+# The five masked shapes both correctness sections run: a small mixed-count
+# case (including an empty group), the Qwen3-30B-A3B gate_up projection at
+# decode and mid counts, and its down projection at K=768 (K%128, which the
+# sm_120 block-FP8 kernel cannot do) small and large.
+MASKED_SHAPES = [
+    dict(G=4, m_cap=128, N=512, K=512, masked_list=[120, 64, 1, 0]),
+    dict(G=128, m_cap=64, N=1536, K=2048, masked_list=[1] * 128),    # gate_up decode (m_cap>=block_m 64)
+    dict(G=128, m_cap=64, N=1536, K=2048, masked_list=[4] * 128),    # gate_up mid
+    dict(G=128, m_cap=64, N=2048, K=768, masked_list=[4] * 128),     # down K=768 (K%128)
+    dict(G=128, m_cap=512, N=2048, K=768, masked_list=[32] * 128),   # down large
+]
+
+
 def main():
+    ran, skipped, failed = [], [], []
+
+    def section(name, heading, body):
+        """Run one named section; record whether it passed."""
+        print(heading)
+        try:
+            body()
+        except Exception as exc:  # noqa: BLE001 - report every section, hide none
+            print(f"  FAIL {name}: {exc!r}")
+            failed.append(name)
+        ran.append(name)
+
+    def done():
+        print("FAILED: " + ", ".join(failed) if failed else "ALL OK")
+        print(f"ran: {', '.join(ran) if ran else 'none'}, "
+              f"skipped: {', '.join(skipped) if skipped else 'none'}")
+        return 1 if failed else 0
+
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
-        print("sm_90 grouped block-FP8 is H200-only; skip")
-        return 0
-    if not HAVE_DG:
-        print("deep_gemm not importable; skip")
-        return 0
-    print("== sm_90 grouped block-scale FP8 masked vs deep_gemm ==")
-    test_vs_deepgemm(G=4, m_cap=128, N=512, K=512, masked_list=[120, 64, 1, 0])
-    test_vs_deepgemm(G=128, m_cap=64, N=1536, K=2048, masked_list=[1] * 128)            # gate_up decode (m_cap>=block_m 64)
-    test_vs_deepgemm(G=128, m_cap=64, N=1536, K=2048, masked_list=[4] * 128)            # gate_up mid
-    test_vs_deepgemm(G=128, m_cap=64, N=2048, K=768, masked_list=[4] * 128)             # down K=768 (K%128)
-    test_vs_deepgemm(G=128, m_cap=512, N=2048, K=768, masked_list=[32] * 128)           # down large
-    print("== H2 layout-native quantize (full fso, no deep_gemm transform) ==")
-    test_h2_layout_native(m_cap=64, N=1536, K=2048, label="gate_up decode")
-    test_h2_layout_native(m_cap=128, N=1536, K=2048, label="gate_up mid")
-    test_h2_layout_native(m_cap=128, N=2048, K=768, label="down K=768")
-    test_h2_silu()
-    print("== CUDA graph (single GEMM) ==")
-    test_graph_replay()
-    print("== H3 composed 6-kernel MoE layer (Qwen3-30B-A3B) + graph ==")
-    for M in (1, 8, 64, 512):
-        test_h3_layer(M)
-    print("ALL OK")
-    return 0
+        where = "no CUDA device" if not torch.cuda.is_available() \
+            else f"device is sm_{torch.cuda.get_device_capability()[0]}x"
+        print(f"SKIP: sm_90 grouped block-FP8 is H200-only ({where})")
+        skipped.append(f"every section (sm_90 only; {where})")
+        return done()
+
+    section("masked vs dequantised reference",
+            "== sm_90 grouped block-scale FP8 masked vs dequantised operands ==",
+            lambda: [test_vs_dequant_reference(**s) for s in MASKED_SHAPES])
+
+    if HAVE_DG:
+        section("masked vs deep_gemm",
+                "== sm_90 grouped block-scale FP8 masked vs deep_gemm ==",
+                lambda: [test_vs_deepgemm(**s) for s in MASKED_SHAPES])
+    else:
+        print("SKIP test_vs_deepgemm: deep_gemm not importable "
+              "(pip install deep_gemm or use the tiny_sglang venv)")
+        skipped.append("masked vs deep_gemm (deep_gemm not importable)")
+
+    def _h2():
+        test_h2_layout_native(m_cap=64, N=1536, K=2048, label="gate_up decode")
+        test_h2_layout_native(m_cap=128, N=1536, K=2048, label="gate_up mid")
+        test_h2_layout_native(m_cap=128, N=2048, K=768, label="down K=768")
+        test_h2_silu()
+
+    section("H2 layout-native quantize",
+            "== H2 layout-native quantize (full fso, no deep_gemm transform) ==",
+            _h2)
+    section("CUDA graph (single GEMM)",
+            "== CUDA graph (single GEMM) ==",
+            test_graph_replay)
+    section("H3 composed MoE layer",
+            "== H3 composed 6-kernel MoE layer (Qwen3-30B-A3B) + graph ==",
+            lambda: [test_h3_layer(M) for M in (1, 8, 64, 512)])
+    return done()
 
 
 if __name__ == "__main__":
