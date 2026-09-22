@@ -586,6 +586,29 @@ def _cos_against(h_fp8, sh, live, m_cap, inter, ref) -> float:
     return _cos(torch.cat(got), torch.cat(want))
 
 
+def _fused_max_ulp_gap(h_a, sa_, h_b, sb_, live, m_cap, inter) -> float:
+    """Largest disagreement between two MXFP8 activation slabs, measured in
+    steps of the e4m3 grid at each element's own magnitude.
+
+    Both slabs carry their own 1x32 UE8M0 scales, so an element's grid spacing
+    is `scale * 2^(e-3)` for a normal e4m3 number of exponent e and
+    `scale * 2^-9` at the bottom of the subnormal range. Taking the coarser of
+    the two arms' spacings makes the measure symmetric.
+    """
+    sa_b = _decode_scales_grouped(sa_, m_cap, inter)
+    sb_b = _decode_scales_grouped(sb_, m_cap, inter)
+    worst = 0.0
+    for gi, n in live.items():
+        a = _deq_group(h_a[gi, :n], sa_b[gi, :n])
+        b = _deq_group(h_b[gi, :n], sb_b[gi, :n])
+        sa_e = sa_b[gi, :n].to(a.device, torch.float32).repeat_interleave(32, dim=1)
+        sb_e = sb_b[gi, :n].to(a.device, torch.float32).repeat_interleave(32, dim=1)
+        mag = torch.maximum(a.abs(), b.abs())
+        step = torch.maximum(mag * 0.125, torch.maximum(sa_e, sb_e) * (2.0 ** -9))
+        worst = max(worst, float(((a - b).abs() / step).max()))
+    return worst
+
+
 def fused_cell(fam: str, M: int, draw: str, chain: bool = False) -> None:
     """One (family, M, draw) cell: the fused FC1 against the two-kernel pair,
     both scored on the same FP32 reference, plus the two negative controls and
@@ -642,8 +665,21 @@ def fused_cell(fam: str, M: int, draw: str, chain: bool = False) -> None:
         f"fused FC1 {fam} M={M} {draw}: NON-interleaved weights scored {c_bad:.7f}, which the " \
         f"accuracy gate would accept — the negative control no longer discriminates"
 
+    # The two arms are not bit-identical on purpose (the fused one never
+    # rounds the gate_up product to bf16), so the discriminating check is that
+    # they land on neighbouring points of the SAME e4m3 grid. One step of that
+    # grid at a value's own magnitude is 2^-3 of it for a normal e4m3 number,
+    # and the grid does not get finer than 2^-9 of the block's dequant scale,
+    # which is the floor below. A store that reduced the amax over the wrong
+    # 32 values would move whole blocks by a power of two and fail this.
+    d_ulp = _fused_max_ulp_gap(h_fus, sh_fus, h_two, sh_two, live, m_cap, inter)
+    assert d_ulp <= 1.0 + 1e-6, \
+        f"fused FC1 {fam} M={M} {draw}: the fused and two-kernel outputs differ by " \
+        f"{d_ulp:.3f} e4m3 steps, more than the one step the removed bf16 staging explains"
+
     print(f"  fused-fc1  {fam} M={M:>5} {draw:<6} live={len(live):>3}  "
-          f"cos={c_fus:.7f} (two-kernel {c_two:.7f}, non-interleaved control {c_bad:.4f})  OK")
+          f"cos={c_fus:.7f} (two-kernel {c_two:.7f}, non-interleaved control {c_bad:.4f}, "
+          f"gap {d_ulp:.3f} e4m3 steps)  OK")
 
     if chain:
         # FC1 -> FC2: hand each FC1 output to the unchanged grouped GEMM and
@@ -758,14 +794,29 @@ def test_fused_pairwise_kernel(fam: str, M: int = 64) -> None:
 def moe_layer_fso_fused(hidden, w13i_fp8, sw13i, w2_fp8, sw2, topk_ids, topk_w,
                         m_cap, expected_m, out, G, max_active_groups=0):
     """The layer with the fused FC1: five kernels instead of six. The SwiGLU
-    kernel is gone because FC1's epilogue already produced FC2's operand."""
-    masked_m, _row_map, slot_of_flat = fso.gemm.moe_build_routing(topk_ids, G, m_cap)
+    kernel is gone because FC1's epilogue already produced FC2's operand.
+
+    The packed active-expert list is asked for only where the dispatcher would
+    take the slot-bound route, since that route is its only reader; everywhere
+    else the routing kernel skips the compaction that builds it. The layer's
+    two GEMMs are FC1 (N = 2 * inter, K = hidden) and FC2 (N = hidden,
+    K = inter) and either one can be on the slot route, so the flag is the
+    disjunction over both."""
+    inter2 = w13i_fp8.shape[1]           # 2 * inter
+    hidden_dim = w2_fp8.shape[1]
+    inter = w2_fp8.shape[2]
+    want_slots = (
+        fso.gemm.mxfp8_grouped_slot_possible(m_cap, inter2, hidden_dim, G, max_active_groups)
+        or fso.gemm.mxfp8_grouped_slot_possible(m_cap, hidden_dim, inter, G, max_active_groups))
+    routing = fso.gemm.moe_build_routing(topk_ids, G, m_cap, with_slots=want_slots)
+    masked_m, _row_map, slot_of_flat = routing[:3]
+    slot_to_expert = routing[3] if want_slots else None
     topk = topk_ids.shape[1]
     hq, sh = fso.gemm.quantize_1x32_grouped_gather_fp8(hidden, slot_of_flat, topk, G, m_cap)
     dq, sd = fso.gemm.linear_mxfp8_grouped_masked_swiglu(
-        hq, w13i_fp8, sh, sw13i, masked_m, expected_m, max_active_groups)
+        hq, w13i_fp8, sh, sw13i, masked_m, expected_m, max_active_groups, slot_to_expert)
     dn = fso.gemm.linear_mxfp8_grouped_masked(dq, w2_fp8, sd, sw2, masked_m, expected_m,
-                                              max_active_groups)
+                                              max_active_groups, slot_to_expert)
     out.copy_(fso.gemm.moe_combine(dn, slot_of_flat, topk_w))
     return out
 
@@ -828,9 +879,10 @@ def test_fused_layer_graph(M: int, fam: str = "B") -> None:
 
 
 def test_fused_route_helper() -> None:
-    """The host-side router. With the knob unset it must be the negation of the
-    slot-route verdict, so the fused FC1 is off exactly where the decode route
-    is on; the two forced settings must override it in both directions."""
+    """The host-side router. Both grouped routes carry a fused FC1 now — the
+    pointer-array cascade and the swap-orientation slot kernel — so with the
+    knob unset the answer is yes on both sides of the route boundary, and
+    FSO_FC1_FUSED=0 must still turn the whole feature off."""
     G, topk, hidden, inter = FUSED_FAMILIES["B"]
     n_w = 2 * inter
     knob = os.environ.get("FSO_FC1_FUSED")
@@ -846,14 +898,41 @@ def test_fused_route_helper() -> None:
         assert decode and prefill and no_bound, \
             f"FSO_FC1_FUSED=1 did not force the fused FC1: {decode} {prefill} {no_bound}"
     else:
-        assert not decode, "the router took the fused FC1 at m_cap=4 with a slot bound, where " \
-                           "the dispatcher takes the slot route and the fusion does not exist"
+        assert decode, "the router refused the fused FC1 at m_cap=4 with a slot bound, where " \
+                       "the dispatcher takes the slot route and that route has its own fused " \
+                       "epilogue (run b300_mxfp8_20260917/M-A2)"
         assert prefill, "the router refused the fused FC1 at m_cap=1024, where the dispatcher " \
                         "takes the pointer-array cascade"
         assert no_bound, "the router refused the fused FC1 with no slot bound, where the slot " \
                          "route is unreachable and the cascade always runs"
     print(f"  fused-route  FSO_FC1_FUSED={knob or '<unset>'}  m_cap=4/bound -> {decode}, "
           f"m_cap=1024 -> {prefill}, m_cap=4/no bound -> {no_bound}  OK")
+
+
+def test_fused_slot_persistent_skip(fam: str, M: int) -> None:
+    """The fused FC1 on the slot route, at a grid with more tiles than the
+    machine has SMs.
+
+    Why this needs its own case. CUTLASS's static persistent scheduler
+    truncates the grid to the SM count, so past that point one CTA walks
+    several tiles and the kernel re-tests liveness at every one of them. The
+    fused epilogue adds a shared buffer and two named-barrier arrivals per
+    tile, which is exactly the kind of state a skipped tile could leave
+    inconsistent: if a dead tile took the barrier and a live one did not, or the
+    other way round, the epilogue warps of one CTA would deadlock or read the
+    previous tile's maxima. A hot draw is used so that one expert holds every
+    row, which maximises the number of live tiles per CTA.
+    """
+    G, topk, hidden, inter = FUSED_FAMILIES[fam]
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    m_cap = (M + 3) // 4 * 4
+    mag = min(M * topk, G)
+    tiles = mag * ((2 * inter + 127) // 128)
+    assert tiles > sms, \
+        f"fused slot persistent case {fam} M={M}: {tiles} tiles does not exceed {sms} SMs, so " \
+        f"the scheduler would not truncate the grid and the case tests nothing"
+    fused_cell(fam, M, "hot")
+    print(f"  fused-slot-persistent {fam} M={M:>3}  {tiles} tiles over {sms} SMs  OK")
 
 
 def run_fused_cases() -> None:
@@ -863,13 +942,19 @@ def run_fused_cases() -> None:
 
     for fam in ("B", "C"):
         test_fused_interleave_bit_exact(fam)
+    # M <= 32 is the decode band, where the dispatcher takes the
+    # swap-orientation slot kernel, so these cells exercise the slot route's own
+    # fused epilogue; M = 64 and 1024 stay on the pointer-array one.
     for fam in ("B", "C"):
-        for M in (1, 8, 64, 1024):
+        for M in (1, 2, 4, 8, 16, 32, 64, 1024):
             for draw in ("random", "hot", "dead"):
                 fused_cell(fam, M, draw, chain=(draw == "random"))
     for fam in ("B", "C"):
+        test_fused_slot_persistent_skip(fam, 16)
+        test_fused_slot_persistent_skip(fam, 32)
+    for fam in ("B", "C"):
         test_fused_pairwise_kernel(fam)
-    for M in (1, 64, 1024):
+    for M in (1, 8, 64, 1024):
         test_fused_layer_graph(M)
 
     # FSO_FC1_FUSED is a per-process static, so each setting is its own

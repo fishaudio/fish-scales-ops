@@ -581,10 +581,19 @@ def run_worker(cell):
             # layer-style prep: routing kernel + flat-pair gather-quant.
             # `with_slots=True` makes the routing kernel emit the packed
             # active-expert list as well, which is what lets the sm_100
-            # slot-bound decode route skip building it again per GEMM.
+            # slot-bound decode route skip building it again per GEMM. The list
+            # is only worth its block-wide compaction where that route is
+            # actually taken, so the library is asked first: outside the decode
+            # band, and on every architecture that has no slot route, the cell
+            # runs the routing kernel without it.
+            want_slots = fso.gemm.mxfp8_grouped_slot_possible(
+                m_cap, N, K, E, max_active_groups)
+            result["with_slots"] = int(want_slots)
             x_tok = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.1
-            masked_dev, row_map, slot_of_flat, slot_to_expert = fso.gemm.moe_build_routing(
-                topk_ids, E, m_cap, with_slots=True)
+            routing = fso.gemm.moe_build_routing(
+                topk_ids, E, m_cap, with_slots=want_slots)
+            masked_dev, row_map, slot_of_flat = routing[:3]
+            slot_to_expert = routing[3] if want_slots else None
             a_fp8, sa = fso.gemm.quantize_1x32_grouped_gather_fp8(
                 x_tok, slot_of_flat, TOPK, E, m_cap)
             w_fp8, sw = fso.gemm.quantize_moe_weights_1x32_fp8(w)
@@ -826,12 +835,13 @@ def run_worker(cell):
             #     decides how w13 is quantised. It is false when
             #     FSO_FC1_FUSED=0, which is exactly the control arm: the layer
             #     is then byte-for-byte the one this round started from.
-            #   * `fused_route` is the PER-CALL one. Where the dispatcher takes
-            #     the swap-orientation decode route the fusion does not exist
-            #     (that geometry puts gate_j and up_j in different lanes), so
-            #     the layer keeps the unfused FC1 there — but on interleaved
-            #     weights, which is what the SwiGLU kernel's `pairwise` flag
-            #     is for.
+            #   * `fused_route` is the PER-CALL one. Both grouped routes carry
+            #     a fused FC1 now (run b300_mxfp8_20260917/M-A2 added the
+            #     swap-orientation one), so it answers yes on both sides of the
+            #     route boundary and what it really selects is which fused
+            #     kernel the call lands on. Where it answers no the layer keeps
+            #     the unfused FC1 on interleaved weights, which is what the
+            #     SwiGLU kernel's `pairwise` flag is for.
             n_w = 2 * INTER
             fc1_interleaved = fso.gemm.mxfp8_grouped_swiglu_available(n_w, HIDDEN)
             fc1_fused = fc1_interleaved and fso.gemm.mxfp8_grouped_swiglu_fused_route(
@@ -844,13 +854,28 @@ def run_worker(cell):
 
             # The routing kernel emits the packed active-expert list in the
             # same launch (run b300_mxfp8_20260917/M-I1). Where the dispatcher
-            # takes the slot-bound decode route it then launches only the GEMM;
-            # where it does not, the list is validated and unused. Either way
-            # the layer is one kernel shorter per grouped GEMM than it was.
+            # takes the slot-bound decode route it then launches only the GEMM.
+            # Where it does not, nothing reads the list, and building it is a
+            # block-wide compaction the layer pays for nothing — so the library
+            # is asked, once per cell, whether EITHER of the layer's two grouped
+            # GEMMs would take that route (FC1 is 2*INTER x HIDDEN, FC2 is
+            # HIDDEN x INTER), and `with_slots` follows that answer. On sm_120,
+            # and on sm_100 above the decode band, the answer is no and the
+            # routing kernel does less work than it did.
+            want_slots = (
+                fso.gemm.mxfp8_grouped_slot_possible(
+                    m_cap, n_w, HIDDEN, E, max_active_groups)
+                or fso.gemm.mxfp8_grouped_slot_possible(
+                    m_cap, HIDDEN, INTER, E, max_active_groups))
+            result["with_slots"] = int(want_slots)
+
+            def build_routing():
+                r = fso.gemm.moe_build_routing(topk_ids, E, m_cap, with_slots=want_slots)
+                return r[0], r[2], (r[3] if want_slots else None)
+
             if fc1_fused:
                 def layer_fn():
-                    masked_dev, row_map, slot_of_flat, slot_to_expert = (
-                        fso.gemm.moe_build_routing(topk_ids, E, m_cap, with_slots=True))
+                    masked_dev, slot_of_flat, slot_to_expert = build_routing()
                     hq, sh = fso.gemm.quantize_1x32_grouped_gather_fp8(
                         hidden, slot_of_flat, TOPK, E, m_cap)
                     dq, sd = fso.gemm.linear_mxfp8_grouped_masked_swiglu(
@@ -862,8 +887,7 @@ def run_worker(cell):
                     return fso.gemm.moe_combine(dn, slot_of_flat, topk_w)
             else:
                 def layer_fn():
-                    masked_dev, row_map, slot_of_flat, slot_to_expert = (
-                        fso.gemm.moe_build_routing(topk_ids, E, m_cap, with_slots=True))
+                    masked_dev, slot_of_flat, slot_to_expert = build_routing()
                     hq, sh = fso.gemm.quantize_1x32_grouped_gather_fp8(
                         hidden, slot_of_flat, TOPK, E, m_cap)
                     gu = fso.gemm.linear_mxfp8_grouped_masked(

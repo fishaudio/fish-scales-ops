@@ -64,10 +64,11 @@ def linear_mxfp8(
         NotImplementedError: on sm_90 (use ``linear_fp8`` there).
     """
     _require_mxfp8_arch()
-    # sm_100/sm_103 (Blackwell datacenter) has a three-tier best-per-shape
-    # dispatch — cuBLAS scaled_mm on decode / DSL on prefill+peak / C++
-    # cascade for the narrow-N split-K decode + square cubic paths. Full
-    # rationale in `_sm100_dispatch.py`.
+    # sm_100/sm_103 (Blackwell datacenter) has a best-per-shape dispatch: an
+    # M <= 32 decode row of vendored CuTe-DSL kernels in front of three tiers
+    # — cuBLAS scaled_mm on the rest of the small-M band / DSL on
+    # prefill+peak / C++ cascade for the narrow-N split-K and square cubic
+    # paths. Full rationale in `_sm100_dispatch.py`.
     if sm_major() == 10:
         from . import _sm100_dispatch
         y = _sm100_dispatch.route(x_fp8, w_fp8, sx, sw)
@@ -258,12 +259,15 @@ def linear_mxfp8_grouped_masked_swiglu(
         sa, sw13: the opaque int32 Sm1xx atom slabs of the two operands.
         masked_m: int32 ``[G]`` on device — valid rows per group.
         expected_m: host-side tile-selection hint (``ceil(total_rows / G)``).
-        max_active_groups: accepted for signature parity with
-            :func:`linear_mxfp8_grouped_masked` and ignored — it is a
-            slot-route quantity and the fused FC1 is pointer-array only.
-        slot_to_expert: accepted for the same reason, validated the same way,
-            and likewise ignored: the slot-bound route has no fused FC1, so no
-            kernel reached from here reads the list.
+        max_active_groups: the host-static bound ``min(M * topk, G)`` on how
+            many experts can hold a row, exactly as for
+            :func:`linear_mxfp8_grouped_masked`. It selects the route: on the
+            decode band the call lands on the swap-orientation slot kernel,
+            whose fused variant needs this bound to size its grid.
+        slot_to_expert: the packed active-expert list,
+            ``moe_build_routing(..., with_slots=True)``'s fourth output. Passing
+            it lets a decode-band call launch nothing but the GEMM; leaving it
+            ``None`` costs a one-block builder launch.
 
     Returns:
         ``(h_fp8 [G, m_cap, I], sh)`` — exactly the pair
@@ -272,16 +276,16 @@ def linear_mxfp8_grouped_masked_swiglu(
         operand. Rows ``>= masked_m[g]`` are undefined.
 
     Raises:
-        NotImplementedError: on sm_120/121 and sm_90. The fused epilogue is a
-            clone of the CUTLASS pointer-array NoSmem epilogue, which exists
-            only on sm_100/sm_103; the other architectures drive different
-            grouped kernels (and sm_90 has no MXFP8 hardware at all).
+        NotImplementedError: on sm_120/121 and sm_90. The two fused epilogues
+            are clones of CUTLASS's sm_100 NoSmem epilogues, which exist only
+            on sm_100/sm_103; the other architectures drive different grouped
+            kernels (and sm_90 has no MXFP8 hardware at all).
     """
     if sm_major() != 10:
         raise NotImplementedError(
             f"linear_mxfp8_grouped_masked_swiglu needs sm_100/sm_103 (B200 / B300); this device is sm_{sm_major()}0. "
-            "The fused FC1 epilogue is a clone of the CUTLASS pointer-array NoSmem epilogue and exists only "
-            "there. On sm_120/121 use linear_mxfp8_grouped_masked + silu_chunk_mul_quantize_1x32_grouped_fp8; "
+            "The fused FC1 epilogues are clones of CUTLASS's sm_100 NoSmem epilogues and exist only there. "
+            "On sm_120/121 use linear_mxfp8_grouped_masked + silu_chunk_mul_quantize_1x32_grouped_fp8; "
             "on sm_90 use the block-FP8 grouped surface."
         )
     return torch.ops.fish_scales_ops.linear_mxfp8_grouped_masked_swiglu(
@@ -300,11 +304,12 @@ def mxfp8_grouped_swiglu_fused_route(
 
     The answer is host-static and has to be taken before the layer is composed,
     because the two forms need different weights (interleaved vs ``[gate; up]``)
-    and different follow-on kernels. It is the negation of the sm_100
-    slot-route verdict: the fused FC1 lives only on the pointer-array route,
-    while the decode band is served by the swap-orientation slot kernel, whose
-    geometry puts ``gate_j`` and ``up_j`` in different lanes and so cannot fuse.
-    Every non-sm_100 device answers ``False``.
+    and different follow-on kernels. Both sm_100 grouped routes now carry a
+    fused FC1 — the pointer-array cascade and the swap-orientation slot kernel
+    — so with the knob unset this answers ``True`` on both sides of the route
+    boundary, and what the same ``slot_route`` verdict really decides is which
+    of the two fused kernels the call lands on. It answers ``False`` only where
+    no fused instantiation covers the shape, and on every non-sm_100 device.
 
     ``FSO_FC1_FUSED`` overrides it: ``0`` always ``False``, unset applies the
     rule, ``1`` always ``True`` where the op is legal. The variable is read
@@ -339,6 +344,50 @@ def mxfp8_grouped_swiglu_available(n_w: int, k: int) -> bool:
     shape whose output width ``n_w / 2`` is not a multiple of 128.
     """
     return bool(torch.ops.fish_scales_ops.mxfp8_grouped_swiglu_available(n_w, k))
+
+
+def mxfp8_grouped_slot_possible(
+    m_cap: int,
+    n_w: int,
+    k: int,
+    num_groups: int,
+    max_active_groups: int = 0,
+) -> bool:
+    """Would a grouped GEMM of this shape take the slot-bound decode route?
+
+    The slot route is the only kernel that reads the packed active-expert list
+    :func:`moe_build_routing` emits under ``with_slots=True``, so this is the
+    question a caller has to answer before it decides whether to ask for that
+    list. The list is not free — the routing kernel pays a block-wide
+    compaction of the per-expert histogram to build it — and everywhere the
+    slot route is not taken the result is a tensor no kernel ever looks at.
+    A layer should therefore pass ``with_slots=`` the disjunction of this query
+    over its two GEMMs (FC1 ``n_w = 2 * INTER``, ``k = HIDDEN``; FC2
+    ``n_w = HIDDEN``, ``k = INTER``), which is what the benches and the layer
+    test do.
+
+    The verdict is the dispatcher's own ``slot_route``, so ``FSO_GROUPED_SLOT``
+    steers this answer exactly as it steers the route, and the two cannot drift
+    apart. Passing the list where this answers ``False`` is never wrong, only
+    wasteful; withholding it where it answers ``True`` is also correct and
+    costs that route one extra one-block launch per call.
+
+    Returns ``False`` on every architecture but sm_100/sm_103, which have no
+    slot route at all.
+
+    Args:
+        m_cap: the per-group row capacity the layer will allocate.
+        n_w: the GEMM's weight-row count N.
+        k: the GEMM's reduction extent K.
+        num_groups: G.
+        max_active_groups: ``min(M * topk, G)``; ``0`` (not supplied) keeps the
+            slot route off and so answers ``False``.
+    """
+    return bool(
+        torch.ops.fish_scales_ops.mxfp8_grouped_slot_possible(
+            m_cap, n_w, k, num_groups, max_active_groups
+        )
+    )
 
 
 def _w13_interleave_perm(two_inter: int, device: torch.device) -> torch.Tensor:
@@ -482,8 +531,20 @@ def silu_chunk_mul_quantize_1x32_grouped_fp8(
         (h_fp8 ``[G, m_cap, INTER]``, sh int32 opaque per-group scales — the
         same arch-native layout :func:`quantize_1x32_grouped_gather_fp8`
         produces, with INTER in place of K).
+
+    Raises:
+        NotImplementedError: with ``pairwise=True`` on anything but
+            sm_100/sm_103. The interleaved row order exists only to feed the
+            sm_100 fused FC1, so no other architecture ever produces a ``gu``
+            in that order.
     """
     _require_grouped_arch()
+    if pairwise and sm_major() != 10:
+        raise NotImplementedError(
+            f"silu_chunk_mul_quantize_1x32_grouped_fp8(pairwise=True) targets the sm_100/sm_103 "
+            f"interleaved gate_up layout; this device is sm_{sm_major()}0, whose grouped FC1 always "
+            f"produces the chunked [gate; up] order. Call it with pairwise=False there."
+        )
     return torch.ops.fish_scales_ops.silu_chunk_mul_quantize_1x32_grouped(
         gu, slot_of_flat, True, pairwise
     )

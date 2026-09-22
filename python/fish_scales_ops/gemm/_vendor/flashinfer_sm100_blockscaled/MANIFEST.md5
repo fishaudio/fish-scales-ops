@@ -1,0 +1,8 @@
+# vendored file md5                     wheel file md5                       file
+1abeb63cf4646f1801eaf86085bb6982  99892be684e2b5af81662ed0768ce9bb  dense_blockscaled_gemm_sm100.py
+cf5abea42ad30c91a0c22359925090cd  dba4261b2cac84e24bcf79bc46dcb0ba  dense_blockscaled_gemm_sm100_common.py
+d2f29587f1247136bab1acd37bca040a  d2f29587f1247136bab1acd37bca040a  dense_blockscaled_gemm_sm100_splitk.py
+
+# source: flashinfer-python 0.6.18.post1, flashinfer/gemm/kernels/<file>, copied 2026-09-22
+# the wheel md5 column is what a fresh extraction of that wheel must hash to;
+# the difference between the two columns is exactly TRIM.diff (see README.md).

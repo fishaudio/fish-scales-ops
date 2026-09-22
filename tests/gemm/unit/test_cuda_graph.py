@@ -537,6 +537,14 @@ def main():
         (1024,  2560, 9728),  # down M=1024 (streamk active)
         (  32,  2560, 9728),  # down M=32   (E7 override)
         (   2,  2560, 9728),  # down M=2    (streamk path)
+        # sm_100/103 decode row (M <= 32): narrow-N picks the vendored
+        # in-cluster split-K kernel and wide-N the vendored persistent kernel,
+        # and both compile through `cute.compile` on their first eager call.
+        # These two cells are what proves that compile happened during the
+        # warmup and not inside the capture; on sm_120 they are ordinary
+        # cascade cells and cost nothing extra.
+        (   1,  2560, 4096),  # wo   M=1  (decode row, split-K kernel)
+        (   1, 19456, 2560),  # gate_up M=1 (decode row, persistent kernel)
     ]
 
     # BSFP8 (1×128) paths exist on sm_90 (DeepGEMM JIT) and sm_120

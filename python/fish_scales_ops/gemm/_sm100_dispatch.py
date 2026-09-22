@@ -3,6 +3,14 @@
 Every ``linear_mxfp8`` call on Blackwell datacenter (SM100/SM103) enters
 here. The tiers, in order:
 
+0. **Decode kernels** (see :mod:`._sm100_decode`) — the M ≤ 32 band, and only
+   that band. Two vendored NVIDIA/FlashInfer CuTe-DSL kernels in swap-AB
+   orientation with an 8/16/32-wide token tile: an in-cluster split-K kernel
+   for narrow-N shapes and the plain persistent kernel for wide-N shapes.
+   This row exists only when the installed ``nvidia-cutlass-dsl`` is at least
+   4.5.0; below that it is inert and the three tiers below behave exactly as
+   they did before it was added.
+
 1. **cuBLAS ``scaled_mm``** (see :mod:`._sm100_smm`) — the small-M /
    decode wide-N band. Fair MLP bench 2026-07-07: cuBLAS's
    ``nvjet_128x128_128x6_4x1_v_bz`` (4-CTA multicast cluster + 6-stage
@@ -18,13 +26,14 @@ here. The tiers, in order:
    CollectiveBuilder doesn't pick by default.
 
 3. **C++ cascade** (``dispatch_sm100_mxfp8`` in ``dispatch.cuh``) —
-   fall-through catch-all. Owns the ``down``/``wo`` narrow-N band which
-   uses a two-kernel parallel split-K decode scheme that neither
+   fall-through catch-all. Owns the ``down``/``wo`` narrow-N band above the
+   decode band, which uses a two-kernel parallel split-K scheme that neither
    cuBLAS nor the DSL kernel can match, plus a NoSmem-epilogue
    overlapping-accumulator path for square cubic shapes.
 
 Env kills: ``FSO_DISABLE_SMM=1`` skips tier 1, ``FSO_DISABLE_DSL=1``
-skips tier 2, both together = pure C++.
+skips tier 2 and the decode row, ``FSO_DISABLE_DECODE_DSL=1`` skips the decode
+row alone, all together = pure C++.
 """
 from __future__ import annotations
 
@@ -41,6 +50,19 @@ def route(x_fp8: torch.Tensor, w_fp8: torch.Tensor,
         return None
     m, k = x_fp8.shape
     n = w_fp8.shape[0]
+
+    # Decode row: M ≤ 32 only. It is asked first because every tier below
+    # loses that band — tier 1 and tier 2 cannot narrow their N tile below 128
+    # and tier 3 answers a narrow-N decode cell with two serialised launches.
+    # ``pick_config`` returns None for every cell it does not own, including
+    # all of M > 32, so the tiers below are reached exactly as before.
+    if m <= 32:
+        from . import _sm100_decode
+        cfg = _sm100_decode.pick_config(m, n, k)
+        if cfg is not None:
+            y = _sm100_decode.linear_mxfp8_decode(x_fp8, w_fp8, sx, sw, cfg)
+            if y is not None:
+                return y
 
     # Tier 1: cuBLAS scaled_mm for the small-M wide-N decode band.
     from . import _sm100_smm

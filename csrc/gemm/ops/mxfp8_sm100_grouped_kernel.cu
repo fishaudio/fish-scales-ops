@@ -82,14 +82,15 @@ cudaError_t launch_sm100_mxfp8_grouped_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3*
 // precondition; the ATen op documents it for callers.
 cudaError_t launch_sm100_mxfp8_grouped_swiglu_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_fp8_e4m3* H,
     int32_t* SFH, int32_t* SFA, int32_t* SFB, int32_t* masked_m, int num_groups, int m_cap, int N, int K,
-    int expected_m, cudaStream_t stream)
+    int expected_m, int max_active_groups, int const* slot_to_expert, cudaStream_t stream)
 {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-    return sm100_blockscaled_gemm::gemm_dispatch_sm100_mxfp8_grouped_swiglu(
-        A, B, H, SFH, SFA, SFB, masked_m, num_groups, m_cap, N, K, expected_m, stream);
+    return sm100_blockscaled_gemm::gemm_dispatch_sm100_mxfp8_grouped_swiglu(A, B, H, SFH, SFA, SFB, masked_m,
+        num_groups, m_cap, N, K, expected_m, max_active_groups, slot_to_expert, stream);
 #else
     (void) A; (void) B; (void) H; (void) SFH; (void) SFA; (void) SFB; (void) masked_m;
-    (void) num_groups; (void) m_cap; (void) N; (void) K; (void) expected_m; (void) stream;
+    (void) num_groups; (void) m_cap; (void) N; (void) K; (void) expected_m;
+    (void) max_active_groups; (void) slot_to_expert; (void) stream;
     return cudaErrorNotSupported;
 #endif
 }
@@ -142,6 +143,33 @@ int sm100_mxfp8_grouped_slot_refusal(int m_cap, int N, int K, int groups, int ma
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
     return static_cast<int>(
         sm100_blockscaled_gemm::grouped_detail::slot_route(m_cap, N, K, groups, max_active_groups));
+#else
+    (void) m_cap; (void) N; (void) K; (void) groups; (void) max_active_groups;
+    return 0;
+#endif
+}
+
+// Whether the dispatcher WOULD take the slot-bound decode route for this
+// (m_cap, N, K, G, max_active_groups).
+//
+// The slot route is the only consumer of the packed active-expert list that
+// `moe_build_routing(..., with_slots=True)` emits, so a caller that knows the
+// answer in advance can leave the list unbuilt wherever nothing would read it.
+// The list is not free: the routing kernel pays a block-wide scan over the
+// per-expert histogram to compact it, and outside the decode band that scan
+// produces a tensor every kernel ignores.
+//
+// Returns 1 only for `kSlotRouteSlot`. Every refusal code answers 0 as well,
+// because a refused forced call does not reach the slot kernel either. The
+// enum lives in the dispatcher header, which only this translation unit
+// includes, so the comparison stays here rather than in the ATen layer.
+int sm100_mxfp8_grouped_slot_taken(int m_cap, int N, int K, int groups, int max_active_groups)
+{
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+    return sm100_blockscaled_gemm::grouped_detail::slot_route(m_cap, N, K, groups, max_active_groups)
+            == sm100_blockscaled_gemm::grouped_detail::kSlotRouteSlot
+        ? 1
+        : 0;
 #else
     (void) m_cap; (void) N; (void) K; (void) groups; (void) max_active_groups;
     return 0;

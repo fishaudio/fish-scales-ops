@@ -112,6 +112,12 @@ GENERATED_HEADERS = [
     (CSRC / "gemm" / "tools" / "make_sm100_fused_swiglu_epilogue.py",
      Path("blockscale_gemm/arch/sm100/mxfp8/sm100_fused_swiglu_epilogue.hpp"),
      GROUPED_TU),
+    # The slot route's own fused-SwiGLU epilogue. It is a second header for the
+    # SAME translation unit as the slot kernel, which is what the (generator,
+    # header, TU) shape of this list is for.
+    (CSRC / "gemm" / "tools" / "make_sm100_fused_swiglu_slot_epilogue.py",
+     Path("blockscale_gemm/arch/sm100/mxfp8/sm100_fused_swiglu_slot_epilogue.hpp"),
+     SLOT_TU),
 ]
 
 

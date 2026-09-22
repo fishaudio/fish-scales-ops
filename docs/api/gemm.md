@@ -22,7 +22,7 @@ routing itself is CUDA-graph safe):
 |---|---|---|---|
 | sm_90 (H200) | deep_gemm WGMMA kernels, NVRTC-JIT-compiled in-process at first call; FP32 scales | not available (`NotImplementedError`) | block-FP8, expert-sorted contiguous layout (`moe_layer_fp8_sm90`) and a masked-layout variant |
 | sm_120 / sm_121 (RTX 5090, RTX PRO 6000) | CUTLASS `Sm120BlockScaledKernel`; UE8M0 scales packed into int32 words | CUTLASS `Sm120BlockScaledKernel` | MXFP8, masked slab layout |
-| sm_100 / sm_103 (B200 / B300) | since 2026-09-05: the MXFP8 tcgen05 path with each 1×128 UE8M0 scale byte replicated into its four 32-wide slots (same kernels, same bytes as MXFP8) | CUTLASS tcgen05 BlockScaled behind a three-tier router (cuBLAS `scaled_mm`, CuTe DSL persistent kernel, C++ cascade) | MXFP8, masked slab layout — same Python surface as sm_120, CUTLASS pointer-array (grouped) tcgen05 kernels |
+| sm_100 / sm_103 (B200 / B300) | since 2026-09-05: the MXFP8 tcgen05 path with each 1×128 UE8M0 scale byte replicated into its four 32-wide slots (same kernels, same bytes as MXFP8) | CUTLASS tcgen05 BlockScaled behind a router: an M ≤ 32 decode row (vendored NVIDIA CuTe-DSL split-K / persistent kernels, swap-AB, 8/16/32-wide token tile) in front of three tiers (cuBLAS `scaled_mm`, CuTe DSL persistent kernel, C++ cascade) | MXFP8, masked slab layout — same Python surface as sm_120, CUTLASS pointer-array (grouped) tcgen05 kernels |
 
 Scale tensors are **arch-native and opaque**. Quantize on the device arch the
 GEMM runs on; a scale tensor produced on one arch generation is not valid on
@@ -80,7 +80,7 @@ is the reference composition.
 | `linear_qx(x_bf16, w_fp8, sw)` | bf16 `[M, K]`, fp8 `[N, K]`, fp32 `[N/128, K/128]` | bf16 `[M, N]` | block-FP8 path, fused activation quantize; sm_90 and sm_120; raises on sm_100/103 |
 | `quantize_1x32_fp8(x)` | bf16 `[..., K]`, `K % 128 == 0` | (fp8 `[..., K]`, opaque int32 scales, arch-native) | MXFP8, UE8M0 always; sm_100/103 and sm_120 |
 | `silu_chunk_mul_quantize_1x32_fp8(gu)` | bf16 `[..., 2*INTER]` (`gate ‖ up`), `INTER % 128 == 0` | (fp8 `[..., INTER]`, opaque int32 scales) | `silu(gate) * up` quantized without materialising the BF16 intermediate; sm_100/103 and sm_120 |
-| `linear_mxfp8(x_fp8, w_fp8, sx, sw)` | fp8 `[M, K]`, fp8 `[N, K]`, opaque int32 scales from `quantize_1x32_fp8` on the same arch | bf16 `[M, N]` | `K % 128 == 0`, `N % 128 == 0`; sm_100/103 routes through the three tiers, sm_120 through the CUTLASS cascade |
+| `linear_mxfp8(x_fp8, w_fp8, sx, sw)` | fp8 `[M, K]`, fp8 `[N, K]`, opaque int32 scales from `quantize_1x32_fp8` on the same arch | bf16 `[M, N]` | `K % 128 == 0`, `N % 128 == 0`; sm_100/103 routes through the decode row and the three tiers, sm_120 through the CUTLASS cascade |
 
 The same names are exported from `fso.gemm` and from the submodules
 `fso.gemm.fp8`, `fso.gemm.mxfp8`, `fso.gemm.bf16`.
@@ -124,7 +124,7 @@ opaque scale byte layout differs (see the two `grouped MXFP8 … scales` rows in
 
 | step | function | in → out |
 |---|---|---|
-| routing | `moe_build_routing(topk_ids, num_groups, m_cap, with_slots=False)` | int32 `[M, topk]` → (`masked_m [G]`, `row_map [G*m_cap]`, `slot_of_flat [M*topk]`), plus `slot_to_expert [G]` when `with_slots=True`; `G <= 1024`, `m_cap % 4 == 0`, `m_cap >= M` |
+| routing | `moe_build_routing(topk_ids, num_groups, m_cap, with_slots=False)` | int32 `[M, topk]` → (`masked_m [G]`, `row_map [G*m_cap]`, `slot_of_flat [M*topk]`), plus `slot_to_expert [G]` when `with_slots=True`; `G <= 1024`, `m_cap % 4 == 0`, `m_cap >= M`. Ask for `with_slots` only when `mxfp8_grouped_slot_possible(…)` says a GEMM of this layer's shape would take the sm_100/103 slot route, which is the list's only reader (see *the slot-bound decode route* below) |
 | gather + quantize | `quantize_1x32_grouped_gather_fp8(x, slot_of_flat, topk, num_groups, m_cap)` | bf16 `[M, K]` → (fp8 `[G, m_cap, K]`, int32 `[G, K/128, m_cap]`) |
 | gate_up | `linear_mxfp8_grouped_masked(a_fp8, w13_fp8, sa, sw13, masked_m, expected_m, max_active_groups=0, slot_to_expert=None)` | → bf16 `[G, m_cap, 2*INTER]` |
 | SwiGLU + quantize | `silu_chunk_mul_quantize_1x32_grouped_fp8(gu, slot_of_flat)` | → (fp8 `[G, m_cap, INTER]`, int32 `[G, INTER/128, m_cap]`) |
@@ -221,9 +221,21 @@ optional argument, `slot_to_expert` (int32 `[G]` on device, contiguous, on
 output and the route launches nothing but the GEMM. Omit it and the route
 builds the same list itself with a one-block kernel before the GEMM, which is
 what it did before, so existing callers keep working unchanged.
-`linear_mxfp8_grouped_masked_swiglu` accepts and validates the same argument
-for signature parity and does not use it, because the fused FC1 exists only on
-the pointer-array route.
+`linear_mxfp8_grouped_masked_swiglu` takes the same argument and uses it the
+same way, because its decode-band form is this route's kernel with the fused
+epilogue.
+
+Ask for the list only where it will be read. `with_slots=True` makes the
+routing kernel compact the per-expert histogram it already holds into that
+list, and this route is the only consumer, so
+`mxfp8_grouped_slot_possible(m_cap, n_w, k, num_groups, max_active_groups)`
+answers — from the dispatcher's own route rule, under the same
+`FSO_GROUPED_SLOT` setting — whether a GEMM of that shape would take it; a
+layer passes `with_slots=` the disjunction of the query over its two GEMMs and
+so pays for the list on the decode band only. Passing the list where the answer
+is `False` is wasteful but never wrong, and withholding it where the answer is
+`True` costs the route one extra one-block launch per call. Every architecture
+but sm_100/103 answers `False`, because no other architecture has the route.
 
 CUTLASS's static persistent scheduler clamps the launched grid to the SM count,
 so whenever the tile space is larger than the machine each CTA loops over
@@ -299,28 +311,37 @@ bytes, because the 1×32 weight quantizer works per row along K. The op is
 sm_100/103 only and raises `NotImplementedError` naming the architecture
 elsewhere.
 
-Why the interleave is needed. The fusion works because the epilogue's
-TMEM-to-register copy hands one thread one output row and 64 consecutive N
-columns of it. With interleaved weight rows those 64 columns are 32 gate/up
-pairs, which is exactly one 1×32 output scale block, so the pairing, the SwiGLU
-and the 32-element amax all happen inside one thread's registers, with no
-shuffle, no shared memory and no second TMA descriptor. With the stacked order
-`gate_j` and `up_j` are `INTER` columns apart and never meet in one thread.
+Why the interleave is needed. The fusion works because gate and up have to
+meet in the same place in the accumulator, and the interleave is what puts them
+there. On the pointer-array route the epilogue's TMEM-to-register copy hands one
+thread one output row and 64 consecutive N columns of it, so with interleaved
+weight rows those 64 columns are 32 gate/up pairs — exactly one 1×32 output
+scale block — and the pairing, the SwiGLU and the 32-element amax all happen
+inside one thread's registers. On the swap-orientation decode route the weight
+rows sit on the accumulator's M axis instead, so with the same interleave
+`gate_j` is row `2j` and `up_j` is row `2j+1`, i.e. two adjacent LANES of one
+warp: the pairing is one `shfl_xor`, the amax over a block is one warp-wide
+reduction plus one step across the warp pair that holds the block's two halves,
+and the fp8 bytes go out transposed. Either way, with the stacked order `gate_j`
+and `up_j` are `INTER` rows or columns apart and never meet at all.
 
 Two decisions, both host-static, both taken by the library so a caller never
 restates the rule. `mxfp8_grouped_swiglu_available(n_w, k)` is the load-time
 one: a model holds one weight layout, so it decides how `w13` is quantized.
 `mxfp8_grouped_swiglu_fused_route(m_cap, n_w, k, num_groups,
-max_active_groups)` is the per-call one, and it is the negation of the
-slot-route verdict above — where the dispatcher takes the swap-orientation
-decode route the fusion does not exist, because that geometry puts `gate_j` and
-`up_j` in different lanes of the accumulator. A layer that carries interleaved
-weights and falls back to the unfused FC1 there must therefore pass
-`pairwise=True` to `silu_chunk_mul_quantize_1x32_grouped_fp8`, which reads
-`gate_i` at column `2i` and `up_i` at column `2i+1` instead of from the two
-halves of the row. That flag is sm_100/103 only and, like the weight layout,
-cannot be inferred: the wrong value multiplies the wrong pairs together and
-raises nothing.
+max_active_groups)` is the per-call one. Both grouped routes carry a fused FC1,
+so with the knob unset it answers yes on both sides of the route boundary; what
+it really decides, through the same `slot_route` the unfused FC1 asks, is WHICH
+fused kernel the call lands on. A caller that ends up on the unfused FC1 anyway
+(because it set `FSO_FC1_FUSED=0` for only part of its model, or because a
+future shape has no fused instantiation) must pass `pairwise=True` to
+`silu_chunk_mul_quantize_1x32_grouped_fp8` if its weights are interleaved; that
+kernel then reads `gate_i` at column `2i` and `up_i` at column `2i+1` instead of
+from the two halves of the row. The flag is sm_100/103 only — `pairwise=True`
+raises `NotImplementedError` naming the architecture anywhere else, because no
+other architecture's grouped FC1 ever produces a row in that order — and, like
+the weight layout, its *value* cannot be inferred: on sm_100/103 the wrong one
+multiplies the wrong pairs together and raises nothing.
 
 `FSO_FC1_FUSED` switches the whole feature: `0` never uses the fused FC1 (and
 `mxfp8_grouped_swiglu_available` then answers false, so a caller driven by it
@@ -328,9 +349,14 @@ keeps the stacked weight layout as well), unset applies the rule above, and `1`
 uses it wherever it is legal. Like the other knobs it is read once per process
 and must not change between a capture and its replays.
 
-The fused FC1 runs on the N tile the pointer-array cascade would pick for the
-unfused GEMM, with the direct-store epilogue in every case, and with one
-documented exception: the cascade's rule that prefers a 192-wide N tile when
+On the swap-orientation decode route the fused FC1 is the same 128×64×128
+kernel the unfused decode route runs, with the direct-store epilogue in place of
+the TMA-store one; its mainloop stage count is unchanged at eight and it uses
+less shared memory than the unfused kernel, because the 1 KiB the cross-warp
+amax step needs is far smaller than the staged bf16 D tiles it replaces.
+On the pointer-array route the fused FC1 runs on the N tile that cascade would
+pick for the unfused GEMM, with the direct-store epilogue in every case, and
+with one documented exception: the cascade's rule that prefers a 192-wide N tile when
 192 divides `N` and that tile's last wave of CTAs is fuller is capped at
 `expected_m <= 16` for the unfused GEMM, and that cap does not apply to the
 fused FC1. The cap exists because a wide BF16 direct store stops being cheap
@@ -389,8 +415,28 @@ layout. `moe_build_routing`, `moe_build_sorted`, `moe_combine` and
   raises there.
 - On sm_100/103 the cuBLAS `scaled_mm` tier needs a torch build with MXFP8
   `scaled_mm` (2.12); on older torch the router uses the DSL and C++ tiers
-  only. The DSL tier JIT-compiles each (tile, cluster) configuration at first
-  use (about 10 s per configuration per process).
+  only. The DSL rows JIT-compile each configuration at first use, which on a
+  B300 with nvidia-cutlass-dsl 4.8.0 costs 0.2-0.6 s per configuration per
+  process.
+- The sm_100/103 CuTe-DSL rows need `nvidia-cutlass-dsl` (the `sm100` extra).
+  The M ≤ 32 decode row needs at least **4.5.0** and **4.8.0 is the
+  recommended pin**: 4.4.2 cannot run its kernels at all, 4.5.0 through 4.5.2
+  make the JIT about four times slower than 4.4.2 on these configurations, and
+  from 4.6.1 on it is two to three times faster than 4.4.2. Below the floor,
+  or with the package missing entirely, the decode row disables itself and the
+  router behaves exactly as it did before the row existed; `FSO_LOG=1` prints
+  the one-line reason once per process.
+- The decode row costs more HOST time per call than the tiers it displaces,
+  and that is a property of the calling convention rather than of the kernels.
+  Launching it through the plain (non-TVM-FFI) CuTe-DSL convention this
+  library uses takes roughly 26 to 29 µs of host time per eager call, against
+  roughly 9 µs for the C++ cascade op and 17 µs for the cuBLAS `scaled_mm`
+  tier, because each call rebuilds the output descriptor, queries the current
+  stream and marshals ten arguments through the DSL's Python-level host entry.
+  A CUDA-graph-captured caller pays none of it: the marshalling happens once,
+  at capture, and each replay is one `cudaGraphLaunch`. Decode loops should
+  capture; a caller that must run the op eagerly one token at a time should
+  set `FSO_DISABLE_DECODE_DSL=1` and keep the previous tiers.
 
 ## Picking the right op
 
@@ -434,6 +480,7 @@ silu_chunk_mul_quantize_1x32_grouped(Tensor gu, Tensor slot_of_flat, bool use_ue
 linear_mxfp8_grouped_masked_swiglu(Tensor a_fp8, Tensor w13_fp8, Tensor sa_int32, Tensor sw13_int32, Tensor masked_m, int expected_m, int max_active_groups=0, Tensor? slot_to_expert=None) -> (Tensor, Tensor)
 mxfp8_grouped_swiglu_available(int n_w, int k) -> bool
 mxfp8_grouped_swiglu_fused_route(int m_cap, int n_w, int k, int num_groups, int max_active_groups) -> bool
+mxfp8_grouped_slot_possible(int m_cap, int n_w, int k, int num_groups, int max_active_groups) -> bool
 moe_build_routing(Tensor topk_ids, int num_groups, int m_cap, bool with_slots=False) -> (Tensor, Tensor, Tensor, Tensor)
 moe_combine(Tensor dn, Tensor slot_of_flat, Tensor topk_w) -> Tensor
 moe_build_sorted(Tensor topk_ids, int num_groups, int block_m) -> (Tensor, Tensor, Tensor)
@@ -464,9 +511,21 @@ the multi-CTA routing builder's scratch pool and the slot-bound route's
 slot-list pool (sm_100/103; all are per host thread, so each thread that
 captures needs its own eager call), the deep_gemm NVRTC compilation of each
 kernel configuration (sm_90; in-memory only, no disk cache), and the DSL JIT
-per configuration (sm_100/103). `tests/gemm/unit/test_cuda_graph.py` is the
+per configuration (sm_100/103), for the mid-band tier and for the M ≤ 32
+decode row alike. `tests/gemm/unit/test_cuda_graph.py` is the
 reference discipline: eager reference → three warm calls on the capture
 stream → capture → replay, compared bit-exactly.
+
+The sm_100/103 decode row adds one requirement to that contract, and it is the
+only place in this library where it applies to a scale buffer. Its launch path
+binds raw `data_ptr()` values rather than passing tensors, and the two MXFP8
+scale buffers are passed as bare pointers because their six-dimensional
+block-scaled layout cannot be expressed as a torch tensor. A captured graph
+therefore keeps reading the addresses that were live at capture time, for the
+activation, the weight, the output **and both scale buffers**. Rewriting any
+of those buffers in place and replaying is correct and bit-exact; handing the
+op a different tensor and replaying silently reuses the old address, exactly as
+it would for any captured kernel, with nothing to raise about it.
 
 What may change between replays: the routing. Both MoE layouts keep the
 per-expert counts and index maps on the device and derive them inside the
@@ -501,10 +560,12 @@ contract — the cascades already encode the measured picks.
 | `FSO_SWAP_STAGES=<n>` | sm_90 swap-AB grouped GEMM | pipeline depth of the swap-AB kernel (clamped to the smem budget) |
 | `FSO_JIT_INCLUDE_DIRS=a:b:c` | sm_90 | NVRTC include directories for the deep_gemm JIT (default baked at build time) |
 | `TRTLLM_DG_JIT_DEBUG=1`, `TRTLLM_DG_JIT_DUMP_CUBIN=1`, `TRTLLM_DG_JIT_USE_NVCC=1`, `TRTLLM_DG_NVCC_COMPILER=<path>`, `TRTLLM_DG_CACHE_DIR=<dir>` | sm_90 | deep_gemm JIT diagnostics: verbose compile, dump cubins, compile with nvcc instead of NVRTC, compiler path, dump directory |
-| `FSO_DISABLE_SMM=1`, `FSO_DISABLE_DSL=1` | sm_100/103 MXFP8 router | skip the cuBLAS `scaled_mm` tier / the CuTe DSL tier (both set = pure C++ cascade) |
-| `FSO_DSL_KERNEL_PATH=<file>` | sm_100/103 | alternative DSL kernel source |
+| `FSO_DISABLE_SMM=1`, `FSO_DISABLE_DSL=1` | sm_100/103 MXFP8 router | skip the cuBLAS `scaled_mm` tier / both CuTe-DSL rows, the M ≤ 32 decode row and the mid-band tier (both set = pure C++ cascade) |
+| `FSO_DISABLE_DECODE_DSL=1` | sm_100/103 MXFP8 router | skip the M ≤ 32 decode row only, leaving the mid-band DSL tier alive; this is the A/B knob for the decode row |
+| `FSO_LOG=1` | sm_100/103 MXFP8 decode row | print, once per process, why the decode row is inactive (DSL too old, package missing, import failed). Silent when the row is working |
+| `FSO_DSL_KERNEL_PATH=<file>` | sm_100/103 | alternative DSL kernel source for the mid-band tier (the decode row's kernels are vendored in-tree and not overridable) |
 | `FSO_FORCE_SWIZZLE=<n>`, `FSO_FORCE_RASTER={1,2}`, `FSO_SK_NDET=1`, `FSO_SK_DECOMP={1,2,3}` | sm_100/103 C++ cascade | scheduler raster swizzle size, raster direction (along M / along N), nondeterministic Stream-K reduction, decomposition mode — probe knobs, never wired into the cascade |
-| `FSO_PRINT_TILE_INFO=1` | sm_100/103 dense cascade | make every kernel instantiation print, once, the mainloop stage count `StageCountAutoCarveout` derived for it and its shared-memory footprint. That is the quantity that says whether a narrower `TileN` bought pipeline depth or only extra CTAs, and it is the only way to see a stage collapse (a tile whose epilogue eats the carve-out and leaves one mainloop stage) without guessing |
+| `FSO_PRINT_TILE_INFO=1` | sm_100/103 dense and grouped cascades | make every kernel instantiation print, once, the mainloop stage count `StageCountAutoCarveout` derived for it and its shared-memory footprint. That is the quantity that says whether a narrower `TileN` bought pipeline depth or only extra CTAs, and it is the only way to see a stage collapse (a tile whose epilogue eats the carve-out and leaves one mainloop stage) without guessing |
 | `FSO_GROUPED_SLOT={0,1,force,force@<N>}` | sm_100/103 grouped MoE decode route | `0` never takes the slot-bound swap-orientation route, unset or `1` applies the dispatcher's rule, `force` takes it wherever it is legal and raises where it is not, `force@<N>` forces it for the GEMM whose `N` it names only (see the grouped section above; the `force` forms are A/B knobs) |
 | `FSO_GATHER_QUANT_ONCE={0,1}` | sm_100/103 grouped MoE gather-quantize | `0` always quantizes per routed (token, expert) pair, unset applies the launcher's rule (the token-space form once its grid covers one full wave of SMs), `1` always quantizes each token once and scatters the bytes to its top-k destinations |
 | `FSO_FC1_FUSED={0,1}` | sm_100/103 grouped MoE FC1 | `0` never uses the fused FC1 (and `mxfp8_grouped_swiglu_available` then answers false, so a caller keeps the `[gate; up]` weight layout too), unset applies the router, `1` uses it wherever it is legal |

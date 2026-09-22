@@ -66,6 +66,11 @@ std::tuple<at::Tensor, at::Tensor> linear_mxfp8_grouped_masked_swiglu(at::Tensor
 bool mxfp8_grouped_swiglu_fused_route(
     int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups, int64_t max_active_groups);
 bool mxfp8_grouped_swiglu_available(int64_t n_w, int64_t k);
+// Would this grouped GEMM shape take the slot-bound decode route? The only
+// consumer of moe_build_routing's packed active-expert list, so a caller uses
+// it to decide whether to ask for that list at all.
+bool mxfp8_grouped_slot_possible(
+    int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups, int64_t max_active_groups);
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_build_routing(
     at::Tensor topk_ids, int64_t num_groups, int64_t m_cap, bool with_slots);
 at::Tensor moe_combine(at::Tensor dn, at::Tensor slot_of_flat, at::Tensor topk_w);
@@ -123,6 +128,9 @@ TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
         &blockscale_gemm::mxfp8_grouped_swiglu_fused_route);
     m.def("mxfp8_grouped_swiglu_available(int n_w, int k) -> bool",
         &blockscale_gemm::mxfp8_grouped_swiglu_available);
+    m.def("mxfp8_grouped_slot_possible(int m_cap, int n_w, int k, int num_groups, "
+                                       "int max_active_groups) -> bool",
+        &blockscale_gemm::mxfp8_grouped_slot_possible);
     m.def("moe_build_routing(Tensor topk_ids, int num_groups, int m_cap, bool with_slots=False) "
           "-> (Tensor, Tensor, Tensor, Tensor)");
     m.def("moe_combine(Tensor dn, Tensor slot_of_flat, Tensor topk_w) -> Tensor");

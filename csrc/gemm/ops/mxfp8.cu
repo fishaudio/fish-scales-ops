@@ -51,12 +51,16 @@ cudaError_t launch_sm100_mxfp8_grouped_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3*
     int expected_m, int max_active_groups, int const* slot_to_expert, cudaStream_t stream);
 bool sm100_mxfp8_grouped_compiled();
 int sm100_mxfp8_grouped_slot_refusal(int m_cap, int N, int K, int groups, int max_active_groups);
+int sm100_mxfp8_grouped_slot_taken(int m_cap, int N, int K, int groups, int max_active_groups);
 int sm100_mxfp8_grouped_slot_tile_n();
-// Fused-SwiGLU FC1 (sm_100/sm_103 pointer-array route only) and the host-side
-// router that says whether a call should take it.
+// Fused-SwiGLU FC1 (sm_100/sm_103) and the host-side router that says whether a
+// call should take it. Both grouped routes carry the fusion now -- the
+// pointer-array cascade and the swap-orientation slot kernel -- so the
+// dispatcher needs the slot route's two extra arguments as well (run
+// b300_mxfp8_20260917/M-A2).
 cudaError_t launch_sm100_mxfp8_grouped_swiglu_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_fp8_e4m3* H,
     int32_t* SFH, int32_t* SFA, int32_t* SFB, int32_t* masked_m, int num_groups, int m_cap, int N, int K,
-    int expected_m, cudaStream_t stream);
+    int expected_m, int max_active_groups, int const* slot_to_expert, cudaStream_t stream);
 int sm100_mxfp8_grouped_fused_fc1_route(int m_cap, int N, int K, int groups, int max_active_groups);
 int sm100_mxfp8_grouped_fused_fc1_available(int N, int K);
 void fp8bs_quantize_1x32_packed_grouped_gather(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
@@ -469,8 +473,11 @@ at::Tensor linear_mxfp8_grouped_masked(at::Tensor a_fp8, at::Tensor w_fp8, at::T
 // What it replaces: `linear_mxfp8_grouped_masked` on the FC1 weights followed
 // by `silu_chunk_mul_quantize_1x32_grouped`. The intermediate bf16
 // [G, m_cap, 2*I] tensor is never written and the second kernel disappears.
-// Only the sm_100/sm_103 pointer-array route has it; see the note in
-// docs/api/gemm.md for why the swap-orientation decode route cannot.
+// Both sm_100/sm_103 grouped routes carry the fusion -- the pointer-array
+// cascade and the swap-orientation slot kernel of the decode band -- and the
+// call is routed between them by the same `slot_route` rule the unfused FC1
+// uses, so `max_active_groups` and `slot_to_expert` matter here exactly as they
+// do for `linear_mxfp8_grouped_masked`.
 //
 // Returns (h_fp8 [G, m_cap, I], sh) where sh is the same opaque per-group Sm1xx
 // atom slab `silu_chunk_mul_quantize_1x32_grouped` produces, so FC2 consumes
@@ -481,9 +488,9 @@ std::tuple<at::Tensor, at::Tensor> linear_mxfp8_grouped_masked_swiglu(at::Tensor
     std::optional<at::Tensor> slot_to_expert)
 {
     TORCH_CHECK(is_sm100_family(),
-        "linear_mxfp8_grouped_masked_swiglu is implemented only on sm_100/sm_103 (B200 / B300). The fused FC1 "
-        "epilogue is a clone of the CUTLASS pointer-array NoSmem epilogue, which exists only on that "
-        "architecture; sm_120/121 drives a different grouped kernel and sm_90 has no MXFP8 hardware at all. Use "
+        "linear_mxfp8_grouped_masked_swiglu is implemented only on sm_100/sm_103 (B200 / B300). The two fused "
+        "FC1 epilogues are clones of CUTLASS sm_100 NoSmem epilogues, which exist only on that architecture; "
+        "sm_120/121 drives a different grouped kernel and sm_90 has no MXFP8 hardware at all. Use "
         "linear_mxfp8_grouped_masked + silu_chunk_mul_quantize_1x32_grouped there.");
     TORCH_CHECK(detail::sm100_mxfp8_grouped_compiled(),
         "linear_mxfp8_grouped_masked_swiglu on sm_100/sm_103 requires the extension to be built with CUDA >= 12.8 "
@@ -522,7 +529,7 @@ std::tuple<at::Tensor, at::Tensor> linear_mxfp8_grouped_masked_swiglu(at::Tensor
     TORCH_CHECK(sw13_int32.numel() == static_cast<int64_t>(G) * kp * N,
         "sw13_int32 must be [G, 2*I * K/128] (per-group Sm1xx atom slab)");
     TORCH_CHECK(sa_int32.is_contiguous() && sw13_int32.is_contiguous(), "sa/sw13 must be contiguous");
-    (void) check_slot_to_expert(slot_to_expert, G, masked_m);
+    int const* const slot_ptr = check_slot_to_expert(slot_to_expert, G, masked_m);
 
     auto h = at::empty({G, m_cap, INTER}, a_fp8.options().dtype(at::kFloat8_e4m3fn));
     auto sh = at::empty({G, m_pad * (INTER / 128)}, a_fp8.options().dtype(at::kInt));
@@ -536,13 +543,8 @@ std::tuple<at::Tensor, at::Tensor> linear_mxfp8_grouped_masked_swiglu(at::Tensor
         reinterpret_cast<int32_t*>(sa_int32.data_ptr()),
         reinterpret_cast<int32_t*>(sw13_int32.data_ptr()),
         reinterpret_cast<int32_t*>(masked_m.data_ptr()),
-        G, m_cap, N, K, static_cast<int>(expected_m), stream);
+        G, m_cap, N, K, static_cast<int>(expected_m), static_cast<int>(max_active_groups), slot_ptr, stream);
     TORCH_CHECK(err == cudaSuccess, "sm100 fused-SwiGLU grouped mxfp8 kernel error: ", cudaGetErrorString(err));
-    // The fused FC1 exists only on the pointer-array route, so neither the
-    // group bound nor the slot list can reach a kernel from here. Both are
-    // accepted and validated so that a caller can pass the same arguments to
-    // this op and to linear_mxfp8_grouped_masked without a special case.
-    (void) max_active_groups;
     return {h, sh};
 }
 
@@ -582,6 +584,34 @@ bool mxfp8_grouped_swiglu_available(int64_t n_w, int64_t k)
     if (!is_sm100_family() || !detail::sm100_mxfp8_grouped_compiled())
         return false;
     return detail::sm100_mxfp8_grouped_fused_fc1_available(static_cast<int>(n_w), static_cast<int>(k)) != 0;
+}
+
+
+// mxfp8_grouped_slot_possible: would a grouped GEMM of this shape take the
+// slot-bound decode route?
+//
+// The question a caller actually needs answered is "will anything read the
+// packed active-expert list if I ask the routing kernel for it?", and the
+// slot route is the only reader. Building the list is not free: the routing
+// kernel adds a block-wide compaction of the histogram it already holds, which
+// costs the sm_120 layer a quarter to half a microsecond per call and the
+// sm_100 layer up to three quarters of one above the decode band -- in both
+// cases for a tensor no kernel then looks at. A caller that asks this first
+// and passes `with_slots=` accordingly pays for the list exactly where it is
+// used. Every architecture but sm_100/103 answers false, because no other
+// architecture has the slot route at all.
+//
+// The verdict comes from the dispatcher's own `slot_route`, not from a
+// restatement of its rule, so the two cannot drift apart; FSO_GROUPED_SLOT
+// therefore steers this answer exactly as it steers the route.
+bool mxfp8_grouped_slot_possible(
+    int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups, int64_t max_active_groups)
+{
+    if (!is_sm100_family() || !detail::sm100_mxfp8_grouped_compiled())
+        return false;
+    return detail::sm100_mxfp8_grouped_slot_taken(static_cast<int>(m_cap), static_cast<int>(n_w),
+               static_cast<int>(k), static_cast<int>(num_groups), static_cast<int>(max_active_groups))
+        != 0;
 }
 
 

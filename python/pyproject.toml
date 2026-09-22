@@ -10,11 +10,31 @@ requires-python = ">=3.10"
 dependencies = ["torch>=2.5"]
 license = { text = "Apache-2.0" }
 
+[project.optional-dependencies]
+# sm_100 / sm_103 (B200 / B300) only. The MXFP8 router's CuTe-DSL rows -- the
+# M <= 32 decode row of `_sm100_decode.py` and the mid-band/peak tier of
+# `_sm100_dsl.py` -- import this package at runtime; every other architecture
+# and every other path in this library works without it. The floor for the
+# decode row is 4.5.0 (4.4.2 lacks `cute.nvgpu.OperandMajorMode` and
+# `Numeric.bitcast`, both of which the vendored kernels use, and below the
+# floor the decode row turns itself off rather than failing); 4.8.0 is pinned
+# here because its JIT is two to three times faster than 4.4.2's on these
+# configurations, while 4.5.0 through 4.5.2 are about four times slower.
+sm100 = ["nvidia-cutlass-dsl>=4.8.0,<5"]
+
 [tool.setuptools]
 package-dir = { "" = "." }
 packages = [
     "fish_scales_ops",
     "fish_scales_ops.gemm",
+    "fish_scales_ops.gemm._vendor",
+    "fish_scales_ops.gemm._vendor.flashinfer_sm100_blockscaled",
     "fish_scales_ops.attention",
     "fish_scales_ops.attention.backends",
+]
+
+[tool.setuptools.package-data]
+# The vendored kernels are BSD-3-Clause; their notice travels with them.
+"fish_scales_ops.gemm._vendor.flashinfer_sm100_blockscaled" = [
+    "LICENSE", "README.md", "MANIFEST.md5",
 ]

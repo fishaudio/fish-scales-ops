@@ -130,6 +130,14 @@
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/util/packed_stride.hpp"
 
+// Also generated at build time, by csrc/gemm/tools/make_sm100_fused_swiglu_slot_epilogue.py,
+// into the same build directory: the clone of CUTLASS's dense NoSmem EVT
+// epilogue whose store emits MXFP8(silu(gate) * up) in this route's swap
+// orientation. It is what the fused FC1 variant of the slot kernel binds, and
+// it comes after the epilogue collective builder because the CUTLASS header it
+// clones is only ever included from there.
+#include "blockscale_gemm/arch/sm100/mxfp8/sm100_fused_swiglu_slot_epilogue.hpp"
+
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -215,10 +223,179 @@ struct Sm100MxFP8SlotGemmConfig
     using Sm1xxBlkScaledConfig = typename CollectiveMainloop::Sm1xxBlkScaledConfig;
 };
 
+// ---------------------------------------------------------------------------
+// The fused FC1 variant of the same kernel
+// ---------------------------------------------------------------------------
+//
+// Same geometry, same forked kernel, same slot remap and per-tile skip; the
+// only difference is the epilogue, and with it the outputs. Instead of a bf16
+// [G, m_cap, 2*I] gate_up tensor it writes the fp8 [G, m_cap, I] tensor and the
+// 1x32 UE8M0 scale slab that FC2 consumes as its activation operand, so the
+// separate SwiGLU-and-requantise kernel disappears from the decode band. Run
+// b300_mxfp8_20260917/M-R1 priced that kernel at 1.8 to 4.5 microseconds of the
+// Family B M = 8 layer, on a gap of 2.03; run b300_mxfp8_20260917/M-A2 is the
+// measurement of what removing it is actually worth here.
+//
+// Two configuration knobs differ from the unfused config, and both are forced
+// by the fragment the fused store is written against rather than chosen.
+//
+//   * the epilogue SCHEDULE is the direct store (`NoSmemWarpSpecialized1Sm`)
+//     rather than `EpilogueScheduleAuto`, which resolves to the TMA bulk store.
+//     The fused store writes two transposed destinations with plain global
+//     stores and stages nothing, so a TMA store epilogue would only contribute
+//     a descriptor it never uses and the staged D tiles the mainloop then has
+//     to give up shared memory for. The NoSmem builder also pins the epilogue
+//     tile to (TileM, min(64, TileN)) = (128, 64), so one subtile is the whole
+//     CTA tile and a thread's accumulator run is the complete token tile.
+//   * the epilogue's D layout tag is N-MAJOR (RowMajor over (M, N)) rather than
+//     the caller-facing ColumnMajor. That tag does not describe a tensor any
+//     instruction touches — the fused store replaces the D store — it selects
+//     the TMEM-to-register copy atom. `sm100_get_tmem_load_op` answers
+//     16dp256b (stmatrix_t) for an M-major bf16 D, where a thread owns two rows
+//     and two columns and the gate/up partner of a value is not in a lane
+//     neighbour, and 32dp32b for an N-major one, where a thread owns ONE row
+//     and 64 consecutive columns and lane = row. Only the second shape lets the
+//     gate/up pair meet under a `shfl_xor(v, 1)`.
+//
+// What it costs: `FusedSwiGluSlotArgs` adds four scalars to the epilogue's
+// Params, and the cross-warp amax exchange adds 1 KiB to the epilogue's shared
+// storage. Both are charged to `StageCountAutoCarveout` like any other epilogue
+// storage; the resulting mainloop stage count prints under
+// FSO_PRINT_TILE_INFO=1 next to the unfused kernel's.
+template <class ET, class EC, class SC, class ED, class SD, class FC, class CT, class AC, class AD>
+class FusedSwiGluSlotEpilogueWS
+    : public cutlass::epilogue::collective::detail::Sm100TmaWarpSpecializedAdapter<
+          cutlass::epilogue::collective::FsoFusedSwiGluSlotNoSmem<ET, EC, SC, ED, SD, FC, CT, AC, AD>>
+{
+public:
+    using cutlass::epilogue::collective::detail::Sm100TmaWarpSpecializedAdapter<
+        cutlass::epilogue::collective::FsoFusedSwiGluSlotNoSmem<ET, EC, SC, ED, SD, FC, CT, AC,
+            AD>>::Sm100TmaWarpSpecializedAdapter;
+};
+
+// Re-emit the builder's OWN ten epilogue template arguments against the
+// generated clone.
+//
+// The NoSmem builder returns `CollectiveEpilogue<Sm100NoSmemWarpSpecialized,
+// EpilogueTile, ElementC, StrideC, ElementD, StrideD, FusionCallbacks,
+// CopyOpT2R, AlignmentC, AlignmentD>`. Pattern-matching that type and passing
+// its arguments through means not a single template argument of the fused
+// epilogue is guessed here: the epilogue tile, the accumulator load op and the
+// alignments are whatever the builder computed for this tile shape. If a
+// CUTLASS bump changes the builder's return type this fails to compile instead
+// of silently binding a differently-partitioned epilogue.
+template <class T>
+struct RebindFusedSwiGluSlot;
+
+template <class ET, class EC, class SC, class ED, class SD, class FC, class CT, class AC, class AD>
+struct RebindFusedSwiGluSlot<cutlass::epilogue::collective::CollectiveEpilogue<
+    cutlass::epilogue::Sm100NoSmemWarpSpecialized, ET, EC, SC, ED, SD, FC, CT, AC, AD>>
+{
+    using type = FusedSwiGluSlotEpilogueWS<ET, EC, SC, ED, SD, FC, CT, AC, AD>;
+};
+
+template <int TileM, int TileN, int TileK>
+struct Sm100MxFP8SlotSwiGluGemmConfig
+{
+    static_assert(TileM == 128, "1SM only: cluster 1x1x1 / TileM 128 is the only configuration built and measured");
+    static_assert(TileN == 64,
+        "the fused slot store is written against a 64-column token tile held whole by one thread (one epilogue "
+        "subtile); a wider token tile is also outside the route's correctness guard m_cap <= TileN");
+    static_assert(TileK == 128, "TileK must be 128 (K-major mxf8f6f4 TMA constraint; TileK 256 was not built)");
+
+    using ElementAPair = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
+    using ElementBPair = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
+    using ElementA = cutlass::float_e4m3_t;
+    using ElementB = cutlass::float_e4m3_t;
+    using ElementSF = cutlass::float_ue8m0_t;
+    // ElementD is still bf16 and D is still declared, because CUTLASS sizes the
+    // epilogue's register fragments from the D tile. Nothing is stored through
+    // it — edit 10 of the generator deletes that store — so the D pointer and
+    // stride only feed address arithmetic no instruction dereferences.
+    using ElementD = cutlass::bfloat16_t;
+    using ElementAccumulator = float;
+
+    using LayoutATag = cutlass::layout::RowMajor;
+    using LayoutBTag = cutlass::layout::ColumnMajor;
+    // See the note above: this tag is the copy-atom selector, not a description
+    // of a tensor that is written.
+    using LayoutDEpiTag = cutlass::layout::RowMajor;
+    static constexpr int AlignmentAB = 16;
+    static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
+
+    using MmaTileShape = Shape<Int<TileM>, Int<TileN>, Int<TileK>>;
+    using ClusterShape = Shape<_1, _1, _1>;
+
+    using StockEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<cutlass::arch::Sm100,
+        cutlass::arch::OpClassBlockScaledTensorOp, MmaTileShape, ClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementAccumulator, void, LayoutDEpiTag,
+        AlignmentD, ElementD, LayoutDEpiTag, AlignmentD,
+        cutlass::epilogue::NoSmemWarpSpecialized1Sm>::CollectiveOp;
+
+    using CollectiveEpilogue = typename RebindFusedSwiGluSlot<StockEpilogue>::type;
+
+    // The clone adds exactly the cross-warp amax buffer and nothing else. This
+    // is an assertion rather than a sentence in a comment because the whole
+    // stage-count argument rests on the size of this struct.
+    static_assert(sizeof(typename CollectiveEpilogue::SharedStorage)
+            <= sizeof(typename StockEpilogue::SharedStorage)
+                + sizeof(float) * cutlass::epilogue::collective::fso_swiglu_slot::kSlotAmaxFloats + 16,
+        "the fused slot epilogue grew beyond its cross-warp amax buffer, which would cost mainloop stages");
+
+    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<cutlass::arch::Sm100,
+        cutlass::arch::OpClassBlockScaledTensorOp, ElementAPair, LayoutATag, AlignmentAB, ElementBPair, LayoutBTag,
+        AlignmentAB, ElementAccumulator, MmaTileShape, ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+        cutlass::gemm::KernelTmaWarpSpecialized1SmMxf8f6f4Sm100>::CollectiveOp;
+
+    // Swapped: (M, N, K, L) = (N_w, m_cap, K, G).
+    using ProblemShape = Shape<int, int, int, int>;
+
+    using GemmKernel = cutlass::gemm::kernel::FsoSm100SlotGemm<ProblemShape, CollectiveMainloop, CollectiveEpilogue,
+        cutlass::gemm::StaticPersistentScheduler>;
+
+    using StrideA = typename GemmKernel::StrideA;
+    using StrideB = typename GemmKernel::StrideB;
+    using StrideD = typename GemmKernel::StrideD;
+    using Sm1xxBlkScaledConfig = typename CollectiveMainloop::Sm1xxBlkScaledConfig;
+};
+
 // Upper bound on experts; matches `grouped_detail::kMaxGroups` and
 // moe_glue.cu's kMaxGroups, so the slot-list pool is sized once and never
 // reallocated.
 constexpr int kMaxSlots = 1024;
+
+// FSO_PRINT_TILE_INFO=1: print, once per instantiation, what
+// StageCountAutoCarveout gave the mainloop and what the epilogue cost it. The
+// fused and unfused slot kernels print the same line so the two are directly
+// comparable, which is the measurement the fused epilogue's shared buffer has
+// to justify itself against.
+inline bool slot_print_tile_info() noexcept
+{
+    static bool const on = []
+    {
+        char const* e = std::getenv("FSO_PRINT_TILE_INFO");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    return on;
+}
+
+template <class Config>
+inline void slot_report_tile_info(char const* tag, int tile_n)
+{
+    if (!slot_print_tile_info())
+        return;
+    static bool s_done = false;
+    if (s_done)
+        return;
+    s_done = true;
+    std::fprintf(stderr,
+        "[fso] sm100 slot %s: TileM=128 TileN=%d TileK=128 cluster=1x1 stages=%d epi_smem=%zu kernel_smem=%zu\n", tag,
+        tile_n, static_cast<int>(Config::CollectiveMainloop::DispatchPolicy::Stages),
+        sizeof(typename Config::CollectiveEpilogue::SharedStorage),
+        static_cast<std::size_t>(Config::GemmKernel::SharedStorageSize));
+}
 
 // Whether this translation unit compiled CUTLASS's sm_100 grid-dependency
 // control instructions into the forked kernel. The defining translation unit
@@ -507,6 +684,7 @@ cudaError_t launch_sm100_mxfp8_slot_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* ma
 
     if (!GemmKernel::can_implement(args))
         return cudaErrorInvalidValue;
+    sd::slot_report_tile_info<Config>("unfused", static_cast<int>(cute::size<1>(typename Config::MmaTileShape{})));
     Params const params = GemmKernel::to_underlying_arguments(args, s_ws); // host-only
     dim3 const grid = GemmKernel::get_grid_shape(params);
 
@@ -587,6 +765,203 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8_slot(__nv_fp8_e4m3* mat_a, __nv_fp8
         return cudaErrorInvalidValue;
     return launch_sm100_mxfp8_slot_gemm<slot_detail::Sm100MxFP8SlotGemmConfig<128, kSlotTileN, 128>>(mat_a, mat_b,
         mat_d, scales_a, scales_b, masked_m, groups, num_slots, m_cap, shape_n, shape_k, slot_to_expert, stream);
+}
+
+// ---------------------------------------------------------------------------
+// The fused FC1 on the slot route
+// ---------------------------------------------------------------------------
+//
+// Everything the unfused launcher above does — the slot list, the prep kernel,
+// the programmatic dependent launch, the workspace pool, the shared-memory
+// attribute — it does too; only the destinations change. Two things are
+// specific to it.
+//
+// First, D. The generated epilogue's last edit deletes the bf16 store, but the
+// D tensor is still declared because CUTLASS sizes the epilogue's register
+// fragments from it. The pointer and the stride therefore only ever feed
+// address arithmetic that no instruction dereferences. They are pointed at the
+// real fp8 output slab rather than at a second allocation so that the address
+// the epilogue forms is inside a buffer that exists, which keeps a debugger's
+// view of it meaningful; compute-sanitizer confirms nothing is read or written
+// through it.
+//
+// Second, the Params cache. There is none here, for the same reason the unfused
+// slot launcher has none: `to_underlying_arguments` on this kernel is cheap
+// (the dense kernel builds five TMA descriptors from host-static extents and
+// does not walk a per-group argument array), and a captured graph holds the
+// Params its node was captured with either way.
+template <class Config>
+cudaError_t launch_sm100_mxfp8_slot_swiglu_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_fp8_e4m3* out_h,
+    int32_t* out_sfh, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int groups, int num_slots, int m_cap,
+    int shape_n, int shape_k, int const* slot_to_expert, cudaStream_t stream)
+{
+    using GemmKernel = typename Config::GemmKernel;
+    using Params = typename GemmKernel::Params;
+    using Args = typename GemmKernel::Arguments;
+    namespace sd = slot_detail;
+
+    if (groups < 1 || groups > sd::kMaxSlots)
+        return cudaErrorInvalidValue;
+    if (num_slots < 1 || num_slots > groups)
+        num_slots = groups;
+    // The output width I = N_w / 2 must be a whole number of the scale slab's
+    // 128-column blocks, or a 1x32 block would straddle two of them. The caller
+    // is refused above this point; this is the last line of defence.
+    if ((shape_n & 1) != 0 || ((shape_n / 2) % 128) != 0 || (m_cap % 4) != 0)
+        return cudaErrorInvalidValue;
+
+    bool const pdl = sd::slot_pdl_enabled();
+    int const* slots = slot_to_expert;
+    if (slots == nullptr)
+    {
+        int* const own = sd::SlotPool::instance().acquire(stream);
+        if (own == nullptr)
+            return cudaErrorMemoryAllocation;
+        slots = own;
+        cudaLaunchConfig_t cfg{};
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = pdl ? 1 : 0;
+        cfg.gridDim = dim3(1);
+        cfg.blockDim = dim3(256);
+        cfg.dynamicSmemBytes = 0;
+        cfg.stream = stream;
+        cfg.attrs = attrs;
+        cfg.numAttrs = 1;
+        cudaError_t const prep_err = cudaLaunchKernelEx(
+            &cfg, sd::sm100_slot_build_kernel, own, static_cast<int32_t const*>(masked_m), groups, num_slots, pdl);
+        if (prep_err != cudaSuccess)
+            return prep_err;
+    }
+
+    int const pm = shape_n; // expert weight rows (2*I, gate/up interleaved), on the M axis
+    int const pn = m_cap;   // routed token rows, on the N axis
+    int64_t const inter = shape_n / 2;
+    int64_t const m_pad = (static_cast<int64_t>(m_cap) + 127) / 128 * 128;
+    auto const stride_a
+        = cutlass::make_cute_packed_stride(typename Config::StrideA{}, cute::make_shape(pm, shape_k, groups));
+    auto const stride_b
+        = cutlass::make_cute_packed_stride(typename Config::StrideB{}, cute::make_shape(pn, shape_k, groups));
+    auto const stride_d
+        = cutlass::make_cute_packed_stride(typename Config::StrideD{}, cute::make_shape(pm, pn, groups));
+
+    auto const layout_sfa
+        = Config::Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(pm, pn, shape_k, groups));
+    auto const layout_sfb
+        = Config::Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(pm, pn, shape_k, groups));
+
+    cutlass::KernelHardwareInfo hw_info;
+    hw_info.device_id = 0;
+    hw_info.sm_count = sd::device_sm_count();
+
+    Args args{cutlass::gemm::GemmUniversalMode::kGemm, {pm, pn, shape_k, groups},
+        {reinterpret_cast<typename Config::ElementA const*>(mat_b), stride_a,
+            reinterpret_cast<typename Config::ElementB const*>(mat_a), stride_b,
+            reinterpret_cast<typename Config::ElementSF const*>(scales_b), layout_sfa,
+            reinterpret_cast<typename Config::ElementSF const*>(scales_a), layout_sfb},
+        {{}, nullptr, stride_d, reinterpret_cast<typename Config::ElementD*>(out_h), stride_d}, hw_info, {}};
+    args.epilogue.thread.alpha = 1.0f;
+    args.epilogue.thread.beta = 0.0f;
+    // The two real destinations. Base pointers plus per-group element counts,
+    // because the MoE slabs are contiguous in the group index and the epilogue
+    // already holds the expert id.
+    args.epilogue.fused.ptr_h = out_h;
+    args.epilogue.fused.ptr_sfh = out_sfh;
+    args.epilogue.fused.h_group_elems = static_cast<long long>(m_cap) * inter;
+    args.epilogue.fused.sf_group_words = m_pad * (inter / 128);
+    args.fso_slot_to_expert = slots;
+    args.fso_masked_m = masked_m;
+    args.fso_num_slots = num_slots;
+
+    static thread_local void* s_ws = nullptr;
+    static thread_local std::size_t s_ws_bytes = 0;
+    std::size_t const need = GemmKernel::get_workspace_size(args);
+    if (need > s_ws_bytes)
+    {
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(stream, &cap);
+        if (cap == cudaStreamCaptureStatusActive)
+        {
+            std::fprintf(stderr,
+                "[fish_scales_ops] sm_100 slot-bound fused-SwiGLU MXFP8: needs %zu workspace bytes during stream "
+                "capture but the pool holds %zu. Warm up linear_mxfp8_grouped_masked_swiglu eagerly before "
+                "capturing.\n",
+                need, s_ws_bytes);
+            std::abort();
+        }
+        if (s_ws)
+            cudaFree(s_ws);
+        if (need > 0 && cudaMalloc(&s_ws, need) != cudaSuccess)
+            return cudaErrorMemoryAllocation;
+        s_ws_bytes = need;
+        if (GemmKernel::initialize_workspace(args, s_ws, stream) != cutlass::Status::kSuccess)
+            return cudaErrorUnknown;
+    }
+
+    if (!GemmKernel::can_implement(args))
+        return cudaErrorInvalidValue;
+    sd::slot_report_tile_info<Config>("fused", static_cast<int>(cute::size<1>(typename Config::MmaTileShape{})));
+    Params const params = GemmKernel::to_underlying_arguments(args, s_ws); // host-only
+    dim3 const grid = GemmKernel::get_grid_shape(params);
+
+    static bool s_smem_configured = false;
+    if (!s_smem_configured)
+    {
+        if (GemmKernel::SharedStorageSize >= (48 << 10))
+        {
+            cudaError_t const result = cudaFuncSetAttribute(cutlass::device_kernel<GemmKernel>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, GemmKernel::SharedStorageSize);
+            if (result != cudaSuccess)
+                return result;
+        }
+        s_smem_configured = true;
+    }
+
+    dim3 const block = GemmKernel::get_block_shape();
+    if (sd::kSlotGdcCompiled && pdl)
+    {
+        cudaLaunchConfig_t cfg{};
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = 1;
+        cfg.gridDim = grid;
+        cfg.blockDim = block;
+        cfg.dynamicSmemBytes = GemmKernel::SharedStorageSize;
+        cfg.stream = stream;
+        cfg.attrs = attrs;
+        cfg.numAttrs = 1;
+        cudaError_t const r = cudaLaunchKernelEx(&cfg, cutlass::device_kernel<GemmKernel>, params);
+        if (r != cudaSuccess)
+            return r;
+        return cudaGetLastError();
+    }
+    cutlass::device_kernel<GemmKernel><<<grid, block, GemmKernel::SharedStorageSize, stream>>>(params);
+    return cudaGetLastError();
+}
+
+// Which (N_w, K) the fused slot variant is instantiated for. The extra clause
+// over `sm100_mxfp8_slot_instantiated` is the output width: I = N_w / 2 must be
+// a whole number of the scale slab's 128-column blocks, so that a 1x32 output
+// block never straddles two of them. Every MoE class this route serves as FC1
+// satisfies it (Family B N_w = 1536 -> I = 768, Family C N_w = 1024 -> I = 512).
+inline bool sm100_mxfp8_slot_swiglu_instantiated(int shape_n, int shape_k)
+{
+    return sm100_mxfp8_slot_instantiated(shape_n, shape_k) && (shape_n % 2 == 0) && ((shape_n / 2) % 128 == 0);
+}
+
+// Top-level sm_100 / sm_103 slot-bound fused-SwiGLU FC1 entry. Legality
+// (m_cap <= kSlotTileN, an instantiation for (N_w, K), a known slot bound) is
+// decided in `grouped_dispatch.cuh` and refused by the op before the call gets
+// here; the check below is the last line of defence, not the guard.
+inline cudaError_t gemm_dispatch_sm100_mxfp8_slot_swiglu(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b,
+    __nv_fp8_e4m3* out_h, int32_t* out_sfh, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int groups,
+    int num_slots, int m_cap, int shape_n, int shape_k, int const* slot_to_expert, cudaStream_t stream)
+{
+    if (m_cap > kSlotTileN || num_slots < 1 || !sm100_mxfp8_slot_swiglu_instantiated(shape_n, shape_k))
+        return cudaErrorInvalidValue;
+    return launch_sm100_mxfp8_slot_swiglu_gemm<slot_detail::Sm100MxFP8SlotSwiGluGemmConfig<128, kSlotTileN, 128>>(
+        mat_a, mat_b, out_h, out_sfh, scales_a, scales_b, masked_m, groups, num_slots, m_cap, shape_n, shape_k,
+        slot_to_expert, stream);
 }
 
 } // namespace sm100_blockscaled_gemm

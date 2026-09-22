@@ -89,10 +89,33 @@ using namespace cute;
 // call site in the cascade exactly like the dense path, because the dense
 // A/B measurements showed the direct store wins only where the store phase
 // is a small fraction of the tile's work.
-template <int TileM, int TileN, int ClusterM, int ClusterN, int TileK = 128, bool NoSmemEpi = false>
+//
+// `EvtEpi` (run b300_mxfp8_20260917/M-A1) selects HOW the direct-store epilogue
+// partitions the CTA tile, and it only means anything when `NoSmemEpi` is set.
+//
+// With the OpClass below left at `OpClassTensorOp` the CUTLASS builder takes
+// its legacy `thread::LinearCombination` branch, and that branch selects the
+// DEFAULT-fusion specialisation of the pointer-array NoSmem epilogue, which
+// brings the WHOLE CTA tile of the accumulator into one thread's registers
+// before it stores. The register cost of that therefore grows with TileN, and
+// the M-A1 sweep measured exactly that shape: on the Family B FC2 at
+// expected_m = 4 the direct store is the fastest configuration at TileN = 192
+// (46.70 us) and the slowest at TileN = 256 (69.00 us), a non-monotonicity a
+// store-volume argument cannot produce.
+//
+// `OpClassBlockScaledTensorOp` selects the EVT specialisation instead, which
+// divides the CTA tile by the epilogue tile the NoSmem builder pins to,
+// (TileM, min(64, TileN)). The fragment is then one output row by 64 columns
+// whatever TileN is, so the register cost stops growing with the N tile. That
+// is the same specialisation the fused-SwiGLU FC1 config below already builds
+// against; this flag makes it reachable for the ORDINARY bf16 store as well.
+template <int TileM, int TileN, int ClusterM, int ClusterN, int TileK = 128, bool NoSmemEpi = false,
+    bool EvtEpi = false>
 struct Sm100MxFP8GroupedGemmConfig
 {
     static_assert(TileM == 128 || TileM == 256, "blockscaled UMMA: TileM must be 128 (1SM) or 256 (2SM)");
+    static_assert(!EvtEpi || NoSmemEpi,
+        "EvtEpi chooses how the DIRECT store partitions the CTA tile; it is meaningless for the TMA store");
     static_assert(TileN == 64 || TileN == 128 || TileN == 192 || TileN == 256,
         "blockscaled UMMA: TileN must be 64, 128, 192 or 256 (the SF block is padded up on the N axis)");
     static_assert(TileK == 128 || TileK == 256, "TileK must be 128 or 256 (K-major mxf8f6f4 TMA constraint)");
@@ -129,8 +152,15 @@ struct Sm100MxFP8GroupedGemmConfig
             cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm,
             cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm>>;
 
+    // See the note on `EvtEpi` above the template: this is the one argument
+    // that picks between the builder's default-fusion and EVT specialisations
+    // of the pointer-array NoSmem epilogue. It is inert when NoSmemEpi is
+    // false, because the TMA-store schedule has one specialisation either way.
+    using EpilogueOpClass
+        = cute::conditional_t<EvtEpi, cutlass::arch::OpClassBlockScaledTensorOp, cutlass::arch::OpClassTensorOp>;
+
     using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-        cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm100, EpilogueOpClass,
         MmaTileShape, ClusterShape,
         cutlass::epilogue::collective::EpilogueTileAuto,
         ElementAccumulator, ElementAccumulator,
@@ -158,6 +188,16 @@ struct Sm100MxFP8GroupedGemmConfig
         CollectiveEpilogue>;
 
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+    // Mainloop depth that StageCountAutoCarveout derived for this tile after
+    // the epilogue's shared storage was subtracted, plus the resulting per-CTA
+    // shared-memory footprint. Same three constants the dense config exposes,
+    // for the same reason: a tile choice trades staged bytes per buffer against
+    // the number of buffers, and FSO_PRINT_TILE_INFO should report that rather
+    // than leave it to be guessed.
+    static constexpr int kStages = CollectiveMainloop::DispatchPolicy::Stages;
+    static constexpr int kSmemBytes = static_cast<int>(GemmKernel::SharedStorageSize);
+    static constexpr int kEpiSmemBytes = static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage));
 
     using Sm1xxBlkScaledConfig = typename GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
     using InternalLayoutSFA = typename GemmKernel::CollectiveMainloop::InternalLayoutSFA;
@@ -315,6 +355,16 @@ struct Sm100MxFP8GroupedSwiGluGemmConfig
         CollectiveEpilogue>;
 
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+    // Mainloop depth that StageCountAutoCarveout derived for this tile after
+    // the epilogue's shared storage was subtracted, plus the resulting per-CTA
+    // shared-memory footprint. Same three constants the dense config exposes,
+    // for the same reason: a tile choice trades staged bytes per buffer against
+    // the number of buffers, and FSO_PRINT_TILE_INFO should report that rather
+    // than leave it to be guessed.
+    static constexpr int kStages = CollectiveMainloop::DispatchPolicy::Stages;
+    static constexpr int kSmemBytes = static_cast<int>(GemmKernel::SharedStorageSize);
+    static constexpr int kEpiSmemBytes = static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage));
 
     using Sm1xxBlkScaledConfig = typename GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
     using InternalLayoutSFA = typename GemmKernel::CollectiveMainloop::InternalLayoutSFA;

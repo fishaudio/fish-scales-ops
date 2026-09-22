@@ -72,6 +72,13 @@
 //   ST=6 -> 2SM cluster(2,1) K128 direct-store (NoSmem) epilogue
 //   ST=7 -> 1SM cluster(1,1) K256 direct-store (NoSmem) epilogue
 //   ST=8 -> 2SM cluster(2,1) K256 direct-store (NoSmem) epilogue
+//   ST=9 -> 1SM cluster(1,1) K128 direct store, EVT-partitioned epilogue tile
+//   ST=11-> 1SM cluster(2,1) K128 TMA epilogue (weight tile multicast to the
+//           two CTAs of the cluster, which hold neighbouring M tiles)
+// ST 9 and ST 11 were added in run b300_mxfp8_20260917/M-A1 and are wired at
+// TN 128/192/256 (ST 9) and TN 192/256 (ST 11). ST=10 is deliberately unused:
+// the 2SM form of ST 9 would need the 2Sm NoSmem epilogue class, which the
+// direct-store fragment this variant exists to fix is not written against.
 //
 // The TN field carries the N-tile width. Until 2026-09-17 only 128 and 256
 // were instantiated; the narrow widths the block-scaled builder also accepts
@@ -84,7 +91,9 @@
 //   128,192,5   1SM cluster(1,1) K128 direct-store epilogue, 192-wide N tile
 // The 2SM and TileK 256 variants are deliberately not extended to the narrow
 // widths: both lost everywhere in the 2026-09-15 sweep, so a narrow-N version
-// of them would only enlarge the binary.
+// of them would only enlarge the binary. Run b300_mxfp8_20260917/M-A1 re-swept
+// all twenty pre-existing codes on both Qwen3 MoE families at M = 64 to 4096
+// and reproduced that verdict at every cell, so the omission stands.
 
 #pragma once
 
@@ -128,6 +137,22 @@ using GSfConfig = typename RefConfig::Sm1xxBlkScaledConfig;
 // pool can be sized once and never reallocated (a reallocation would strand
 // the cached Params, which hold the array pointers).
 constexpr int kMaxGroups = 1024;
+
+// FSO_PRINT_TILE_INFO: print, once per kernel instantiation, the mainloop stage
+// count StageCountAutoCarveout derived and the shared memory the kernel asks
+// for. The dense path has had this since the sm_100 port; the grouped path had
+// not, which is why the picked tile could only be read out of an nsys trace's
+// mangled name. Host-side, read once, and off unless the variable is set.
+inline bool read_print_tile_info() noexcept
+{
+    static int s_cache = -1;
+    if (s_cache < 0)
+    {
+        char const* env = std::getenv("FSO_PRINT_TILE_INFO");
+        s_cache = (env && *env && env[0] != '0') ? 1 : 0;
+    }
+    return s_cache != 0;
+}
 
 // Builds every per-group argument array from `masked_m`. One thread per group.
 //
@@ -439,6 +464,17 @@ cudaError_t slot_kernel_launch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_
     int32_t* scales_b, int32_t* masked_m, int groups, int num_slots, int m_cap, int shape_n, int shape_k,
     int const* slot_to_expert, cudaStream_t stream);
 
+// The same kernel with the SwiGLU and the MXFP8 requantise folded into its
+// epilogue: it writes the fp8 [G, m_cap, I] tensor and its 1x32 UE8M0 scale
+// slab instead of the bf16 [G, m_cap, 2*I] gate_up tensor, so the decode band
+// no longer launches the separate SwiGLU kernel either (run
+// b300_mxfp8_20260917/M-A2). Same two-function shape as above, for the same
+// translation-unit reason.
+bool slot_swiglu_kernel_instantiated(int shape_n, int shape_k);
+cudaError_t slot_swiglu_kernel_launch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_fp8_e4m3* out_h,
+    int32_t* out_sfh, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int groups, int num_slots, int m_cap,
+    int shape_n, int shape_k, int const* slot_to_expert, cudaStream_t stream);
+
 // What the route decision came out as. Anything from kSlotRouteRefusedMcap
 // onwards means the caller forced the slot route on a configuration its
 // correctness guard rejects; the op turns each of those into a TORCH_CHECK
@@ -633,8 +669,12 @@ inline SlotRouteDecision slot_route(
 // store (that is the specialisation the fused store is written against).
 struct CascadePick
 {
-    int tile_n;   // 128, 192 or 256
-    bool nosmem;  // true = direct TMEM->register->global store, false = TMA bulk store
+    int tile_n;        // 128, 192 or 256
+    bool nosmem;       // true = direct TMEM->register->global store, false = TMA bulk store
+    bool evt = false;  // with nosmem: partition the CTA tile by the epilogue tile
+                       // (the EVT form, see `EvtEpi` in grouped_gemm_types.cuh)
+                       // instead of holding the whole CTA tile in one thread's
+                       // registers. Ignored when nosmem is false.
 };
 
 // Rule 4's wave arithmetic: how full is the last wave of the grid a given
@@ -667,13 +707,27 @@ inline CascadePick cascade_pick(int m_cap, int shape_n, int shape_k, int groups,
             return CascadePick{192, true};
         return CascadePick{256, false};
     }
-    // Short mainloop, sliver store: 128-wide N tile with the direct store. The
-    // shorter the mainloop, the further up expected_m the direct store stays
-    // ahead.
-    int const nosmem_em_max = (shape_k <= 512) ? 16 : 1;
-    if (em <= nosmem_em_max)
-        return CascadePick{128, true};
-    // Short mainloop, full store: back to the 256-wide tile and the TMA store.
+    // Short mainloop (rule 3, re-derived in run b300_mxfp8_20260917/M-A1; the
+    // long comment on rules 1-5 below carries the measurement). The question
+    // the branch asks is whether the 192-wide tile's five mainloop buffers
+    // cover the whole K loop.
+    //
+    // Four K-tiles or fewer: they do, and that tile with the EVT-partitioned
+    // direct store was the fastest configuration measured at every expected_m,
+    // eleven consecutive M without a crossover. The cap at 256 is not a
+    // measured boundary -- expected_m only reached 128 on the grid -- it is
+    // there so an unmeasured extrapolation cannot run away.
+    if (shape_k <= 512)
+    {
+        if (em <= 256)
+            return CascadePick{shape_n >= 192 ? 192 : 128, true, true};
+        return CascadePick{256, false};
+    }
+    // More K-tiles than the narrower tile can buffer: take the 256-wide tile,
+    // with the EVT direct store while the store is still a sliver and the TMA
+    // bulk store once the rows pile up.
+    if (em <= 64)
+        return CascadePick{shape_n >= 256 ? 256 : 128, true, true};
     return CascadePick{256, false};
 }
 
@@ -685,17 +739,19 @@ inline CascadePick cascade_pick(int m_cap, int shape_n, int shape_k, int groups,
 // `1` uses it wherever it is legal. Read once into a function-local static, so
 // nothing can change between a CUDA-graph capture and its replays.
 //
-// The rule. The fused FC1 exists only on the pointer-array route, because the
-// fusion needs a thread to hold one output row and a contiguous run of that
-// row's N columns; the slot route puts the weight rows on the M axis instead,
-// so gate_j and up_j land in different TMEM datapaths and the fusion would need
-// a cross-lane amax and a transposed store (run b300_mxfp8_20260917/M-E1
-// section 1.8). Wherever the dispatcher would take the slot route, then, the
-// layer must keep the old pair — the old FC1 plus the separate SwiGLU kernel —
-// and wherever it would take the pointer-array cascade the fused FC1 replaces
-// both. So the decision is exactly the negation of `slot_route`'s verdict, and
-// it is computed from the same function rather than from a restatement of its
-// rule, so the two can never drift apart.
+// The rule. BOTH routes now have a fused FC1, so the answer is simply "yes
+// wherever an instantiation exists". The two fusions are different pieces of
+// code because the two routes hold the accumulator differently — the
+// pointer-array route has a thread own one output row and a contiguous run of
+// that row's N columns, so the gate/up pairing and the 32-wide amax are
+// register-local, while the slot route's swap puts the weight rows on M, so the
+// pair sits in two lanes and one 1x32 block spans two warps (run
+// b300_mxfp8_20260917/M-E1 section 1.8 stated the problem, run
+// b300_mxfp8_20260917/M-A2 solved it with a `shfl_xor` for the pair, one
+// `redux.sync` per warp and one shared-memory step across the warp pair). What
+// the dispatcher has to decide is therefore not WHETHER to fuse but WHICH fused
+// kernel to launch, and that question is answered by `slot_route` exactly as it
+// is for the unfused FC1, so the two can never drift apart.
 //
 // `shape_n` here is the FC1 weight-row count N = 2 * I, the same quantity
 // `slot_route` is asked about for the unfused FC1.
@@ -738,19 +794,28 @@ inline bool fused_fc1_route(int m_cap, int shape_n, int shape_k, int groups, int
         return false;
     if (fused_fc1_knob() == 2)
         return true;
-    return slot_route(m_cap, shape_n, shape_k, groups, max_active_groups) != kSlotRouteSlot;
+    // Where the dispatcher takes the slot route, the fused FC1 is the slot
+    // route's own fused variant, so the caller may still use the fused op — but
+    // only if that variant is instantiated for this shape. If it is not, the
+    // caller must keep the old pair, because the fused op would otherwise have
+    // to fall back to the pointer-array fused kernel on a band where the slot
+    // route is 2 to 9 per cent faster.
+    if (slot_route(m_cap, shape_n, shape_k, groups, max_active_groups) == kSlotRouteSlot)
+        return slot_swiglu_kernel_instantiated(shape_n, shape_k);
+    return true;
 }
 
 } // namespace grouped_detail
 
 // Launch one (TileM, TileN, ClusterM, ClusterN, TileK, NoSmemEpi)
 // instantiation of the grouped kernel.
-template <int TileM, int TileN, int ClusterM, int ClusterN, int TileK = 128, bool NoSmemEpi = false>
+template <int TileM, int TileN, int ClusterM, int ClusterN, int TileK = 128, bool NoSmemEpi = false,
+    bool EvtEpi = false>
 cudaError_t launch_sm100_mxfp8_grouped_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bfloat16* mat_d,
     int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int groups, int m_cap, int shape_n, int shape_k,
     cudaStream_t stream, int swizzle = 0)
 {
-    using Config = Sm100MxFP8GroupedGemmConfig<TileM, TileN, ClusterM, ClusterN, TileK, NoSmemEpi>;
+    using Config = Sm100MxFP8GroupedGemmConfig<TileM, TileN, ClusterM, ClusterN, TileK, NoSmemEpi, EvtEpi>;
     using Gemm = typename Config::Gemm;
     using GemmKernel = typename Config::GemmKernel;
     using Args = typename Gemm::Arguments;
@@ -765,6 +830,20 @@ cudaError_t launch_sm100_mxfp8_grouped_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3*
 
     if (groups < 1 || groups > gd::kMaxGroups)
         return cudaErrorInvalidValue;
+
+    if (gd::read_print_tile_info())
+    {
+        static bool s_info_printed = false;
+        if (!s_info_printed)
+        {
+            s_info_printed = true;
+            std::fprintf(stderr,
+                "[fso sm100 grouped tile] %dx%dx%d cluster=(%d,%d) nosmem=%d evt=%d "
+                "stages=%d smem_bytes=%d epi_smem_bytes=%d\n",
+                TileM, TileN, TileK, ClusterM, ClusterN, static_cast<int>(NoSmemEpi),
+                static_cast<int>(EvtEpi), Config::kStages, Config::kSmemBytes, Config::kEpiSmemBytes);
+        }
+    }
 
     auto& pool = gd::ArgPool::instance();
     int const slot_idx = pool.acquire(stream);
@@ -963,17 +1042,89 @@ cudaError_t launch_sm100_mxfp8_grouped_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3*
 // flight than it can run, and the narrower tile measured 2.5-4.6 % faster on
 // the layer cell at M = 2 and M = 4 while being a tie at M = 1.
 //
-// Rule 3 — the direct-store (NoSmem) epilogue wins exactly while the store is
-// a sliver. The epilogue writes a 128-row tile but only expected_m of those
-// rows are inside the problem, so the store volume grows with expected_m while
-// the mainloop does not, and the shorter the mainloop the sooner the store
-// dominates. That is why the cut-off is K-dependent: at K = 512 (4 K-tiles)
-// the direct store is 4-9 % faster all the way to expected_m = 16 and only
-// turns into a 14 % loss at expected_m = 64, while at K = 768 (6 K-tiles) it
-// is ahead by 0.6-1.7 % at expected_m = 1 and already 1.3-1.7 % behind at
-// expected_m = 4. On the long-K route the 256-wide tile with a direct store was
-// the worst config measured anywhere (+9 to +46 %), so the wide route keeps the
-// TMA store; rule 4 below is the one narrow exception.
+// Rule 3 — on a short mainloop the direct store beats the TMA bulk store for
+// most of the band, it has to be the EVT-partitioned form of that epilogue, and
+// which N tile it is paired with is decided by whether that tile's mainloop
+// buffers cover the K loop.
+//
+// Re-derived in run b300_mxfp8_20260917/M-A1. That run forced every
+// instantiation the pointer-array family can express — four N widths x two
+// TileK x 1SM/2SM x two epilogues, the twenty codes ST 1-8 — through
+// FSO_FORCE_TILE on the FC2 of both Qwen3 MoE families at M = 64 to 4096, on
+// the LAYER cell, two interleaved passes whose median pass-to-pass
+// disagreement was 0.12 per cent and whose worst was 1.04 per cent, against a
+// control whose process timed the same list of cells. (An unmatched control is
+// worth up to 2.3 per cent on this bench, because a process that has drawn and
+// freed more tensors meets the next M with a different allocator state; that
+// had to be fixed before any of the numbers below meant anything.)
+//
+// What the twenty said, and what was wrong with them. The shipped pick — the
+// 256-wide tile with the TMA bulk store — was the best of the twenty from
+// expected_m = 32 upwards on both families, and below that the 192-wide tile
+// with the DIRECT store was 0.2 to 3.7 per cent faster. But the direct store
+// was not monotone in the N tile: at expected_m = 4 on Family B it cost 49.00
+// microseconds at TileN = 128, 46.70 at 192 and 69.00 at 256. No argument about
+// store volume produces that shape.
+//
+// The cause, and the instantiation that removes it. The unfused config built
+// the pointer-array NoSmem epilogue through the CUTLASS builder's
+// DEFAULT-fusion branch, which brings the whole CTA tile of the accumulator
+// into one thread's registers, so the register cost grows with TileN until the
+// tile stops fitting. `EvtEpi` in grouped_gemm_types.cuh selects the EVT
+// specialisation instead, whose fragment is one output row by 64 columns
+// whatever TileN is. That the epilogue is the whole of the difference can be
+// read off FSO_PRINT_TILE_INFO, which now reports the grouped path too: the two
+// direct-store forms produce the SAME mainloop — 6 / 5 / 4 stages at TileN
+// 128 / 192 / 256 and the same 206976 / 216576 / 206848 bytes of shared memory
+// — and differ only in a 1-byte against a 32-byte epilogue carve-out. Nothing
+// about the loads changed; only how the accumulator reaches global memory.
+// With that one template argument the 256-wide direct store stops collapsing
+// and becomes the fastest configuration measured anywhere in the band: on
+// Family B it takes the whole layer cell from 128.14 to 124.04 microseconds at
+// M = 64, 133.16 to 128.80 at 128, 137.74 to 133.45 at 256, 145.20 to 141.19
+// at 512 and 158.22 to 154.85 at 1024 — 2.1 to 3.3 per cent of the layer — and
+// the isolated FC2 from 46.81 to 44.56 microseconds at M = 64.
+//
+// Why the branch is on `shape_k <= 512` rather than on a single width. The
+// direct store's shared-memory carve-out is one byte where the TMA store's is
+// 17408, so StageCountAutoCarveout gives the direct store's 192-wide tile FIVE
+// mainloop buffers against the 256-wide tile's four. Family C's FC2 has
+// K = 512, four K-tiles at TileK 128, so the fifth buffer covers the WHOLE
+// mainloop and no K-tile load is ever waited on; Family B's has K = 768, six
+// K-tiles, so it does not, and the wider tile's smaller CTA count wins instead.
+// Measured, Family C prefers 192 at every M of the grid by 1.1 to 2.1 per cent
+// of the layer and Family B prefers 256 at every M by 1.0 to 1.8 per cent; both
+// runs are seven consecutive M wide and reproduce on both passes.
+//
+// Why only the long-K side of the branch carries a cut-off. Where the fifth
+// buffer covers the loop there is no crossover to find: on Family C the
+// 192-wide EVT direct store is ahead of the shipped pick at expected_m = 1, 2,
+// 3, 4, 8, 16, 32, 48, 64, 96 and 128 — eleven consecutive M, by 0.6 to 6.7 per
+// cent of the layer — and the grid ends before it turns over. Where it does
+// not, Family B crosses over between expected_m = 96 (the EVT direct store
+// still wins the layer by 0.8 per cent) and expected_m = 128 (it loses by 0.9,
+// and the isolated FC2 by 5.6). The cut-off is written at 64 rather than 96
+// because 64 is the last expected_m at which the win is decisive (2.1 per cent)
+// rather than inside the noise band; the 0.8 per cent at expected_m = 96 is
+// knowingly left on the table.
+//
+// What did NOT change, with the numbers that say so. The 2SM (256-row) tile
+// lost at every M of both families, by 36 per cent at M = 64 and 7 per cent at
+// M = 4096 on the isolated FC2, so rule 1 stands. TileK 256 lost at every M of
+// both families, by 13 per cent at M = 64 and 18 per cent at M = 4096, so the K
+// tile stays at 128. A two-CTA cluster on the 1SM tile, which multicasts the
+// weight tile to the two CTAs holding neighbouring M tiles and is the one axis
+// of this family no earlier sweep had touched, lost at every M of both families
+// — its best width runs 1.10 to 1.86 times the cascade's own pick on the
+// isolated FC2 and 1.03 to 1.30 times on the layer — which is the same verdict
+// the dense path recorded for cluster multicast in the mid band. It stays
+// reachable as ST 11 and is not on the cascade.
+//
+// Rule 4 below keeps the default-fusion direct store it was tuned with. The EVT
+// form is very likely right there too, but rule 4 governs the LONG-mainloop
+// route, and neither family's layer ever reaches the unfused long-K cascade
+// (above m_cap = 32 the fused FC1 takes that shape and below it the slot route
+// does), so there is no layer cell to decide it on and it was left alone.
 //
 // Cascade v2 adds rule 4 (2026-09-17, second tuning pass, subtask T6). Nothing
 // in rules 1-3 changed.
@@ -1035,6 +1186,13 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8_grouped(__nv_fp8_e4m3* mat_a, __nv_
 #define DISPATCH_SM100_GROUPED(TM_, TN_, CM_, CN_, TK_, NOSMEM_)                                                       \
     launch_sm100_mxfp8_grouped_gemm<TM_, TN_, CM_, CN_, TK_, NOSMEM_>(                                                 \
         mat_a, mat_b, mat_d, scales_a, scales_b, masked_m, groups, m_cap, shape_n, shape_k, stream)
+// The same launcher with the EVT-partitioned direct store (see `EvtEpi` in
+// grouped_gemm_types.cuh). Separate macro rather than a seventh argument on the
+// one above, so the twenty pre-existing lines of the force table stay
+// character-for-character what they were.
+#define DISPATCH_SM100_GROUPED_EVT(TM_, TN_, CM_, CN_, TK_)                                                            \
+    launch_sm100_mxfp8_grouped_gemm<TM_, TN_, CM_, CN_, TK_, true, true>(                                              \
+        mat_a, mat_b, mat_d, scales_a, scales_b, masked_m, groups, m_cap, shape_n, shape_k, stream)
 
     auto forced = tensorrt_llm::kernels::blockscale_gemm::read_force_tile();
     if (tensorrt_llm::kernels::blockscale_gemm::force_tile_applies(forced, static_cast<uint32_t>(shape_k))
@@ -1061,6 +1219,24 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8_grouped(__nv_fp8_e4m3* mat_a, __nv_
         if (tm == 128 && tn == 256 && st == 7) return DISPATCH_SM100_GROUPED(128, 256, 1, 1, 256, true);
         if (tm == 256 && tn == 128 && st == 8) return DISPATCH_SM100_GROUPED(256, 128, 2, 1, 256, true);
         if (tm == 256 && tn == 256 && st == 8) return DISPATCH_SM100_GROUPED(256, 256, 2, 1, 256, true);
+        // ST 9 (run b300_mxfp8_20260917/M-A1): the direct store again, but with
+        // the EVT partitioning of the CTA tile instead of the builder's
+        // default-fusion whole-tile-in-registers form. Same store destination,
+        // same bytes; what changes is how many registers the epilogue needs,
+        // which is what made the default-fusion direct store collapse at
+        // TileN = 256.
+        if (tm == 128 && tn == 128 && st == 9) return DISPATCH_SM100_GROUPED_EVT(128, 128, 1, 1, 128);
+        if (tm == 128 && tn == 192 && st == 9) return DISPATCH_SM100_GROUPED_EVT(128, 192, 1, 1, 128);
+        if (tm == 128 && tn == 256 && st == 9) return DISPATCH_SM100_GROUPED_EVT(128, 256, 1, 1, 128);
+        // ST 11: the 1-SM 128-row tile in a TWO-CTA cluster. The cluster's two
+        // CTAs hold neighbouring M tiles of the same N tile, so the weight tile
+        // is TMA-multicast to both instead of being fetched twice. It is the
+        // one axis of the pointer-array family the M-A1 sweep had not touched,
+        // and it is aimed at the only band the sweep left open: prefill, where
+        // an expert holds more than one 128-row tile and the FC2 therefore
+        // streams each expert's weights more than once.
+        if (tm == 128 && tn == 192 && st == 11) return DISPATCH_SM100_GROUPED(128, 192, 2, 1, 128, false);
+        if (tm == 128 && tn == 256 && st == 11) return DISPATCH_SM100_GROUPED(128, 256, 2, 1, 128, false);
         std::fprintf(stderr,
             "[fso] FSO_FORCE_TILE=%d,%d,%d not wired on the sm_100 grouped path; falling through to cascade\n", tm, tn,
             st);
@@ -1091,6 +1267,12 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8_grouped(__nv_fp8_e4m3* mat_a, __nv_
     // the two cannot drift apart.
     grouped_detail::CascadePick const pick
         = grouped_detail::cascade_pick(m_cap, shape_n, shape_k, groups, expected_m);
+    if (pick.nosmem && pick.evt)
+    {
+        if (pick.tile_n == 128) return DISPATCH_SM100_GROUPED_EVT(128, 128, 1, 1, 128);
+        if (pick.tile_n == 192) return DISPATCH_SM100_GROUPED_EVT(128, 192, 1, 1, 128);
+        return DISPATCH_SM100_GROUPED_EVT(128, 256, 1, 1, 128);
+    }
     if (pick.nosmem)
     {
         if (pick.tile_n == 128) return DISPATCH_SM100_GROUPED(128, 128, 1, 1, 128, true);
@@ -1102,6 +1284,7 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8_grouped(__nv_fp8_e4m3* mat_a, __nv_
     return DISPATCH_SM100_GROUPED(128, 256, 1, 1, 128, false);
 
 #undef DISPATCH_SM100_GROUPED
+#undef DISPATCH_SM100_GROUPED_EVT
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,6 +1327,19 @@ cudaError_t launch_sm100_mxfp8_grouped_swiglu_gemm(__nv_fp8_e4m3* mat_a, __nv_fp
     // 2*I with I a multiple of 128), so this only fires if that contract broke.
     if (shape_n % TileN != 0 || (shape_n / 2) % 128 != 0)
         return cudaErrorInvalidValue;
+
+    if (gd::read_print_tile_info())
+    {
+        static bool s_info_printed = false;
+        if (!s_info_printed)
+        {
+            s_info_printed = true;
+            std::fprintf(stderr,
+                "[fso sm100 grouped tile] %dx%dx%d cluster=(1,1) fused-swiglu "
+                "stages=%d smem_bytes=%d epi_smem_bytes=%d\n",
+                TileM, TileN, TileK, Config::kStages, Config::kSmemBytes, Config::kEpiSmemBytes);
+        }
+    }
 
     auto& pool = gd::ArgPool::instance();
     int const slot_idx = pool.acquire(stream);
@@ -1344,11 +1540,31 @@ cudaError_t launch_sm100_mxfp8_grouped_swiglu_gemm(__nv_fp8_e4m3* mat_a, __nv_fp
 // the caller has to choose the SwiGLU kernel to match.
 inline cudaError_t gemm_dispatch_sm100_mxfp8_grouped_swiglu(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b,
     __nv_fp8_e4m3* out_h, int32_t* out_sfh, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int groups,
-    int m_cap, int shape_n, int shape_k, int expected_m, cudaStream_t stream)
+    int m_cap, int shape_n, int shape_k, int expected_m, int max_active_groups, int const* slot_to_expert,
+    cudaStream_t stream)
 {
 #define DISPATCH_SM100_GROUPED_SWIGLU(TN_)                                                                            \
     launch_sm100_mxfp8_grouped_swiglu_gemm<128, TN_, 128>(                                                            \
         mat_a, mat_b, out_h, out_sfh, scales_a, scales_b, masked_m, groups, m_cap, shape_n, shape_k, stream)
+
+    // The route first, the tile second. `slot_route` is the SAME function the
+    // unfused FC1 asks, so the fused FC1 changes which kernel a call lands on
+    // in exactly the places the unfused one does; the fusion is a property of
+    // the epilogue, not of the routing. On the decode band that means the
+    // swap-orientation slot kernel with the fused epilogue, which is the one
+    // path where the separate SwiGLU kernel used to survive the fusion (run
+    // b300_mxfp8_20260917/M-A2).
+    //
+    // FSO_FORCE_TILE is an N-tile knob of the pointer-array cascade and says
+    // nothing about the slot route, so it is not consulted here; FSO_GROUPED_SLOT
+    // is the knob that steers this decision, through `slot_route` itself.
+    if (grouped_detail::slot_route(m_cap, shape_n, shape_k, groups, max_active_groups) == grouped_detail::kSlotRouteSlot
+        && grouped_detail::slot_swiglu_kernel_instantiated(shape_n, shape_k))
+    {
+        return grouped_detail::slot_swiglu_kernel_launch(mat_a, mat_b, out_h, out_sfh, scales_a, scales_b, masked_m,
+            groups, max_active_groups < groups ? max_active_groups : groups, m_cap, shape_n, shape_k, slot_to_expert,
+            stream);
+    }
 
     // FSO_FORCE_TILE stays the A/B knob it is on the unfused path: the TN field
     // names the N-tile width and the ST field is ignored here, because the
