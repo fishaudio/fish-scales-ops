@@ -42,12 +42,16 @@ from .fp8 import (
     repack_fp8_wgt_scales,
 )
 from .mxfp8 import (
+    interleave_w13_fp8,
     linear_mxfp8,
     linear_mxfp8_grouped_masked,
+    linear_mxfp8_grouped_masked_swiglu,
     moe_build_routing,
     moe_build_sorted,
     moe_combine,
     moe_combine_sorted,
+    mxfp8_grouped_swiglu_available,
+    mxfp8_grouped_swiglu_fused_route,
     quantize_1x32_fp8,
     quantize_1x32_grouped_gather_fp8,
     quantize_moe_weights_1x32_fp8,
@@ -80,6 +84,10 @@ __all__ = [
     "linear_mxfp8",
     # Grouped MXFP8 MoE, masked layout (sm_120)
     "linear_mxfp8_grouped_masked",
+    "linear_mxfp8_grouped_masked_swiglu",
+    "mxfp8_grouped_swiglu_fused_route",
+    "mxfp8_grouped_swiglu_available",
+    "interleave_w13_fp8",
     "quantize_1x32_grouped_gather_fp8",
     "silu_chunk_mul_quantize_1x32_grouped_fp8",
     "quantize_moe_weights_1x32_fp8",

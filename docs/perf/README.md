@@ -16,11 +16,12 @@ are split by domain, then by SM version:
 | `attention/sm120.md` | NVIDIA RTX 5090 (sm_120) | prefill / paged decode / paged prefill |
 | `attention/sm100.md` | — | n/a (no native sm_100 attention kernel) |
 
-Status (2026-09-17): structure frozen; every sm_90, sm_120 and sm_103 table
+Status (2026-09-22): structure frozen; every sm_90, sm_120 and sm_103 table
 is generated from `tests/baselines/`. The B300 (sm_103) GEMM and layer tables
-were first filled on 2026-09-15 and were re-measured in full on 2026-09-17,
-from the run in `/data/bench-runs/b300_final2_20260917/`; that run was taken on
-a different card of the same pod than the 2026-09-15 one, so it replaced those
+were first filled on 2026-09-15, re-measured in full on 2026-09-17 and
+re-measured in full again on 2026-09-22, from the run in
+`/data/bench-runs/b300_final5_20260922/`; each of those runs was taken on a
+different card of the same pod than the one before it, so each replaced those
 tables rather than being merged with them. They are unlocked-clock numbers and
 labelled as such. The old single `perf.md` is archived
 outside the repository (`../fso-doc_review-backup-20260915/repo/docs/perf.md`).
@@ -181,7 +182,7 @@ environment block.
 |---|---|---|---|---|
 | sm_90 | reference column | ✓ deep_gemm JIT (dense + grouped) | — | K % 128 |
 | sm_120 | reference column | ✓ CUTLASS block-scaled (dense; K % 128, UE8M0 activation and weight scales) | ✓ dense + grouped | Family B/C MoE rows are MXFP8; block-FP8 required K % 512 and had an FP32-weight-scale bug until 2026-09-05 (section 8) |
-| sm_103 | reference column | ✓ since 2026-09-05: 1×128 scales expanded ×4 onto the MXFP8 tcgen05 tiers (same kernels and bytes as MXFP8; K % 128, N % 128); tables published 2026-09-15, re-measured 2026-09-17 | ✓ dense + grouped since 2026-09-15 | grouped MoE (M3) landed 2026-09-15: CUTLASS pointer-array block-scaled kernel on the masked slab layout, eight kernels in the captured layer; cascade v2 and the programmatic dependent launch on the prep kernel and the grouped GEMM since 2026-09-17, and the dense path gained the wave-tile rule with its 64- and 192-wide N tiles on the same day |
+| sm_103 | reference column | ✓ since 2026-09-05: 1×128 scales expanded ×4 onto the MXFP8 tcgen05 tiers (same kernels and bytes as MXFP8; K % 128, N % 128); tables published 2026-09-15, re-measured 2026-09-17 and 2026-09-22 | ✓ dense + grouped since 2026-09-15 | grouped MoE (M3) landed 2026-09-15: CUTLASS pointer-array block-scaled kernel on the masked slab layout, eight kernels in the captured layer; cascade v2 and the programmatic dependent launch on the prep kernel and the grouped GEMM since 2026-09-17, and the dense path gained the wave-tile rule with its 64- and 192-wide N tiles on the same day; since 2026-09-22 the captured layer is six kernels in the decode band, where a slot-bound grouped route indexed by the routing kernel's packed active-expert list needs no argument-preparation launch, and seven above it, where FC1's SwiGLU and requantize move into the grouped GEMM's epilogue |
 
 ## 7. Regeneration
 

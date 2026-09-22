@@ -15,6 +15,7 @@
 #include <torch/library.h>
 #include <torch/torch.h>
 
+#include <optional>
 #include <tuple>
 
 namespace blockscale_gemm
@@ -51,14 +52,22 @@ at::Tensor linear_mxfp8_raw(at::Tensor x_fp8, at::Tensor w_fp8,
                             at::Tensor sx_int32, at::Tensor sw_int32);
 // Grouped (MoE, masked layout) MXFP8 — sm_120 only (M1).
 at::Tensor linear_mxfp8_grouped_masked(at::Tensor a_fp8, at::Tensor w_fp8, at::Tensor sa_int32,
-    at::Tensor sw_int32, at::Tensor masked_m, int64_t expected_m);
+    at::Tensor sw_int32, at::Tensor masked_m, int64_t expected_m, int64_t max_active_groups,
+    std::optional<at::Tensor> slot_to_expert);
 std::tuple<at::Tensor, at::Tensor> quantize_1x32_grouped_gather(
     at::Tensor x, at::Tensor slot_of_flat, int64_t topk, int64_t num_groups,
     int64_t m_cap, bool use_ue8m0);
 std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x32_grouped(
-    at::Tensor gu, at::Tensor slot_of_flat, bool use_ue8m0);
-std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_build_routing(
-    at::Tensor topk_ids, int64_t num_groups, int64_t m_cap);
+    at::Tensor gu, at::Tensor slot_of_flat, bool use_ue8m0, bool pairwise);
+// Fused-SwiGLU FC1 (sm_100/sm_103 only) and its host-side router.
+std::tuple<at::Tensor, at::Tensor> linear_mxfp8_grouped_masked_swiglu(at::Tensor a_fp8, at::Tensor w13_fp8,
+    at::Tensor sa_int32, at::Tensor sw13_int32, at::Tensor masked_m, int64_t expected_m, int64_t max_active_groups,
+    std::optional<at::Tensor> slot_to_expert);
+bool mxfp8_grouped_swiglu_fused_route(
+    int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups, int64_t max_active_groups);
+bool mxfp8_grouped_swiglu_available(int64_t n_w, int64_t k);
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_build_routing(
+    at::Tensor topk_ids, int64_t num_groups, int64_t m_cap, bool with_slots);
 at::Tensor moe_combine(at::Tensor dn, at::Tensor slot_of_flat, at::Tensor topk_w);
 std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_build_sorted(
     at::Tensor topk_ids, int64_t num_groups, int64_t block_m);
@@ -97,13 +106,25 @@ TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
     m.def("linear_mxfp8_raw(Tensor x_fp8, Tensor w_fp8, "
                             "Tensor sx_int32, Tensor sw_int32) -> Tensor");
     m.def("linear_mxfp8_grouped_masked(Tensor a_fp8, Tensor w_fp8, Tensor sa_int32, "
-                                       "Tensor sw_int32, Tensor masked_m, int expected_m) -> Tensor");
+                                       "Tensor sw_int32, Tensor masked_m, int expected_m, "
+                                       "int max_active_groups=0, Tensor? slot_to_expert=None) -> Tensor");
     m.def("quantize_1x32_grouped_gather(Tensor x, Tensor slot_of_flat, int topk, "
                                         "int num_groups, int m_cap, bool use_ue8m0=True) -> (Tensor, Tensor)");
     m.def("silu_chunk_mul_quantize_1x32_grouped(Tensor gu, Tensor slot_of_flat, "
-                                                "bool use_ue8m0=True) -> (Tensor, Tensor)");
-    m.def("moe_build_routing(Tensor topk_ids, int num_groups, int m_cap) "
-          "-> (Tensor, Tensor, Tensor)");
+                                                "bool use_ue8m0=True, bool pairwise=False) -> (Tensor, Tensor)");
+    m.def("linear_mxfp8_grouped_masked_swiglu(Tensor a_fp8, Tensor w13_fp8, Tensor sa_int32, "
+                                              "Tensor sw13_int32, Tensor masked_m, int expected_m, "
+                                              "int max_active_groups=0, Tensor? slot_to_expert=None) "
+                                              "-> (Tensor, Tensor)");
+    // A pure host-side query (no tensor argument), so it carries its own
+    // catch-all kernel here instead of a CUDA-dispatched impl below.
+    m.def("mxfp8_grouped_swiglu_fused_route(int m_cap, int n_w, int k, int num_groups, "
+                                            "int max_active_groups) -> bool",
+        &blockscale_gemm::mxfp8_grouped_swiglu_fused_route);
+    m.def("mxfp8_grouped_swiglu_available(int n_w, int k) -> bool",
+        &blockscale_gemm::mxfp8_grouped_swiglu_available);
+    m.def("moe_build_routing(Tensor topk_ids, int num_groups, int m_cap, bool with_slots=False) "
+          "-> (Tensor, Tensor, Tensor, Tensor)");
     m.def("moe_combine(Tensor dn, Tensor slot_of_flat, Tensor topk_w) -> Tensor");
     m.def("moe_build_sorted(Tensor topk_ids, int num_groups, int block_m) "
           "-> (Tensor, Tensor, Tensor)");
@@ -135,6 +156,7 @@ TORCH_LIBRARY_IMPL(fish_scales_ops, CUDA, m)
     m.impl("linear_mxfp8_grouped_masked", &blockscale_gemm::linear_mxfp8_grouped_masked);
     m.impl("quantize_1x32_grouped_gather", &blockscale_gemm::quantize_1x32_grouped_gather);
     m.impl("silu_chunk_mul_quantize_1x32_grouped", &blockscale_gemm::silu_chunk_mul_quantize_1x32_grouped);
+    m.impl("linear_mxfp8_grouped_masked_swiglu", &blockscale_gemm::linear_mxfp8_grouped_masked_swiglu);
     m.impl("moe_build_routing", &blockscale_gemm::moe_build_routing);
     m.impl("moe_combine", &blockscale_gemm::moe_combine);
     m.impl("moe_build_sorted", &blockscale_gemm::moe_build_sorted);

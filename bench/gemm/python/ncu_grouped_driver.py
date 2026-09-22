@@ -29,6 +29,11 @@ def main():
 
     m_cap = (M + 3) // 4 * 4
     expected_m = max(1, (M * TOPK + E - 1) // E)
+    # Host-static upper bound on the number of experts that can hold a row
+    # (a top-k router gives an expert at most one row per token). The sm_100
+    # grouped dispatcher needs it to size the decode route's grid; without it
+    # that route is never taken, so profiling here would miss it.
+    max_active_groups = min(M * TOPK, E)
 
     g = torch.Generator(device="cpu").manual_seed(M * 7 + 3)
     topk_ids = torch.stack([torch.randperm(E, generator=g)[:TOPK] for _ in range(M)])
@@ -43,7 +48,8 @@ def main():
 
     torch.cuda.synchronize()
     for _ in range(iters):
-        fso.gemm.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, expected_m)
+        fso.gemm.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m,
+                                             expected_m, max_active_groups)
     torch.cuda.synchronize()
     print(f"done {proj} M={M} iters={iters}")
 

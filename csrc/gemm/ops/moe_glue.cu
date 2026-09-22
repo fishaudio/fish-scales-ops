@@ -9,7 +9,8 @@
  * launch-economics failure reproduced inside our own pipeline. These two
  * kernels replace all of it:
  *
- *   moe_build_routing : topk_ids -> (masked_m, row_map, slot_of_flat) in ONE
+ *   moe_build_routing : topk_ids -> (masked_m, row_map, slot_of_flat, and
+ *     optionally slot_to_expert) in ONE
  *     launch. Single CTA, shared-memory histogram (G <= kMaxGroups), atomic
  *     rank assignment. Slot order within a group is atomic-arrival order —
  *     a permutation of the sorted recipe, semantically equivalent (every
@@ -44,15 +45,76 @@ namespace
 constexpr int kMaxGroups = 1024;
 constexpr int kRoutingThreads = 512;
 
+// Emit the packed active-expert list that the sm_100 slot-bound grouped MXFP8
+// GEMM's grid is indexed by: the ids of the experts holding at least one routed
+// row, ascending, in the low slots, and -1 in every slot after them.
+//
+// Why it lives here. That GEMM sizes its grid by a host-static bound on the
+// number of experts that can hold rows and remaps each CTA's batch coordinate
+// from a slot to an expert id through this list, so the list has to be rebuilt
+// on device on every call (and on every graph replay). Building it takes the
+// per-expert routed row count and nothing else, and this kernel already holds
+// that count in shared memory, so a caller that asks for the list here pays a
+// block-wide scan instead of a second one-block launch of its own
+// (run b300_mxfp8_20260917/M-P1 §5.5 measured that launch at 1.58-2.32 us).
+//
+// Preconditions: `counts` holds the FINAL per-expert routed row count, the
+// block has synchronised on it, and every slot of `slot_to_expert` has already
+// been set to -1 (the scan only writes the active prefix). Block-uniform: every
+// thread of the block must reach this call.
+__device__ inline void fso_emit_slot_list(
+    int32_t* __restrict__ slot_to_expert, int32_t const* __restrict__ counts, int num_groups)
+{
+    // ONE warp does the whole scan, and that is the point: a block-wide scan
+    // needs two `__syncthreads()` -- one to publish the per-warp totals, one to
+    // publish their prefixes -- and two barriers across the routing kernel's 512
+    // threads cost about as much again as the entire kernel without the list
+    // (0.69 against 0.68 microseconds at Family B M = 1, run
+    // b300_mxfp8_20260917/M-I1, stage slopes). A single warp carries the base in
+    // a register instead and needs no barrier at all, covering kMaxGroups in 32
+    // iterations of a 32-lane shuffle scan. Every thread of the block may call
+    // this; the warps that do not participate return immediately, which is safe
+    // precisely because there is no barrier inside.
+    if ((static_cast<int>(threadIdx.x) >> 5) != 0)
+        return;
+    int const lane = static_cast<int>(threadIdx.x) & 31;
+    int base = 0;
+    for (int g0 = 0; g0 < num_groups; g0 += 32)
+    {
+        int const g = g0 + lane;
+        int const active = (g < num_groups && counts[g] > 0) ? 1 : 0;
+        int x = active;
+        for (int off = 1; off < 32; off <<= 1)
+        {
+            int const y = __shfl_up_sync(0xffffffffu, x, off);
+            if (lane >= off)
+                x += y;
+        }
+        if (active)
+            slot_to_expert[base + x - active] = g;
+        base += __shfl_sync(0xffffffffu, x, 31);
+    }
+}
+
 __global__ void moe_build_routing_kernel(
     int32_t const* __restrict__ topk_ids, // [M * topk]
     int32_t* __restrict__ masked_m,       // [G]
     int32_t* __restrict__ row_map,        // [G * m_cap] (valid slots only)
     int32_t* __restrict__ slot_of_flat,   // [M * topk]
+    int32_t* __restrict__ slot_to_expert, // [G] or nullptr (see fso_emit_slot_list)
     int num_pairs, int topk, int num_groups, int m_cap, bool pdl)
 {
     // PDL: order the topk_ids read behind the parent (upstream layer /
     // router), then release the dependent's prologue.
+    //
+    // The release stays where it is when this call also emits the slot list.
+    // The consumer of that list -- the sm_100 slot-bound GEMM -- reads it in
+    // its own prologue, so the ordering it needs is enforced on its side, by a
+    // `griddepcontrol.wait` placed ahead of that read; see the generator
+    // csrc/gemm/tools/make_sm100_slot_kernel.py, edit 4c. Withholding the
+    // release here instead would have cost every OTHER consumer of this kernel
+    // its prologue overlap, on every architecture, for a hazard that belongs to
+    // one route.
     if (pdl)
     {
         cudaGridDependencySynchronize();
@@ -64,6 +126,11 @@ __global__ void moe_build_routing_kernel(
     __shared__ int32_t cnt[kMaxGroups];
     for (int g = threadIdx.x; g < num_groups; g += blockDim.x)
         cnt[g] = 0;
+    if (slot_to_expert != nullptr)
+    {
+        for (int s = threadIdx.x; s < num_groups; s += blockDim.x)
+            slot_to_expert[s] = -1;
+    }
     __syncthreads();
 
     for (int i = threadIdx.x; i < num_pairs; i += blockDim.x)
@@ -78,6 +145,9 @@ __global__ void moe_build_routing_kernel(
 
     for (int g = threadIdx.x; g < num_groups; g += blockDim.x)
         masked_m[g] = cnt[g];
+
+    if (slot_to_expert != nullptr)
+        fso_emit_slot_list(slot_to_expert, cnt, num_groups);
 }
 
 __global__ void moe_combine_kernel(
@@ -195,7 +265,8 @@ __global__ void moe_combine_kernel(
 //   phase 3  each CTA re-reads its chunk and assigns each pair a row inside
 //            its own reserved block using shared-memory atomics;
 //   phase 4  the CTA that arrives last (a global arrival counter plus a
-//            threadfence) publishes `masked_m` from the global counters and
+//            threadfence) publishes `masked_m` from the global counters, emits
+//            the packed active-expert list when one was asked for, and
 //            re-zeroes both scratch arrays for the next call.
 //
 // Slot order inside a group therefore changes from single-CTA arrival order to
@@ -218,6 +289,7 @@ __global__ void moe_build_routing_multi_kernel(
     int32_t* __restrict__ slot_of_flat,   // [M * topk]
     int32_t* __restrict__ gcnt,           // [G]  scratch, zero in, zero out
     int32_t* __restrict__ gdone,          // [1]  scratch, zero in, zero out
+    int32_t* __restrict__ slot_to_expert, // [G] or nullptr (see fso_emit_slot_list)
     int num_pairs, int topk, int num_groups, int m_cap, bool pdl)
 {
     if (pdl)
@@ -266,14 +338,29 @@ __global__ void moe_build_routing_multi_kernel(
     __syncthreads();
     if (s_last)
     {
+        // The slot list is emitted in this same final pass, by the one CTA that
+        // already publishes `masked_m`, because it is the only CTA that can see
+        // the finished per-expert totals. Those totals live in `gcnt`, which the
+        // same loop has to zero for the next call, so they are parked in the
+        // shared `base` array -- dead since phase 3 -- and the scan reads them
+        // from there.
         for (int g = threadIdx.x; g < num_groups; g += blockDim.x)
         {
-            masked_m[g] = gcnt[g];
+            int32_t const total = gcnt[g];
+            masked_m[g] = total;
+            base[g] = total;
             gcnt[g] = 0;
+        }
+        if (slot_to_expert != nullptr)
+        {
+            for (int s = threadIdx.x; s < num_groups; s += blockDim.x)
+                slot_to_expert[s] = -1;
         }
         __syncthreads();
         if (threadIdx.x == 0)
             *gdone = 0;
+        if (slot_to_expert != nullptr)
+            fso_emit_slot_list(slot_to_expert, base, num_groups);
     }
 }
 
@@ -579,8 +666,18 @@ constexpr int kRoutingMultiMaxCtas = 132;
 
 // moe_build_routing: topk_ids [M, topk] int32 -> (masked_m [G] int32,
 // row_map [G * m_cap] int32, slot_of_flat [M * topk] int32), one launch.
-std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_build_routing(
-    at::Tensor topk_ids, int64_t num_groups, int64_t m_cap)
+//
+// With `with_slots` it also returns `slot_to_expert` [G] int32: the ids of the
+// experts that hold at least one routed row, ascending, in the low entries, and
+// -1 in the rest. That is exactly the list the sm_100 slot-bound grouped MXFP8
+// GEMM's grid is indexed by, and it is derived from the per-expert histogram
+// this kernel already holds, so producing it here replaces a separate one-block
+// launch per grouped GEMM (two per MoE layer). Without the flag the returned
+// tensor is empty and no slot work is done at all, so every existing caller is
+// unaffected. The list is architecture-independent glue -- sm_120 and sm_90
+// produce it too, and simply have no route that consumes it.
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_build_routing(
+    at::Tensor topk_ids, int64_t num_groups, int64_t m_cap, bool with_slots)
 {
     TORCH_CHECK(topk_ids.is_cuda() && topk_ids.dtype() == at::kInt,
         "topk_ids must be CUDA int32");
@@ -599,6 +696,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_build_routing(
     auto masked_m = at::empty({num_groups}, opts);
     auto row_map = at::empty({num_groups * m_cap}, opts);
     auto slot_of_flat = at::empty({static_cast<int64_t>(M) * topk}, opts);
+    // One entry per expert, not per active expert: the caller's grid bound is a
+    // host-static min(M * topk, G) that it does not have to agree with here,
+    // and a [G] list is legal for any bound it chooses.
+    auto slot_to_expert = at::empty({with_slots ? num_groups : 0}, opts);
+    int32_t* const slot_ptr = with_slots ? reinterpret_cast<int32_t*>(slot_to_expert.data_ptr()) : nullptr;
 
     auto stream = at::cuda::getCurrentCUDAStream();
     int const n_pairs = M * topk;
@@ -616,18 +718,18 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_build_routing(
                 fso_pdl_enabled(), reinterpret_cast<int32_t const*>(topk_ids.data_ptr()),
                 reinterpret_cast<int32_t*>(masked_m.data_ptr()),
                 reinterpret_cast<int32_t*>(row_map.data_ptr()),
-                reinterpret_cast<int32_t*>(slot_of_flat.data_ptr()), scratch, scratch + kMaxGroups, n_pairs, topk,
-                static_cast<int>(num_groups), static_cast<int>(m_cap));
-            return {masked_m, row_map, slot_of_flat};
+                reinterpret_cast<int32_t*>(slot_of_flat.data_ptr()), scratch, scratch + kMaxGroups, slot_ptr, n_pairs,
+                topk, static_cast<int>(num_groups), static_cast<int>(m_cap));
+            return {masked_m, row_map, slot_of_flat, slot_to_expert};
         }
     }
     fso_pdl_launch(moe_build_routing_kernel, dim3(1), dim3(kRoutingThreads), stream, fso_pdl_enabled(),
         reinterpret_cast<int32_t const*>(topk_ids.data_ptr()),
         reinterpret_cast<int32_t*>(masked_m.data_ptr()),
         reinterpret_cast<int32_t*>(row_map.data_ptr()),
-        reinterpret_cast<int32_t*>(slot_of_flat.data_ptr()),
+        reinterpret_cast<int32_t*>(slot_of_flat.data_ptr()), slot_ptr,
         n_pairs, topk, static_cast<int>(num_groups), static_cast<int>(m_cap));
-    return {masked_m, row_map, slot_of_flat};
+    return {masked_m, row_map, slot_of_flat, slot_to_expert};
 }
 
 

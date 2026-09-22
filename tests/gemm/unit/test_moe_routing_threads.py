@@ -23,7 +23,9 @@ routing contract:
   * every pair's slot lies inside its own expert's block and below that
     expert's count;
   * the slots are a permutation - no two pairs share a slot;
-  * row_map at a pair's slot names that pair's source token.
+  * row_map at a pair's slot names that pair's source token;
+  * slot_to_expert, when asked for, lists exactly the experts with a non-zero
+    count, ascending, followed by -1 in every remaining entry.
 
 A scratch buffer shared between the two streams shows up immediately as a
 count that is too large (both threads' pairs land in one counter) or as a
@@ -53,11 +55,24 @@ def make_routing(m, e, topk, seed, device):
     return ids.to(device, torch.int32)
 
 
-def check(ids, masked, row_map, slot, e, m_cap, topk):
+def slot_list_reference(counts, e):
+    """The packed active-expert list the routing kernel must emit."""
+    active = torch.nonzero(counts > 0).flatten().to(torch.int32)
+    ref = torch.full((e,), -1, dtype=torch.int32, device=counts.device)
+    ref[: active.numel()] = active
+    return ref
+
+
+def check(ids, masked, row_map, slot, e, m_cap, topk, slot_to_expert=None):
     """Return a list of failure strings; empty means the result is valid."""
     bad = []
     flat = ids.flatten().to(torch.int64)
     counts = torch.bincount(flat, minlength=e).to(torch.int32)
+    if slot_to_expert is not None:
+        ref = slot_list_reference(counts, e)
+        if not torch.equal(slot_to_expert, ref):
+            n = int((slot_to_expert != ref).sum())
+            bad.append(f"slot_to_expert mismatch in {n} of {e} entries")
     if not torch.equal(masked, counts):
         d = (masked.to(torch.int64) - counts.to(torch.int64))
         bad.append(f"masked_m mismatch, max |delta| {int(d.abs().max())}")
@@ -95,12 +110,13 @@ def main():
     # Sanity anchor: the same input below the multi-CTA threshold goes through
     # the single-CTA builder and must satisfy the same contract.
     small = make_routing(256, E, TOPK, 7, dev)
-    ms, rm, sl = fso.gemm.moe_build_routing(small, E, (256 + 3) // 4 * 4)
-    bad = check(small, ms, rm, sl, E, (256 + 3) // 4 * 4, TOPK)
+    ms, rm, sl, se = fso.gemm.moe_build_routing(
+        small, E, (256 + 3) // 4 * 4, with_slots=True)
+    bad = check(small, ms, rm, sl, E, (256 + 3) // 4 * 4, TOPK, se)
     if bad:
         print("FAIL single-CTA anchor: " + "; ".join(bad))
         return 1
-    print(f"  single-CTA anchor (M=256, {256 * TOPK} pairs)  OK")
+    print(f"  single-CTA anchor (M=256, {256 * TOPK} pairs, with_slots)  OK")
 
     failures = []
     lock = threading.Lock()
@@ -121,7 +137,7 @@ def main():
             with torch.cuda.stream(stream):
                 # One eager call first: the scratch pool allocates on the first
                 # call of each host thread and never again.
-                fso.gemm.moe_build_routing(draws[tid][0], E, m_cap)
+                fso.gemm.moe_build_routing(draws[tid][0], E, m_cap, with_slots=True)
                 stream.synchronize()
                 for rnd in range(ROUNDS):
                     if tid == 0:
@@ -135,11 +151,16 @@ def main():
                     out = []
                     for b in range(BURST):
                         ids = draws[tid][(rnd * BURST + b) % DRAWS]
+                        # with_slots on every call: the fourth output is
+                        # produced by the same final pass that publishes
+                        # masked_m, so a scratch buffer shared between the two
+                        # streams corrupts it too and the check catches it.
                         out.append((ids,) + tuple(fso.gemm.moe_build_routing(
-                            ids, E, m_cap)))
+                            ids, E, m_cap, with_slots=True)))
                     stream.synchronize()
-                    for b, (ids, masked, row_map, slot) in enumerate(out):
-                        bad = check(ids, masked, row_map, slot, E, m_cap, TOPK)
+                    for b, (ids, masked, row_map, slot, sl_exp) in enumerate(out):
+                        bad = check(ids, masked, row_map, slot, E, m_cap, TOPK,
+                                    sl_exp)
                         if bad:
                             with lock:
                                 failures.append(

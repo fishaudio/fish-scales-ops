@@ -183,10 +183,22 @@ inline int grid_ctas(int M, int N, int cluster_rows, int ctas_per_cluster, int t
 //     puts 128 CTAs on the machine against cuBLAS's 96; every 192-wide win in
 //     the sweep came from the 1-SM form.
 //
-// Ties (the same CTA count from a 1-SM and a 2-SM tile) go to the 1-SM tile.
-// The two forms agree to within the replay tick where both were measured
-// (`wo` and `down` at M = 1024: 12.40 / 22.57 us for 1-SM against
-// 12.37 / 22.55 for 2-SM) and the 1-SM form does not pad a 256-row tile.
+// Ties (the same CTA count from a 1-SM and a 2-SM tile) go to the 2-SM tile.
+// At an equal CTA count the two forms keep the same number of SMs busy, but
+// the 2-SM form covers 256 rows per tile instead of 128, so the kernel makes
+// half as many passes over the B operand -- the weight matrix. Timed on their
+// own the two forms agree to within the replay tick (`wo` and `down` at
+// M = 1024: 12.40 / 22.57 us for 1-SM against 12.37 / 22.55 for 2-SM), because
+// an isolated dense cell replays one GEMM 150 times and its whole working set
+// (10 MB of activations plus a 25 MB weight at `down` M = 1024) stays resident
+// in this part's 132 MB L2, which makes the extra passes free. In a fused
+// layer they are not free: the Family A MLP block runs `down` straight after
+// `gate_up`, whose 50 MB weight and 40 MB BF16 output have just swept L2, so
+// `down` starts with a cold weight and every extra pass over it is HBM
+// traffic. Measured at M = 1024, N = 2560 with nsys inside the captured block
+// (per-launch median): the 1-SM 192-wide tile costs 21.38 us on its own but
+// 25.44 us in the block, while the 2-SM 192-wide tile costs 20.90 us on its
+// own and 21.10 us in the block (run b300_head_vs_wt_20260921/R2).
 inline int pick_wave_tile(int M, int N) noexcept
 {
     if (M < 64 || M > 1024)
@@ -212,6 +224,15 @@ inline int pick_wave_tile(int M, int N) noexcept
         return 0;                 // tie at M = 256, loses at M = 512
     if (best_m == 256 && best_n == 192)
         return 0;                 // measured counter-example at gdn.in_proj M = 64 / 128
+    // Equal-CTA tie-break, applied after the guards above so that each of their
+    // rejections keeps its exact meaning: when the 2-SM form of the SAME N
+    // width launches the same number of CTAs, take it, for the halved number of
+    // passes over the weight matrix explained in the comment above. The test is
+    // an equality on CTA counts, so it can only fire above M = 128 (below it a
+    // 2-SM tile always doubles the count) and it never changes which cells the
+    // rule owns -- only which tile an already-owned cell gets.
+    if (best_m == 128 && grid_ctas(M, N, 256, 2, best_n) == best_ctas)
+        best_m = 256;
     return best_m * 1000 + best_n;
 }
 
@@ -896,6 +917,7 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3
         case 128 * 1000 + 64:  return DISPATCH_SM100_MX(128, 64, 1, 1, 128, false);
         case 128 * 1000 + 192: return DISPATCH_SM100_MX(128, 192, 1, 1, 128, false);
         case 256 * 1000 + 64:  return DISPATCH_SM100_MX(256, 64, 2, 1, 128, false);
+        case 256 * 1000 + 192: return DISPATCH_SM100_MX(256, 192, 2, 1, 128, false);
         default: break;
         }
     }

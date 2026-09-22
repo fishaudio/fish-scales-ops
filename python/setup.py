@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 from setuptools import setup
@@ -91,6 +93,78 @@ def _explicit_gencode_flags() -> list[str]:
     return flags
 
 
+# Two sm_100 kernels are forks of a CUTLASS header, produced by in-tree
+# generators at build time: the slot-bound grouped kernel and the fused-SwiGLU
+# FC1 epilogue. Nothing under 3rdparty/ is modified and neither generated header
+# is ever written into the source tree: both go into the build directory, and
+# only the translation units that include them get that directory on their
+# include path.
+SLOT_TU = CSRC / "gemm" / "ops" / "mxfp8_sm100_slot_kernel.cu"
+GROUPED_TU = CSRC / "gemm" / "ops" / "mxfp8_sm100_grouped_kernel.cu"
+
+# (generator script, header path inside the generated-include root, the
+# translation unit that includes it). The TU column is what scopes the include
+# path; a second entry for the same TU would simply add a second header.
+GENERATED_HEADERS = [
+    (CSRC / "gemm" / "tools" / "make_sm100_slot_kernel.py",
+     Path("blockscale_gemm/arch/sm100/mxfp8/sm100_slot_gemm_kernel.hpp"),
+     SLOT_TU),
+    (CSRC / "gemm" / "tools" / "make_sm100_fused_swiglu_epilogue.py",
+     Path("blockscale_gemm/arch/sm100/mxfp8/sm100_fused_swiglu_epilogue.hpp"),
+     GROUPED_TU),
+]
+
+
+def _generate_headers(gen_root: Path) -> None:
+    """Run every generator into `gen_root`. Each one's textual edits assert
+    their exact match count, so a CUTLASS bump that moved any of them fails the
+    build here, naming the edit, rather than producing a silently different
+    kernel."""
+    env = dict(os.environ, CUTLASS_DIR=str(CUTLASS))
+    for generator, header, _tu in GENERATED_HEADERS:
+        dst = gen_root / header
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run([sys.executable, str(generator), str(dst)], check=True, env=env)
+
+
+class FsoBuildExtension(BuildExtension):
+    """BuildExtension that generates the sm_100 headers listed in
+    GENERATED_HEADERS and scopes their include path to the translation units
+    that need them.
+
+    setuptools compiles every source of one extension with one flag set, so the
+    scoping is done by splitting the compile call in two: the translation units
+    that consume a generated header are compiled on their own with the
+    generated-header directory appended to the include path, everything else
+    with the include path the extension declares. That keeps the command line of
+    every sm_90 / sm_120 object unchanged. `self.compiler.compile` is wrapped
+    here rather than in `build_extensions` because the base class installs its
+    own ninja wrapper before it reaches this point.
+    """
+
+    def build_extension(self, ext) -> None:
+        gen_root = Path(self.build_temp).resolve() / "fso_generated"
+        _generate_headers(gen_root)
+        gen_srcs = {os.path.normpath(_rel(tu)) for _g, _h, tu in GENERATED_HEADERS}
+        original_compile = self.compiler.compile
+
+        def split_compile(sources, **kwargs):
+            gen = [s for s in sources if os.path.normpath(s) in gen_srcs]
+            rest = [s for s in sources if os.path.normpath(s) not in gen_srcs]
+            objects = list(original_compile(rest, **kwargs)) if rest else []
+            if gen:
+                gen_kwargs = dict(kwargs)
+                gen_kwargs["include_dirs"] = list(kwargs.get("include_dirs") or []) + [str(gen_root)]
+                objects += list(original_compile(gen, **gen_kwargs))
+            return objects
+
+        self.compiler.compile = split_compile
+        try:
+            super().build_extension(ext)
+        finally:
+            self.compiler.compile = original_compile
+
+
 def _gemm_sources() -> list[str]:
     base = CSRC / "gemm"
     return [
@@ -99,7 +173,8 @@ def _gemm_sources() -> list[str]:
         _rel(base / "ops" / "mxfp8.cu"),
         _rel(base / "ops" / "mxfp8_kernel.cu"),
         _rel(base / "ops" / "mxfp8_sm100_kernel.cu"),
-        _rel(base / "ops" / "mxfp8_sm100_grouped_kernel.cu"),
+        _rel(GROUPED_TU),
+        _rel(SLOT_TU),
         _rel(base / "ops" / "quant_kernels.cu"),
         _rel(base / "ops" / "moe_glue.cu"),
         _rel(base / "src" / "runner.cu"),
@@ -193,5 +268,5 @@ ext = CUDAExtension(
 
 setup(
     ext_modules=[ext],
-    cmdclass={"build_ext": BuildExtension},
+    cmdclass={"build_ext": FsoBuildExtension},
 )

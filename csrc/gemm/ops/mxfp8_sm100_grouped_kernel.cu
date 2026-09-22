@@ -62,15 +62,100 @@ bool sm100_mxfp8_grouped_compiled()
 }
 
 cudaError_t launch_sm100_mxfp8_grouped_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D, int32_t* SFA,
-    int32_t* SFB, int32_t* masked_m, int num_groups, int m_cap, int N, int K, int expected_m, cudaStream_t stream)
+    int32_t* SFB, int32_t* masked_m, int num_groups, int m_cap, int N, int K, int expected_m, int max_active_groups,
+    int const* slot_to_expert, cudaStream_t stream)
 {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
     return sm100_blockscaled_gemm::gemm_dispatch_sm100_mxfp8_grouped(
-        A, B, D, SFA, SFB, masked_m, num_groups, m_cap, N, K, expected_m, stream);
+        A, B, D, SFA, SFB, masked_m, num_groups, m_cap, N, K, expected_m, max_active_groups, slot_to_expert, stream);
 #else
     (void) A; (void) B; (void) D; (void) SFA; (void) SFB; (void) masked_m;
+    (void) num_groups; (void) m_cap; (void) N; (void) K; (void) expected_m;
+    (void) max_active_groups; (void) slot_to_expert; (void) stream;
+    return cudaErrorNotSupported;
+#endif
+}
+
+// The fused-SwiGLU FC1: one grouped GEMM whose epilogue writes
+// MXFP8(silu(gate) * up) instead of the bf16 gate_up tensor. See the comment
+// on `Sm100MxFP8GroupedSwiGluGemmConfig` for the interleaved-weight
+// precondition; the ATen op documents it for callers.
+cudaError_t launch_sm100_mxfp8_grouped_swiglu_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_fp8_e4m3* H,
+    int32_t* SFH, int32_t* SFA, int32_t* SFB, int32_t* masked_m, int num_groups, int m_cap, int N, int K,
+    int expected_m, cudaStream_t stream)
+{
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+    return sm100_blockscaled_gemm::gemm_dispatch_sm100_mxfp8_grouped_swiglu(
+        A, B, H, SFH, SFA, SFB, masked_m, num_groups, m_cap, N, K, expected_m, stream);
+#else
+    (void) A; (void) B; (void) H; (void) SFH; (void) SFA; (void) SFB; (void) masked_m;
     (void) num_groups; (void) m_cap; (void) N; (void) K; (void) expected_m; (void) stream;
     return cudaErrorNotSupported;
+#endif
+}
+
+// Whether a caller whose FC1 is this (m_cap, N_w, K, G, max_active_groups)
+// should use the fused FC1 or keep the old pair (unfused FC1 + the separate
+// SwiGLU kernel).
+//
+// The choice is not the caller's taste: the fused FC1 exists only on the
+// pointer-array route, so wherever the dispatcher would take the slot route the
+// layer must keep the old pair. The rule lives with `slot_route` in the
+// dispatcher and this only exposes its verdict to the ATen layer, so the
+// bench, the tests and any future layer op all read the same decision.
+// Returns 1 for "use the fused FC1", 0 for "keep the old pair".
+int sm100_mxfp8_grouped_fused_fc1_route(int m_cap, int N, int K, int groups, int max_active_groups)
+{
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+    return sm100_blockscaled_gemm::grouped_detail::fused_fc1_route(m_cap, N, K, groups, max_active_groups) ? 1 : 0;
+#else
+    (void) m_cap; (void) N; (void) K; (void) groups; (void) max_active_groups;
+    return 0;
+#endif
+}
+
+// The load-time half: may this (N_w, K) use the fused FC1 on any M? A caller
+// needs it before it quantises its weights, because the interleaved row order
+// is one decision for the whole model while the route is a per-call one.
+int sm100_mxfp8_grouped_fused_fc1_available(int N, int K)
+{
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+    return sm100_blockscaled_gemm::grouped_detail::fused_fc1_available(N, K) ? 1 : 0;
+#else
+    (void) N; (void) K;
+    return 0;
+#endif
+}
+
+// Host-side guard query for `linear_mxfp8_grouped_masked`.
+//
+// The op has to be able to refuse a forced-but-illegal slot-route call with a
+// readable message BEFORE any kernel runs, because outside the guard the slot
+// kernel does not fail: it returns 2^-127 times the right answer, or NaN, with
+// no error of any kind. The decision itself stays in one place (the
+// dispatcher's `slot_route`); this only exposes its verdict to the ATen layer.
+// The return value is `sm100_blockscaled_gemm::grouped_detail::SlotRouteDecision`
+// as an int: 0/1 mean the call may proceed, 2 the row capacity exceeds the
+// token tile, 3 no instantiation covers (N, K), 4 no slot bound was supplied.
+int sm100_mxfp8_grouped_slot_refusal(int m_cap, int N, int K, int groups, int max_active_groups)
+{
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+    return static_cast<int>(
+        sm100_blockscaled_gemm::grouped_detail::slot_route(m_cap, N, K, groups, max_active_groups));
+#else
+    (void) m_cap; (void) N; (void) K; (void) groups; (void) max_active_groups;
+    return 0;
+#endif
+}
+
+// The token-tile width of the slot route's phase-1 instantiation, for the
+// message the op prints when the guard refuses a call.
+int sm100_mxfp8_grouped_slot_tile_n()
+{
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+    return sm100_blockscaled_gemm::grouped_detail::slot_kernel_tile_n();
+#else
+    return 0;
 #endif
 }
 

@@ -820,8 +820,12 @@ void fp8bs_silu_chunk_mul_quantize_1x128_fp32_grouped(__nv_fp8_e4m3* x_q, float*
 // stay undefined; the GEMM's masked contract already ignores them.
 //
 //   * ..._grouped_gather: fused token-gather + quantize (src row = i/topk).
+//   * ..._grouped_scatter: the same result computed once per TOKEN and
+//     scattered to that token's topk slots — see its own comment below.
 //   * silu_chunk_mul_quantize_1x32_packed_grouped: SwiGLU fused quant for
 //     the grouped down-GEMM input (row = slot, in place in the pair space).
+//     This one has no fan-out — each destination slot has exactly one source
+//     row — so there is nothing for a scatter form to amortise here.
 
 namespace
 {
@@ -947,7 +951,199 @@ __global__ void fp8bs_quantize_1x32_packed_grouped_gather_kernel(
     }
 }
 
-template <bool USE_UE8M0, int K_BLOCKS_PER_WARP, bool SM1XX_SF = false>
+// Token-space form of the kernel above: quantize each token ONCE and scatter
+// the result to all of its topk destination slots.
+//
+// Precondition. `slot_of_flat` is dense and token-major: moe_build_routing
+// writes exactly one entry per routed pair at index i = token * topk + j, so
+// the topk destinations of token `src` are the contiguous entries
+// slot_of_flat[src * topk .. src * topk + topk - 1], and every one of them is
+// a valid slot (there is no "unrouted pair" sentinel in this space).
+//
+// What the pair-space kernel above does. It gives one warp to each
+// (routed pair, K-chunk), so for a token routed to topk experts the SAME
+// source row is loaded from `input`, amax-reduced across the warp, turned into
+// a UE8M0 byte and converted to FP8 topk separate times, and the launch grid
+// is topk times the number of distinct token rows.
+//
+// Why that is wasted work. The FP8 bytes and the scale byte a pair writes are
+// functions of the token row alone -- the destination slot only selects WHERE
+// they are stored. topk - 1 of the topk loads, reductions and conversions
+// therefore recompute a value the kernel already holds.
+//
+// Consequence. The measurements in run b300_mxfp8_20260917/M-Q1 show the
+// pair-space kernel running at a very low fraction of memory speed-of-light
+// while issuing M * topk CTAs, i.e. it is latency- and occupancy-bound on
+// redundant loads rather than bandwidth-bound on the bytes it owes. This form
+// issues M CTAs, reads each token row once and performs the same number of
+// stores, so the loads and the float work fall by a factor of topk while the
+// store traffic is unchanged.
+//
+// The trade it makes. Parallelism: the grid is topk times smaller, so below
+// the point where the token-space grid still fills the device the pair-space
+// form has more CTAs to hide latency with and stays faster. The launcher's
+// rule (see fso_gather_quant_use_scatter below) is what decides between them.
+//
+// TOPK_STATIC > 0 compiles the destination loop for a fixed topk so the slot
+// loads can be hoisted above the arithmetic and the store loop fully unrolled;
+// TOPK_STATIC == 0 keeps the runtime loop for any other topk.
+//
+// Architecture. This is an sm_100/103 path: the launcher only selects it when
+// the sm_100 scale-factor layout was requested, and the body below is compiled
+// out on every other architecture so the sm_90 and sm_120 SASS passes emit an
+// empty stub (the same technique the sm_90 fatbin uses for sm_120-only code).
+template <bool USE_UE8M0, int K_BLOCKS_PER_WARP, bool SM1XX_SF, int TOPK_STATIC>
+__global__ void fp8bs_quantize_1x32_packed_grouped_scatter_kernel(
+    __nv_fp8_e4m3* __restrict__ out_fp8, int32_t* __restrict__ out_packed,
+    __nv_bfloat16 const* __restrict__ input, int32_t const* __restrict__ slot_of_flat,
+    int num_tokens, int topk, int m_cap, int K, bool pdl)
+{
+    static_assert(K_BLOCKS_PER_WARP == 4 || K_BLOCKS_PER_WARP == 8,
+        "K_BLOCKS_PER_WARP must be 4 (1 int32/warp) or 8 (2 int32/warp).");
+    static_assert(TOPK_STATIC >= 0, "TOPK_STATIC must be 0 (runtime) or a positive topk.");
+
+#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200)
+    constexpr int kVec = kMxFp8VecSize;
+    constexpr int kIterKBlocks = 4;
+    constexpr int kNumIters = K_BLOCKS_PER_WARP / kIterKBlocks;
+
+    // PDL entry (see the pair-space kernel above).
+    if (pdl)
+    {
+        cudaGridDependencySynchronize();
+        if (threadIdx.x == 0)
+        {
+            cudaTriggerProgrammaticLaunchCompletion();
+        }
+    }
+    // Token-space indexing: one warp per (token row, K-chunk).
+    int const warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int const lane_id = threadIdx.x & 31;
+    int const k_groups = K / (kVec * K_BLOCKS_PER_WARP);
+    int const src = warp_id / k_groups;   // source token row
+    int const kg = warp_id % k_groups;
+    if (src >= num_tokens)
+        return;
+
+    int const kp_base = kg * (K_BLOCKS_PER_WARP / 4);
+    int const num_kp = K / 128;
+
+    // Destination slots are pure address material: issue their loads before
+    // the arithmetic so the scattered-store addresses are already resolved
+    // when the amax reduction finishes.
+    constexpr int kSlotRegs = TOPK_STATIC > 0 ? TOPK_STATIC : 1;
+    int slots[kSlotRegs];
+    if constexpr (TOPK_STATIC > 0)
+    {
+#pragma unroll
+        for (int t = 0; t < TOPK_STATIC; ++t)
+        {
+            slots[t] = slot_of_flat[src * TOPK_STATIC + t];
+        }
+    }
+
+    uint32_t fp_words[kNumIters] = {};
+    int packed_words[K_BLOCKS_PER_WARP / 4] = {};
+
+#pragma unroll
+    for (int it = 0; it < kNumIters; ++it) {
+        int const kb_base = kg * K_BLOCKS_PER_WARP + it * kIterKBlocks;
+        int const k_base  = kb_base * kVec;
+
+        uint64_t const xword = *reinterpret_cast<uint64_t const*>(
+            &input[static_cast<int64_t>(src) * K + k_base + lane_id * 4]);
+        __nv_bfloat16 const* xv = reinterpret_cast<__nv_bfloat16 const*>(&xword);
+        float const x0 = __bfloat162float(xv[0]);
+        float const x1 = __bfloat162float(xv[1]);
+        float const x2 = __bfloat162float(xv[2]);
+        float const x3 = __bfloat162float(xv[3]);
+
+        float my_ax = fmaxf(fmaxf(fabsf(x0), fabsf(x1)),
+                            fmaxf(fabsf(x2), fabsf(x3)));
+#pragma unroll
+        for (int off = 4; off > 0; off >>= 1) {
+            my_ax = fmaxf(my_ax, __shfl_xor_sync(0xFFFFFFFFu, my_ax, off));
+        }
+        my_ax = fmaxf(my_ax, 1e-10f);
+
+        float qs;
+        uint8_t byte_v;
+        e8m0_from_amax<USE_UE8M0>(my_ax, qs, byte_v);
+
+        fp_words[it] = fp8x4_from_floats(x0 * qs, x1 * qs, x2 * qs, x3 * qs);
+
+        uint32_t const b0 = byte_v;
+        uint32_t const b1 = __shfl_sync(0xFFFFFFFFu, byte_v, 8);
+        uint32_t const b2 = __shfl_sync(0xFFFFFFFFu, byte_v, 16);
+        uint32_t const b3 = __shfl_sync(0xFFFFFFFFu, byte_v, 24);
+        if (lane_id == 0) {
+            packed_words[it] = static_cast<int>(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+        }
+    }
+
+    // One destination: the same stores the pair-space kernel performs for the
+    // pair that owns this slot, from values that were computed once.
+    auto store_slot = [&](int slot) {
+#pragma unroll
+        for (int it = 0; it < kNumIters; ++it) {
+            int const k_base = (kg * K_BLOCKS_PER_WARP + it * kIterKBlocks) * kVec;
+            *reinterpret_cast<uint32_t*>(
+                &out_fp8[static_cast<int64_t>(slot) * K + k_base + lane_id * 4]) = fp_words[it];
+        }
+        if (lane_id == 0) {
+            int const g = slot / m_cap;
+            int const m_in = slot % m_cap;
+#pragma unroll
+            for (int p = 0; p < K_BLOCKS_PER_WARP / 4; ++p) {
+                if constexpr (SM1XX_SF) {
+                    out_packed[sf_word_index_grouped_atom(m_in, kp_base + p, m_cap, num_kp, g)] = packed_words[p];
+                } else {
+                    out_packed[sf_word_index_grouped(m_in, kp_base + p, m_cap, num_kp, g)] = packed_words[p];
+                }
+            }
+        }
+    };
+
+    if constexpr (TOPK_STATIC > 0)
+    {
+#pragma unroll
+        for (int t = 0; t < TOPK_STATIC; ++t)
+        {
+            store_slot(slots[t]);
+        }
+    }
+    else
+    {
+        for (int t = 0; t < topk; ++t)
+        {
+            store_slot(slot_of_flat[src * topk + t]);
+        }
+    }
+#else
+    (void) out_fp8; (void) out_packed; (void) input; (void) slot_of_flat;
+    (void) num_tokens; (void) topk; (void) m_cap; (void) K; (void) pdl;
+#endif
+}
+
+// PAIRWISE selects where the kernel finds gate_i and up_i inside a row of `gu`.
+//
+// false (the layout every caller used before the sm_100 fused FC1 existed): the
+// row is [gate_0 .. gate_{K-1}, up_0 .. up_{K-1}], so up_i sits K columns after
+// gate_i and the two halves are loaded as two separate 8-byte words.
+//
+// true: the row is [gate_0, up_0, gate_1, up_1, ...], the order a GEMM produces
+// when its weight rows are gate/up interleaved. The four outputs a lane owns
+// then need eight consecutive bf16 values, which is one 16-byte load instead of
+// two 8-byte ones, followed by a de-interleave into the (gate, gate) and
+// (up, up) pairs that `silu2_mul` takes. Everything after that point — the
+// amax reduction, the UE8M0 byte, the fp8 conversion and both stores — is
+// shared, so the two forms produce bit-identical results on the same values.
+//
+// Why a template flag rather than a second kernel: the two differ only in the
+// load and the shuffle that follows it, and a compile-time flag keeps the
+// PAIRWISE=false instantiation's machine code exactly what it was (verified by
+// disassembly, see run b300_mxfp8_20260917/M-E2).
+template <bool USE_UE8M0, int K_BLOCKS_PER_WARP, bool SM1XX_SF = false, bool PAIRWISE = false>
 __global__ void silu_chunk_mul_quantize_1x32_packed_grouped_kernel(
     __nv_fp8_e4m3* __restrict__ out_fp8, int32_t* __restrict__ out_packed,
     __nv_bfloat16 const* __restrict__ gu, int32_t const* __restrict__ slot_of_flat,
@@ -992,15 +1188,43 @@ __global__ void silu_chunk_mul_quantize_1x32_packed_grouped_kernel(
         int const kb_base = kg * K_BLOCKS_PER_WARP + it * kIterKBlocks;
         int const k_base  = kb_base * kVec;
 
-        uint64_t const gate_word = *reinterpret_cast<uint64_t const*>(
-            &gu[slot * stride_m_gu + 0 + k_base + lane_id * 4]);
-        uint64_t const up_word = *reinterpret_cast<uint64_t const*>(
-            &gu[slot * stride_m_gu + K + k_base + lane_id * 4]);
-        __nv_bfloat162 const* gv2 = reinterpret_cast<__nv_bfloat162 const*>(&gate_word);
-        __nv_bfloat162 const* uv2 = reinterpret_cast<__nv_bfloat162 const*>(&up_word);
+        // Both branches end at the same two float2s, and the PAIRWISE=false
+        // branch holds the original expressions unchanged so its machine code
+        // is unchanged.
+        float2 f01, f23;
+        if constexpr (PAIRWISE)
+        {
+            // Eight consecutive bf16 = [g0,u0,g1,u1,g2,u2,g3,u3], 16-byte
+            // aligned because the element offset is a multiple of 8 (k_base is
+            // a multiple of 32 and the lane stride is 8).
+            uint4 const w = *reinterpret_cast<uint4 const*>(
+                &gu[slot * stride_m_gu + 2 * (k_base + lane_id * 4)]);
+            // Each 32-bit word is one (gate, up) pair, gate in the low half.
+            // __byte_perm picks bytes from two sources: nibble values 0-3 index
+            // the first operand's bytes, 4-7 the second's, least significant
+            // nibble first. 0x5410 therefore builds (a.lo, b.lo) = (gate, gate)
+            // and 0x7632 builds (a.hi, b.hi) = (up, up).
+            uint32_t const p0 = __byte_perm(w.x, w.y, 0x5410);
+            uint32_t const p1 = __byte_perm(w.x, w.y, 0x7632);
+            uint32_t const p2 = __byte_perm(w.z, w.w, 0x5410);
+            uint32_t const p3 = __byte_perm(w.z, w.w, 0x7632);
+            f01 = __bfloat1622float2(silu2_mul(*reinterpret_cast<__nv_bfloat162 const*>(&p0),
+                *reinterpret_cast<__nv_bfloat162 const*>(&p1)));
+            f23 = __bfloat1622float2(silu2_mul(*reinterpret_cast<__nv_bfloat162 const*>(&p2),
+                *reinterpret_cast<__nv_bfloat162 const*>(&p3)));
+        }
+        else
+        {
+            uint64_t const gate_word = *reinterpret_cast<uint64_t const*>(
+                &gu[slot * stride_m_gu + 0 + k_base + lane_id * 4]);
+            uint64_t const up_word = *reinterpret_cast<uint64_t const*>(
+                &gu[slot * stride_m_gu + K + k_base + lane_id * 4]);
+            __nv_bfloat162 const* gv2 = reinterpret_cast<__nv_bfloat162 const*>(&gate_word);
+            __nv_bfloat162 const* uv2 = reinterpret_cast<__nv_bfloat162 const*>(&up_word);
 
-        float2 const f01 = __bfloat1622float2(silu2_mul(gv2[0], uv2[0]));
-        float2 const f23 = __bfloat1622float2(silu2_mul(gv2[1], uv2[1]));
+            f01 = __bfloat1622float2(silu2_mul(gv2[0], uv2[0]));
+            f23 = __bfloat1622float2(silu2_mul(gv2[1], uv2[1]));
+        }
         float const h0 = f01.x, h1 = f01.y, h2 = f23.x, h3 = f23.y;
 
         float my_ax = fmaxf(fmaxf(fabsf(h0), fabsf(h1)), fmaxf(fabsf(h2), fabsf(h3)));
@@ -1077,10 +1301,104 @@ static inline void fso_pdl_launch(KernelT kernel, dim3 grid, dim3 block, cudaStr
     cudaLaunchKernelEx(&cfg, kernel, args..., pdl);
 }
 
+// ----- Token-scatter selection for the grouped gather-quantize -------------
+//
+// FSO_GATHER_QUANT_ONCE selects between the two forms of the grouped
+// activation gather-quantize: `0` always uses the pair-space kernel (one warp
+// per routed pair), `1` always uses the token-scatter kernel (one warp per
+// token, result scattered to the topk slots), and leaving it unset uses the
+// rule below. Read once into a function-local static, so a captured graph
+// never re-reads the environment and every replay launches the same kernel.
+static inline int fso_gather_quant_once_mode()
+{
+    static int const v = []
+    {
+        char const* e = std::getenv("FSO_GATHER_QUANT_ONCE");
+        if (e == nullptr)
+            return -1;
+        if (e[0] == '0')
+            return 0;
+        if (e[0] == '1')
+            return 1;
+        return -1;
+    }();
+    return v;
+}
+
+// Measurement knob, not a tuning knob: `0` forbids the compile-time-topk
+// instantiation of the scatter kernel so the runtime-topk loop can be timed
+// against it inside one build (run b300_mxfp8_20260917/M-Q1).
+static inline bool fso_gather_quant_topk_static()
+{
+    static bool const v = []
+    {
+        char const* e = std::getenv("FSO_GATHER_QUANT_TOPK_STATIC");
+        return !(e && e[0] == '0');
+    }();
+    return v;
+}
+
+// Multiprocessor count of the current device, queried once. This translation
+// unit has no ATen, so the CUDA runtime attribute is the available source; the
+// query happens at the first launch (eager warm-up) and never inside a graph
+// capture. Single-device assumption, the same one fso_pdl_enabled makes.
+static inline int fso_device_sm_count()
+{
+    static int const v = []
+    {
+        int dev = 0;
+        int n = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess
+            && cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && n > 0)
+        {
+            return n;
+        }
+        return 1;
+    }();
+    return v;
+}
+
+// Where the two forms cross.
+//
+// The token-scatter form removes (topk - 1) / topk of the global loads and of
+// the amax / conversion work, and issues exactly the same stores, but its grid
+// is topk times smaller. Below the point where the token-space grid alone
+// covers the device, the pair-space form's extra CTAs are what hides the
+// scattered-store latency and it stays ahead despite the redundant loads;
+// above it the machine is full either way and only the removed work is left.
+// The rule therefore asks one question: does the token-space grid fill at
+// least this many waves of CTAs across the device's multiprocessors? Stated in
+// (num_tokens, k_groups, warps per block, SM count) rather than in M, it
+// carries across families and K without a per-family constant. The crossover
+// measured in run b300_mxfp8_20260917/M-Q1 sits at one wave.
+constexpr int kFsoScatterMinWaves = 1;
+
+static inline bool fso_gather_quant_use_scatter(int num_tokens, int topk, int k_groups, int warps_per_block)
+{
+    int const mode = fso_gather_quant_once_mode();
+    if (mode == 0)
+        return false;
+    if (topk < 2)
+        return false; // one destination per token: nothing to amortise
+    if (mode == 1)
+        return true;
+    int64_t const ctas
+        = (static_cast<int64_t>(num_tokens) * k_groups + warps_per_block - 1) / warps_per_block;
+    return ctas >= static_cast<int64_t>(kFsoScatterMinWaves) * fso_device_sm_count();
+}
+
 // `sm1xx_sf_layout` picks the sm_100/sm_103 per-group Sm1xx atom slab instead
 // of the sm_120 per-group K-major slab. The sm_120 instantiations are
 // unchanged (SM1XX_SF defaults to false and the generated store is the same
 // expression it always was), so sm_120 output stays byte-identical.
+//
+// Two kernels implement this call and produce byte-identical output on every
+// defined row: the pair-space kernel (one warp per routed pair) and the
+// token-scatter kernel (one warp per token, result scattered to the topk
+// slots). The scatter form is offered on the sm_100/103 layout only and is
+// selected by fso_gather_quant_use_scatter; sm_120 and sm_90 always take the
+// pair-space kernel, exactly as before. Applying the same idea on sm_120 is a
+// separate exercise: the arch is first-class, it is deferred, not dismissed.
 void fp8bs_quantize_1x32_packed_grouped_gather(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
     __nv_bfloat16 const* x, int32_t const* slot_of_flat, int n_pairs, int topk,
     int m_cap, int K, cudaStream_t stream, bool use_ue8m0, bool sm1xx_sf_layout)
@@ -1091,6 +1409,32 @@ void fp8bs_quantize_1x32_packed_grouped_gather(__nv_fp8_e4m3* x_q, int32_t* pack
     auto launch = [&](auto kBlocksPerWarpT, auto ue8m0T, auto sfAtomT) {
         constexpr int kBlocksPerWarp = decltype(kBlocksPerWarpT)::value;
         int const k_groups = K / (kMxFp8VecSize * kBlocksPerWarp);
+        // Token-scatter form, sm_100/103 scale layout only. The pair space is
+        // dense and token-major (n_pairs = num_tokens * topk), which is what
+        // lets a token's topk destinations be read as one contiguous run of
+        // slot_of_flat; if a caller ever passes a ragged pair space the
+        // equality below fails and the pair-space kernel is used.
+        if constexpr (decltype(sfAtomT)::value) {
+            int const num_tokens = topk > 0 ? n_pairs / topk : 0;
+            bool const dense = topk > 0 && num_tokens * topk == n_pairs;
+            if (dense && fso_gather_quant_use_scatter(num_tokens, topk, k_groups, kWarpsPerBlock)) {
+                int64_t const warps = static_cast<int64_t>(num_tokens) * k_groups;
+                int const grid = static_cast<int>((warps + kWarpsPerBlock - 1) / kWarpsPerBlock);
+                bool const pdl = fso_pdl_enabled() && static_cast<unsigned>(grid) <= kFsoPdlMaxGridCtas;
+                if (topk == 8 && fso_gather_quant_topk_static()) {
+                    fso_pdl_launch(fp8bs_quantize_1x32_packed_grouped_scatter_kernel<decltype(ue8m0T)::value,
+                                       kBlocksPerWarp, true, 8>,
+                        dim3(grid), dim3(kThreadsPerBlock), stream, pdl, x_q, packed_scales, x, slot_of_flat,
+                        num_tokens, topk, m_cap, K);
+                } else {
+                    fso_pdl_launch(fp8bs_quantize_1x32_packed_grouped_scatter_kernel<decltype(ue8m0T)::value,
+                                       kBlocksPerWarp, true, 0>,
+                        dim3(grid), dim3(kThreadsPerBlock), stream, pdl, x_q, packed_scales, x, slot_of_flat,
+                        num_tokens, topk, m_cap, K);
+                }
+                return;
+            }
+        }
         int64_t const total_warps = static_cast<int64_t>(n_pairs) * k_groups;
         int const grid = static_cast<int>((total_warps + kWarpsPerBlock - 1) / kWarpsPerBlock);
         bool const pdl = fso_pdl_enabled() && static_cast<unsigned>(grid) <= kFsoPdlMaxGridCtas;
@@ -1113,29 +1457,42 @@ void fp8bs_quantize_1x32_packed_grouped_gather(__nv_fp8_e4m3* x_q, int32_t* pack
 
 void fp8bs_silu_chunk_mul_quantize_1x32_packed_grouped(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
     __nv_bfloat16 const* gu, int32_t const* slot_of_flat, int n_pairs, int m_cap, int K,
-    cudaStream_t stream, bool use_ue8m0, bool sm1xx_sf_layout)
+    cudaStream_t stream, bool use_ue8m0, bool sm1xx_sf_layout, bool pairwise)
 {
     constexpr int kThreadsPerBlock = 256;
     constexpr int kWarpsPerBlock = kThreadsPerBlock / 32;
 
-    auto launch = [&](auto kBlocksPerWarpT, auto ue8m0T, auto sfAtomT) {
+    auto launch = [&](auto kBlocksPerWarpT, auto ue8m0T, auto sfAtomT, auto pairT) {
         constexpr int kBlocksPerWarp = decltype(kBlocksPerWarpT)::value;
         int const k_groups = K / (kMxFp8VecSize * kBlocksPerWarp);
         int64_t const total_warps = static_cast<int64_t>(n_pairs) * k_groups;
         int const grid = static_cast<int>((total_warps + kWarpsPerBlock - 1) / kWarpsPerBlock);
         bool const pdl = fso_pdl_enabled() && static_cast<unsigned>(grid) <= kFsoPdlMaxGridCtas;
         fso_pdl_launch(silu_chunk_mul_quantize_1x32_packed_grouped_kernel<decltype(ue8m0T)::value, kBlocksPerWarp,
-                           decltype(sfAtomT)::value>,
+                           decltype(sfAtomT)::value, decltype(pairT)::value>,
             dim3(grid), dim3(kThreadsPerBlock), stream, pdl, x_q, packed_scales, gu, slot_of_flat,
             n_pairs, m_cap, K);
     };
-    auto launch_k = [&](auto ue8m0T, auto sfAtomT) {
-        if (K % 256 == 0) launch(std::integral_constant<int, 8>{}, ue8m0T, sfAtomT);
-        else              launch(std::integral_constant<int, 4>{}, ue8m0T, sfAtomT);
+    auto launch_k = [&](auto ue8m0T, auto sfAtomT, auto pairT) {
+        if (K % 256 == 0) launch(std::integral_constant<int, 8>{}, ue8m0T, sfAtomT, pairT);
+        else              launch(std::integral_constant<int, 4>{}, ue8m0T, sfAtomT, pairT);
     };
+    // The interleaved (pairwise) row order only arises from the sm_100 fused
+    // FC1's weight layout, so it is instantiated in the sm_100 scale-layout
+    // branch alone. Nesting it here rather than as a fourth top-level
+    // dimension is what keeps the sm_120 branch's instantiation set — and
+    // therefore its device code — exactly what it was. The ATen op refuses
+    // pairwise=true on any other architecture before reaching this point.
     auto launch_sf = [&](auto ue8m0T) {
-        if (sm1xx_sf_layout) launch_k(ue8m0T, std::true_type{});
-        else                 launch_k(ue8m0T, std::false_type{});
+        if (sm1xx_sf_layout)
+        {
+            if (pairwise) launch_k(ue8m0T, std::true_type{}, std::true_type{});
+            else          launch_k(ue8m0T, std::true_type{}, std::false_type{});
+        }
+        else
+        {
+            launch_k(ue8m0T, std::false_type{}, std::false_type{});
+        }
     };
     if (use_ue8m0) launch_sf(std::true_type{});
     else           launch_sf(std::false_type{});

@@ -570,16 +570,27 @@ def run_worker(cell):
             import fish_scales_ops as fso
             m_cap = (M + 3) // 4 * 4
             expected_m = max(1, (rows + E - 1) // E)
+            # Upper bound on how many experts can hold at least one row: a
+            # top-k router gives an expert at most one row per token, so
+            # min(M * TOPK, E) bounds it whatever the draw is. It is host
+            # static per (M, TOPK, E), so a graph captured at this M stays
+            # valid for every routing draw at that M.
+            max_active_groups = min(M * TOPK, E)
             result["m_cap"] = m_cap
-            # layer-style prep: routing kernel + flat-pair gather-quant
+            result["max_active_groups"] = max_active_groups
+            # layer-style prep: routing kernel + flat-pair gather-quant.
+            # `with_slots=True` makes the routing kernel emit the packed
+            # active-expert list as well, which is what lets the sm_100
+            # slot-bound decode route skip building it again per GEMM.
             x_tok = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.1
-            masked_dev, row_map, slot_of_flat = fso.gemm.moe_build_routing(
-                topk_ids, E, m_cap)
+            masked_dev, row_map, slot_of_flat, slot_to_expert = fso.gemm.moe_build_routing(
+                topk_ids, E, m_cap, with_slots=True)
             a_fp8, sa = fso.gemm.quantize_1x32_grouped_gather_fp8(
                 x_tok, slot_of_flat, TOPK, E, m_cap)
             w_fp8, sw = fso.gemm.quantize_moe_weights_1x32_fp8(w)
             fn = lambda: fso.gemm.linear_mxfp8_grouped_masked(
-                a_fp8, w_fp8, sa, sw, masked_dev, expected_m)
+                a_fp8, w_fp8, sa, sw, masked_dev, expected_m, max_active_groups,
+                slot_to_expert)
             y = fn()
             torch.cuda.synchronize()
             cs, n_cs = 0.0, 0
@@ -797,22 +808,73 @@ def run_worker(cell):
             import fish_scales_ops as fso
             m_cap = (M + 3) // 4 * 4
             expected_m = max(1, (rows + E - 1) // E)
+            # See the kernel cell above: min(M * TOPK, E) is the host-static
+            # upper bound on the number of experts that can hold a row, which
+            # is what the sm_100 grouped dispatcher needs to size the decode
+            # route's grid. `expected_m` cannot supply it (it is
+            # ceil(rows / E) and equals 1 for every decode M at E = 128).
+            max_active_groups = min(M * TOPK, E)
             result["m_cap"] = m_cap
-            w13_fp8, sw13 = fso.gemm.quantize_moe_weights_1x32_fp8(w13)
+            result["max_active_groups"] = max_active_groups
+            # The fused FC1 (run b300_mxfp8_20260917/M-E2): one grouped GEMM
+            # whose epilogue emits MXFP8(silu(gate) * up), so the separate
+            # SwiGLU kernel and the bf16 [E, m_cap, 2*I] intermediate both
+            # disappear. Two host-static decisions, both taken by the library
+            # so the bench cannot invent a rule of its own:
+            #   * `available` is the LOAD-time one. The fused op needs gate/up
+            #     interleaved weight rows, and a model holds one layout, so it
+            #     decides how w13 is quantised. It is false when
+            #     FSO_FC1_FUSED=0, which is exactly the control arm: the layer
+            #     is then byte-for-byte the one this round started from.
+            #   * `fused_route` is the PER-CALL one. Where the dispatcher takes
+            #     the swap-orientation decode route the fusion does not exist
+            #     (that geometry puts gate_j and up_j in different lanes), so
+            #     the layer keeps the unfused FC1 there — but on interleaved
+            #     weights, which is what the SwiGLU kernel's `pairwise` flag
+            #     is for.
+            n_w = 2 * INTER
+            fc1_interleaved = fso.gemm.mxfp8_grouped_swiglu_available(n_w, HIDDEN)
+            fc1_fused = fc1_interleaved and fso.gemm.mxfp8_grouped_swiglu_fused_route(
+                m_cap, n_w, HIDDEN, E, max_active_groups)
+            result["fc1_interleaved"] = int(fc1_interleaved)
+            result["fc1_fused"] = int(fc1_fused)
+            w13_fp8, sw13 = fso.gemm.quantize_moe_weights_1x32_fp8(
+                w13, w13_interleave=fc1_interleaved)
             w2_fp8, sw2 = fso.gemm.quantize_moe_weights_1x32_fp8(w2)
 
-            def layer_fn():
-                masked_dev, row_map, slot_of_flat = fso.gemm.moe_build_routing(
-                    topk_ids, E, m_cap)
-                hq, sh = fso.gemm.quantize_1x32_grouped_gather_fp8(
-                    hidden, slot_of_flat, TOPK, E, m_cap)
-                gu = fso.gemm.linear_mxfp8_grouped_masked(
-                    hq, w13_fp8, sh, sw13, masked_dev, expected_m)
-                dq, sd = fso.gemm.silu_chunk_mul_quantize_1x32_grouped_fp8(
-                    gu, slot_of_flat)
-                dn = fso.gemm.linear_mxfp8_grouped_masked(
-                    dq, w2_fp8, sd, sw2, masked_dev, expected_m)
-                return fso.gemm.moe_combine(dn, slot_of_flat, topk_w)
+            # The routing kernel emits the packed active-expert list in the
+            # same launch (run b300_mxfp8_20260917/M-I1). Where the dispatcher
+            # takes the slot-bound decode route it then launches only the GEMM;
+            # where it does not, the list is validated and unused. Either way
+            # the layer is one kernel shorter per grouped GEMM than it was.
+            if fc1_fused:
+                def layer_fn():
+                    masked_dev, row_map, slot_of_flat, slot_to_expert = (
+                        fso.gemm.moe_build_routing(topk_ids, E, m_cap, with_slots=True))
+                    hq, sh = fso.gemm.quantize_1x32_grouped_gather_fp8(
+                        hidden, slot_of_flat, TOPK, E, m_cap)
+                    dq, sd = fso.gemm.linear_mxfp8_grouped_masked_swiglu(
+                        hq, w13_fp8, sh, sw13, masked_dev, expected_m,
+                        max_active_groups, slot_to_expert)
+                    dn = fso.gemm.linear_mxfp8_grouped_masked(
+                        dq, w2_fp8, sd, sw2, masked_dev, expected_m,
+                        max_active_groups, slot_to_expert)
+                    return fso.gemm.moe_combine(dn, slot_of_flat, topk_w)
+            else:
+                def layer_fn():
+                    masked_dev, row_map, slot_of_flat, slot_to_expert = (
+                        fso.gemm.moe_build_routing(topk_ids, E, m_cap, with_slots=True))
+                    hq, sh = fso.gemm.quantize_1x32_grouped_gather_fp8(
+                        hidden, slot_of_flat, TOPK, E, m_cap)
+                    gu = fso.gemm.linear_mxfp8_grouped_masked(
+                        hq, w13_fp8, sh, sw13, masked_dev, expected_m,
+                        max_active_groups, slot_to_expert)
+                    dq, sd = fso.gemm.silu_chunk_mul_quantize_1x32_grouped_fp8(
+                        gu, slot_of_flat, pairwise=fc1_interleaved)
+                    dn = fso.gemm.linear_mxfp8_grouped_masked(
+                        dq, w2_fp8, sd, sw2, masked_dev, expected_m,
+                        max_active_groups, slot_to_expert)
+                    return fso.gemm.moe_combine(dn, slot_of_flat, topk_w)
 
             out_holder = {}
             if shared_fn is not None:

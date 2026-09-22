@@ -70,6 +70,14 @@
 #include "cutlass/gemm/group_array_problem_shape.hpp"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 
+// The fused-SwiGLU FC1 epilogue (the clone of CUTLASS's pointer-array NoSmem
+// EVT epilogue whose store emits MXFP8(silu(gate)*up)). The header is written
+// into the BUILD directory by csrc/gemm/tools/make_sm100_fused_swiglu_epilogue.py
+// and only the translation unit that compiles the sm_100 grouped kernels gets
+// that directory on its include path (see FsoBuildExtension in python/setup.py),
+// which is why this header is the only file in the source tree that names it.
+#include "blockscale_gemm/arch/sm100/mxfp8/sm100_fused_swiglu_epilogue.hpp"
+
 namespace sm100_blockscaled_gemm
 {
 
@@ -131,6 +139,163 @@ struct Sm100MxFP8GroupedGemmConfig
         void, LayoutDTag, AlignmentD,
         ElementD, LayoutDTag, AlignmentD,
         EpilogueSchedule>::CollectiveOp;
+
+    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm100, cutlass::arch::OpClassBlockScaledTensorOp,
+        ElementAPair, LayoutATag, AlignmentAB,
+        ElementBPair, LayoutBTag, AlignmentAB,
+        ElementAccumulator,
+        MmaTileShape, ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+        KernelSchedule>::CollectiveOp;
+
+    using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
+
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+        ProblemShape,
+        CollectiveMainloop,
+        CollectiveEpilogue>;
+
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+    using Sm1xxBlkScaledConfig = typename GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+    using InternalLayoutSFA = typename GemmKernel::CollectiveMainloop::InternalLayoutSFA;
+    using InternalLayoutSFB = typename GemmKernel::CollectiveMainloop::InternalLayoutSFB;
+    using InternalStrideA = typename GemmKernel::InternalStrideA;
+    using InternalStrideB = typename GemmKernel::InternalStrideB;
+    using InternalStrideD = typename GemmKernel::InternalStrideD;
+};
+
+// ---------------------------------------------------------------------------
+// The fused-SwiGLU FC1 variant of the same pointer-array kernel
+// ---------------------------------------------------------------------------
+//
+// An MoE layer's first projection (FC1, the gate_up projection) is followed by
+// a second kernel that reads the bf16 [G, m_cap, 2*I] result back, computes
+// silu(gate) * up and quantises the result to MXFP8 for the second projection.
+// The config below removes that second kernel: the GEMM keeps its mainloop and
+// its tile scheduler and only its STORE changes, from "write bf16 accumulators"
+// to "pair the columns, apply SwiGLU in FP32, take the 32-wide amax, derive the
+// UE8M0 byte and write the fp8 bytes plus the scale byte". The measured effect
+// on the FC1 stage alone is in run b300_mxfp8_20260917/M-E1 section 4.
+//
+// Two preconditions, both of which the caller must satisfy because the kernel
+// cannot detect their violation:
+//
+//   * the FC1 weight rows are INTERLEAVED, row 2j being gate_j and row 2j+1
+//     being up_j. The reason is the shape of the accumulator fragment a thread
+//     holds; the long form is in fused_swiglu_store.cuh. Fed the usual
+//     [gate; up] stacking the kernel computes silu(gate_j) * gate_{j+I/2}-ish
+//     nonsense and reports no error, which is why the op that drives it says so
+//     in its docstring and in docs/api/gemm.md.
+//   * the output width I = N/2 is a multiple of 128, so a 1x32 scale block
+//     never straddles the atom slab's 128-column block boundary.
+//
+// Everything else — the argument arrays, the prep kernel, the masked contract,
+// the Params cache — is shared with the unfused launcher above.
+//
+// Why the epilogue OpClass differs from the unfused config. The unfused config
+// passes `OpClassTensorOp`, which sends the CUTLASS builder down the legacy
+// `thread::LinearCombination` branch and therefore selects the DEFAULT-fusion
+// specialisation of the pointer-array NoSmem epilogue — the one that loads the
+// WHOLE CTA tile of the accumulator into one thread's registers.
+// `OpClassBlockScaledTensorOp` selects the EVT specialisation instead, which
+// divides the CTA tile by the epilogue tile that the NoSmem builder pins to
+// (TileM, min(64, TileN)). That is the specialisation whose fragment is one
+// output row by 64 consecutive N columns, i.e. exactly 32 interleaved gate/up
+// pairs, i.e. exactly one 1x32 output scale block — so the pairing and the amax
+// are register-local, with no shuffle and no shared memory. The fused store is
+// only expressible against that fragment shape.
+template <class ET, class EC, class SC, class ED, class SD, class FC, class CT, class AC, class AD>
+class FusedSwiGluEpilogueWS
+    : public cutlass::epilogue::collective::detail::Sm100TmaWarpSpecializedAdapter<
+          cutlass::epilogue::collective::FsoFusedSwiGluPtrArrayNoSmem<ET, EC, SC, ED, SD, FC, CT, AC, AD>>
+{
+public:
+    using cutlass::epilogue::collective::detail::Sm100TmaWarpSpecializedAdapter<
+        cutlass::epilogue::collective::FsoFusedSwiGluPtrArrayNoSmem<ET, EC, SC, ED, SD, FC, CT, AC,
+            AD>>::Sm100TmaWarpSpecializedAdapter;
+};
+
+// Re-emit the builder's OWN nine epilogue template arguments against the
+// generated clone.
+//
+// The builder returns `CollectiveEpilogue<Sm100PtrArrayNoSmemWarpSpecialized,
+// EpilogueTile, ElementC, StrideC, ElementD, StrideD, FusionCallbacks,
+// CopyOpT2R, AlignmentC, AlignmentD>`. Pattern-matching that type and passing
+// its arguments through means not a single template argument of the fused
+// epilogue is guessed here: the epilogue tile, the accumulator load op and the
+// alignments are whatever the builder computed for this tile shape. If a
+// CUTLASS bump changes the builder's return type this fails to compile instead
+// of silently binding a differently-partitioned epilogue.
+template <class T>
+struct RebindFusedSwiGlu;
+
+template <class ET, class EC, class SC, class ED, class SD, class FC, class CT, class AC, class AD>
+struct RebindFusedSwiGlu<cutlass::epilogue::collective::CollectiveEpilogue<
+    cutlass::epilogue::Sm100PtrArrayNoSmemWarpSpecialized, ET, EC, SC, ED, SD, FC, CT, AC, AD>>
+{
+    using type = FusedSwiGluEpilogueWS<ET, EC, SC, ED, SD, FC, CT, AC, AD>;
+};
+
+// One kernel instantiation per (TileM, TileN, TileK) of the fused FC1. The
+// cluster is fixed at (1,1,1) and TileM at 128 because the fused store is
+// written against the 1SM NoSmem epilogue's fragment; the 2SM schedules use a
+// different epilogue class and are not offered here (run
+// b300_mxfp8_20260917/M-E1 section 8.5 records that as untried rather than
+// rejected). TileN 64 is excluded because the cascade never selects it and
+// because a 64-wide N tile is a single epilogue subtile, which leaves nothing
+// for the store loop to amortise.
+template <int TileM, int TileN, int TileK = 128>
+struct Sm100MxFP8GroupedSwiGluGemmConfig
+{
+    static_assert(TileM == 128, "the fused FC1 epilogue is written against the 1SM NoSmem epilogue (TileM = 128)");
+    static_assert(TileN == 128 || TileN == 192 || TileN == 256,
+        "fused FC1: TileN must be 128, 192 or 256 (the widths the pointer-array cascade selects)");
+    static_assert(TileN % 64 == 0, "fused FC1: TileN must be a whole number of 64-column epilogue subtiles");
+    static_assert(TileK == 128, "fused FC1: TileK 128 only (TileK 256 was not built; see M-E1 section 8.5)");
+
+    using ElementAPair = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
+    using ElementBPair = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
+    // ElementD is still bf16 and D is still declared, because the epilogue's
+    // register accumulator is sized from the D tile. Nothing is stored through
+    // it — edit 9 of the generator deletes that store — so the D pointer array
+    // only feeds address arithmetic (see the launcher's comment on d_base).
+    using ElementD = cutlass::bfloat16_t;
+    using ElementAccumulator = float;
+
+    using LayoutATag = cutlass::layout::RowMajor*;
+    using LayoutBTag = cutlass::layout::ColumnMajor*;
+    using LayoutDTag = cutlass::layout::RowMajor*;
+    static constexpr int AlignmentAB = 16;
+    static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
+
+    using MmaTileShape = Shape<Int<TileM>, Int<TileN>, Int<TileK>>;
+    using ClusterShape = Shape<_1, _1, _1>;
+
+    using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmMxf8f6f4Sm100;
+    using EpilogueSchedule = cutlass::epilogue::PtrArrayNoSmemWarpSpecialized1Sm;
+
+    using StockEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm100, cutlass::arch::OpClassBlockScaledTensorOp,
+        MmaTileShape, ClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        ElementAccumulator, ElementAccumulator,
+        void, LayoutDTag, AlignmentD,
+        ElementD, LayoutDTag, AlignmentD,
+        EpilogueSchedule>::CollectiveOp;
+
+    using CollectiveEpilogue = typename RebindFusedSwiGlu<StockEpilogue>::type;
+
+    // The fused store writes through plain global stores and stages nothing, so
+    // the epilogue's shared-memory footprint is unchanged and therefore
+    // `StageCountAutoCarveout` gives the mainloop the same number of stages it
+    // gives the stock epilogue. That is the property the whole "free in
+    // resources" claim rests on, so it is a compile-time assertion rather than
+    // a sentence in a comment.
+    static_assert(sizeof(typename CollectiveEpilogue::SharedStorage) == sizeof(typename StockEpilogue::SharedStorage),
+        "the fused FC1 epilogue changed the epilogue shared-memory footprint, which would cost a mainloop stage");
 
     using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
         cutlass::arch::Sm100, cutlass::arch::OpClassBlockScaledTensorOp,

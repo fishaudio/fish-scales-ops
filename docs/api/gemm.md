@@ -124,11 +124,11 @@ opaque scale byte layout differs (see the two `grouped MXFP8 … scales` rows in
 
 | step | function | in → out |
 |---|---|---|
-| routing | `moe_build_routing(topk_ids, num_groups, m_cap)` | int32 `[M, topk]` → (`masked_m [G]`, `row_map [G*m_cap]`, `slot_of_flat [M*topk]`); `G <= 1024`, `m_cap % 4 == 0`, `m_cap >= M` |
+| routing | `moe_build_routing(topk_ids, num_groups, m_cap, with_slots=False)` | int32 `[M, topk]` → (`masked_m [G]`, `row_map [G*m_cap]`, `slot_of_flat [M*topk]`), plus `slot_to_expert [G]` when `with_slots=True`; `G <= 1024`, `m_cap % 4 == 0`, `m_cap >= M` |
 | gather + quantize | `quantize_1x32_grouped_gather_fp8(x, slot_of_flat, topk, num_groups, m_cap)` | bf16 `[M, K]` → (fp8 `[G, m_cap, K]`, int32 `[G, K/128, m_cap]`) |
-| gate_up | `linear_mxfp8_grouped_masked(a_fp8, w13_fp8, sa, sw13, masked_m, expected_m)` | → bf16 `[G, m_cap, 2*INTER]` |
+| gate_up | `linear_mxfp8_grouped_masked(a_fp8, w13_fp8, sa, sw13, masked_m, expected_m, max_active_groups=0, slot_to_expert=None)` | → bf16 `[G, m_cap, 2*INTER]` |
 | SwiGLU + quantize | `silu_chunk_mul_quantize_1x32_grouped_fp8(gu, slot_of_flat)` | → (fp8 `[G, m_cap, INTER]`, int32 `[G, INTER/128, m_cap]`) |
-| down | `linear_mxfp8_grouped_masked(h_fp8, w2_fp8, sh, sw2, masked_m, expected_m)` | → bf16 `[G, m_cap, HIDDEN]` |
+| down | `linear_mxfp8_grouped_masked(h_fp8, w2_fp8, sh, sw2, masked_m, expected_m, max_active_groups=0, slot_to_expert=None)` | → bf16 `[G, m_cap, HIDDEN]` |
 | combine | `moe_combine(dn, slot_of_flat, topk_w)` | → bf16 `[M, HIDDEN]`, `out[t] = Σ_j topk_w[t,j] · dn[slot_of_flat[t*topk+j]]` |
 | weights (offline) | `quantize_moe_weights_1x32_fp8(w)` | bf16 `[G, N, K]` → (fp8 `[G, N, K]`, int32 `[G, K/128, N]`); `N % 128 == 0`, `K % 128 == 0` |
 
@@ -137,6 +137,16 @@ tile selection; pass a plain `int` so the captured graph stays shape-static.
 Caller contract: `masked_m[g] <= m_cap` for every group (the kernel does not
 check; overflow rows are dropped at the TMA bounds). The two grouped GEMM
 constraints are `K % 128 == 0`, `N % 128 == 0`.
+
+`linear_mxfp8_grouped_masked` takes one further optional host-side static hint,
+`max_active_groups` (default `0`, meaning "not supplied"): an upper bound on how
+many groups can hold at least one row, i.e. `min(M * topk, G)`. It carries
+information `expected_m` cannot — `expected_m` is `ceil(rows / G)` and stays at
+`1` across the whole decode band while the number of groups that can hold rows
+runs from `topk` to `G` — and on sm_100/103 it is what lets the dispatcher size
+the slot-bound decode route described below. Like `expected_m` it must be a
+plain `int` and must not vary between a capture and its replays. It is
+constrained to `0 <= max_active_groups <= G`. sm_120/121 accept and ignore it.
 
 On sm_100/103 the GEMM is a CUTLASS pointer-array (grouped) tcgen05
 block-scaled kernel. Its per-group problem shapes, base pointers, strides and
@@ -193,6 +203,139 @@ caller can observe them.
   is the stress test for this: two host threads on two streams, released into
   each burst by a barrier so the kernels really overlap, checking every result
   against the contract above.
+
+**sm_100/103 — the slot-bound decode route.** The sm_100/103 dispatcher has a
+second grouped kernel for the decode band. It swaps the operand roles: the
+expert weight rows go on the GEMM's M axis, where the block-scaled tile's
+128-row granularity is exact, and the routed token rows go on a 64-wide N axis,
+where a decode-sized expert wastes far less of the tile. The output is written
+through a column-major `D` view that addresses the caller's ordinary row-major
+`[G, m_cap, N]` buffer in place, so nothing downstream changes, and both scale
+slabs are consumed exactly as the grouped quantizers emit them — the swap only
+changes which slab is handed to which operand. The grid is sized from `max_active_groups` rather than from `G`, and instead of
+the pointer-array prep kernel the route needs a slot list: the ids of the
+experts holding at least one row, packed ascending into the low entries with
+`-1` after them. `linear_mxfp8_grouped_masked` takes that list as a fourth
+optional argument, `slot_to_expert` (int32 `[G]` on device, contiguous, on
+`masked_m`'s device); pass `moe_build_routing(..., with_slots=True)`'s fourth
+output and the route launches nothing but the GEMM. Omit it and the route
+builds the same list itself with a one-block kernel before the GEMM, which is
+what it did before, so existing callers keep working unchanged.
+`linear_mxfp8_grouped_masked_swiglu` accepts and validates the same argument
+for signature parity and does not use it, because the fused FC1 exists only on
+the pointer-array route.
+
+CUTLASS's static persistent scheduler clamps the launched grid to the SM count,
+so whenever the tile space is larger than the machine each CTA loops over
+several tiles. The kernel therefore decides whether a tile is live — its slot
+holds an expert, and its token tile starts before that expert's routed row
+count — separately for every tile, ahead of that tile's first TMA, rather than
+once for the CTA's first tile. There is no whole-CTA early exit and no knob
+that restores one: an exit taken before the persistent loops begin drops every
+live tile assigned to a CTA whose first tile happens to be dead, and it was
+also measured as never faster.
+
+Two things a caller must know. First, the route is only taken when
+`max_active_groups` is supplied; with the default `0` the call always goes to
+the pointer-array kernel, so existing callers are unaffected. Second, the route
+is correct only while the whole row capacity fits one token tile
+(`m_cap <= 64`); the dispatcher enforces that as a hard check and the op raises
+rather than running the kernel outside it. `FSO_GROUPED_SLOT` switches the
+route: `0` never takes it, unset or `1` applies the dispatcher's rule, `force`
+takes it whenever it is legal and raises when it is not, and `force@<N>` forces
+it only for the GEMM whose `N` it names and sends every other shape to the
+pointer-array kernel (the per-GEMM A/B form: a MoE layer's two grouped GEMMs
+have different `N`, so this routes exactly one of them). The `force` forms are
+A/B knobs, not production settings. The variable is read once per process, so it
+must be set before the first grouped call and cannot change between a capture
+and its replays.
+
+The rule itself has two clauses and is about the size of the **live** tile
+space, not about how many experts are idle. The route is taken while `m_cap` is
+strictly below the 64-wide token tile and while the live tiles the slot grid is
+built from, `max_active_groups * ceil(N / 128)`, are at most fourteen waves of
+the device's SMs.
+
+Why that quantity. What the route buys is mainloop depth: the swap puts the
+expert weight rows on the 128-row M axis and the routed tokens on a 64-wide N
+axis, the activation stage in shared memory shrinks with it, and the freed
+memory becomes pipeline stages — eight, against six and four for the
+pointer-array kernel's tiles — which is what turns the expert weight stream from
+latency-bound into bandwidth-bound. That advantage is a rate, so it is earned
+again on every wave of live tiles, and it is present even when every expert
+holds a row. It is bounded, though, by what the pointer-array kernel's wider
+token tile saves per issue, which also accumulates with the wave count, so past
+a certain number of live waves the wider tile wins. The second clause stops one
+step below a completely full token tile, which is the one place inside the legal
+band where the live-tile clause alone disagrees with the layer measurements.
+
+With top-`k` routing `max_active_groups` is `min(M * topk, G)`, so for
+Qwen3-30B-A3B (`G = 128`, top-8, `N = 1536` and `2048`) both grouped GEMMs take
+the route up to `M = 48`, and for Qwen3.5-35B-A3B (`G = 256`, top-8, `N = 1024`
+and `2048`) `gate_up` takes it up to `M = 48` while `down` stops at `M = 16`.
+
+**sm_100/103 — the fused FC1.** On the pointer-array route the first grouped
+GEMM can also do the SwiGLU and the MXFP8 requantize in its own epilogue, which
+removes both the bf16 `[G, m_cap, 2*INTER]` intermediate and the separate
+`silu_chunk_mul_quantize_1x32_grouped_fp8` launch:
+
+| step | function | in → out |
+|---|---|---|
+| gate_up + SwiGLU + quantize | `linear_mxfp8_grouped_masked_swiglu(a_fp8, w13_fp8, sa, sw13, masked_m, expected_m, max_active_groups=0)` | → (fp8 `[G, m_cap, INTER]`, int32 per-group Sm1xx atom slabs) — the same pair `silu_chunk_mul_quantize_1x32_grouped_fp8` returns, so `down` consumes it unchanged |
+| weights (offline) | `quantize_moe_weights_1x32_fp8(w13, w13_interleave=True)` | as above, with the FC1 rows re-ordered |
+| weights (already quantized) | `interleave_w13_fp8(w13_fp8, sw13)` | → the same bytes in the interleaved row order |
+| load-time router | `mxfp8_grouped_swiglu_available(n_w, k)` | → bool: can this shape use the fused FC1 at all? |
+| per-call router | `mxfp8_grouped_swiglu_fused_route(m_cap, n_w, k, num_groups, max_active_groups)` | → bool: does this call take it? |
+
+**`linear_mxfp8_grouped_masked_swiglu` requires the FC1 weight rows to be
+gate/up interleaved — row `2j` is `gate_j`, row `2j+1` is `up_j`, not the usual
+`[gate; up]` stacking — and it cannot detect the wrong layout: given the
+stacked order it returns a finite, silently wrong answer and raises nothing,
+because the two orders are the same bytes in a different sequence.** Produce
+the interleaved form with `quantize_moe_weights_1x32_fp8(w13,
+w13_interleave=True)`, or, for an already-quantized checkpoint, with
+`interleave_w13_fp8`. Both are pure row permutations and give bit-identical
+bytes, because the 1×32 weight quantizer works per row along K. The op is
+sm_100/103 only and raises `NotImplementedError` naming the architecture
+elsewhere.
+
+Why the interleave is needed. The fusion works because the epilogue's
+TMEM-to-register copy hands one thread one output row and 64 consecutive N
+columns of it. With interleaved weight rows those 64 columns are 32 gate/up
+pairs, which is exactly one 1×32 output scale block, so the pairing, the SwiGLU
+and the 32-element amax all happen inside one thread's registers, with no
+shuffle, no shared memory and no second TMA descriptor. With the stacked order
+`gate_j` and `up_j` are `INTER` columns apart and never meet in one thread.
+
+Two decisions, both host-static, both taken by the library so a caller never
+restates the rule. `mxfp8_grouped_swiglu_available(n_w, k)` is the load-time
+one: a model holds one weight layout, so it decides how `w13` is quantized.
+`mxfp8_grouped_swiglu_fused_route(m_cap, n_w, k, num_groups,
+max_active_groups)` is the per-call one, and it is the negation of the
+slot-route verdict above — where the dispatcher takes the swap-orientation
+decode route the fusion does not exist, because that geometry puts `gate_j` and
+`up_j` in different lanes of the accumulator. A layer that carries interleaved
+weights and falls back to the unfused FC1 there must therefore pass
+`pairwise=True` to `silu_chunk_mul_quantize_1x32_grouped_fp8`, which reads
+`gate_i` at column `2i` and `up_i` at column `2i+1` instead of from the two
+halves of the row. That flag is sm_100/103 only and, like the weight layout,
+cannot be inferred: the wrong value multiplies the wrong pairs together and
+raises nothing.
+
+`FSO_FC1_FUSED` switches the whole feature: `0` never uses the fused FC1 (and
+`mxfp8_grouped_swiglu_available` then answers false, so a caller driven by it
+keeps the stacked weight layout as well), unset applies the rule above, and `1`
+uses it wherever it is legal. Like the other knobs it is read once per process
+and must not change between a capture and its replays.
+
+The fused FC1 runs on the N tile the pointer-array cascade would pick for the
+unfused GEMM, with the direct-store epilogue in every case, and with one
+documented exception: the cascade's rule that prefers a 192-wide N tile when
+192 divides `N` and that tile's last wave of CTAs is fuller is capped at
+`expected_m <= 16` for the unfused GEMM, and that cap does not apply to the
+fused FC1. The cap exists because a wide BF16 direct store stops being cheap
+once the rows pile up; the fused store writes about a quarter of those bytes,
+so the wave arithmetic is allowed to decide at every `expected_m`.
 
 **sm_90 — expert-sorted contiguous layout (block-FP8).** The `M * topk` routed
 pairs are sorted by expert into one compact list, each expert's run padded to
@@ -285,10 +428,13 @@ silu_chunk_mul_quantize_1x32(Tensor gu, bool use_ue8m0=True) -> (Tensor, Tensor)
 repack_mxfp8_scales(Tensor scales_f32) -> Tensor                          # legacy two-step
 linear_mxfp8_raw(Tensor x_fp8, Tensor w_fp8, Tensor sx_int32, Tensor sw_int32) -> Tensor
 
-linear_mxfp8_grouped_masked(Tensor a_fp8, Tensor w_fp8, Tensor sa_int32, Tensor sw_int32, Tensor masked_m, int expected_m) -> Tensor
+linear_mxfp8_grouped_masked(Tensor a_fp8, Tensor w_fp8, Tensor sa_int32, Tensor sw_int32, Tensor masked_m, int expected_m, int max_active_groups=0, Tensor? slot_to_expert=None) -> Tensor
 quantize_1x32_grouped_gather(Tensor x, Tensor slot_of_flat, int topk, int num_groups, int m_cap, bool use_ue8m0=True) -> (Tensor, Tensor)
-silu_chunk_mul_quantize_1x32_grouped(Tensor gu, Tensor slot_of_flat, bool use_ue8m0=True) -> (Tensor, Tensor)
-moe_build_routing(Tensor topk_ids, int num_groups, int m_cap) -> (Tensor, Tensor, Tensor)
+silu_chunk_mul_quantize_1x32_grouped(Tensor gu, Tensor slot_of_flat, bool use_ue8m0=True, bool pairwise=False) -> (Tensor, Tensor)
+linear_mxfp8_grouped_masked_swiglu(Tensor a_fp8, Tensor w13_fp8, Tensor sa_int32, Tensor sw13_int32, Tensor masked_m, int expected_m, int max_active_groups=0, Tensor? slot_to_expert=None) -> (Tensor, Tensor)
+mxfp8_grouped_swiglu_available(int n_w, int k) -> bool
+mxfp8_grouped_swiglu_fused_route(int m_cap, int n_w, int k, int num_groups, int max_active_groups) -> bool
+moe_build_routing(Tensor topk_ids, int num_groups, int m_cap, bool with_slots=False) -> (Tensor, Tensor, Tensor, Tensor)
 moe_combine(Tensor dn, Tensor slot_of_flat, Tensor topk_w) -> Tensor
 moe_build_sorted(Tensor topk_ids, int num_groups, int block_m) -> (Tensor, Tensor, Tensor)
 moe_combine_sorted(Tensor dn, Tensor flat_to_sorted, Tensor topk_w) -> Tensor
@@ -314,11 +460,11 @@ warmup populates the process-static state that must not be created inside a
 capture: the `cudaFuncSetAttribute` guard of each kernel instantiation, the
 Stream-K side-stream pool and its scratch buffer (sm_120), the int32 scale
 scratch pool of the fused runner paths, the grouped GEMM's argument pool and
-the multi-CTA routing builder's scratch pool (sm_100/103; both are per host
-thread, so each thread that captures needs its own eager call), the deep_gemm
-NVRTC compilation of each kernel configuration (sm_90; in-memory only, no disk
-cache), and the DSL JIT per configuration (sm_100/103).
-`tests/gemm/unit/test_cuda_graph.py` is the
+the multi-CTA routing builder's scratch pool and the slot-bound route's
+slot-list pool (sm_100/103; all are per host thread, so each thread that
+captures needs its own eager call), the deep_gemm NVRTC compilation of each
+kernel configuration (sm_90; in-memory only, no disk cache), and the DSL JIT
+per configuration (sm_100/103). `tests/gemm/unit/test_cuda_graph.py` is the
 reference discipline: eager reference → three warm calls on the capture
 stream → capture → replay, compared bit-exactly.
 
@@ -326,8 +472,8 @@ What may change between replays: the routing. Both MoE layouts keep the
 per-expert counts and index maps on the device and derive them inside the
 graph (`moe_build_routing` / `moe_build_sorted` are captured), so a layer
 captured for one `M` replays with any routing of that `M`. What must not
-change: tensor shapes, `m_cap`, `expected_m`, and the sm_90 `M`-dispatch branch
-(all host-static per `M`; capture one graph per `M`).
+change: tensor shapes, `m_cap`, `expected_m`, `max_active_groups`, and the
+sm_90 `M`-dispatch branch (all host-static per `M`; capture one graph per `M`).
 
 Two ops synchronize the device and belong at weight-load time, outside any
 capture: `repack_fp8_act_scales` and `repack_fp8_wgt_scales` (the UE8M0
@@ -359,6 +505,9 @@ contract — the cascades already encode the measured picks.
 | `FSO_DSL_KERNEL_PATH=<file>` | sm_100/103 | alternative DSL kernel source |
 | `FSO_FORCE_SWIZZLE=<n>`, `FSO_FORCE_RASTER={1,2}`, `FSO_SK_NDET=1`, `FSO_SK_DECOMP={1,2,3}` | sm_100/103 C++ cascade | scheduler raster swizzle size, raster direction (along M / along N), nondeterministic Stream-K reduction, decomposition mode — probe knobs, never wired into the cascade |
 | `FSO_PRINT_TILE_INFO=1` | sm_100/103 dense cascade | make every kernel instantiation print, once, the mainloop stage count `StageCountAutoCarveout` derived for it and its shared-memory footprint. That is the quantity that says whether a narrower `TileN` bought pipeline depth or only extra CTAs, and it is the only way to see a stage collapse (a tile whose epilogue eats the carve-out and leaves one mainloop stage) without guessing |
+| `FSO_GROUPED_SLOT={0,1,force,force@<N>}` | sm_100/103 grouped MoE decode route | `0` never takes the slot-bound swap-orientation route, unset or `1` applies the dispatcher's rule, `force` takes it wherever it is legal and raises where it is not, `force@<N>` forces it for the GEMM whose `N` it names only (see the grouped section above; the `force` forms are A/B knobs) |
+| `FSO_GATHER_QUANT_ONCE={0,1}` | sm_100/103 grouped MoE gather-quantize | `0` always quantizes per routed (token, expert) pair, unset applies the launcher's rule (the token-space form once its grid covers one full wave of SMs), `1` always quantizes each token once and scatters the bytes to its top-k destinations |
+| `FSO_FC1_FUSED={0,1}` | sm_100/103 grouped MoE FC1 | `0` never uses the fused FC1 (and `mxfp8_grouped_swiglu_available` then answers false, so a caller keeps the `[gate; up]` weight layout too), unset applies the router, `1` uses it wherever it is legal |
 | `FSO_BENCH_WARM_MS=<ms>` | benches only | spin the GPU before each cell's timing (needed on unlocked devices, see `../perf/README.md` §5) |
 
 ### `FSO_FORCE_TILE` on the sm_100/103 dense cascade
