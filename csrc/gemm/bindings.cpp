@@ -17,6 +17,7 @@
 
 #include <optional>
 #include <tuple>
+#include <vector>
 
 namespace blockscale_gemm
 {
@@ -53,7 +54,7 @@ at::Tensor linear_mxfp8_raw(at::Tensor x_fp8, at::Tensor w_fp8,
 // Grouped (MoE, masked layout) MXFP8 — sm_120 only (M1).
 at::Tensor linear_mxfp8_grouped_masked(at::Tensor a_fp8, at::Tensor w_fp8, at::Tensor sa_int32,
     at::Tensor sw_int32, at::Tensor masked_m, int64_t expected_m, int64_t max_active_groups,
-    std::optional<at::Tensor> slot_to_expert);
+    std::optional<at::Tensor> slot_to_expert, std::optional<at::Tensor> problem_shapes);
 std::tuple<at::Tensor, at::Tensor> quantize_1x32_grouped_gather(
     at::Tensor x, at::Tensor slot_of_flat, int64_t topk, int64_t num_groups,
     int64_t m_cap, bool use_ue8m0);
@@ -62,7 +63,7 @@ std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x32_grouped(
 // Fused-SwiGLU FC1 (sm_100/sm_103 only) and its host-side router.
 std::tuple<at::Tensor, at::Tensor> linear_mxfp8_grouped_masked_swiglu(at::Tensor a_fp8, at::Tensor w13_fp8,
     at::Tensor sa_int32, at::Tensor sw13_int32, at::Tensor masked_m, int64_t expected_m, int64_t max_active_groups,
-    std::optional<at::Tensor> slot_to_expert);
+    std::optional<at::Tensor> slot_to_expert, std::optional<at::Tensor> problem_shapes);
 bool mxfp8_grouped_swiglu_fused_route(
     int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups, int64_t max_active_groups);
 bool mxfp8_grouped_swiglu_available(int64_t n_w, int64_t k);
@@ -70,9 +71,17 @@ bool mxfp8_grouped_swiglu_available(int64_t n_w, int64_t k);
 // consumer of moe_build_routing's packed active-expert list, so a caller uses
 // it to decide whether to ask for that list at all.
 bool mxfp8_grouped_slot_possible(
-    int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups, int64_t max_active_groups);
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_build_routing(
-    at::Tensor topk_ids, int64_t num_groups, int64_t m_cap, bool with_slots);
+    int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups, int64_t max_active_groups, bool fused_swiglu);
+// Would this grouped GEMM shape read a caller-supplied problem_shapes tensor
+// (the pointer-array route's counterpart of the slot list)? A caller uses it
+// to ask moe_build_routing for the shapes exactly where a GEMM consumes them.
+// `fused_swiglu` names the kernel, as above: the two queries are complements
+// only when asked with the same flag.
+bool mxfp8_grouped_problem_shapes_consumed(
+    int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups, int64_t max_active_groups, bool fused_swiglu);
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_build_routing(
+    at::Tensor topk_ids, int64_t num_groups, int64_t m_cap, bool with_slots,
+    std::vector<int64_t> problem_shapes_nk);
 at::Tensor moe_combine(at::Tensor dn, at::Tensor slot_of_flat, at::Tensor topk_w);
 std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_build_sorted(
     at::Tensor topk_ids, int64_t num_groups, int64_t block_m);
@@ -112,14 +121,16 @@ TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
                             "Tensor sx_int32, Tensor sw_int32) -> Tensor");
     m.def("linear_mxfp8_grouped_masked(Tensor a_fp8, Tensor w_fp8, Tensor sa_int32, "
                                        "Tensor sw_int32, Tensor masked_m, int expected_m, "
-                                       "int max_active_groups=0, Tensor? slot_to_expert=None) -> Tensor");
+                                       "int max_active_groups=0, Tensor? slot_to_expert=None, "
+                                       "Tensor? problem_shapes=None) -> Tensor");
     m.def("quantize_1x32_grouped_gather(Tensor x, Tensor slot_of_flat, int topk, "
                                         "int num_groups, int m_cap, bool use_ue8m0=True) -> (Tensor, Tensor)");
     m.def("silu_chunk_mul_quantize_1x32_grouped(Tensor gu, Tensor slot_of_flat, "
                                                 "bool use_ue8m0=True, bool pairwise=False) -> (Tensor, Tensor)");
     m.def("linear_mxfp8_grouped_masked_swiglu(Tensor a_fp8, Tensor w13_fp8, Tensor sa_int32, "
                                               "Tensor sw13_int32, Tensor masked_m, int expected_m, "
-                                              "int max_active_groups=0, Tensor? slot_to_expert=None) "
+                                              "int max_active_groups=0, Tensor? slot_to_expert=None, "
+                                              "Tensor? problem_shapes=None) "
                                               "-> (Tensor, Tensor)");
     // A pure host-side query (no tensor argument), so it carries its own
     // catch-all kernel here instead of a CUDA-dispatched impl below.
@@ -129,10 +140,13 @@ TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
     m.def("mxfp8_grouped_swiglu_available(int n_w, int k) -> bool",
         &blockscale_gemm::mxfp8_grouped_swiglu_available);
     m.def("mxfp8_grouped_slot_possible(int m_cap, int n_w, int k, int num_groups, "
-                                       "int max_active_groups) -> bool",
+                                       "int max_active_groups, bool fused_swiglu=False) -> bool",
         &blockscale_gemm::mxfp8_grouped_slot_possible);
-    m.def("moe_build_routing(Tensor topk_ids, int num_groups, int m_cap, bool with_slots=False) "
-          "-> (Tensor, Tensor, Tensor, Tensor)");
+    m.def("mxfp8_grouped_problem_shapes_consumed(int m_cap, int n_w, int k, int num_groups, "
+                                                 "int max_active_groups, bool fused_swiglu=False) -> bool",
+        &blockscale_gemm::mxfp8_grouped_problem_shapes_consumed);
+    m.def("moe_build_routing(Tensor topk_ids, int num_groups, int m_cap, bool with_slots=False, "
+                             "int[] problem_shapes_nk=[]) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def("moe_combine(Tensor dn, Tensor slot_of_flat, Tensor topk_w) -> Tensor");
     m.def("moe_build_sorted(Tensor topk_ids, int num_groups, int block_m) "
           "-> (Tensor, Tensor, Tensor)");

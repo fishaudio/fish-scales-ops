@@ -56,6 +56,26 @@
 //     capture-time allocation aborts with a message telling the caller to warm
 //     up eagerly first.
 //
+// Routing-supplied problem shapes: the launch without a prep kernel
+// -----------------------------------------------------------------------
+// Of the eleven per-group arrays only the problem shapes depend on the routing
+// (see the note on `sm100_grouped_prep_kernel` for why `layout_sfa` does not
+// have to). `moe_build_routing` already holds every group's row count when it
+// publishes `masked_m`, so it can write the `(rows, N, K)` triples for each
+// GEMM of the layer in the same pass, and a caller that hands that tensor in
+// as `problem_shapes` lets the launcher skip the prep launch altogether (run
+// b300_round3_20260922/M-A4; the two prep launches were the whole of the
+// per-layer kernel-time budget item L4 of run b300_remeasure_20260922). The
+// ten remaining arrays are then a pure function of the tensor set -- the five
+// base addresses, the per-group byte strides, m_cap, N and K -- and are built
+// ONCE per distinct tensor set into a key-addressed block of `StaticArena`
+// below, and reused by every later call that presents the same key. Two
+// consequences a caller can observe, both explained at `StaticArena`: a block
+// bound while a stream is capturing is written OUTSIDE the capture (a side
+// stream plus a host wait, under the relaxed capture mode) so the captured
+// graph carries no writer of its arrays, and such a block is pinned for the
+// life of the process because the graph's kernel node keeps reading it.
+//
 // A second route, not a tile of this one, lives in
 // `grouped_slot_dispatch.cuh`: the slot-bound swap-orientation kernel for the
 // decode band, selected by `grouped_detail::slot_route` below and switched with
@@ -108,6 +128,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
+#include <vector>
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -256,6 +277,45 @@ __global__ void sm100_grouped_prep_kernel(GProblemShape* __restrict__ problem, v
 #endif
 }
 
+// The routing-independent arrays on their own, for the launch that takes its
+// problem shapes from `moe_build_routing` (run b300_round3_20260922/M-A4).
+//
+// Same ten arrays, same values as the first half of the prep kernel, with one
+// deliberate difference: `layout_sfa` is derived from `m_cap` at every row
+// capacity, not from `masked_m[g]` above 128 rows. That is safe for the
+// reason the prep kernel's note gives for the sub-128 case, extended: the
+// scale-factor descriptor is read one 128-row atom per M tile, and the grouped
+// scheduler only ever issues the ceil(masked_m[g] / 128) tiles the problem
+// shape allows, so every tile that runs finds its atom in bounds under either
+// row extent and loads the same bytes. The row extent past the last live tile
+// is never addressed. The launch is plain (no programmatic attribute): it
+// happens only on the eager path, immediately before the GEMM, and the GEMM's
+// own `griddepcontrol.wait` then orders it.
+__global__ void sm100_grouped_static_kernel(void const** __restrict__ ptr_a, void const** __restrict__ ptr_b,
+    void const** __restrict__ ptr_sfa, void const** __restrict__ ptr_sfb, void** __restrict__ ptr_d,
+    GStrideA* __restrict__ stride_a, GStrideB* __restrict__ stride_b, GStrideD* __restrict__ stride_d,
+    GLayoutSFA* __restrict__ layout_sfa, GLayoutSFB* __restrict__ layout_sfb, int groups, int m_cap, int shape_n,
+    int shape_k, char* a_base, char* b_base, char* sfa_base, char* sfb_base, char* d_base, int64_t a_bytes,
+    int64_t b_bytes, int64_t sfa_bytes, int64_t sfb_bytes, int64_t d_bytes)
+{
+    int const g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= groups)
+        return;
+    ptr_a[g] = a_base + static_cast<int64_t>(g) * a_bytes;
+    ptr_b[g] = b_base + static_cast<int64_t>(g) * b_bytes;
+    ptr_sfa[g] = sfa_base + static_cast<int64_t>(g) * sfa_bytes;
+    ptr_sfb[g] = sfb_base + static_cast<int64_t>(g) * sfb_bytes;
+    ptr_d[g] = d_base + static_cast<int64_t>(g) * d_bytes;
+    stride_a[g] = cute::make_stride(static_cast<int64_t>(shape_k), cute::Int<1>{}, cute::Int<0>{});
+    stride_b[g] = cute::make_stride(static_cast<int64_t>(shape_k), cute::Int<1>{}, cute::Int<0>{});
+    stride_d[g] = cute::make_stride(static_cast<int64_t>(shape_n), cute::Int<1>{}, cute::Int<0>{});
+    layout_sfb[g] = GSfConfig::tile_atom_to_shape_SFB(cute::make_shape(128, shape_n, shape_k, 1));
+    // 128 is the row extent every m_cap in [1, 128] rounds up to (and the
+    // prep kernel's fallback), so the two launches agree exactly there.
+    int const m_desc = m_cap < 128 ? 128 : m_cap;
+    layout_sfa[g] = GSfConfig::tile_atom_to_shape_SFA(cute::make_shape(m_desc, shape_n, shape_k, 1));
+}
+
 // Device-side argument arrays for the grouped launch.
 //
 // Two slots, used alternately: consecutive grouped GEMMs in one MoE layer
@@ -375,6 +435,367 @@ struct ArgPool
     }
 };
 
+// ---------------------------------------------------------------------------
+// Key-addressed static argument blocks (run b300_round3_20260922/M-A4)
+// ---------------------------------------------------------------------------
+//
+// What a block is. When the caller supplies the problem shapes, the ten
+// remaining per-group arrays are a function of nothing but this key: the five
+// base addresses, the per-group byte strides, the group count, m_cap, N and K.
+// Two calls with the same key need the same bytes in those arrays, so a block
+// is written once when it is bound to a key and read by every later call that
+// presents the key again. The key is compared on the host; nothing here reads
+// device memory.
+//
+// Why a capture binds its block outside the capture. A `torch.cuda.graph`
+// capture allocates its tensors from the graph's private pool, so the
+// addresses the captured GEMM will read are not the addresses the eager
+// warm-up bound, and the key misses. Writing the block through the capturing
+// stream would put the writer back into the graph as a node, which is the
+// launch this route exists to remove. The block is therefore written on the
+// arena's own non-blocking stream and waited for on the host before the call
+// returns, with the calling thread switched to `cudaStreamCaptureModeRelaxed`
+// for the duration -- the same exchange the PyTorch caching allocator makes
+// around its own capture-time cudaMalloc -- so that the launch and the wait
+// are neither captured nor treated as capture-invalidating calls. By the time
+// the graph is instantiated the arrays are resident, and the graph's kernel
+// node reads them on every replay with no writer ahead of it.
+//
+// Why a capture-bound block is pinned. That kernel node keeps reading the
+// block for as long as the graph exists, and the pool has no way to learn when
+// a graph is destroyed, so the block can never be rebound: eviction is
+// restricted to blocks that only eager calls have used, least recently used
+// first. Memory therefore grows with the number of distinct (capture, GEMM)
+// pairs a host thread creates, at `block_bytes(groups)` each (about 13 KB at
+// 128 experts, 106 KB at the 1024 cap); the arena is one allocation of
+// FSO_GROUPED_ARG_POOL_MB megabytes (default 16), made on the first eager
+// call of the thread and never grown. A capture that finds the arena full
+// aborts with a message naming the variable, because the alternative is to
+// fall back to the prep launch inside the graph and silently give back the
+// kernel this change removed; an eager call that finds it full falls back to
+// exactly that prep launch, which is always correct.
+//
+// What is NOT protected, and was not before either. An eager-bound block may
+// be evicted and rewritten while a GEMM issued earlier on another stream is
+// still reading it. The two-slot alternation the prep path uses has the same
+// exposure with a two-call window; the arena's window is the number of
+// evictable blocks, so it is no worse. Within one stream, order alone makes
+// the rewrite safe.
+struct StaticKey
+{
+    void const* a;
+    void const* b;
+    void const* sfa;
+    void const* sfb;
+    void const* d;
+    int64_t a_bytes;
+    int64_t b_bytes;
+    int64_t sfa_bytes;
+    int64_t sfb_bytes;
+    int64_t d_bytes;
+    int groups;
+    int m_cap;
+    int shape_n;
+    int shape_k;
+};
+
+struct StaticBlock
+{
+    StaticKey key;
+    ArgSlot arrays; // `problem` stays nullptr: the shapes come from the caller
+    std::size_t bytes = 0;
+    bool pinned = false;
+    unsigned long long last_use = 0;
+};
+
+struct StaticArena
+{
+    char* base = nullptr;
+    std::size_t capacity = 0;
+    std::size_t used = 0;
+    std::vector<StaticBlock> blocks;
+    unsigned long long tick = 0;
+    cudaStream_t side = nullptr;
+    bool failed = false;
+    bool warned_full = false;
+
+    static StaticArena& instance()
+    {
+        static thread_local StaticArena a;
+        return a;
+    }
+
+    static std::size_t pool_bytes()
+    {
+        static std::size_t const v = []
+        {
+            char const* e = std::getenv("FSO_GROUPED_ARG_POOL_MB");
+            long mb = (e && *e) ? std::atol(e) : 16;
+            if (mb < 1)
+                mb = 1;
+            return static_cast<std::size_t>(mb) << 20;
+        }();
+        return v;
+    }
+
+    // Byte size of one block's ten arrays for `groups` groups, each array
+    // 16-byte aligned and the whole rounded to 256 so blocks never share a
+    // cache line.
+    static std::size_t block_bytes(int groups)
+    {
+        std::size_t off = 0;
+        auto take = [&](std::size_t bytes) { off = ArgPool::align_up(off, 16) + bytes; };
+        for (int i = 0; i < 5; ++i)
+            take(sizeof(void*) * groups);
+        take(sizeof(GStrideA) * groups);
+        take(sizeof(GStrideB) * groups);
+        take(sizeof(GStrideD) * groups);
+        take(sizeof(GLayoutSFA) * groups);
+        take(sizeof(GLayoutSFB) * groups);
+        return ArgPool::align_up(off, 256);
+    }
+
+    static void carve(char* raw, int groups, ArgSlot& s)
+    {
+        std::size_t off = 0;
+        auto take = [&](std::size_t bytes) -> char*
+        {
+            off = ArgPool::align_up(off, 16);
+            char* p = raw + off;
+            off += bytes;
+            return p;
+        };
+        s.problem = nullptr;
+        s.ptr_a = reinterpret_cast<void const**>(take(sizeof(void*) * groups));
+        s.ptr_b = reinterpret_cast<void const**>(take(sizeof(void*) * groups));
+        s.ptr_sfa = reinterpret_cast<void const**>(take(sizeof(void*) * groups));
+        s.ptr_sfb = reinterpret_cast<void const**>(take(sizeof(void*) * groups));
+        s.ptr_d = reinterpret_cast<void**>(take(sizeof(void*) * groups));
+        s.stride_a = reinterpret_cast<GStrideA*>(take(sizeof(GStrideA) * groups));
+        s.stride_b = reinterpret_cast<GStrideB*>(take(sizeof(GStrideB) * groups));
+        s.stride_d = reinterpret_cast<GStrideD*>(take(sizeof(GStrideD) * groups));
+        s.layout_sfa = reinterpret_cast<GLayoutSFA*>(take(sizeof(GLayoutSFA) * groups));
+        s.layout_sfb = reinterpret_cast<GLayoutSFB*>(take(sizeof(GLayoutSFB) * groups));
+    }
+
+    // First use: the arena and its side stream. Refused inside a capture, as
+    // the prep path's pool is, and for the same reason (cudaMalloc).
+    bool init(bool capturing)
+    {
+        if (base != nullptr)
+            return true;
+        if (failed)
+            return false;
+        if (capturing)
+        {
+            std::fprintf(stderr,
+                "[fish_scales_ops] sm_100 grouped MXFP8: the static argument arena is empty during stream "
+                "capture. Call the grouped GEMM once eagerly (with problem_shapes) before capturing.\n");
+            std::abort();
+        }
+        capacity = pool_bytes();
+        if (cudaMalloc(reinterpret_cast<void**>(&base), capacity) != cudaSuccess)
+        {
+            base = nullptr;
+            failed = true;
+            return false;
+        }
+        if (cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking) != cudaSuccess)
+        {
+            side = nullptr;
+            failed = true;
+            return false;
+        }
+        blocks.reserve(64);
+        return true;
+    }
+
+    // The block for `key`: an existing one on a hit, otherwise the least
+    // recently used evictable block of the same size, otherwise a fresh carve.
+    // Returns -1 when none of those is available. `need_build` tells the
+    // caller whether the block's arrays still have to be written.
+    int bind(StaticKey const& key, bool capturing, bool& need_build)
+    {
+        need_build = false;
+        ++tick;
+        for (std::size_t i = 0; i < blocks.size(); ++i)
+        {
+            if (std::memcmp(&blocks[i].key, &key, sizeof(key)) == 0)
+            {
+                blocks[i].last_use = tick;
+                // A graph is about to reference it: from now on it may never
+                // be rebound, whoever bound it first. If an eager call bound
+                // it, its write was a launch on that call's stream and nothing
+                // here proves it has landed, so the block is written again
+                // through the capture path (same bytes, host-waited) before
+                // the graph can be instantiated.
+                if (capturing && !blocks[i].pinned)
+                {
+                    blocks[i].pinned = true;
+                    need_build = true;
+                }
+                return static_cast<int>(i);
+            }
+        }
+        std::size_t const need = block_bytes(key.groups);
+        int victim = -1;
+        for (std::size_t i = 0; i < blocks.size(); ++i)
+        {
+            if (blocks[i].pinned || blocks[i].bytes != need)
+                continue;
+            if (victim < 0 || blocks[i].last_use < blocks[static_cast<std::size_t>(victim)].last_use)
+                victim = static_cast<int>(i);
+        }
+        if (victim < 0)
+        {
+            if (used + need > capacity)
+                return -1;
+            StaticBlock b{};
+            carve(base + used, key.groups, b.arrays);
+            b.bytes = need;
+            used += need;
+            blocks.push_back(b);
+            victim = static_cast<int>(blocks.size()) - 1;
+        }
+        StaticBlock& b = blocks[static_cast<std::size_t>(victim)];
+        std::memcpy(&b.key, &key, sizeof(key));
+        b.pinned = capturing;
+        b.last_use = tick;
+        need_build = true;
+        return victim;
+    }
+};
+
+// Build a key from the call's operands. Zero-filled first so the padding
+// bytes compare equal under memcmp.
+inline StaticKey make_static_key(void const* a, void const* b, void const* sfa, void const* sfb, void const* d,
+    int64_t a_bytes, int64_t b_bytes, int64_t sfa_bytes, int64_t sfb_bytes, int64_t d_bytes, int groups, int m_cap,
+    int shape_n, int shape_k)
+{
+    StaticKey k;
+    std::memset(&k, 0, sizeof(k));
+    k.a = a;
+    k.b = b;
+    k.sfa = sfa;
+    k.sfb = sfb;
+    k.d = d;
+    k.a_bytes = a_bytes;
+    k.b_bytes = b_bytes;
+    k.sfa_bytes = sfa_bytes;
+    k.sfb_bytes = sfb_bytes;
+    k.d_bytes = d_bytes;
+    k.groups = groups;
+    k.m_cap = m_cap;
+    k.shape_n = shape_n;
+    k.shape_k = shape_k;
+    return k;
+}
+
+// Write a block's arrays. Eager: a plain launch on the caller's stream, ahead
+// of the GEMM. Capturing: on the arena's side stream, waited for on the host,
+// under the relaxed capture mode -- see the note on `StaticArena` for why.
+inline cudaError_t build_static_block(StaticArena& arena, StaticBlock const& blk, cudaStream_t stream,
+    bool capturing, char* a_base, char* b_base, char* sfa_base, char* sfb_base, char* d_base)
+{
+    StaticKey const& k = blk.key;
+    ArgSlot const& s = blk.arrays;
+    int const threads = 32;
+    int const grid = (k.groups + threads - 1) / threads;
+    cudaError_t err = cudaSuccess;
+    if (!capturing)
+    {
+        sm100_grouped_static_kernel<<<grid, threads, 0, stream>>>(s.ptr_a, s.ptr_b, s.ptr_sfa, s.ptr_sfb, s.ptr_d,
+            s.stride_a, s.stride_b, s.stride_d, s.layout_sfa, s.layout_sfb, k.groups, k.m_cap, k.shape_n,
+            k.shape_k, a_base, b_base, sfa_base, sfb_base, d_base, k.a_bytes, k.b_bytes, k.sfa_bytes, k.sfb_bytes,
+            k.d_bytes);
+        return cudaGetLastError();
+    }
+    cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+    err = cudaThreadExchangeStreamCaptureMode(&mode); // `mode` now holds the caller's
+    if (err != cudaSuccess)
+        return err;
+    sm100_grouped_static_kernel<<<grid, threads, 0, arena.side>>>(s.ptr_a, s.ptr_b, s.ptr_sfa, s.ptr_sfb, s.ptr_d,
+        s.stride_a, s.stride_b, s.stride_d, s.layout_sfa, s.layout_sfb, k.groups, k.m_cap, k.shape_n, k.shape_k,
+        a_base, b_base, sfa_base, sfb_base, d_base, k.a_bytes, k.b_bytes, k.sfa_bytes, k.sfb_bytes, k.d_bytes);
+    err = cudaGetLastError();
+    if (err == cudaSuccess)
+        err = cudaStreamSynchronize(arena.side);
+    cudaError_t const restore = cudaThreadExchangeStreamCaptureMode(&mode);
+    return err != cudaSuccess ? err : restore;
+}
+
+// The caller's problem-shape tensor is int32 [G, 3] holding (rows, N, K) per
+// group, and the launcher hands it to CUTLASS as a `cute::Shape<int, int, int>`
+// array. cute's tuple stores its three ints in declaration order with no
+// padding on every compiler this library builds with, but that is a property
+// of the ABI and not of the language, so it is checked once at run time
+// instead of assumed: a mismatch refuses the route with a clear error rather
+// than feeding the scheduler transposed shapes.
+inline bool problem_shape_is_three_plain_ints()
+{
+    static bool const ok = []
+    {
+        if (sizeof(GProblemShape) != 3 * sizeof(int))
+            return false;
+        GProblemShape s = cute::make_shape(0x11223344, 0x55667788, 0x0a0b0c0d);
+        int v[3];
+        std::memcpy(v, &s, sizeof(v));
+        return v[0] == 0x11223344 && v[1] == 0x55667788 && v[2] == 0x0a0b0c0d;
+    }();
+    return ok;
+}
+
+// The static-array block for one call on the routing-supplied-shapes path,
+// bound and, if needed, written. Returns nullptr when the arena is exhausted
+// (eager only: a capture aborts inside `init`/here instead), in which case the
+// caller takes the prep launch.
+inline ArgSlot const* acquire_static_arrays(cudaStream_t stream, StaticKey const& key, char* a_base, char* b_base,
+    char* sfa_base, char* sfb_base, char* d_base, cudaError_t& err)
+{
+    err = cudaSuccess;
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(stream, &cap);
+    bool const capturing = (cap == cudaStreamCaptureStatusActive);
+    StaticArena& arena = StaticArena::instance();
+    if (!arena.init(capturing))
+    {
+        err = cudaErrorMemoryAllocation;
+        return nullptr;
+    }
+    bool need_build = false;
+    int const idx = arena.bind(key, capturing, need_build);
+    if (idx < 0)
+    {
+        if (capturing)
+        {
+            std::fprintf(stderr,
+                "[fish_scales_ops] sm_100 grouped MXFP8: the static argument arena (%zu MB) is full during "
+                "stream capture; every captured (graph, GEMM) pair pins one block. Raise "
+                "FSO_GROUPED_ARG_POOL_MB before the first grouped call.\n",
+                arena.capacity >> 20);
+            std::abort();
+        }
+        if (!arena.warned_full)
+        {
+            arena.warned_full = true;
+            std::fprintf(stderr,
+                "[fish_scales_ops] sm_100 grouped MXFP8: the static argument arena (%zu MB) is full of "
+                "capture-pinned blocks; eager calls fall back to the per-launch prep kernel. Raise "
+                "FSO_GROUPED_ARG_POOL_MB to keep them on the launch-free path.\n",
+                arena.capacity >> 20);
+        }
+        return nullptr;
+    }
+    StaticBlock const& blk = arena.blocks[static_cast<std::size_t>(idx)];
+    if (need_build)
+    {
+        err = build_static_block(arena, blk, stream, capturing, a_base, b_base, sfa_base, sfb_base, d_base);
+        if (err != cudaSuccess)
+            return nullptr;
+    }
+    return &blk.arrays;
+}
+
 // Whether this translation unit compiled CUTLASS's sm_100 grid-dependency
 // control (GDC) instructions into the grouped kernel. The defining translation
 // unit is `csrc/gemm/ops/mxfp8_sm100_grouped_kernel.cu`, which sets
@@ -474,6 +895,11 @@ bool slot_swiglu_kernel_instantiated(int shape_n, int shape_k);
 cudaError_t slot_swiglu_kernel_launch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_fp8_e4m3* out_h,
     int32_t* out_sfh, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int groups, int num_slots, int m_cap,
     int shape_n, int shape_k, int const* slot_to_expert, cudaStream_t stream);
+// The token-column chunk the fused epilogue walks (`kSlotChunk` in
+// fused_swiglu_slot_store.cuh: 32 columns, one warp width). `slot_route`
+// admits the fused slot kernel only while the whole row capacity fits ONE such
+// chunk (run b300_round3_20260922/M-A3, see the rule below).
+int slot_swiglu_epilogue_chunk();
 
 // What the route decision came out as. Anything from kSlotRouteRefusedMcap
 // onwards means the caller forced the slot route on a configuration its
@@ -601,17 +1027,6 @@ inline int slot_route_mode() noexcept
 // and eventually overtakes it. On this 148-SM part fourteen waves is 2072
 // tiles, which sits between the measured 2048 (still winning) and 3072 (losing).
 //
-// The second clause is the top of the legal range, m_cap < TileN. At m_cap = 64
-// the slot route's token tile is exactly full, and that is the one place inside
-// the legal band where the measurement disagrees with the live-tile clause
-// alone: Family C `gate_up` has 2048 live tiles at m_cap = 48 and at m_cap = 64
-// and is 0.8 per cent faster at the first and 1.3 per cent slower at the second,
-// on otherwise identical dispatcher quantities. Nothing but m_cap separates
-// those two cells, so the rule stops one step below the full tile. The cost of
-// stopping there is one cell: Family B at M = 64, where the forced arm is 2.8
-// per cent faster than what the rule takes. That is knowingly left on the table
-// rather than fitted around.
-//
 // The dead-tile wave guard that the previous rule carried has been REMOVED, and
 // removing it is not a simplification but a consequence of the measurement
 // above. It required the pointer-array grid's dead tiles to be worth at least
@@ -619,8 +1034,56 @@ inline int slot_route_mode() noexcept
 // Family B cells at S = G = 128 have no dead tiles whatsoever and the route wins
 // 6 to 9 per cent there, so that premise is false and the guard would have
 // switched the route off exactly where it pays best.
+//
+// The second clause, re-derived once the FC1 was fused on BOTH routes (run
+// b300_round3_20260922/M-A3). The M-I5 table above was measured with an unfused
+// FC1 and a separate SwiGLU kernel on both routes, and it stopped one step
+// below the full token tile because Family C `gate_up` lost 1.3 per cent at
+// m_cap = 64. Since then the pointer-array FC1 gained the fused SwiGLU EVT
+// direct-store epilogue (runs b300_mxfp8_20260917/M-E2 and M-A1) and the slot
+// FC1 its own fused epilogue (run .../M-A2), and the two fusions do not pay
+// equally: the pointer-array store writes one thread's whole row with vector
+// stores, while the swap orientation puts one token's output element in each
+// lane, so the slot epilogue's fp8 bytes and scale bytes go out transposed, one
+// byte per lane per token, in 32-column chunks that each cost a warp reduction,
+// a shared-memory exchange and a named barrier. That cost grows with the row
+// capacity, and it overtakes the mainloop-depth advantage between m_cap = 32
+// (one chunk) and m_cap = 40 (two chunks). Layer microseconds relative to the
+// pointer-array control, the route forced on ONE GEMM at a time, best of two
+// passes, worst spread 0.55 per cent:
+//
+//   Family B, G = 128                  (M = 24, 32, 40, 48, 56, 64)
+//     FC1 fused slot / fused cascade   0.972 0.981 1.006 1.013 1.025 1.041
+//     FC2 slot / cascade               0.978 0.976 0.977 0.981 0.986 0.984
+//   Family C, G = 256
+//     FC1 fused slot / fused cascade   0.962 0.972 1.020 1.032 1.033 1.066
+//     FC2 slot / cascade               1.011 1.043 1.046 1.057 1.046 1.059
+//
+// The K-copies stage slopes say the same about the kernels themselves: at
+// M = 48 / 64 the fused slot FC1 costs 3.2 / 5.6 microseconds MORE than the
+// fused pointer-array FC1 on Family B and 0.9 / 8.5 more on Family C, while
+// the plain slot FC2 costs 3.0 / 1.3 LESS on Family B (Family C's FC2 sits
+// above the wave clause and loses 3.2 / 4.6, as the clause says). The plain
+// kernel cells agree: forced onto the slot route at m_cap = 48 / 64 the
+// unfused gate_up is 4.9 / 2.5 per cent faster on Family B and 2.4 / 0.3 (+)
+// on Family C, and down is 9.2 / 5.3 per cent faster on Family B.
+//
+// So the second clause is a property of the KERNEL the call lands on, which
+// the dispatcher knows because the fused FC1 has its own entry point: the
+// fused-SwiGLU slot kernel is taken only while the whole row capacity fits one
+// epilogue chunk (m_cap <= 32), and the plain slot kernel is taken up to the
+// full token tile (m_cap <= 64, which is also the legality bound). The
+// live-tile clause applies to both. What this changes on the published layers:
+// Family B keeps the slot FC2 at M = 40..64 with the FC1 back on the fused
+// pointer-array kernel (M = 64: 123.9 -> 122.2 microseconds, and M = 48 / 56
+// gain 1.0 / 1.7 per cent), and Family C's `gate_up` leaves the slot route at
+// M = 40..56, where the previous clause had it 1.9 to 3.3 per cent behind the
+// pointer-array kernel (Family C routed M = 40 / 48 / 56: 123.3 / 135.5 / 142.1
+// -> 121.1 / 131.7 / 137.6). The crossover between m_cap = 32 and 40 is not
+// resolved finer than the M grid (36 was not measured), so the fused clause
+// stops at the chunk width rather than at a fitted value.
 inline SlotRouteDecision slot_route(
-    int m_cap, int shape_n, int shape_k, int groups, int max_active_groups) noexcept
+    int m_cap, int shape_n, int shape_k, int groups, int max_active_groups, bool fused_swiglu = false) noexcept
 {
     SlotRouteKnob const& knob = slot_route_knob();
     int const mode = knob.mode;
@@ -640,10 +1103,10 @@ inline SlotRouteDecision slot_route(
         return forced ? kSlotRouteRefusedShape : kSlotRouteCascade;
     if (forced)
         return kSlotRouteSlot;
-    // Stop one step below a full token tile (see the note above: m_cap = 64 is
-    // the only place inside the legal band where the live-tile clause alone
-    // disagrees with the measurement).
-    if (m_cap >= slot_kernel_tile_n())
+    // The fused-SwiGLU slot kernel only while the row capacity fits one
+    // epilogue chunk (see the note above); the plain kernel runs up to the full
+    // token tile, which the legality check has already admitted.
+    if (fused_swiglu && m_cap > slot_swiglu_epilogue_chunk())
         return kSlotRouteCascade;
     // The live tiles the slot grid is built from must be at most fourteen waves
     // of this machine. `groups` is unused by this clause and stays in the
@@ -654,6 +1117,24 @@ inline SlotRouteDecision slot_route(
         return kSlotRouteCascade;
     (void) groups;
     return kSlotRouteSlot;
+}
+
+// Whether a grouped call of this shape would READ a caller-supplied
+// `problem_shapes` tensor (run b300_round3_20260922/M-A4). The pointer-array
+// cascade is the only reader; the slot route sizes its grid from `masked_m`
+// and the slot list. A caller uses this to ask `moe_build_routing` for the
+// shapes exactly where a GEMM will consume them, the same discipline
+// `slot_route` gives the slot list. A refused forced call answers "consumed"
+// too, which is harmless: the op raises before any kernel runs.
+// `fused_swiglu` names the kernel the call lands on, exactly as for
+// `slot_route`: the fused-SwiGLU FC1 leaves the slot route one step earlier
+// than the plain grouped GEMM (one epilogue chunk against the full token
+// tile), so the two queries are complements only when asked with the same
+// flag, and a layer asks both for its FC1 with the flag set.
+inline bool problem_shapes_consumed(
+    int m_cap, int shape_n, int shape_k, int groups, int max_active_groups, bool fused_swiglu = false) noexcept
+{
+    return slot_route(m_cap, shape_n, shape_k, groups, max_active_groups, fused_swiglu) != kSlotRouteSlot;
 }
 
 // The tile the pointer-array cascade picks, as data rather than as a sequence
@@ -794,13 +1275,16 @@ inline bool fused_fc1_route(int m_cap, int shape_n, int shape_k, int groups, int
         return false;
     if (fused_fc1_knob() == 2)
         return true;
-    // Where the dispatcher takes the slot route, the fused FC1 is the slot
-    // route's own fused variant, so the caller may still use the fused op — but
-    // only if that variant is instantiated for this shape. If it is not, the
-    // caller must keep the old pair, because the fused op would otherwise have
-    // to fall back to the pointer-array fused kernel on a band where the slot
-    // route is 2 to 9 per cent faster.
-    if (slot_route(m_cap, shape_n, shape_k, groups, max_active_groups) == kSlotRouteSlot)
+    // Where the dispatcher takes the slot route FOR THE FUSED KERNEL, the fused
+    // FC1 is the slot route's own fused variant, so the caller may still use
+    // the fused op — but only if that variant is instantiated for this shape.
+    // If it is not, the caller must keep the old pair, because the fused op
+    // would otherwise have to fall back to the pointer-array fused kernel on a
+    // band where the slot route is 2 to 4 per cent faster. The verdict is asked
+    // with `fused_swiglu = true` because that is the kernel the fused op lands
+    // on: its clause stops at one epilogue chunk, one step short of the plain
+    // kernel's (run b300_round3_20260922/M-A3).
+    if (slot_route(m_cap, shape_n, shape_k, groups, max_active_groups, /*fused_swiglu=*/true) == kSlotRouteSlot)
         return slot_swiglu_kernel_instantiated(shape_n, shape_k);
     return true;
 }
@@ -809,11 +1293,16 @@ inline bool fused_fc1_route(int m_cap, int shape_n, int shape_k, int groups, int
 
 // Launch one (TileM, TileN, ClusterM, ClusterN, TileK, NoSmemEpi)
 // instantiation of the grouped kernel.
+//
+// `problem_shapes`, when not null, is the caller's int32 [groups, 3] array of
+// (rows, N, K) per group, written by `moe_build_routing`; the launcher then
+// issues no prep kernel and takes its static arrays from `StaticArena`. Null
+// keeps the prep launch of the original design.
 template <int TileM, int TileN, int ClusterM, int ClusterN, int TileK = 128, bool NoSmemEpi = false,
     bool EvtEpi = false>
 cudaError_t launch_sm100_mxfp8_grouped_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bfloat16* mat_d,
     int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int groups, int m_cap, int shape_n, int shape_k,
-    cudaStream_t stream, int swizzle = 0)
+    cudaStream_t stream, int32_t const* problem_shapes = nullptr, int swizzle = 0)
 {
     using Config = Sm100MxFP8GroupedGemmConfig<TileM, TileN, ClusterM, ClusterN, TileK, NoSmemEpi, EvtEpi>;
     using Gemm = typename Config::Gemm;
@@ -845,12 +1334,6 @@ cudaError_t launch_sm100_mxfp8_grouped_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3*
         }
     }
 
-    auto& pool = gd::ArgPool::instance();
-    int const slot_idx = pool.acquire(stream);
-    if (slot_idx < 0)
-        return cudaErrorMemoryAllocation;
-    gd::ArgSlot const& slot = pool.slots[slot_idx];
-
     // Per-group byte strides of the caller's packed slabs.
     int64_t const kp = shape_k / 128;
     int64_t const m_pad = (static_cast<int64_t>(m_cap) + 127) / 128 * 128;
@@ -861,7 +1344,39 @@ cudaError_t launch_sm100_mxfp8_grouped_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3*
     int64_t const d_bytes = static_cast<int64_t>(m_cap) * shape_n * static_cast<int64_t>(sizeof(__nv_bfloat16));
 
     bool const pdl = gd::grouped_pdl_enabled();
+
+    // Which arrays the kernel reads: the caller's problem shapes plus a
+    // key-bound static block (no launch), or the prep kernel's slot (one
+    // launch). `arrays` and `problem` are what the two paths have in common.
+    gd::ArgSlot const* arrays = nullptr;
+    gd::GProblemShape* problem = nullptr;
+    if (problem_shapes != nullptr && gd::problem_shape_is_three_plain_ints())
     {
+        cudaError_t bind_err = cudaSuccess;
+        arrays = gd::acquire_static_arrays(stream,
+            gd::make_static_key(mat_a, mat_b, scales_a, scales_b, mat_d, a_bytes, b_bytes, sfa_bytes, sfb_bytes,
+                d_bytes, groups, m_cap, shape_n, shape_k),
+            reinterpret_cast<char*>(mat_a), reinterpret_cast<char*>(mat_b), reinterpret_cast<char*>(scales_a),
+            reinterpret_cast<char*>(scales_b), reinterpret_cast<char*>(mat_d), bind_err);
+        if (bind_err != cudaSuccess)
+            return bind_err;
+        if (arrays != nullptr)
+            problem = reinterpret_cast<gd::GProblemShape*>(const_cast<int32_t*>(problem_shapes));
+    }
+    else if (problem_shapes != nullptr)
+    {
+        std::fprintf(stderr,
+            "[fish_scales_ops] sm_100 grouped MXFP8: cute::Shape<int,int,int> is not three plain ints on this "
+            "toolchain; refusing the routing-supplied problem shapes.\n");
+        return cudaErrorInvalidValue;
+    }
+    if (arrays == nullptr)
+    {
+        auto& pool = gd::ArgPool::instance();
+        int const slot_idx = pool.acquire(stream);
+        if (slot_idx < 0)
+            return cudaErrorMemoryAllocation;
+        gd::ArgSlot const& slot = pool.slots[slot_idx];
         // One thread per group, spread over 32-thread blocks: the prep is a
         // latency problem, not a throughput one, and a single 128-thread block
         // puts every group's layout arithmetic on one SM.
@@ -875,7 +1390,10 @@ cudaError_t launch_sm100_mxfp8_grouped_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3*
             sfb_bytes, d_bytes);
         if (prep_err != cudaSuccess)
             return prep_err;
+        arrays = &slot;
+        problem = slot.problem;
     }
+    gd::ArgSlot const& slot = *arrays;
 
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
@@ -906,9 +1424,8 @@ cudaError_t launch_sm100_mxfp8_grouped_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3*
     epilogue_args.ptr_D = reinterpret_cast<decltype(epilogue_args.ptr_D)>(slot.ptr_d);
     epilogue_args.dD = slot.stride_d;
 
-    Args args{cutlass::gemm::GemmUniversalMode::kGrouped,
-        typename Config::ProblemShape{groups, slot.problem, nullptr}, mainloop_args, epilogue_args, hw_info,
-        scheduler};
+    Args args{cutlass::gemm::GemmUniversalMode::kGrouped, typename Config::ProblemShape{groups, problem, nullptr},
+        mainloop_args, epilogue_args, hw_info, scheduler};
 
     // Workspace: per-SM tensormap scratch. Its size depends only on the SM
     // count, so it is allocated once per instantiation and never grows — which
@@ -939,11 +1456,14 @@ cudaError_t launch_sm100_mxfp8_grouped_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3*
 
     // Params cache. For grouped mode CUTLASS builds the initial TMA
     // descriptors from the tile shape, so Params depends on the argument-array
-    // pointers, the group count and the scheduler knobs — never on
-    // (m_cap, N, K).
+    // pointers, the problem-shape pointer, the group count and the scheduler
+    // knobs — never on (m_cap, N, K). The two pointers stand for the slot on
+    // the prep path (both fixed per slot) and for the static block plus the
+    // caller's tensor on the routing-supplied path.
     struct CacheKey
     {
-        int slot;
+        void const* arrays;
+        void const* problem;
         int groups;
         int swizzle;
         bool operator==(CacheKey const& o) const { return std::memcmp(this, &o, sizeof(o)) == 0; }
@@ -965,7 +1485,8 @@ cudaError_t launch_sm100_mxfp8_grouped_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3*
     static thread_local std::unordered_map<CacheKey, Params, CacheHash> s_params_cache;
     CacheKey key;
     std::memset(&key, 0, sizeof(key));
-    key.slot = slot_idx;
+    key.arrays = slot.ptr_a;
+    key.problem = problem;
     key.groups = groups;
     key.swizzle = swizzle;
 
@@ -980,7 +1501,11 @@ cudaError_t launch_sm100_mxfp8_grouped_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3*
         if (Gemm::can_implement(args) != cutlass::Status::kSuccess)
             return cudaErrorInvalidValue;
         kernel_params = GemmKernel::to_underlying_arguments(args, s_ws); // host-only
-        if (s_params_cache.size() < 64u)
+        // Each capture on the routing-supplied path brings a new key (its
+        // own block and its own shape tensor), so the cap is wide enough for
+        // a bench process's captures; past it the host recomputes Params,
+        // which is correct and costs microseconds of host time only.
+        if (s_params_cache.size() < 256u)
             s_params_cache.emplace(key, kernel_params);
     }
 
@@ -1000,9 +1525,16 @@ cudaError_t launch_sm100_mxfp8_grouped_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3*
 
     // PDL on the GEMM itself. The kernel's own `griddepcontrol.wait` — present
     // only when this translation unit compiled GDC, see kGroupedGdcCompiled —
-    // keeps the ordering against the prep kernel, while the CTAs, their cluster
-    // launch and the per-group tensormap initialisation start while the prep
-    // kernel is still running.
+    // keeps the ordering against whatever precedes the GEMM in the stream: the
+    // prep kernel on that path, and on the routing-supplied path the kernel
+    // ahead of the GEMM in the layer (gather-quantize or the other GEMM),
+    // whose completion in turn implies the routing kernel's, because every
+    // kernel of the chain executes its own wait before it can retire. The
+    // wait sits at cutlass/gemm/kernel/sm100_gemm_array_tma_warpspecialized.hpp
+    // line 839 (v4.4.2), and the first read of the problem shapes is the tile
+    // scheduler's constructor at line 842 (sm90_tile_scheduler_group.hpp lines
+    // 283-289). Meanwhile the CTAs, their cluster launch and the per-group
+    // tensormap initialisation still start early.
     bool const gemm_pdl = gd::kGroupedGdcCompiled && pdl;
     return Gemm::run(kernel_params, stream, nullptr, gemm_pdl) == cutlass::Status::kSuccess
         ? cudaSuccess
@@ -1179,20 +1711,26 @@ cudaError_t launch_sm100_mxfp8_grouped_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3*
 // FSO_FORCE_TILE names a pointer-array tile and is the A/B knob for rules 1-4,
 // so an explicit tile request must keep reaching the kernel it names. The two
 // knobs are not meant to be combined.
+//
+// `problem_shapes` (run b300_round3_20260922/M-A4) is the caller's int32
+// [groups, 3] array from `moe_build_routing`, or null. Only the pointer-array
+// cascade reads it; the slot route derives its grid from `masked_m` and the
+// slot list and ignores it.
 inline cudaError_t gemm_dispatch_sm100_mxfp8_grouped(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bfloat16* mat_d,
     int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int groups, int m_cap, int shape_n, int shape_k,
-    int expected_m, int max_active_groups, int const* slot_to_expert, cudaStream_t stream)
+    int expected_m, int max_active_groups, int const* slot_to_expert, int32_t const* problem_shapes,
+    cudaStream_t stream)
 {
 #define DISPATCH_SM100_GROUPED(TM_, TN_, CM_, CN_, TK_, NOSMEM_)                                                       \
     launch_sm100_mxfp8_grouped_gemm<TM_, TN_, CM_, CN_, TK_, NOSMEM_>(                                                 \
-        mat_a, mat_b, mat_d, scales_a, scales_b, masked_m, groups, m_cap, shape_n, shape_k, stream)
+        mat_a, mat_b, mat_d, scales_a, scales_b, masked_m, groups, m_cap, shape_n, shape_k, stream, problem_shapes)
 // The same launcher with the EVT-partitioned direct store (see `EvtEpi` in
 // grouped_gemm_types.cuh). Separate macro rather than a seventh argument on the
 // one above, so the twenty pre-existing lines of the force table stay
 // character-for-character what they were.
 #define DISPATCH_SM100_GROUPED_EVT(TM_, TN_, CM_, CN_, TK_)                                                            \
     launch_sm100_mxfp8_grouped_gemm<TM_, TN_, CM_, CN_, TK_, true, true>(                                              \
-        mat_a, mat_b, mat_d, scales_a, scales_b, masked_m, groups, m_cap, shape_n, shape_k, stream)
+        mat_a, mat_b, mat_d, scales_a, scales_b, masked_m, groups, m_cap, shape_n, shape_k, stream, problem_shapes)
 
     auto forced = tensorrt_llm::kernels::blockscale_gemm::read_force_tile();
     if (tensorrt_llm::kernels::blockscale_gemm::force_tile_applies(forced, static_cast<uint32_t>(shape_k))
@@ -1242,7 +1780,7 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8_grouped(__nv_fp8_e4m3* mat_a, __nv_
             st);
     }
 
-    switch (grouped_detail::slot_route(m_cap, shape_n, shape_k, groups, max_active_groups))
+    switch (grouped_detail::slot_route(m_cap, shape_n, shape_k, groups, max_active_groups, /*fused_swiglu=*/false))
     {
     case grouped_detail::kSlotRouteSlot:
         // The slot list and the grid are sized by the host-static bound on how
@@ -1304,7 +1842,7 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8_grouped(__nv_fp8_e4m3* mat_a, __nv_
 template <int TileM, int TileN, int TileK = 128>
 cudaError_t launch_sm100_mxfp8_grouped_swiglu_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b,
     __nv_fp8_e4m3* out_h, int32_t* out_sfh, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int groups,
-    int m_cap, int shape_n, int shape_k, cudaStream_t stream)
+    int m_cap, int shape_n, int shape_k, cudaStream_t stream, int32_t const* problem_shapes = nullptr)
 {
     using Config = Sm100MxFP8GroupedSwiGluGemmConfig<TileM, TileN, TileK>;
     using Gemm = typename Config::Gemm;
@@ -1341,12 +1879,6 @@ cudaError_t launch_sm100_mxfp8_grouped_swiglu_gemm(__nv_fp8_e4m3* mat_a, __nv_fp
         }
     }
 
-    auto& pool = gd::ArgPool::instance();
-    int const slot_idx = pool.acquire(stream);
-    if (slot_idx < 0)
-        return cudaErrorMemoryAllocation;
-    gd::ArgSlot const& slot = pool.slots[slot_idx];
-
     int64_t const kp = shape_k / 128;
     int64_t const m_pad = (static_cast<int64_t>(m_cap) + 127) / 128 * 128;
     int64_t const inter = shape_n / 2;
@@ -1364,7 +1896,38 @@ cudaError_t launch_sm100_mxfp8_grouped_swiglu_gemm(__nv_fp8_e4m3* mat_a, __nv_fp
     int64_t const d_bytes = static_cast<int64_t>(m_cap) * inter;
 
     bool const pdl = gd::grouped_pdl_enabled();
+
+    // Same two paths as the unfused launcher: the caller's shapes plus a
+    // key-bound static block, or the prep kernel's slot.
+    gd::ArgSlot const* arrays = nullptr;
+    gd::GProblemShape* problem = nullptr;
+    if (problem_shapes != nullptr && gd::problem_shape_is_three_plain_ints())
     {
+        cudaError_t bind_err = cudaSuccess;
+        arrays = gd::acquire_static_arrays(stream,
+            gd::make_static_key(mat_a, mat_b, scales_a, scales_b, out_h, a_bytes, b_bytes, sfa_bytes, sfb_bytes,
+                d_bytes, groups, m_cap, shape_n, shape_k),
+            reinterpret_cast<char*>(mat_a), reinterpret_cast<char*>(mat_b), reinterpret_cast<char*>(scales_a),
+            reinterpret_cast<char*>(scales_b), reinterpret_cast<char*>(out_h), bind_err);
+        if (bind_err != cudaSuccess)
+            return bind_err;
+        if (arrays != nullptr)
+            problem = reinterpret_cast<gd::GProblemShape*>(const_cast<int32_t*>(problem_shapes));
+    }
+    else if (problem_shapes != nullptr)
+    {
+        std::fprintf(stderr,
+            "[fish_scales_ops] sm_100 fused-SwiGLU grouped MXFP8: cute::Shape<int,int,int> is not three plain "
+            "ints on this toolchain; refusing the routing-supplied problem shapes.\n");
+        return cudaErrorInvalidValue;
+    }
+    if (arrays == nullptr)
+    {
+        auto& pool = gd::ArgPool::instance();
+        int const slot_idx = pool.acquire(stream);
+        if (slot_idx < 0)
+            return cudaErrorMemoryAllocation;
+        gd::ArgSlot const& slot = pool.slots[slot_idx];
         int const threads = 32;
         int const blocks = (groups + threads - 1) / threads;
         cudaError_t const prep_err = gd::launch_prep_kernel(dim3(blocks), dim3(threads), stream, pdl, slot.problem,
@@ -1375,7 +1938,10 @@ cudaError_t launch_sm100_mxfp8_grouped_swiglu_gemm(__nv_fp8_e4m3* mat_a, __nv_fp
             sfb_bytes, d_bytes);
         if (prep_err != cudaSuccess)
             return prep_err;
+        arrays = &slot;
+        problem = slot.problem;
     }
+    gd::ArgSlot const& slot = *arrays;
 
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
@@ -1412,9 +1978,8 @@ cudaError_t launch_sm100_mxfp8_grouped_swiglu_gemm(__nv_fp8_e4m3* mat_a, __nv_fp
     epilogue_args.fused.h_group_elems = static_cast<long long>(m_cap) * inter;
     epilogue_args.fused.sf_group_words = m_pad * (inter / 128);
 
-    Args args{cutlass::gemm::GemmUniversalMode::kGrouped,
-        typename Config::ProblemShape{groups, slot.problem, nullptr}, mainloop_args, epilogue_args, hw_info,
-        scheduler};
+    Args args{cutlass::gemm::GemmUniversalMode::kGrouped, typename Config::ProblemShape{groups, problem, nullptr},
+        mainloop_args, epilogue_args, hw_info, scheduler};
 
     static thread_local void* s_ws = nullptr;
     static thread_local std::size_t s_ws_bytes = 0;
@@ -1449,7 +2014,8 @@ cudaError_t launch_sm100_mxfp8_grouped_swiglu_gemm(__nv_fp8_e4m3* mat_a, __nv_fp
     // keying on them costs nothing and keeps the cache correct.
     struct CacheKey
     {
-        int slot;
+        void const* arrays;
+        void const* problem;
         int groups;
         void const* ptr_h;
         void const* ptr_sfh;
@@ -1474,7 +2040,8 @@ cudaError_t launch_sm100_mxfp8_grouped_swiglu_gemm(__nv_fp8_e4m3* mat_a, __nv_fp
     static thread_local std::unordered_map<CacheKey, Params, CacheHash> s_params_cache;
     CacheKey key;
     std::memset(&key, 0, sizeof(key));
-    key.slot = slot_idx;
+    key.arrays = slot.ptr_a;
+    key.problem = problem;
     key.groups = groups;
     key.ptr_h = out_h;
     key.ptr_sfh = out_sfh;
@@ -1492,7 +2059,7 @@ cudaError_t launch_sm100_mxfp8_grouped_swiglu_gemm(__nv_fp8_e4m3* mat_a, __nv_fp
         if (Gemm::can_implement(args) != cutlass::Status::kSuccess)
             return cudaErrorInvalidValue;
         kernel_params = GemmKernel::to_underlying_arguments(args, s_ws); // host-only
-        if (s_params_cache.size() < 64u)
+        if (s_params_cache.size() < 256u)
             s_params_cache.emplace(key, kernel_params);
     }
 
@@ -1541,11 +2108,11 @@ cudaError_t launch_sm100_mxfp8_grouped_swiglu_gemm(__nv_fp8_e4m3* mat_a, __nv_fp
 inline cudaError_t gemm_dispatch_sm100_mxfp8_grouped_swiglu(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b,
     __nv_fp8_e4m3* out_h, int32_t* out_sfh, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int groups,
     int m_cap, int shape_n, int shape_k, int expected_m, int max_active_groups, int const* slot_to_expert,
-    cudaStream_t stream)
+    int32_t const* problem_shapes, cudaStream_t stream)
 {
 #define DISPATCH_SM100_GROUPED_SWIGLU(TN_)                                                                            \
-    launch_sm100_mxfp8_grouped_swiglu_gemm<128, TN_, 128>(                                                            \
-        mat_a, mat_b, out_h, out_sfh, scales_a, scales_b, masked_m, groups, m_cap, shape_n, shape_k, stream)
+    launch_sm100_mxfp8_grouped_swiglu_gemm<128, TN_, 128>(mat_a, mat_b, out_h, out_sfh, scales_a, scales_b,         \
+        masked_m, groups, m_cap, shape_n, shape_k, stream, problem_shapes)
 
     // The route first, the tile second. `slot_route` is the SAME function the
     // unfused FC1 asks, so the fused FC1 changes which kernel a call lands on
@@ -1557,8 +2124,12 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8_grouped_swiglu(__nv_fp8_e4m3* mat_a
     //
     // FSO_FORCE_TILE is an N-tile knob of the pointer-array cascade and says
     // nothing about the slot route, so it is not consulted here; FSO_GROUPED_SLOT
-    // is the knob that steers this decision, through `slot_route` itself.
-    if (grouped_detail::slot_route(m_cap, shape_n, shape_k, groups, max_active_groups) == grouped_detail::kSlotRouteSlot
+    // is the knob that steers this decision, through `slot_route` itself. The
+    // verdict is asked for the FUSED kernel, whose clause stops at one epilogue
+    // chunk (m_cap <= 32) where the plain kernel's runs to the full tile (run
+    // b300_round3_20260922/M-A3).
+    if (grouped_detail::slot_route(m_cap, shape_n, shape_k, groups, max_active_groups, /*fused_swiglu=*/true)
+            == grouped_detail::kSlotRouteSlot
         && grouped_detail::slot_swiglu_kernel_instantiated(shape_n, shape_k))
     {
         return grouped_detail::slot_swiglu_kernel_launch(mat_a, mat_b, out_h, out_sfh, scales_a, scales_b, masked_m,

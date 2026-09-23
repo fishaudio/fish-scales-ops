@@ -22,7 +22,7 @@ routing itself is CUDA-graph safe):
 |---|---|---|---|
 | sm_90 (H200) | deep_gemm WGMMA kernels, NVRTC-JIT-compiled in-process at first call; FP32 scales | not available (`NotImplementedError`) | block-FP8, expert-sorted contiguous layout (`moe_layer_fp8_sm90`) and a masked-layout variant |
 | sm_120 / sm_121 (RTX 5090, RTX PRO 6000) | CUTLASS `Sm120BlockScaledKernel`; UE8M0 scales packed into int32 words | CUTLASS `Sm120BlockScaledKernel` | MXFP8, masked slab layout |
-| sm_100 / sm_103 (B200 / B300) | since 2026-09-05: the MXFP8 tcgen05 path with each 1×128 UE8M0 scale byte replicated into its four 32-wide slots (same kernels, same bytes as MXFP8) | CUTLASS tcgen05 BlockScaled behind a router: an M ≤ 32 decode row (vendored NVIDIA CuTe-DSL split-K / persistent kernels, swap-AB, 8/16/32-wide token tile) in front of three tiers (cuBLAS `scaled_mm`, CuTe DSL persistent kernel, C++ cascade) | MXFP8, masked slab layout — same Python surface as sm_120, CUTLASS pointer-array (grouped) tcgen05 kernels |
+| sm_100 / sm_103 (B200 / B300) | since 2026-09-05: the MXFP8 tcgen05 path with each 1×128 UE8M0 scale byte replicated into its four 32-wide slots (same kernels, same bytes as MXFP8) | CUTLASS tcgen05 BlockScaled behind a router: an M ≤ 64 decode row (vendored NVIDIA CuTe-DSL split-K / persistent kernels, swap-AB, 8/16/32-wide token tile to M = 32 and a 64-wide token tile on the 2-CTA 256-row weight tile above it, long-K narrow-N cells above M = 32 excepted) in front of three tiers (cuBLAS `scaled_mm`, CuTe DSL persistent kernel, C++ cascade) | MXFP8, masked slab layout — same Python surface as sm_120, CUTLASS pointer-array (grouped) tcgen05 kernels |
 
 Scale tensors are **arch-native and opaque**. Quantize on the device arch the
 GEMM runs on; a scale tensor produced on one arch generation is not valid on
@@ -124,11 +124,11 @@ opaque scale byte layout differs (see the two `grouped MXFP8 … scales` rows in
 
 | step | function | in → out |
 |---|---|---|
-| routing | `moe_build_routing(topk_ids, num_groups, m_cap, with_slots=False)` | int32 `[M, topk]` → (`masked_m [G]`, `row_map [G*m_cap]`, `slot_of_flat [M*topk]`), plus `slot_to_expert [G]` when `with_slots=True`; `G <= 1024`, `m_cap % 4 == 0`, `m_cap >= M`. Ask for `with_slots` only when `mxfp8_grouped_slot_possible(…)` says a GEMM of this layer's shape would take the sm_100/103 slot route, which is the list's only reader (see *the slot-bound decode route* below) |
+| routing | `moe_build_routing(topk_ids, num_groups, m_cap, with_slots=False, problem_shapes_for=None)` | int32 `[M, topk]` → (`masked_m [G]`, `row_map [G*m_cap]`, `slot_of_flat [M*topk]`), plus `slot_to_expert [G]` when `with_slots=True`, plus a list of int32 `[G, 3]` per-group `(rows, N, K)` tensors, one per `(N, K)` pair in `problem_shapes_for`; `G <= 1024`, `m_cap % 4 == 0`, `m_cap >= M`. Ask for `with_slots` only when `mxfp8_grouped_slot_possible(…)` says a GEMM of this layer's shape would take the sm_100/103 slot route, which is the list's only reader, and for `problem_shapes_for` only the pairs for which `mxfp8_grouped_problem_shapes_consumed(…)` answers `True` (see *the slot-bound decode route* and *routing-supplied problem shapes* below) |
 | gather + quantize | `quantize_1x32_grouped_gather_fp8(x, slot_of_flat, topk, num_groups, m_cap)` | bf16 `[M, K]` → (fp8 `[G, m_cap, K]`, int32 `[G, K/128, m_cap]`) |
-| gate_up | `linear_mxfp8_grouped_masked(a_fp8, w13_fp8, sa, sw13, masked_m, expected_m, max_active_groups=0, slot_to_expert=None)` | → bf16 `[G, m_cap, 2*INTER]` |
+| gate_up | `linear_mxfp8_grouped_masked(a_fp8, w13_fp8, sa, sw13, masked_m, expected_m, max_active_groups=0, slot_to_expert=None, problem_shapes=None)` | → bf16 `[G, m_cap, 2*INTER]` |
 | SwiGLU + quantize | `silu_chunk_mul_quantize_1x32_grouped_fp8(gu, slot_of_flat)` | → (fp8 `[G, m_cap, INTER]`, int32 `[G, INTER/128, m_cap]`) |
-| down | `linear_mxfp8_grouped_masked(h_fp8, w2_fp8, sh, sw2, masked_m, expected_m, max_active_groups=0, slot_to_expert=None)` | → bf16 `[G, m_cap, HIDDEN]` |
+| down | `linear_mxfp8_grouped_masked(h_fp8, w2_fp8, sh, sw2, masked_m, expected_m, max_active_groups=0, slot_to_expert=None, problem_shapes=None)` | → bf16 `[G, m_cap, HIDDEN]` |
 | combine | `moe_combine(dn, slot_of_flat, topk_w)` | → bf16 `[M, HIDDEN]`, `out[t] = Σ_j topk_w[t,j] · dn[slot_of_flat[t*topk+j]]` |
 | weights (offline) | `quantize_moe_weights_1x32_fp8(w)` | bf16 `[G, N, K]` → (fp8 `[G, N, K]`, int32 `[G, K/128, N]`); `N % 128 == 0`, `K % 128 == 0` |
 
@@ -150,18 +150,21 @@ constrained to `0 <= max_active_groups <= G`. sm_120/121 accept and ignore it.
 
 On sm_100/103 the GEMM is a CUTLASS pointer-array (grouped) tcgen05
 block-scaled kernel. Its per-group problem shapes, base pointers, strides and
-scale-factor layouts live in device memory and are rebuilt from `masked_m` by a
-small kernel that runs immediately before every GEMM launch, which is what
-keeps a captured graph correct across re-routing. That preparation kernel is
-split around a grid-dependency barrier — the arrays that depend only on the
-tensor set are written before it, the two that depend on the routing after —
-and both it and the GEMM are launched as programmatic dependent launches, so
-the routing-independent half runs while the kernel ahead of it is still on the
-machine. `FSO_DISABLE_PDL=1` turns both launches back into plain serialised
-ones. Two further consequences follow from the hardware's 128-row / 128-column
-block-scaled tile granularity: a group with fewer than 128 valid rows still
-runs one 128-row tile (the padding rows are zero-filled on load and dropped on
-store), and a group with zero valid rows contributes no tiles at all.
+scale-factor layouts live in device memory. Without `problem_shapes` they are
+rebuilt from `masked_m` by a small kernel that runs immediately before every
+GEMM launch, which is what keeps a captured graph correct across re-routing.
+That preparation kernel is split around a grid-dependency barrier — the arrays
+that depend only on the tensor set are written before it, the two that depend
+on the routing after — and both it and the GEMM are launched as programmatic
+dependent launches, so the routing-independent half runs while the kernel
+ahead of it is still on the machine. With `problem_shapes` the preparation
+kernel is not launched at all; see *routing-supplied problem shapes* below.
+`FSO_DISABLE_PDL=1` turns every launch of the chain back into a plain
+serialised one. Two further consequences follow from the hardware's 128-row /
+128-column block-scaled tile granularity: a group with fewer than 128 valid
+rows still runs one 128-row tile (the padding rows are zero-filled on load and
+dropped on store), and a group with zero valid rows contributes no tiles at
+all.
 
 **`moe_build_routing` on sm_100/103 — the multi-CTA builder.** On this arch
 `moe_build_routing` selects a multi-CTA kernel once the call has at least 4096
@@ -228,7 +231,7 @@ epilogue.
 Ask for the list only where it will be read. `with_slots=True` makes the
 routing kernel compact the per-expert histogram it already holds into that
 list, and this route is the only consumer, so
-`mxfp8_grouped_slot_possible(m_cap, n_w, k, num_groups, max_active_groups)`
+`mxfp8_grouped_slot_possible(m_cap, n_w, k, num_groups, max_active_groups, fused_swiglu=False)`
 answers — from the dispatcher's own route rule, under the same
 `FSO_GROUPED_SLOT` setting — whether a GEMM of that shape would take it; a
 layer passes `with_slots=` the disjunction of the query over its two GEMMs and
@@ -236,6 +239,61 @@ so pays for the list on the decode band only. Passing the list where the answer
 is `False` is wasteful but never wrong, and withholding it where the answer is
 `True` costs the route one extra one-block launch per call. Every architecture
 but sm_100/103 answers `False`, because no other architecture has the route.
+
+**sm_100/103 — routing-supplied problem shapes (the pointer-array route
+without its preparation kernel).** Of the eleven per-group arrays the
+pointer-array kernel reads, only the problem shapes depend on the routing: the
+`(rows, N, K)` triple of every group. `moe_build_routing` already holds every
+group's row count when it publishes `masked_m`, so
+`moe_build_routing(..., problem_shapes_for=[(N, K), ...])` writes those
+triples — one int32 `[G, 3]` tensor per named GEMM, `rows` clamped to `m_cap`
+— in the same pass, and a grouped GEMM handed its tensor as `problem_shapes=`
+launches nothing but itself. The ten remaining arrays (base addresses,
+strides, scale-factor layouts) are a function of the tensor set alone and are
+built once per distinct tensor set into a key-addressed block of a per-thread
+arena, then reused by every call that presents the same addresses and shapes;
+the key is compared on the host, and nothing reads device memory to decide.
+Both ops take the argument; a layer asks
+`mxfp8_grouped_problem_shapes_consumed(m_cap, n_w, k, num_groups,
+max_active_groups, fused_swiglu=False)` per GEMM — the complement of
+`mxfp8_grouped_slot_possible`, from the same route rule — and requests the
+shapes for the GEMMs that consume them, which is what the benches and the
+layer test do. The two queries are complements only when both are asked with
+the same `fused_swiglu` flag, because the fused-SwiGLU FC1 leaves the slot
+route one step earlier than the plain grouped GEMM (see *the slot-bound
+decode route* above): a layer asks both for its FC1 with the flag set to
+whether it will call the fused op, and for its FC2 with it clear, and then
+per GEMM exactly one of the slot list and the problem shapes is requested. The slot route derives
+its grid from `masked_m` and the slot list and ignores the tensor; sm_120/121
+validates the shape and ignores it, so a caller can pass the same arguments on
+every architecture. Omitting the argument keeps the preparation kernel and
+changes nothing for existing callers.
+
+Two consequences of the arena a caller can observe. First, the capture
+contract gains one item, stated again under *CUDA-graph compatibility*: a
+`torch.cuda.graph` capture allocates its tensors from the graph's private pool,
+so the block a captured GEMM needs is bound during the capture, written outside
+it (on the arena's own stream, with the host waiting, under the relaxed
+capture mode) so that the graph carries no writer of its arrays, and then
+pinned for the life of the process, because the graph's kernel node keeps
+reading it and the library cannot learn when a graph is destroyed. Memory
+therefore grows with the number of distinct (capture, GEMM) pairs a host
+thread creates — about 13 KB per pair at 128 experts, 106 KB at the 1024
+cap — inside one allocation of `FSO_GROUPED_ARG_POOL_MB` megabytes (default
+16) made on the thread's first eager grouped call. A capture that finds the
+arena full aborts with a message naming the variable, because falling back to
+the preparation kernel inside the graph would silently give back the launch
+this route removes; an eager call that finds it full takes that fallback,
+which is always correct. Second, the shapes are read by the GEMM's tile
+scheduler several launches after the routing kernel wrote them, under
+programmatic dependent launch: that is safe because the CUTLASS grouped kernel
+executes its grid-dependency wait before it constructs the scheduler (the
+first read), and every kernel between the two executes its own wait before it
+can retire, so the wait on the immediate predecessor implies the routing
+kernel's completion. The content of the tensor cannot be checked on the device
+— a triple built for another GEMM would walk tiles that do not exist —
+so `FSO_CHECK_PROBLEM_SHAPES=1` makes the op copy it to the host and verify
+`N`, `K` and `rows <= m_cap` on every call, for debugging only.
 
 CUTLASS's static persistent scheduler clamps the launched grid to the SM count,
 so whenever the tile space is larger than the machine each CTA loops over
@@ -263,10 +321,14 @@ must be set before the first grouped call and cannot change between a capture
 and its replays.
 
 The rule itself has two clauses and is about the size of the **live** tile
-space, not about how many experts are idle. The route is taken while `m_cap` is
-strictly below the 64-wide token tile and while the live tiles the slot grid is
-built from, `max_active_groups * ceil(N / 128)`, are at most fourteen waves of
-the device's SMs.
+space and about which slot kernel the call lands on, not about how many experts
+are idle. The live tiles the slot grid is built from,
+`max_active_groups * ceil(N / 128)`, must be at most fourteen waves of the
+device's SMs; and the row capacity must fit the kernel's token tile — the whole
+64-wide tile for the plain slot kernel (`linear_mxfp8_grouped_masked`), but only
+one 32-column epilogue chunk for the fused-SwiGLU slot kernel
+(`linear_mxfp8_grouped_masked_swiglu`), so `m_cap <= 64` and `m_cap <= 32`
+respectively.
 
 Why that quantity. What the route buys is mainloop depth: the swap puts the
 expert weight rows on the 128-row M axis and the routed tokens on a 64-wide N
@@ -277,14 +339,22 @@ latency-bound into bandwidth-bound. That advantage is a rate, so it is earned
 again on every wave of live tiles, and it is present even when every expert
 holds a row. It is bounded, though, by what the pointer-array kernel's wider
 token tile saves per issue, which also accumulates with the wave count, so past
-a certain number of live waves the wider tile wins. The second clause stops one
-step below a completely full token tile, which is the one place inside the legal
-band where the live-tile clause alone disagrees with the layer measurements.
+a certain number of live waves the wider tile wins. The second clause is about
+the epilogue: the swap orientation puts one token's output element in each
+lane, so the fused slot kernel's fp8 bytes and scale bytes leave transposed, one
+byte per lane per token, in 32-column chunks that each cost a warp reduction, a
+shared-memory exchange and a barrier, while the pointer-array kernel's fused
+epilogue writes a thread's whole row with vector stores. That cost grows with
+`m_cap` and overtakes the mainloop-depth advantage once a second chunk is
+needed, which is why the fused slot kernel stops at one chunk while the plain
+kernel, whose TMA-store epilogue has no such term, runs to the full tile.
 
 With top-`k` routing `max_active_groups` is `min(M * topk, G)`, so for
-Qwen3-30B-A3B (`G = 128`, top-8, `N = 1536` and `2048`) both grouped GEMMs take
-the route up to `M = 48`, and for Qwen3.5-35B-A3B (`G = 256`, top-8, `N = 1024`
-and `2048`) `gate_up` takes it up to `M = 48` while `down` stops at `M = 16`.
+Qwen3-30B-A3B (`G = 128`, top-8, `N = 1536` and `2048`) the fused FC1 takes the
+route up to `M = 32` and `down` up to `M = 64`, and for Qwen3.5-35B-A3B
+(`G = 256`, top-8, `N = 1024` and `2048`) the fused FC1 takes it up to `M = 32`
+while `down` stops at `M = 16`. Ask `mxfp8_grouped_slot_possible` with
+`fused_swiglu=True` for the FC1 that will run the fused op, as the benches do.
 
 **sm_100/103 — the fused FC1.** On the pointer-array route the first grouped
 GEMM can also do the SwiGLU and the MXFP8 requantize in its own epilogue, which
@@ -419,7 +489,7 @@ layout. `moe_build_routing`, `moe_build_sorted`, `moe_combine` and
   B300 with nvidia-cutlass-dsl 4.8.0 costs 0.2-0.6 s per configuration per
   process.
 - The sm_100/103 CuTe-DSL rows need `nvidia-cutlass-dsl` (the `sm100` extra).
-  The M ≤ 32 decode row needs at least **4.5.0** and **4.8.0 is the
+  The M ≤ 64 decode row needs at least **4.5.0** and **4.8.0 is the
   recommended pin**: 4.4.2 cannot run its kernels at all, 4.5.0 through 4.5.2
   make the JIT about four times slower than 4.4.2 on these configurations, and
   from 4.6.1 on it is two to three times faster than 4.4.2. Below the floor,
@@ -474,14 +544,15 @@ silu_chunk_mul_quantize_1x32(Tensor gu, bool use_ue8m0=True) -> (Tensor, Tensor)
 repack_mxfp8_scales(Tensor scales_f32) -> Tensor                          # legacy two-step
 linear_mxfp8_raw(Tensor x_fp8, Tensor w_fp8, Tensor sx_int32, Tensor sw_int32) -> Tensor
 
-linear_mxfp8_grouped_masked(Tensor a_fp8, Tensor w_fp8, Tensor sa_int32, Tensor sw_int32, Tensor masked_m, int expected_m, int max_active_groups=0, Tensor? slot_to_expert=None) -> Tensor
+linear_mxfp8_grouped_masked(Tensor a_fp8, Tensor w_fp8, Tensor sa_int32, Tensor sw_int32, Tensor masked_m, int expected_m, int max_active_groups=0, Tensor? slot_to_expert=None, Tensor? problem_shapes=None) -> Tensor
 quantize_1x32_grouped_gather(Tensor x, Tensor slot_of_flat, int topk, int num_groups, int m_cap, bool use_ue8m0=True) -> (Tensor, Tensor)
 silu_chunk_mul_quantize_1x32_grouped(Tensor gu, Tensor slot_of_flat, bool use_ue8m0=True, bool pairwise=False) -> (Tensor, Tensor)
-linear_mxfp8_grouped_masked_swiglu(Tensor a_fp8, Tensor w13_fp8, Tensor sa_int32, Tensor sw13_int32, Tensor masked_m, int expected_m, int max_active_groups=0, Tensor? slot_to_expert=None) -> (Tensor, Tensor)
+linear_mxfp8_grouped_masked_swiglu(Tensor a_fp8, Tensor w13_fp8, Tensor sa_int32, Tensor sw13_int32, Tensor masked_m, int expected_m, int max_active_groups=0, Tensor? slot_to_expert=None, Tensor? problem_shapes=None) -> (Tensor, Tensor)
 mxfp8_grouped_swiglu_available(int n_w, int k) -> bool
 mxfp8_grouped_swiglu_fused_route(int m_cap, int n_w, int k, int num_groups, int max_active_groups) -> bool
-mxfp8_grouped_slot_possible(int m_cap, int n_w, int k, int num_groups, int max_active_groups) -> bool
-moe_build_routing(Tensor topk_ids, int num_groups, int m_cap, bool with_slots=False) -> (Tensor, Tensor, Tensor, Tensor)
+mxfp8_grouped_slot_possible(int m_cap, int n_w, int k, int num_groups, int max_active_groups, bool fused_swiglu=False) -> bool
+mxfp8_grouped_problem_shapes_consumed(int m_cap, int n_w, int k, int num_groups, int max_active_groups, bool fused_swiglu=False) -> bool
+moe_build_routing(Tensor topk_ids, int num_groups, int m_cap, bool with_slots=False, int[] problem_shapes_nk=[]) -> (Tensor, Tensor, Tensor, Tensor, Tensor)   # the Python wrapper takes problem_shapes_for=[(N, K), ...] and returns the [P, G, 3] tensor as a list of [G, 3] views
 moe_combine(Tensor dn, Tensor slot_of_flat, Tensor topk_w) -> Tensor
 moe_build_sorted(Tensor topk_ids, int num_groups, int block_m) -> (Tensor, Tensor, Tensor)
 moe_combine_sorted(Tensor dn, Tensor flat_to_sorted, Tensor topk_w) -> Tensor
@@ -507,11 +578,12 @@ warmup populates the process-static state that must not be created inside a
 capture: the `cudaFuncSetAttribute` guard of each kernel instantiation, the
 Stream-K side-stream pool and its scratch buffer (sm_120), the int32 scale
 scratch pool of the fused runner paths, the grouped GEMM's argument pool and
-the multi-CTA routing builder's scratch pool and the slot-bound route's
-slot-list pool (sm_100/103; all are per host thread, so each thread that
-captures needs its own eager call), the deep_gemm NVRTC compilation of each
+its static-array arena, the multi-CTA routing builder's scratch pool and the
+slot-bound route's slot-list pool (sm_100/103; all are per host thread, so
+each thread that captures needs its own eager call), the deep_gemm NVRTC
+compilation of each
 kernel configuration (sm_90; in-memory only, no disk cache), and the DSL JIT
-per configuration (sm_100/103), for the mid-band tier and for the M ≤ 32
+per configuration (sm_100/103), for the mid-band tier and for the M ≤ 64
 decode row alike. `tests/gemm/unit/test_cuda_graph.py` is the
 reference discipline: eager reference → three warm calls on the capture
 stream → capture → replay, compared bit-exactly.
@@ -533,6 +605,18 @@ graph (`moe_build_routing` / `moe_build_sorted` are captured), so a layer
 captured for one `M` replays with any routing of that `M`. What must not
 change: tensor shapes, `m_cap`, `expected_m`, `max_active_groups`, and the
 sm_90 `M`-dispatch branch (all host-static per `M`; capture one graph per `M`).
+
+The sm_100/103 grouped GEMMs handed `problem_shapes` add one more item. The
+static argument block such a GEMM reads is bound during the capture and written
+outside it — on the arena's own stream with the host waiting, under the relaxed
+capture mode — so the captured graph contains no writer of those arrays, and
+the block is then pinned for the life of the process. Every distinct
+(capture, GEMM) pair a host thread creates therefore keeps its block (about
+13 KB at 128 experts, 106 KB at 1024) inside the `FSO_GROUPED_ARG_POOL_MB`
+arena (default 16 MB); a capture that finds the arena full aborts with a
+message rather than putting a launch back into the graph. Rewriting the
+routing buffers in place and replaying is correct; handing a graph's GEMM a
+different tensor set means a different graph.
 
 Two ops synchronize the device and belong at weight-load time, outside any
 capture: `repack_fp8_act_scales` and `repack_fp8_wgt_scales` (the UE8M0
@@ -560,8 +644,8 @@ contract — the cascades already encode the measured picks.
 | `FSO_SWAP_STAGES=<n>` | sm_90 swap-AB grouped GEMM | pipeline depth of the swap-AB kernel (clamped to the smem budget) |
 | `FSO_JIT_INCLUDE_DIRS=a:b:c` | sm_90 | NVRTC include directories for the deep_gemm JIT (default baked at build time) |
 | `TRTLLM_DG_JIT_DEBUG=1`, `TRTLLM_DG_JIT_DUMP_CUBIN=1`, `TRTLLM_DG_JIT_USE_NVCC=1`, `TRTLLM_DG_NVCC_COMPILER=<path>`, `TRTLLM_DG_CACHE_DIR=<dir>` | sm_90 | deep_gemm JIT diagnostics: verbose compile, dump cubins, compile with nvcc instead of NVRTC, compiler path, dump directory |
-| `FSO_DISABLE_SMM=1`, `FSO_DISABLE_DSL=1` | sm_100/103 MXFP8 router | skip the cuBLAS `scaled_mm` tier / both CuTe-DSL rows, the M ≤ 32 decode row and the mid-band tier (both set = pure C++ cascade) |
-| `FSO_DISABLE_DECODE_DSL=1` | sm_100/103 MXFP8 router | skip the M ≤ 32 decode row only, leaving the mid-band DSL tier alive; this is the A/B knob for the decode row |
+| `FSO_DISABLE_SMM=1`, `FSO_DISABLE_DSL=1` | sm_100/103 MXFP8 router | skip the cuBLAS `scaled_mm` tier / both CuTe-DSL rows, the M ≤ 64 decode row and the mid-band tier (both set = pure C++ cascade) |
+| `FSO_DISABLE_DECODE_DSL=1` | sm_100/103 MXFP8 router | skip the M ≤ 64 decode row only, leaving the mid-band DSL tier alive; this is the A/B knob for the decode row |
 | `FSO_LOG=1` | sm_100/103 MXFP8 decode row | print, once per process, why the decode row is inactive (DSL too old, package missing, import failed). Silent when the row is working |
 | `FSO_DSL_KERNEL_PATH=<file>` | sm_100/103 | alternative DSL kernel source for the mid-band tier (the decode row's kernels are vendored in-tree and not overridable) |
 | `FSO_FORCE_SWIZZLE=<n>`, `FSO_FORCE_RASTER={1,2}`, `FSO_SK_NDET=1`, `FSO_SK_DECOMP={1,2,3}` | sm_100/103 C++ cascade | scheduler raster swizzle size, raster direction (along M / along N), nondeterministic Stream-K reduction, decomposition mode — probe knobs, never wired into the cascade |
@@ -569,6 +653,8 @@ contract — the cascades already encode the measured picks.
 | `FSO_GROUPED_SLOT={0,1,force,force@<N>}` | sm_100/103 grouped MoE decode route | `0` never takes the slot-bound swap-orientation route, unset or `1` applies the dispatcher's rule, `force` takes it wherever it is legal and raises where it is not, `force@<N>` forces it for the GEMM whose `N` it names only (see the grouped section above; the `force` forms are A/B knobs) |
 | `FSO_GATHER_QUANT_ONCE={0,1}` | sm_100/103 grouped MoE gather-quantize | `0` always quantizes per routed (token, expert) pair, unset applies the launcher's rule (the token-space form once its grid covers one full wave of SMs), `1` always quantizes each token once and scatters the bytes to its top-k destinations |
 | `FSO_FC1_FUSED={0,1}` | sm_100/103 grouped MoE FC1 | `0` never uses the fused FC1 (and `mxfp8_grouped_swiglu_available` then answers false, so a caller keeps the `[gate; up]` weight layout too), unset applies the router, `1` uses it wherever it is legal |
+| `FSO_GROUPED_ARG_POOL_MB=<n>` | sm_100/103 grouped GEMMs with `problem_shapes` | capacity of the per-thread static-array arena (default 16 MB; allocated once, on the first eager grouped call). Every distinct (capture, GEMM) pair pins one block of it; a capture that finds it full aborts with a message, an eager call falls back to the preparation kernel |
+| `FSO_CHECK_PROBLEM_SHAPES=1` | sm_100/103 grouped GEMMs with `problem_shapes` | copy the caller's `[G, 3]` tensor to the host on every call and verify that its `N` and `K` are this GEMM's and that every row count lies in `[0, m_cap]`; read on every call (not cached), debugging only |
 | `FSO_BENCH_WARM_MS=<ms>` | benches only | spin the GPU before each cell's timing (needed on unlocked devices, see `../perf/README.md` §5) |
 
 ### `FSO_FORCE_TILE` on the sm_100/103 dense cascade

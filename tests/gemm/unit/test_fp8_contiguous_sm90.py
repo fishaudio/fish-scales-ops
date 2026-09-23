@@ -50,6 +50,16 @@ def contiguous_layer(hidden, w13_fp8, sw13, w2_fp8, sw2, topk_ids, topk_w,
 
 
 def main():
+    # This suite drives the sm_90 (H200) deep_gemm contiguous path only; on any
+    # other device the first op raises NotImplementedError, which used to exit 1
+    # and read as a failure. Skip explicitly instead, in the form
+    # test_fp8_grouped_sm90.py uses (run b300_round3_20260922/M-A3).
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
+        where = "no CUDA device" if not torch.cuda.is_available() \
+            else f"device is sm_{torch.cuda.get_device_capability()[0]}x"
+        print(f"SKIP: test_fp8_contiguous_sm90 is sm_90 (H200) only ({where})")
+        return 0
+
     torch.manual_seed(0)
     w13 = torch.randn(E, 2 * INTER, HIDDEN, device="cuda", dtype=torch.bfloat16) / math.sqrt(HIDDEN)
     w2 = torch.randn(E, HIDDEN, INTER, device="cuda", dtype=torch.bfloat16) / math.sqrt(INTER)

@@ -87,6 +87,14 @@ bool slot_swiglu_kernel_instantiated(int shape_n, int shape_k)
     return sm100_mxfp8_slot_swiglu_instantiated(shape_n, shape_k);
 }
 
+// The fused epilogue's token-column chunk, read from the store itself so the
+// dispatcher's rule cannot drift from the kernel: `slot_route` admits the fused
+// slot kernel only while m_cap fits one chunk (run b300_round3_20260922/M-A3).
+int slot_swiglu_epilogue_chunk()
+{
+    return cutlass::epilogue::collective::fso_swiglu_slot::kSlotChunk;
+}
+
 cudaError_t slot_swiglu_kernel_launch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_fp8_e4m3* out_h,
     int32_t* out_sfh, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int groups, int num_slots, int m_cap,
     int shape_n, int shape_k, int const* slot_to_expert, cudaStream_t stream)

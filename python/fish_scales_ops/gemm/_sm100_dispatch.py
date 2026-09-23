@@ -3,13 +3,16 @@
 Every ``linear_mxfp8`` call on Blackwell datacenter (SM100/SM103) enters
 here. The tiers, in order:
 
-0. **Decode kernels** (see :mod:`._sm100_decode`) — the M ≤ 32 band, and only
+0. **Decode kernels** (see :mod:`._sm100_decode`) — the M ≤ 64 band, and only
    that band. Two vendored NVIDIA/FlashInfer CuTe-DSL kernels in swap-AB
-   orientation with an 8/16/32-wide token tile: an in-cluster split-K kernel
-   for narrow-N shapes and the plain persistent kernel for wide-N shapes.
-   This row exists only when the installed ``nvidia-cutlass-dsl`` is at least
-   4.5.0; below that it is inert and the three tiers below behave exactly as
-   they did before it was added.
+   orientation with an 8/16/32-wide token tile up to M = 32 — an in-cluster
+   split-K kernel for narrow-N shapes and the plain persistent kernel for
+   wide-N shapes — and, from M = 33 to 64, the persistent kernel with a
+   64-wide token tile and the 2-CTA 256-row weight tile in a cluster of two;
+   the long-K narrow-N cells of that upper band stay with the C++ cascade.
+   This row exists only when the installed
+   ``nvidia-cutlass-dsl`` is at least 4.5.0; below that it is inert and the
+   three tiers below behave exactly as they did before it was added.
 
 1. **cuBLAS ``scaled_mm``** (see :mod:`._sm100_smm`) — the small-M /
    decode wide-N band. Fair MLP bench 2026-07-07: cuBLAS's
@@ -51,12 +54,14 @@ def route(x_fp8: torch.Tensor, w_fp8: torch.Tensor,
     m, k = x_fp8.shape
     n = w_fp8.shape[0]
 
-    # Decode row: M ≤ 32 only. It is asked first because every tier below
+    # Decode row: M ≤ 64 only. It is asked first because every tier below
     # loses that band — tier 1 and tier 2 cannot narrow their N tile below 128
-    # and tier 3 answers a narrow-N decode cell with two serialised launches.
+    # and tier 3 answers a narrow-N decode cell with two serialised launches
+    # or, from M = 33, with a 256-row token tile that is three quarters empty.
     # ``pick_config`` returns None for every cell it does not own, including
-    # all of M > 32, so the tiers below are reached exactly as before.
-    if m <= 32:
+    # all of M > 64 and the long-K narrow-N cells of the upper band, so the
+    # tiers below are reached exactly as before on those.
+    if m <= 64:
         from . import _sm100_decode
         cfg = _sm100_decode.pick_config(m, n, k)
         if cfg is not None:

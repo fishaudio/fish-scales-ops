@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
+#include <vector>
 
 #include <cuda_bf16.h>
 
@@ -44,6 +45,41 @@ namespace
 
 constexpr int kMaxGroups = 1024;
 constexpr int kRoutingThreads = 512;
+
+// The (N, K) pairs of the grouped GEMMs a layer will run on this routing, for
+// which the routing kernels also emit CUTLASS-style per-group problem shapes
+// (run b300_round3_20260922/M-A4). Passed to the kernel by value; four is
+// more than any MoE layer of this library runs (two routed GEMMs), and the
+// op refuses more rather than sizing the struct for an unbounded list.
+constexpr int kMaxProblemShapeSets = 4;
+
+struct ProblemShapeList
+{
+    int32_t n[kMaxProblemShapeSets];
+    int32_t k[kMaxProblemShapeSets];
+    int32_t count;
+};
+
+// Write group g's (rows, N, K) triple for every requested GEMM. Called by the
+// same thread, in the same pass, that publishes masked_m[g], so the shapes
+// and the counts a GEMM reads are published together. The row count is
+// clamped to m_cap exactly as the sm_100 preparation kernel clamps it, so the
+// two ways of producing the array agree byte for byte on a malformed routing
+// as well as on a legal one.
+__device__ __forceinline__ void fso_emit_problem_shapes(
+    int32_t* __restrict__ problem_shapes, ProblemShapeList const& ps, int g, int num_groups, int rows, int m_cap)
+{
+    if (problem_shapes == nullptr)
+        return;
+    int const m = rows < 0 ? 0 : (rows > m_cap ? m_cap : rows);
+    for (int p = 0; p < ps.count; ++p)
+    {
+        int32_t* dst = problem_shapes + (static_cast<size_t>(p) * num_groups + g) * 3;
+        dst[0] = m;
+        dst[1] = ps.n[p];
+        dst[2] = ps.k[p];
+    }
+}
 
 // Emit the packed active-expert list that the sm_100 slot-bound grouped MXFP8
 // GEMM's grid is indexed by: the ids of the experts holding at least one routed
@@ -96,12 +132,20 @@ __device__ inline void fso_emit_slot_list(
     }
 }
 
-__global__ void moe_build_routing_kernel(
+// The body of the single-CTA routing builder, shared by the two kernels below
+// it. `kShapes` selects whether the per-group problem shapes are emitted (run
+// b300_round3_20260922/M-A4); with it false the body is the pre-existing
+// kernel's, instruction for instruction, so callers that never ask for the
+// shapes keep the kernel they had, on every architecture.
+template <bool kShapes>
+__device__ __forceinline__ void moe_build_routing_body(
     int32_t const* __restrict__ topk_ids, // [M * topk]
     int32_t* __restrict__ masked_m,       // [G]
     int32_t* __restrict__ row_map,        // [G * m_cap] (valid slots only)
     int32_t* __restrict__ slot_of_flat,   // [M * topk]
     int32_t* __restrict__ slot_to_expert, // [G] or nullptr (see fso_emit_slot_list)
+    int32_t* __restrict__ problem_shapes, // [P * G * 3] (see fso_emit_problem_shapes), read iff kShapes
+    ProblemShapeList const& ps,
     int num_pairs, int topk, int num_groups, int m_cap, bool pdl)
 {
     // PDL: order the topk_ids read behind the parent (upstream layer /
@@ -144,10 +188,42 @@ __global__ void moe_build_routing_kernel(
     __syncthreads();
 
     for (int g = threadIdx.x; g < num_groups; g += blockDim.x)
+    {
         masked_m[g] = cnt[g];
+        if constexpr (kShapes)
+            fso_emit_problem_shapes(problem_shapes, ps, g, num_groups, cnt[g], m_cap);
+    }
 
     if (slot_to_expert != nullptr)
         fso_emit_slot_list(slot_to_expert, cnt, num_groups);
+}
+
+__global__ void moe_build_routing_kernel(
+    int32_t const* __restrict__ topk_ids, // [M * topk]
+    int32_t* __restrict__ masked_m,       // [G]
+    int32_t* __restrict__ row_map,        // [G * m_cap] (valid slots only)
+    int32_t* __restrict__ slot_of_flat,   // [M * topk]
+    int32_t* __restrict__ slot_to_expert, // [G] or nullptr (see fso_emit_slot_list)
+    int num_pairs, int topk, int num_groups, int m_cap, bool pdl)
+{
+    moe_build_routing_body<false>(topk_ids, masked_m, row_map, slot_of_flat, slot_to_expert, nullptr,
+        ProblemShapeList{}, num_pairs, topk, num_groups, m_cap, pdl);
+}
+
+// The same builder, also emitting the per-group problem shapes of every GEMM
+// the caller named (run b300_round3_20260922/M-A4).
+__global__ void moe_build_routing_ps_kernel(
+    int32_t const* __restrict__ topk_ids, // [M * topk]
+    int32_t* __restrict__ masked_m,       // [G]
+    int32_t* __restrict__ row_map,        // [G * m_cap] (valid slots only)
+    int32_t* __restrict__ slot_of_flat,   // [M * topk]
+    int32_t* __restrict__ slot_to_expert, // [G] or nullptr (see fso_emit_slot_list)
+    int32_t* __restrict__ problem_shapes, // [P * G * 3] (see fso_emit_problem_shapes)
+    ProblemShapeList ps,
+    int num_pairs, int topk, int num_groups, int m_cap, bool pdl)
+{
+    moe_build_routing_body<true>(topk_ids, masked_m, row_map, slot_of_flat, slot_to_expert, problem_shapes, ps,
+        num_pairs, topk, num_groups, m_cap, pdl);
 }
 
 __global__ void moe_combine_kernel(
@@ -282,7 +358,10 @@ __global__ void moe_combine_kernel(
 // replays this kernel any number of times always finds them zero. A first call
 // made inside a capture is refused with a message, exactly as the grouped
 // GEMM's argument pool does.
-__global__ void moe_build_routing_multi_kernel(
+// Body shared by the two multi-CTA kernels below, on the same `kShapes`
+// footing as the single-CTA body above.
+template <bool kShapes>
+__device__ __forceinline__ void moe_build_routing_multi_body(
     int32_t const* __restrict__ topk_ids, // [M * topk]
     int32_t* __restrict__ masked_m,       // [G]
     int32_t* __restrict__ row_map,        // [G * m_cap] (valid slots only)
@@ -290,6 +369,8 @@ __global__ void moe_build_routing_multi_kernel(
     int32_t* __restrict__ gcnt,           // [G]  scratch, zero in, zero out
     int32_t* __restrict__ gdone,          // [1]  scratch, zero in, zero out
     int32_t* __restrict__ slot_to_expert, // [G] or nullptr (see fso_emit_slot_list)
+    int32_t* __restrict__ problem_shapes, // [P * G * 3] (see fso_emit_problem_shapes), read iff kShapes
+    ProblemShapeList const& ps,
     int num_pairs, int topk, int num_groups, int m_cap, bool pdl)
 {
     if (pdl)
@@ -348,6 +429,8 @@ __global__ void moe_build_routing_multi_kernel(
         {
             int32_t const total = gcnt[g];
             masked_m[g] = total;
+            if constexpr (kShapes)
+                fso_emit_problem_shapes(problem_shapes, ps, g, num_groups, total, m_cap);
             base[g] = total;
             gcnt[g] = 0;
         }
@@ -362,6 +445,36 @@ __global__ void moe_build_routing_multi_kernel(
         if (slot_to_expert != nullptr)
             fso_emit_slot_list(slot_to_expert, base, num_groups);
     }
+}
+
+__global__ void moe_build_routing_multi_kernel(
+    int32_t const* __restrict__ topk_ids, // [M * topk]
+    int32_t* __restrict__ masked_m,       // [G]
+    int32_t* __restrict__ row_map,        // [G * m_cap] (valid slots only)
+    int32_t* __restrict__ slot_of_flat,   // [M * topk]
+    int32_t* __restrict__ gcnt,           // [G]  scratch, zero in, zero out
+    int32_t* __restrict__ gdone,          // [1]  scratch, zero in, zero out
+    int32_t* __restrict__ slot_to_expert, // [G] or nullptr (see fso_emit_slot_list)
+    int num_pairs, int topk, int num_groups, int m_cap, bool pdl)
+{
+    moe_build_routing_multi_body<false>(topk_ids, masked_m, row_map, slot_of_flat, gcnt, gdone, slot_to_expert,
+        nullptr, ProblemShapeList{}, num_pairs, topk, num_groups, m_cap, pdl);
+}
+
+__global__ void moe_build_routing_multi_ps_kernel(
+    int32_t const* __restrict__ topk_ids, // [M * topk]
+    int32_t* __restrict__ masked_m,       // [G]
+    int32_t* __restrict__ row_map,        // [G * m_cap] (valid slots only)
+    int32_t* __restrict__ slot_of_flat,   // [M * topk]
+    int32_t* __restrict__ gcnt,           // [G]  scratch, zero in, zero out
+    int32_t* __restrict__ gdone,          // [1]  scratch, zero in, zero out
+    int32_t* __restrict__ slot_to_expert, // [G] or nullptr (see fso_emit_slot_list)
+    int32_t* __restrict__ problem_shapes, // [P * G * 3] (see fso_emit_problem_shapes)
+    ProblemShapeList ps,
+    int num_pairs, int topk, int num_groups, int m_cap, bool pdl)
+{
+    moe_build_routing_multi_body<true>(topk_ids, masked_m, row_map, slot_of_flat, gcnt, gdone, slot_to_expert,
+        problem_shapes, ps, num_pairs, topk, num_groups, m_cap, pdl);
 }
 
 
@@ -676,8 +789,21 @@ constexpr int kRoutingMultiMaxCtas = 132;
 // tensor is empty and no slot work is done at all, so every existing caller is
 // unaffected. The list is architecture-independent glue -- sm_120 and sm_90
 // produce it too, and simply have no route that consumes it.
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_build_routing(
-    at::Tensor topk_ids, int64_t num_groups, int64_t m_cap, bool with_slots)
+//
+// `problem_shapes_nk` (run b300_round3_20260922/M-A4) is a flat list of
+// (N, K) pairs -- [N0, K0, N1, K1, ...] -- one per grouped GEMM the caller will
+// run on this routing. For each pair the kernel also writes the per-group
+// CUTLASS problem shape, the int32 triple (rows, N, K) with rows clamped to
+// m_cap, into the fifth output, int32 [P, G, 3], in the same pass that writes
+// `masked_m`. That triple is the only routing-dependent argument the sm_100
+// pointer-array grouped GEMM has, so a caller that hands `problem_shapes[i]`
+// to GEMM i lets it launch without its per-call preparation kernel. An empty
+// list (the default) writes nothing and returns an empty [0, G, 3] tensor, so
+// existing callers are unaffected. Like the slot list this is
+// architecture-independent glue: every architecture produces it and only the
+// sm_100/103 cascade reads it.
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_build_routing(
+    at::Tensor topk_ids, int64_t num_groups, int64_t m_cap, bool with_slots, std::vector<int64_t> problem_shapes_nk)
 {
     TORCH_CHECK(topk_ids.is_cuda() && topk_ids.dtype() == at::kInt,
         "topk_ids must be CUDA int32");
@@ -691,6 +817,21 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_build_routing(
     // Caller contract: with no-replacement topk routing a group receives at
     // most M rows, so m_cap >= M guarantees no slot overflow.
     TORCH_CHECK(m_cap >= M, "m_cap must be >= M (per-expert count can reach M)");
+    TORCH_CHECK(problem_shapes_nk.size() % 2 == 0,
+        "problem_shapes_nk must be a flat list of (N, K) pairs, got ", problem_shapes_nk.size(), " ints");
+    int const num_ps = static_cast<int>(problem_shapes_nk.size() / 2);
+    TORCH_CHECK(num_ps <= kMaxProblemShapeSets,
+        "problem_shapes_nk names ", num_ps, " GEMMs; at most ", kMaxProblemShapeSets, " are supported");
+    ProblemShapeList ps{};
+    for (int p = 0; p < num_ps; ++p)
+    {
+        int64_t const n = problem_shapes_nk[2 * p], k = problem_shapes_nk[2 * p + 1];
+        TORCH_CHECK(n >= 1 && k >= 1 && n <= INT32_MAX && k <= INT32_MAX,
+            "problem_shapes_nk pair ", p, " = (", n, ", ", k, ") must be positive int32");
+        ps.n[p] = static_cast<int32_t>(n);
+        ps.k[p] = static_cast<int32_t>(k);
+    }
+    ps.count = num_ps;
 
     auto opts = topk_ids.options();
     auto masked_m = at::empty({num_groups}, opts);
@@ -701,6 +842,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_build_routing(
     // and a [G] list is legal for any bound it chooses.
     auto slot_to_expert = at::empty({with_slots ? num_groups : 0}, opts);
     int32_t* const slot_ptr = with_slots ? reinterpret_cast<int32_t*>(slot_to_expert.data_ptr()) : nullptr;
+    auto problem_shapes = at::empty({num_ps, num_groups, 3}, opts);
+    int32_t* const ps_ptr = num_ps > 0 ? reinterpret_cast<int32_t*>(problem_shapes.data_ptr()) : nullptr;
 
     auto stream = at::cuda::getCurrentCUDAStream();
     int const n_pairs = M * topk;
@@ -714,22 +857,40 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_build_routing(
                 blocks = kRoutingMultiMaxCtas;
             if (blocks < 1)
                 blocks = 1;
-            fso_pdl_launch(moe_build_routing_multi_kernel, dim3(blocks), dim3(kRoutingMultiThreads), stream,
-                fso_pdl_enabled(), reinterpret_cast<int32_t const*>(topk_ids.data_ptr()),
-                reinterpret_cast<int32_t*>(masked_m.data_ptr()),
-                reinterpret_cast<int32_t*>(row_map.data_ptr()),
-                reinterpret_cast<int32_t*>(slot_of_flat.data_ptr()), scratch, scratch + kMaxGroups, slot_ptr, n_pairs,
-                topk, static_cast<int>(num_groups), static_cast<int>(m_cap));
-            return {masked_m, row_map, slot_of_flat, slot_to_expert};
+            // The pre-existing kernel when no shapes were asked for, so such
+            // callers launch exactly the code they launched before.
+            if (ps_ptr == nullptr)
+                fso_pdl_launch(moe_build_routing_multi_kernel, dim3(blocks), dim3(kRoutingMultiThreads), stream,
+                    fso_pdl_enabled(), reinterpret_cast<int32_t const*>(topk_ids.data_ptr()),
+                    reinterpret_cast<int32_t*>(masked_m.data_ptr()),
+                    reinterpret_cast<int32_t*>(row_map.data_ptr()),
+                    reinterpret_cast<int32_t*>(slot_of_flat.data_ptr()), scratch, scratch + kMaxGroups, slot_ptr,
+                    n_pairs, topk, static_cast<int>(num_groups), static_cast<int>(m_cap));
+            else
+                fso_pdl_launch(moe_build_routing_multi_ps_kernel, dim3(blocks), dim3(kRoutingMultiThreads), stream,
+                    fso_pdl_enabled(), reinterpret_cast<int32_t const*>(topk_ids.data_ptr()),
+                    reinterpret_cast<int32_t*>(masked_m.data_ptr()),
+                    reinterpret_cast<int32_t*>(row_map.data_ptr()),
+                    reinterpret_cast<int32_t*>(slot_of_flat.data_ptr()), scratch, scratch + kMaxGroups, slot_ptr,
+                    ps_ptr, ps, n_pairs, topk, static_cast<int>(num_groups), static_cast<int>(m_cap));
+            return {masked_m, row_map, slot_of_flat, slot_to_expert, problem_shapes};
         }
     }
-    fso_pdl_launch(moe_build_routing_kernel, dim3(1), dim3(kRoutingThreads), stream, fso_pdl_enabled(),
-        reinterpret_cast<int32_t const*>(topk_ids.data_ptr()),
-        reinterpret_cast<int32_t*>(masked_m.data_ptr()),
-        reinterpret_cast<int32_t*>(row_map.data_ptr()),
-        reinterpret_cast<int32_t*>(slot_of_flat.data_ptr()), slot_ptr,
-        n_pairs, topk, static_cast<int>(num_groups), static_cast<int>(m_cap));
-    return {masked_m, row_map, slot_of_flat, slot_to_expert};
+    if (ps_ptr == nullptr)
+        fso_pdl_launch(moe_build_routing_kernel, dim3(1), dim3(kRoutingThreads), stream, fso_pdl_enabled(),
+            reinterpret_cast<int32_t const*>(topk_ids.data_ptr()),
+            reinterpret_cast<int32_t*>(masked_m.data_ptr()),
+            reinterpret_cast<int32_t*>(row_map.data_ptr()),
+            reinterpret_cast<int32_t*>(slot_of_flat.data_ptr()), slot_ptr,
+            n_pairs, topk, static_cast<int>(num_groups), static_cast<int>(m_cap));
+    else
+        fso_pdl_launch(moe_build_routing_ps_kernel, dim3(1), dim3(kRoutingThreads), stream, fso_pdl_enabled(),
+            reinterpret_cast<int32_t const*>(topk_ids.data_ptr()),
+            reinterpret_cast<int32_t*>(masked_m.data_ptr()),
+            reinterpret_cast<int32_t*>(row_map.data_ptr()),
+            reinterpret_cast<int32_t*>(slot_of_flat.data_ptr()), slot_ptr, ps_ptr, ps,
+            n_pairs, topk, static_cast<int>(num_groups), static_cast<int>(m_cap));
+    return {masked_m, row_map, slot_of_flat, slot_to_expert, problem_shapes};
 }
 
 

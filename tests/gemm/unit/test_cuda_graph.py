@@ -320,6 +320,149 @@ def run_slot_graph_cases():
 
 
 
+# --- sm_100/103 routing-supplied problem shapes ------------------------------
+#
+# With `problem_shapes` the pointer-array route launches no argument-
+# preparation kernel: the routing kernel writes the per-group shapes several
+# launches ahead of the GEMM, and the tensor-set arrays live in a static block
+# that is written OUTSIDE the capture and pinned for the graph's life (run
+# b300_round3_20260922/M-A4). Two capture obligations follow and both are
+# checked here: the block arena must exist before a capture (one eager call),
+# and a replay must follow an in-place routing rewrite, which is what proves
+# the GEMM waits for the routing kernel before it reads the shapes -- the
+# `griddepcontrol.wait` at cutlass/gemm/kernel/sm100_gemm_array_tma_warpspecialized.hpp
+# line 839 sits ahead of the scheduler constructor that reads them. PDL is on
+# in these cases (FSO_DISABLE_PDL unset), so the ordering is exercised, not
+# assumed. M = 68 is the first row capacity past the plain slot kernel's
+# 64-wide token tile (run b300_round3_20260922/M-A3 runs the plain kernel up
+# to the tile), i.e. the first cell of the pointer-array route on this shape.
+
+PS_G, PS_TOPK, PS_N, PS_K, PS_M = 128, 8, 2048, 768, 68
+
+
+def _ps_layer_inputs():
+    torch.manual_seed(PS_M * 1009 + PS_N * 17 + PS_K)
+    m_cap = (PS_M + 3) // 4 * 4
+    x = torch.randn(PS_M, PS_K, dtype=torch.bfloat16, device="cuda") * 0.1
+    w = torch.randn(PS_G, PS_N, PS_K, dtype=torch.bfloat16, device="cuda") / (PS_K ** 0.5)
+    w_fp8, sw = fso.gemm.quantize_moe_weights_1x32_fp8(w)
+    g = torch.Generator(device="cpu").manual_seed(9)
+    topk_ids = torch.stack(
+        [torch.randperm(PS_G, generator=g)[:PS_TOPK] for _ in range(PS_M)]
+    ).to("cuda", torch.int32)
+    return x, w_fp8, sw, topk_ids, m_cap
+
+
+def _ps_call(x, w_fp8, sw, topk_ids, m_cap):
+    """Routing (with the shapes) -> gather-quant -> pointer-array GEMM handed
+    the shapes, all on device; a replay follows whatever ids the buffer holds."""
+    mag = min(PS_M * PS_TOPK, PS_G)
+    assert fso.gemm.mxfp8_grouped_problem_shapes_consumed(m_cap, PS_N, PS_K, PS_G, mag), \
+        "this cell must sit on the pointer-array route"
+    masked_m, row_map, slot_of_flat, ps = fso.gemm.moe_build_routing(
+        topk_ids, PS_G, m_cap, problem_shapes_for=[(PS_N, PS_K)])
+    a_fp8, sa = fso.gemm.quantize_1x32_grouped_gather_fp8(x, slot_of_flat, PS_TOPK, PS_G, m_cap)
+    y = fso.gemm.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, 4, mag, None, ps[0])
+    return y, masked_m, row_map
+
+
+def _rows_by_token(y, masked_m, row_map):
+    """The defined rows of every group, ordered by SOURCE TOKEN rather than by
+    slot. `moe_build_routing` assigns a group's slots in atomic-arrival order
+    (docs/api/gemm.md, "Slot order is a free permutation"), and at 512 routed
+    pairs over sixteen warps two runs of it really do produce different
+    permutations, so two per-slot tensors from two routing calls are not
+    comparable row for row even when both are correct. Sorting each group's
+    rows by the token `row_map` names makes the comparison exact and still
+    detects a wrong or missing row."""
+    G, m_cap = y.shape[0], y.shape[1]
+    rm = row_map.view(G, m_cap)
+    parts = []
+    for g in range(G):
+        n = int(masked_m[g])
+        if n == 0:
+            continue
+        order = torch.argsort(rm[g, :n])
+        parts.append(y[g, :n][order])
+    return torch.cat(parts, 0)
+
+
+def test_ps_grouped_graph():
+    x, w_fp8, sw, topk_ids, m_cap = _ps_layer_inputs()
+    for _ in range(3):
+        _ps_call(x, w_fp8, sw, topk_ids, m_cap)
+    torch.cuda.synchronize()
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            _ps_call(x, w_fp8, sw, topk_ids, m_cap)
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=s):
+        captured, captured_mm, captured_rm = _ps_call(x, w_fp8, sw, topk_ids, m_cap)
+
+    for _ in range(200):
+        captured.fill_(float("nan"))
+        g.replay()
+    torch.cuda.synchronize()
+    ref, ref_mm, ref_rm = _ps_call(x, w_fp8, sw, topk_ids, m_cap)
+    torch.cuda.synchronize()
+    assert torch.equal(captured_mm, ref_mm), "problem_shapes grouped: replay rebuilt a different routing"
+    assert torch.equal(_rows_by_token(captured, captured_mm, captured_rm),
+                       _rows_by_token(ref, ref_mm, ref_rm)), "problem_shapes grouped: replay != eager"
+    print(f"  mxfp8 shapes grouped M={PS_M} 200 replays bit-exact (PDL on)  OK")
+
+    g2 = torch.Generator(device="cpu").manual_seed(4343)
+    topk_ids.copy_(torch.stack(
+        [torch.randperm(PS_G, generator=g2)[:PS_TOPK] for _ in range(PS_M)]
+    ).to("cuda", torch.int32))
+    g.replay()
+    torch.cuda.synchronize()
+    ref2, ref2_mm, ref2_rm = _ps_call(x, w_fp8, sw, topk_ids, m_cap)
+    torch.cuda.synchronize()
+    assert torch.equal(captured_mm, ref2_mm), "problem_shapes grouped: reroute replay kept the old routing"
+    assert torch.equal(_rows_by_token(captured, captured_mm, captured_rm),
+                       _rows_by_token(ref2, ref2_mm, ref2_rm)), "problem_shapes grouped: reroute replay != eager"
+    print(f"  mxfp8 shapes reroute M={PS_M} replay bit-exact after in-place rewrite  OK")
+
+
+def test_ps_arena_refuses_capture():
+    """No eager call at all, straight into a capture: the static-array arena
+    must refuse to allocate and say so. Runs as its own process because the
+    refusal aborts."""
+    x, w_fp8, sw, topk_ids, m_cap = _ps_layer_inputs()
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=s):
+        _ps_call(x, w_fp8, sw, topk_ids, m_cap)
+    raise AssertionError("the static-array arena allocated during capture instead of refusing")
+
+
+def run_ps_graph_cases():
+    import subprocess
+
+    def child(case):
+        env = dict(os.environ)
+        for k in ("FSO_GROUPED_SLOT", "FSO_FC1_FUSED", "FSO_DISABLE_PDL"):
+            env.pop(k, None)
+        return subprocess.run([sys.executable, os.path.abspath(__file__), "--ps-case", case],
+                              env=env, capture_output=True, text=True)
+
+    r = child("graph")
+    print(r.stdout, end="")
+    assert r.returncode == 0, f"problem_shapes graph case failed (exit {r.returncode}):\n{r.stderr}"
+    r = child("no_warmup")
+    assert r.returncode != 0, "capture without an eager warmup was allowed to allocate the arena"
+    assert "static argument arena is empty during stream capture" in r.stderr, \
+        f"unexpected failure instead of the arena refusal:\n{r.stderr[-800:]}"
+    print("  mxfp8 shapes arena   capture without eager warmup refused with a message  OK")
+
+
 # --- sm_100/103 fused-SwiGLU FC1 -------------------------------------------
 #
 # The fused FC1 is a second CUTLASS instantiation with its OWN host-side state:
@@ -508,6 +651,12 @@ def main():
         else:
             test_fused_pool_refuses_capture()
         return
+    if len(sys.argv) > 2 and sys.argv[1] == "--ps-case":
+        if sys.argv[2] == "graph":
+            test_ps_grouped_graph()
+        else:
+            test_ps_arena_refuses_capture()
+        return
     if len(sys.argv) > 2 and sys.argv[1] == "--slot-case":
         if sys.argv[2] == "graph":
             test_slot_grouped_graph()
@@ -569,6 +718,9 @@ def main():
 
         print("\n== sm_100/103 fused-SwiGLU FC1 (subprocess per case) ==")
         run_fused_graph_cases()
+
+        print("\n== sm_100/103 routing-supplied problem shapes (subprocess per case) ==")
+        run_ps_graph_cases()
 
     print("\nAll CUDA Graph capture+replay tests passed.")
 

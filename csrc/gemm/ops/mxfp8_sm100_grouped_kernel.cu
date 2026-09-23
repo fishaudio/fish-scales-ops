@@ -63,15 +63,15 @@ bool sm100_mxfp8_grouped_compiled()
 
 cudaError_t launch_sm100_mxfp8_grouped_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D, int32_t* SFA,
     int32_t* SFB, int32_t* masked_m, int num_groups, int m_cap, int N, int K, int expected_m, int max_active_groups,
-    int const* slot_to_expert, cudaStream_t stream)
+    int const* slot_to_expert, int32_t const* problem_shapes, cudaStream_t stream)
 {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-    return sm100_blockscaled_gemm::gemm_dispatch_sm100_mxfp8_grouped(
-        A, B, D, SFA, SFB, masked_m, num_groups, m_cap, N, K, expected_m, max_active_groups, slot_to_expert, stream);
+    return sm100_blockscaled_gemm::gemm_dispatch_sm100_mxfp8_grouped(A, B, D, SFA, SFB, masked_m, num_groups, m_cap,
+        N, K, expected_m, max_active_groups, slot_to_expert, problem_shapes, stream);
 #else
     (void) A; (void) B; (void) D; (void) SFA; (void) SFB; (void) masked_m;
     (void) num_groups; (void) m_cap; (void) N; (void) K; (void) expected_m;
-    (void) max_active_groups; (void) slot_to_expert; (void) stream;
+    (void) max_active_groups; (void) slot_to_expert; (void) problem_shapes; (void) stream;
     return cudaErrorNotSupported;
 #endif
 }
@@ -82,16 +82,38 @@ cudaError_t launch_sm100_mxfp8_grouped_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3*
 // precondition; the ATen op documents it for callers.
 cudaError_t launch_sm100_mxfp8_grouped_swiglu_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_fp8_e4m3* H,
     int32_t* SFH, int32_t* SFA, int32_t* SFB, int32_t* masked_m, int num_groups, int m_cap, int N, int K,
-    int expected_m, int max_active_groups, int const* slot_to_expert, cudaStream_t stream)
+    int expected_m, int max_active_groups, int const* slot_to_expert, int32_t const* problem_shapes,
+    cudaStream_t stream)
 {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
     return sm100_blockscaled_gemm::gemm_dispatch_sm100_mxfp8_grouped_swiglu(A, B, H, SFH, SFA, SFB, masked_m,
-        num_groups, m_cap, N, K, expected_m, max_active_groups, slot_to_expert, stream);
+        num_groups, m_cap, N, K, expected_m, max_active_groups, slot_to_expert, problem_shapes, stream);
 #else
     (void) A; (void) B; (void) H; (void) SFH; (void) SFA; (void) SFB; (void) masked_m;
     (void) num_groups; (void) m_cap; (void) N; (void) K; (void) expected_m;
-    (void) max_active_groups; (void) slot_to_expert; (void) stream;
+    (void) max_active_groups; (void) slot_to_expert; (void) problem_shapes; (void) stream;
     return cudaErrorNotSupported;
+#endif
+}
+
+// Whether a grouped call of this shape would READ a caller-supplied
+// `problem_shapes` tensor (run b300_round3_20260922/M-A4): 1 on the
+// pointer-array cascade, 0 on the slot route, which derives its grid from
+// `masked_m` and the slot list. The ATen layer exposes it so a caller asks
+// `moe_build_routing` for the shapes exactly where a GEMM will consume them.
+// `fused_swiglu` names the kernel, as for `sm100_mxfp8_grouped_slot_taken`
+// below: the two answers are complements only under the same flag.
+int sm100_mxfp8_grouped_problem_shapes_consumed(
+    int m_cap, int N, int K, int groups, int max_active_groups, int fused_swiglu)
+{
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+    return sm100_blockscaled_gemm::grouped_detail::problem_shapes_consumed(
+               m_cap, N, K, groups, max_active_groups, fused_swiglu != 0)
+        ? 1
+        : 0;
+#else
+    (void) m_cap; (void) N; (void) K; (void) groups; (void) max_active_groups; (void) fused_swiglu;
+    return 0;
 #endif
 }
 
@@ -163,15 +185,19 @@ int sm100_mxfp8_grouped_slot_refusal(int m_cap, int N, int K, int groups, int ma
 // because a refused forced call does not reach the slot kernel either. The
 // enum lives in the dispatcher header, which only this translation unit
 // includes, so the comparison stays here rather than in the ATen layer.
-int sm100_mxfp8_grouped_slot_taken(int m_cap, int N, int K, int groups, int max_active_groups)
+// `fused_swiglu` names the kernel the call would land on — the fused-SwiGLU FC1
+// (`linear_mxfp8_grouped_masked_swiglu`) or the plain grouped GEMM — because
+// the two have different row-capacity clauses (run b300_round3_20260922/M-A3).
+int sm100_mxfp8_grouped_slot_taken(int m_cap, int N, int K, int groups, int max_active_groups, int fused_swiglu)
 {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-    return sm100_blockscaled_gemm::grouped_detail::slot_route(m_cap, N, K, groups, max_active_groups)
+    return sm100_blockscaled_gemm::grouped_detail::slot_route(
+               m_cap, N, K, groups, max_active_groups, fused_swiglu != 0)
             == sm100_blockscaled_gemm::grouped_detail::kSlotRouteSlot
         ? 1
         : 0;
 #else
-    (void) m_cap; (void) N; (void) K; (void) groups; (void) max_active_groups;
+    (void) m_cap; (void) N; (void) K; (void) groups; (void) max_active_groups; (void) fused_swiglu;
     return 0;
 #endif
 }

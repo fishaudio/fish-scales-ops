@@ -589,17 +589,26 @@ def run_worker(cell):
             want_slots = fso.gemm.mxfp8_grouped_slot_possible(
                 m_cap, N, K, E, max_active_groups)
             result["with_slots"] = int(want_slots)
+            # The pointer-array route's counterpart (run
+            # b300_round3_20260922/M-A4): where the cascade serves the call,
+            # the routing kernel also emits the per-group (rows, N, K) triples
+            # and the GEMM launches without its argument-preparation kernel.
+            want_ps = fso.gemm.mxfp8_grouped_problem_shapes_consumed(
+                m_cap, N, K, E, max_active_groups)
+            result["with_ps"] = int(want_ps)
             x_tok = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.1
             routing = fso.gemm.moe_build_routing(
-                topk_ids, E, m_cap, with_slots=want_slots)
+                topk_ids, E, m_cap, with_slots=want_slots,
+                problem_shapes_for=[(N, K)] if want_ps else None)
             masked_dev, row_map, slot_of_flat = routing[:3]
             slot_to_expert = routing[3] if want_slots else None
+            problem_shapes = routing[-1][0] if want_ps else None
             a_fp8, sa = fso.gemm.quantize_1x32_grouped_gather_fp8(
                 x_tok, slot_of_flat, TOPK, E, m_cap)
             w_fp8, sw = fso.gemm.quantize_moe_weights_1x32_fp8(w)
             fn = lambda: fso.gemm.linear_mxfp8_grouped_masked(
                 a_fp8, w_fp8, sa, sw, masked_dev, expected_m, max_active_groups,
-                slot_to_expert)
+                slot_to_expert, problem_shapes)
             y = fn()
             torch.cuda.synchronize()
             cs, n_cs = 0.0, 0
@@ -862,42 +871,67 @@ def run_worker(cell):
             # HIDDEN x INTER), and `with_slots` follows that answer. On sm_120,
             # and on sm_100 above the decode band, the answer is no and the
             # routing kernel does less work than it did.
+            # Asked for the kernel each GEMM will actually run: the fused FC1
+            # has a shorter row-capacity clause than the plain grouped GEMM
+            # (run b300_round3_20260922/M-A3).
             want_slots = (
                 fso.gemm.mxfp8_grouped_slot_possible(
-                    m_cap, n_w, HIDDEN, E, max_active_groups)
+                    m_cap, n_w, HIDDEN, E, max_active_groups, fused_swiglu=fc1_fused)
                 or fso.gemm.mxfp8_grouped_slot_possible(
                     m_cap, HIDDEN, INTER, E, max_active_groups))
             result["with_slots"] = int(want_slots)
+            # The pointer-array route's counterpart of the slot list (run
+            # b300_round3_20260922/M-A4). Wherever the cascade serves a GEMM,
+            # the routing kernel also emits that GEMM's per-group (rows, N, K)
+            # triples in the pass that writes masked_m, and the GEMM then
+            # launches without the argument-preparation kernel it used to run
+            # ahead of itself: seven kernels per layer become five. Asked per
+            # GEMM, so the decode band (slot route, no reader) and sm_120 keep
+            # the routing kernel's old work exactly. Asked with the same
+            # kernel flag as the slot query above, because the two answers
+            # are complements only under the same flag: per GEMM exactly one
+            # of the slot list and the problem shapes is then requested.
+            want_ps = [
+                fso.gemm.mxfp8_grouped_problem_shapes_consumed(
+                    m_cap, n_w, HIDDEN, E, max_active_groups, fused_swiglu=fc1_fused),
+                fso.gemm.mxfp8_grouped_problem_shapes_consumed(
+                    m_cap, HIDDEN, INTER, E, max_active_groups)]
+            ps_for = [nk for nk, want in zip([(n_w, HIDDEN), (HIDDEN, INTER)], want_ps) if want]
+            result["with_ps"] = int(any(want_ps))
 
             def build_routing():
-                r = fso.gemm.moe_build_routing(topk_ids, E, m_cap, with_slots=want_slots)
-                return r[0], r[2], (r[3] if want_slots else None)
+                r = fso.gemm.moe_build_routing(topk_ids, E, m_cap, with_slots=want_slots,
+                                               problem_shapes_for=ps_for or None)
+                ps = list(r[-1]) if ps_for else []
+                ps1 = ps.pop(0) if want_ps[0] else None
+                ps2 = ps.pop(0) if want_ps[1] else None
+                return r[0], r[2], (r[3] if want_slots else None), ps1, ps2
 
             if fc1_fused:
                 def layer_fn():
-                    masked_dev, slot_of_flat, slot_to_expert = build_routing()
+                    masked_dev, slot_of_flat, slot_to_expert, ps1, ps2 = build_routing()
                     hq, sh = fso.gemm.quantize_1x32_grouped_gather_fp8(
                         hidden, slot_of_flat, TOPK, E, m_cap)
                     dq, sd = fso.gemm.linear_mxfp8_grouped_masked_swiglu(
                         hq, w13_fp8, sh, sw13, masked_dev, expected_m,
-                        max_active_groups, slot_to_expert)
+                        max_active_groups, slot_to_expert, ps1)
                     dn = fso.gemm.linear_mxfp8_grouped_masked(
                         dq, w2_fp8, sd, sw2, masked_dev, expected_m,
-                        max_active_groups, slot_to_expert)
+                        max_active_groups, slot_to_expert, ps2)
                     return fso.gemm.moe_combine(dn, slot_of_flat, topk_w)
             else:
                 def layer_fn():
-                    masked_dev, slot_of_flat, slot_to_expert = build_routing()
+                    masked_dev, slot_of_flat, slot_to_expert, ps1, ps2 = build_routing()
                     hq, sh = fso.gemm.quantize_1x32_grouped_gather_fp8(
                         hidden, slot_of_flat, TOPK, E, m_cap)
                     gu = fso.gemm.linear_mxfp8_grouped_masked(
                         hq, w13_fp8, sh, sw13, masked_dev, expected_m,
-                        max_active_groups, slot_to_expert)
+                        max_active_groups, slot_to_expert, ps1)
                     dq, sd = fso.gemm.silu_chunk_mul_quantize_1x32_grouped_fp8(
                         gu, slot_of_flat, pairwise=fc1_interleaved)
                     dn = fso.gemm.linear_mxfp8_grouped_masked(
                         dq, w2_fp8, sd, sw2, masked_dev, expected_m,
-                        max_active_groups, slot_to_expert)
+                        max_active_groups, slot_to_expert, ps2)
                     return fso.gemm.moe_combine(dn, slot_of_flat, topk_w)
 
             out_holder = {}

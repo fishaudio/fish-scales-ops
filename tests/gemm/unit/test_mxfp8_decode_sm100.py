@@ -1,26 +1,32 @@
-"""sm_100/sm_103 MXFP8 decode row (M ≤ 32) — accuracy, routing, capture.
+"""sm_100/sm_103 MXFP8 decode row (M ≤ 64) — accuracy, routing, capture.
 
 The decode row (`python/fish_scales_ops/gemm/_sm100_decode.py`) puts two
 vendored NVIDIA CuTe-DSL kernels in front of the three tiers of the sm_100
-MXFP8 router for the band M ≤ 32. This file checks the three things that can
-go wrong when a kernel is swapped in under an existing public op:
+MXFP8 router for the band M ≤ 64: the split-K and persistent kernels at the
+8/16/32-wide token tile up to M = 32, and the persistent kernel at the 64-wide
+token tile with the 2-CTA 256-row weight tile in a cluster of two from M = 33
+to 64 (the long-K narrow-N cells of that upper band stay with the C++
+cascade). This file checks the three things that can go wrong when a kernel is
+swapped in under an existing public op:
 
-1. **Accuracy.** For every Family A dense shape at M ∈ {1, 2, 4, 8, 16, 32} the
-   decode row's output is compared with what the router returned before the row
-   existed (cuBLAS `scaled_mm` on the wide-N shapes, the C++ two-kernel split-K
-   cascade on the narrow-N ones) and with an FP32 reference. The cosine against
-   the reference must agree with the old path's to five decimals, and the two
-   outputs must agree elementwise to within one BF16 ulp — in most cells they
-   are bit-identical, because the two designs sum the same FP32 K-slice
-   partials in the same order.
+1. **Accuracy.** For every Family A dense shape at M ∈ {1, 2, 4, 8, 16, 32} and
+   M ∈ {40, 48, 56, 64} the decode row's output is compared with what the
+   router returned before the row existed (cuBLAS `scaled_mm` on the wide-N
+   shapes below M = 64, the C++ cascade elsewhere: its two-kernel split-K on
+   the narrow-N shapes and its wave tile at M = 64) and with an FP32
+   reference. The cosine against the reference must agree with the old path's
+   to five decimals, and the two outputs must agree elementwise to within one
+   BF16 ulp — in most cells they are bit-identical, because the two designs
+   sum the same FP32 K-slice partials in the same order.
 
-2. **Routing.** The decode row must fire exactly where it is meant to: M ≤ 32
-   with a tactic its own kernels accept, and nowhere else. The M > 32 band, the
-   shapes whose K does not divide into the split-K tiling, and every
-   architecture other than sm_100/103 must be untouched. The version gate is
-   checked by mocking an old `nvidia-cutlass-dsl` in a subprocess and
-   confirming that `route` then returns bit-identical results to the shipped
-   path and that `pick_config` declines every cell.
+2. **Routing.** The decode row must fire exactly where it is meant to: M ≤ 64
+   with a tactic its own kernels accept, and nowhere else. The M > 64 band, the
+   long-K narrow-N and short-K cells above M = 32, the shapes whose K does not
+   divide into the split-K tiling, and every architecture other than
+   sm_100/103 must be untouched. The version gate is checked by mocking an old
+   `nvidia-cutlass-dsl` in a subprocess and confirming that `route` then
+   returns bit-identical results to the shipped path and that `pick_config`
+   declines every cell; `FSO_DISABLE_DECODE_DSL=1` must do the same.
 
 3. **Capture.** After an eager warmup, capturing the call must not compile,
    must not allocate and must not synchronise; a replay after the activation
@@ -50,6 +56,21 @@ SHAPES = [
     ("down",     2560, 9728),   # narrow N (tiles_n = 20) → split-K, K = 9728
 ]
 M_GRID = [1, 2, 4, 8, 16, 32]
+# The upper band: the persistent kernel at the 64-wide token tile, except on
+# the long-K narrow-N class (`down`), which the C++ cascade keeps.
+M_GRID_WIDE = [40, 48, 56, 64]
+WIDE_FORM = ((256, 64), (2, 1), True, 1)
+
+
+def _row_takes(N: int, K: int, M: int) -> bool:
+    """Whether the decode row is expected to own this cell."""
+    if M <= 32:
+        return True
+    if M > 64:
+        return False
+    if K < 1024:
+        return False
+    return not (K >= 8192 and (N + 127) // 128 <= 32)
 
 
 def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -91,8 +112,9 @@ def _baseline(xq, sx, wq, sw):
 
     Mirrors the tier order of `_sm100_dispatch.route` with the decode row
     removed: tier 1 where `should_route` claims the cell, otherwise the raw C++
-    cascade (tier 2's `pick_config` declines the whole M < 256 band, and the
-    `wave_tile_owns` guard cannot fire below M = 64).
+    cascade (tier 2's `pick_config` declines the whole M < 256 band, and at
+    M = 64 the `wave_tile_owns` guard sends the wide-N shapes to the cascade,
+    which is also what `should_route` answers there).
     """
     from fish_scales_ops.gemm import _sm100_smm
     m, k = xq.shape
@@ -110,9 +132,14 @@ def test_accuracy() -> None:
     bit_exact = 0
     total = 0
     for tag, N, K in SHAPES:
-        for M in M_GRID:
+        for M in M_GRID + M_GRID_WIDE:
             x, w, xq, sx, wq, sw = _inputs(M, N, K)
             cfg = _sm100_decode.pick_config(M, N, K)
+            if not _row_takes(N, K, M):
+                assert cfg is None, \
+                    f"{tag} M={M}: the decode row took a long-K narrow-N cell"
+                print(f"  acc  {tag:>8} M={M:>2}  declined (C++ cascade keeps it)  OK")
+                continue
             assert cfg is not None, \
                 f"{tag} M={M}: the decode row declined a cell it should own"
             y_new = fso.gemm.linear_mxfp8(xq, wq, sx, sw)
@@ -137,8 +164,9 @@ def test_accuracy() -> None:
                 bit_exact += 1
             kind = "splitk" if cfg[3] > 1 else "persistent"
             print(f"  acc  {tag:>8} M={M:>2}  {kind:<10} split_k={cfg[3]} "
-                  f"tile={cfg[0]}  cos={c_new:.6f} (was {c_old:.6f}) "
-                  f"maxdiff={diff.max().item():.3e}  vs {tier}  OK")
+                  f"tile={cfg[0]} cluster={cfg[1]}  cos={c_new:.6f} "
+                  f"(was {c_old:.6f}) maxdiff={diff.max().item():.3e}  "
+                  f"vs {tier}  OK")
     print(f"  {bit_exact} of {total} cells bit-identical to the shipped path")
 
 
@@ -197,12 +225,45 @@ def test_routing() -> None:
             f"shared_gate_up M={M}: unexpected split {cfg}")
     print("  routing  a K = 512 narrow-N shape falls through to one slice  OK")
 
+    # The upper band, 32 < M <= 64: one form, the persistent kernel at the
+    # 64-wide token tile with the 2-CTA 256-row weight tile in a cluster of
+    # two, on every shape but the long-K narrow-N class.
+    for tag, N, K in SHAPES:
+        for M in M_GRID_WIDE + [33, 63]:
+            cfg = _sm100_decode.pick_config(M, N, K)
+            if _row_takes(N, K, M):
+                assert cfg == WIDE_FORM, \
+                    f"{tag} M={M}: expected {WIDE_FORM}, got {cfg}"
+            else:
+                assert cfg is None, \
+                    f"{tag} M={M}: a long-K narrow-N cell was taken ({cfg})"
+    # The class boundary is in k and tiles_n, not in the shape name: a
+    # 2560-wide shape one K-tile short of 8192 is taken, one at 8192 is not,
+    # and a long-K shape that is not narrow (48 tiles) is taken.
+    assert _sm100_decode.pick_config(40, 2560, 8064) == WIDE_FORM
+    assert _sm100_decode.pick_config(40, 2560, 8192) is None
+    assert _sm100_decode.pick_config(64, 6144, 9728) == WIDE_FORM
+    # The Family C shared-expert projections: K = 2048 takes the form, the
+    # K = 512 `shared_down` (four mainloop K-tiles, shorter than the pipeline)
+    # is declined and stays on the tier below; the floor is in k alone.
+    assert _sm100_decode.pick_config(48, 1024, 2048) == WIDE_FORM
+    for M in M_GRID_WIDE:
+        assert _sm100_decode.pick_config(M, 2048, 512) is None, \
+            f"shared_down M={M}: the wide-token form took a K = 512 cell"
+    assert _sm100_decode.pick_config(64, 2048, _sm100_decode.MIN_WIDE_TOKEN_K) == WIDE_FORM
+    assert _sm100_decode.pick_config(64, 2048, _sm100_decode.MIN_WIDE_TOKEN_K - 128) is None
+    # An N or K that is not a multiple of 128 is declined in this band too.
+    assert _sm100_decode.pick_config(64, 2560, 2560 + 64) is None
+    assert _sm100_decode.pick_config(64, 2560 + 64, 4096) is None
+    print("  routing  32 < M <= 64 takes the wide-token form except long-K "
+          "narrow-N  OK")
+
     # Out of the band.
     for tag, N, K in SHAPES:
-        for M in (33, 48, 64, 128, 256, 1024, 4096):
+        for M in (65, 96, 128, 256, 1024, 4096):
             assert _sm100_decode.pick_config(M, N, K) is None, \
-                f"{tag} M={M}: the decode row took a cell above M = 32"
-    print("  routing  nothing above M = 32 is taken  OK")
+                f"{tag} M={M}: the decode row took a cell above M = 64"
+    print("  routing  nothing above M = 64 is taken  OK")
 
     # Shapes the kernels cannot serve are declined, not forced.
     assert _sm100_decode.pick_config(1, 2560, 2560 + 64) is None, \
@@ -220,7 +281,13 @@ def test_routing() -> None:
     # them. (This is the regression guard for `should_route` / `pick_config`.)
     assert _sm100_smm.should_route(1, 6144, 2560) is True
     assert _sm100_smm.should_route(1, 2560, 9728) is False
+    assert _sm100_smm.should_route(48, 6144, 2560) is True
+    assert _sm100_smm.should_route(64, 6144, 2560) is False
+    assert _sm100_smm.wave_tile_owns(64, 6144) is True
+    assert _sm100_smm.wave_tile_owns(64, 2560) is True     # 2-SM (256, 64) tile
+    assert _sm100_smm.wave_tile_owns(48, 2560) is False    # below its M floor
     assert _sm100_dsl.pick_config(1, 6144, 2560) is None
+    assert _sm100_dsl.pick_config(64, 6144, 2560) is None
     assert _sm100_dsl.pick_config(4096, 19456, 2560) is not None
     print("  routing  tier 1 and tier 2 predicates unchanged  OK")
 
@@ -228,8 +295,12 @@ def test_routing() -> None:
 def test_capture() -> None:
     """Capture must not compile, allocate or synchronise; replay is bit-exact."""
     from fish_scales_ops.gemm import _sm100_decode
-    for tag, N, K in (("wo", 2560, 4096), ("gate_up", 19456, 2560)):
-        for M in (1, 32):
+    # Both kernel classes at both ends of the M <= 32 band, and the wide-token
+    # form at the top of the row on a narrow-N and a wide-N shape.
+    for tag, N, K, ms in (("wo", 2560, 4096, (1, 32, 64)),
+                          ("gate_up", 19456, 2560, (1, 32)),
+                          ("wqkv", 6144, 2560, (64,))):
+        for M in ms:
             x, w, xq0, sx0, wq, sw = _inputs(M, N, K)
             xq, sx = xq0.clone(), sx0.clone()
 
@@ -309,11 +380,11 @@ def _assert_inert(label: str) -> None:
     assert _sm100_decode.enabled() is False, \
         f"{label}: the decode row claims to be enabled"
     for tag, N, K in SHAPES:
-        for M in M_GRID:
+        for M in M_GRID + M_GRID_WIDE:
             assert _sm100_decode.pick_config(M, N, K) is None, \
                 f"{label} {tag} M={M}: the decode row took a cell"
     for tag, N, K in SHAPES:
-        for M in (1, 32):
+        for M in (1, 32, 64):
             x, w, xq, sx, wq, sw = _inputs(M, N, K)
             y_route = _sm100_dispatch.route(xq, wq, sx, sw)
             y_old, tier = _baseline(xq, sx, wq, sw)
@@ -324,9 +395,10 @@ def _assert_inert(label: str) -> None:
                     f"{label} {tag} M={M}: the router no longer returns what "
                     "tier 1 returns")
             else:
-                # Narrow-N decode is exactly the band where every tier
-                # declines and `linear_mxfp8` falls through to the raw C++ op,
-                # which is what `route` returning None means.
+                # Narrow-N decode, and every shape at M = 64 (the cascade's
+                # wave tile), is exactly where every tier declines and
+                # `linear_mxfp8` falls through to the raw C++ op, which is
+                # what `route` returning None means.
                 assert y_route is None, (
                     f"{label} {tag} M={M}: some tier claimed a cell that used "
                     "to fall through to the C++ cascade")
@@ -363,12 +435,21 @@ def run_old_dsl_case() -> None:
     sys.stdout.write(r.stdout)
     assert r.returncode == 0, \
         f"old-DSL case failed (exit {r.returncode}):\n{r.stderr[-2000:]}"
-    notices = [ln for ln in r.stdout.splitlines()
-               if "nvidia-cutlass-dsl" in ln and ln.startswith("fso: ")]
+    # The notice is diagnostic output and goes to STDERR: the benches parse a
+    # worker's whole stdout as JSON, and a notice there broke every decode cell
+    # of bench_qwen3_4b_mlp_forward.py below the DSL floor (run
+    # b300_round3_20260922/M-A3). So it must appear exactly once on stderr and
+    # never on stdout.
+    def _floor_notices(text: str) -> list:
+        return [ln for ln in text.splitlines()
+                if "nvidia-cutlass-dsl" in ln and ln.startswith("fso: ")]
+    notices = _floor_notices(r.stderr)
     assert len(notices) == 1, (
-        "expected exactly one FSO_LOG notice naming the DSL floor, got "
-        f"{len(notices)}:\n{r.stdout}")
-    print("  old-DSL  FSO_LOG printed the reason exactly once  OK")
+        "expected exactly one FSO_LOG notice naming the DSL floor on stderr, got "
+        f"{len(notices)}:\n{r.stderr[-2000:]}")
+    assert not _floor_notices(r.stdout), \
+        "the FSO_LOG notice leaked onto stdout, which the benches parse as JSON"
+    print("  old-DSL  FSO_LOG printed the reason exactly once, on stderr  OK")
 
 
 def main() -> int:

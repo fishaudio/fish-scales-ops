@@ -19,10 +19,12 @@ are split by domain, then by SM version:
 Status (2026-09-22): structure frozen; every sm_90, sm_120 and sm_103 table
 is generated from `tests/baselines/`. The B300 (sm_103) GEMM and layer tables
 were first filled on 2026-09-15, re-measured in full on 2026-09-17 and
-re-measured in full twice on 2026-09-22, most recently from the run in
-`/data/bench-runs/b300_final6_20260922/`; each of those runs was taken on a
-different card of the same pod than the one before it, so each replaced those
-tables rather than being merged with them. They are unlocked-clock numbers and
+re-measured in full twice on 2026-09-22 and again on 2026-09-23, most
+recently from the run in `/data/bench-runs/b300_final7_20260923/`; the
+2026-09-17 run and the two 2026-09-22 runs were each taken on a different card
+of the same pod than the one before, and the 2026-09-23 run on the same card
+as the last of them, so each replaced those tables rather than being merged
+with them. They are unlocked-clock numbers and
 labelled as such. The old single `perf.md` is archived
 outside the repository (`../fso-doc_review-backup-20260915/repo/docs/perf.md`).
 Rows marked `TBD` have no accepted baseline yet.
@@ -182,7 +184,7 @@ environment block.
 |---|---|---|---|---|
 | sm_90 | reference column | ✓ deep_gemm JIT (dense + grouped) | — | K % 128 |
 | sm_120 | reference column | ✓ CUTLASS block-scaled (dense; K % 128, UE8M0 activation and weight scales) | ✓ dense + grouped | Family B/C MoE rows are MXFP8; block-FP8 required K % 512 and had an FP32-weight-scale bug until 2026-09-05 (section 8) |
-| sm_103 | reference column | ✓ since 2026-09-05: 1×128 scales expanded ×4 onto the MXFP8 tcgen05 tiers (same kernels and bytes as MXFP8; K % 128, N % 128); tables published 2026-09-15, re-measured 2026-09-17 and 2026-09-22 | ✓ dense + grouped since 2026-09-15 | grouped MoE (M3) landed 2026-09-15: CUTLASS pointer-array block-scaled kernel on the masked slab layout, eight kernels in the captured layer; cascade v2 and the programmatic dependent launch on the prep kernel and the grouped GEMM since 2026-09-17, and the dense path gained the wave-tile rule with its 64- and 192-wide N tiles on the same day; since 2026-09-22 the captured layer is five kernels in the decode band, where a slot-bound grouped route indexed by the routing kernel's packed active-expert list needs no argument-preparation launch and carries its own fused SwiGLU epilogue, and seven above it, where the pointer-array form of that epilogue does the same; the dense path additionally gained a vendored CuTe-DSL decode row for M ≤ 32, which needs `nvidia-cutlass-dsl` 4.5.0 (the `sm100` extra) and is inert below it |
+| sm_103 | reference column | ✓ since 2026-09-05: 1×128 scales expanded ×4 onto the MXFP8 tcgen05 tiers (same kernels and bytes as MXFP8; K % 128, N % 128); tables published 2026-09-15, re-measured 2026-09-17 and 2026-09-22 | ✓ dense + grouped since 2026-09-15 | grouped MoE (M3) landed 2026-09-15: CUTLASS pointer-array block-scaled kernel on the masked slab layout, eight kernels in the captured layer; cascade v2 and the programmatic dependent launch on the prep kernel and the grouped GEMM since 2026-09-17, and the dense path gained the wave-tile rule with its 64- and 192-wide N tiles on the same day; since 2026-09-22 the captured layer is five kernels in the decode band, where a slot-bound grouped route indexed by the routing kernel's packed active-expert list needs no argument-preparation launch and carries its own fused SwiGLU epilogue, and since 2026-09-23 five kernels at every M, because the pointer-array route reads its per-group problem shapes from the same routing kernel instead of an argument-preparation launch and the slot route's row-capacity clause is per kernel (the plain slot kernel to its full 64-wide tile, the fused-SwiGLU one to one 32-column chunk); the dense path additionally gained a vendored CuTe-DSL decode row, for M ≤ 32 on 2026-09-22 and extended to M ≤ 64 on 2026-09-23, which needs `nvidia-cutlass-dsl` 4.5.0 (the `sm100` extra) and is inert below it |
 
 ## 7. Regeneration
 

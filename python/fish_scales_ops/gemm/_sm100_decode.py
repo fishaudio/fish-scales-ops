@@ -1,8 +1,8 @@
-"""Dense MXFP8 decode kernels for sm_100/sm_103 (M ≤ 32).
+"""Dense MXFP8 decode kernels for sm_100/sm_103 (M ≤ 64).
 
 This module is the tier-2 *decode* row of the sm_100/sm_103 MXFP8 router. It
 sits in front of the three tiers described in :mod:`._sm100_dispatch` and takes
-only the band M ≤ 32, where every one of the three shipped tiers loses:
+only the band M ≤ 64, where every one of the three shipped tiers loses:
 
 * cuBLAS ``scaled_mm`` (tier 1) picks a 128- or 256-wide N tile and cannot be
   asked for a narrower one, so on a decode shape it leaves most of the machine
@@ -34,9 +34,17 @@ LICENSE). Two classes are used, and which one runs is decided by the shape:
     multiplies the work (measured: +100 % at split_k = 2 and +265 % at 4 on
     ``gate_up``); the single-slice persistent kernel wins instead.
 
+    Above M = 32 the split-K class refuses the cell (its ``supports_m``), and
+    this kernel's own ``can_implement`` refuses a token tile narrower than the
+    token count, so the band 32 < M ≤ 64 runs on this kernel with a 64-wide
+    token tile and the 2-CTA 256-row weight tile in a cluster of two: one
+    tcgen05 MMA spans both CTAs of the cluster and the token operand is
+    multicast to them, so each weight row is streamed once and the token
+    stream is halved against the 128-row tile at cluster (1, 1).
+
 Both are driven in SWAP-AB orientation: the kernel's A operand is the weight
 ``[N, K]`` and its B operand is the activation ``[M, K]``, so the narrow token
-dimension becomes the kernel's N and the 8/16/32-wide MMA tile is the token
+dimension becomes the kernel's N and the 8/16/32/64-wide MMA tile is the token
 tile. fso's ``quantize_1x32_fp8`` already emits its opaque int32 UE8M0 buffer
 in the CUTLASS ``Sm1xxBlockScaledConfig<32>`` atom layout, which is
 byte-identical to the 128×4 swizzled layout these kernels read, so the scale
@@ -51,7 +59,8 @@ Contracts and gates:
   than 4.4.2's). Below the floor this module is INERT: ``_init`` returns None
   before importing the vendored package, ``pick_config`` returns None, and
   ``route`` behaves exactly as it did before this module existed. Set
-  ``FSO_LOG=1`` to get the one-line reason, printed once per process.
+  ``FSO_LOG=1`` to get the one-line reason, printed once per process on
+  stderr (stdout belongs to the benches' per-cell JSON protocol).
 * **Capture.** ``cute.compile`` runs on the first call for a given tactic and
   is cached per (kernel class, tiler, cluster, split_k, pdl), so the eager
   warm-up every caller already performs before ``torch.cuda.graph`` capture
@@ -67,12 +76,16 @@ Contracts and gates:
 
 Provenance of the routing rule: the tactic sweep in the B300 run
 ``b300_mxfp8_20260917/M-D1`` (400 timed rows over four shapes × six M × every
-tactic the split-K kernel accepts), the calling-convention A/B in ``M-D3``, and
-the DSL version table in ``M-D2``.
+tactic the split-K kernel accepts), the calling-convention A/B in ``M-D3``, the
+DSL version table in ``M-D2``, and for the 32 < M ≤ 64 band the persistent
+kernel sweep in ``b300_round3_20260922/M-D5`` (every tiler, cluster,
+orientation and prefetch setting the kernel accepts, four shapes × four M,
+two passes).
 """
 from __future__ import annotations
 
 import os
+import sys
 from typing import Optional, Tuple
 
 import torch
@@ -82,8 +95,21 @@ _ConfigT = Tuple[Tuple[int, int], Tuple[int, int], bool, int]
 
 #: First nvidia-cutlass-dsl release that runs the vendored kernels (M-D2).
 MIN_DSL_VERSION = (4, 5, 0)
-#: The split-K kernel's own MAX_M; also the width of this router row.
-MAX_DECODE_M = 32
+#: Width of this router row. Up to the split-K kernel's own MAX_M (32) the
+#: narrow-N shapes split K in-cluster; from there to 64 the persistent kernel
+#: runs a 64-wide token tile (see ``_compute_config``).
+MAX_DECODE_M = 64
+#: Token tile of the persistent kernel above the split-K class's MAX_M, and
+#: the widest token count the row takes at one tile.
+_WIDE_TOKEN_TILE = 64
+#: Shallowest K the wide-token form takes, in elements: eight mainloop K-tiles
+#: of 128. On a K = 512 shape (Family C `shared_down`) the one-slice mainloop
+#: is four tiles, shorter than the pipeline that fills it, and the form gained
+#: nothing on the per-op slope against the cuBLAS tier while its single-op
+#: replay flipped one ~2 µs tick at M = 48; at K = 2048 it wins clearly. The
+#: floor sits between the two measured points (b300_round3_20260922/M-D5,
+#: tables/SWEEP_BC.txt).
+MIN_WIDE_TOKEN_K = 1024
 #: Programmatic dependent launch. The kernels own both sides of the
 #: griddepcontrol pair (wait at entry, launch-dependents at the end of the
 #: mainloop), which is what makes it capture-safe here; this is unrelated to
@@ -110,13 +136,20 @@ _MISSING = object()
 
 
 def _log_once(msg: str) -> None:
-    """Print ``msg`` at most once per process, and only under ``FSO_LOG=1``."""
+    """Print ``msg`` at most once per process, and only under ``FSO_LOG=1``.
+
+    The notice goes to stderr, never stdout: the benches run one subprocess
+    per cell and parse that subprocess's whole stdout as JSON
+    (``bench_qwen3_4b_mlp_forward.py``), so a diagnostic line on stdout turns
+    every decode cell into a parse error wherever the notice fires, i.e. in any
+    venv below the DSL floor (run b300_round3_20260922/M-A3).
+    """
     if not os.getenv("FSO_LOG"):
         return
     if msg in _LOGGED:
         return
     _LOGGED.add(msg)
-    print("fso: " + msg, flush=True)
+    print("fso: " + msg, file=sys.stderr, flush=True)
 
 
 def _parse_version(raw: str) -> Tuple[int, int, int]:
@@ -197,9 +230,20 @@ def pick_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
     The rule is expressed in ``m``, ``tiles_n`` and ``k`` and then checked
     against the kernels' own validity predicates; there is no per-shape table.
 
-    * ``m > 32`` → None. Above the band the C++ cascade's two-kernel split-K
-      keeps the narrow-N long-K cells (its route extends to M ≤ 128) and tier 1
-      keeps the rest. Nothing measured above M = 32 asked for a change.
+    * ``m > 64`` → None. Above the band the C++ cascade's two-kernel split-K
+      keeps the narrow-N long-K cells (its route extends to M ≤ 128), its
+      wave-tile rule keeps the cells it was measured to win from M = 64 up, and
+      tier 1 keeps the rest. Nothing measured above M = 64 asked for a change.
+    * ``32 < m <= 64`` runs on the persistent kernel with a 64-wide token tile
+      and the 2-CTA 256-row weight tile in a cluster of two, swap-AB, one K
+      slice (``_wide_token_config``); the split-K class refuses the band and the
+      narrower token tiles refuse it too. Two shape classes are declined and
+      left to the tiers below, which were measured ahead or level on them:
+      the long-K narrow-N class (``k >= 8192`` with ``tiles_n <= 32``), whose
+      two-kernel split-K in the C++ cascade keeps the whole machine busy while
+      one weight tile per cluster cannot, and the short-K class
+      (``k < MIN_WIDE_TOKEN_K``), where the form's mainloop is shorter than
+      its pipeline.
     * How deep to split K is one question asked of every shape, and it has
       three parts, all of them about how much of the machine the shape already
       uses and how long each slice's mainloop would be:
@@ -233,11 +277,13 @@ def pick_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
     cfg = _compute_config(m, n, k)
     _CFG_CACHE[key] = cfg
     if cfg is not None and os.getenv("FSO_PRINT_TILE_INFO"):
+        # stderr, like the C++ tile-info prints of the same knob and like
+        # `_log_once` above: stdout is the benches' per-cell JSON channel.
         tile, cluster, swap_ab, split_k = cfg
         print("[fso sm100 decode] M=%d N=%d K=%d -> %s tiler=%s cluster=%s "
               "swap_ab=%s split_k=%d" % (
                   m, n, k, "splitk" if split_k > 1 else "persistent",
-                  tile, cluster, swap_ab, split_k), flush=True)
+                  tile, cluster, swap_ab, split_k), file=sys.stderr, flush=True)
     return cfg
 
 
@@ -253,9 +299,11 @@ def _compute_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
     from . import _sm100_smm
 
     SK, PK, cutlass = st["SK"], st["PK"], st["cutlass"]
-    tile = SK.mma_tiler_mn_for_m(m)
     tiles_n = (n + 127) // 128
     sms = _sm100_smm._sm_count()
+    if not SK.supports_m(m):
+        return _wide_token_config(m, n, k, tiles_n, PK, cutlass)
+    tile = SK.mma_tiler_mn_for_m(m)
     deepest = 4 if (k >= 8192 or m <= 8) else 2
     if tiles_n > 32:
         # Wide N: the N tiles alone already put `tiles_n` CTAs on the machine,
@@ -284,6 +332,57 @@ def _compute_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
     if not ok:
         return None
     return (tile, (1, 1), True, 1)
+
+
+def _wide_token_config(m: int, n: int, k: int, tiles_n: int,
+                       PK, cutlass) -> Optional[_ConfigT]:
+    """The 32 < M ≤ 64 form: persistent kernel, 64-wide token tile, 2-CTA
+    256-row weight tile in a cluster of two, swap-AB, one K slice.
+
+    Why this form and not another. The split-K class stops at M = 32
+    (``supports_m``), and the persistent kernel's ``can_implement`` refuses any
+    token tile narrower than the token count, so 64 is the narrowest tile that
+    holds the band and the only question is how the weight rows are cut. The
+    sweep in ``b300_round3_20260922/M-D5`` timed every cut the kernel accepts
+    — 128- and 256-row weight tiles, clusters of one, two and four along the
+    weight rows, both orientations, prefetch on and off — on four shapes at
+    M = 40, 48, 56 and 64, and the 256-row tile in a cluster of two was the
+    fastest or tied on every cell of every shape it takes: with one tcgen05
+    MMA spanning the two CTAs of a cluster, the token operand is multicast to
+    both, so each CTA streams its 128 weight rows once while the token stream
+    is halved against the 128-row tile at cluster (1, 1), and unlike a cluster
+    of four it never leaves a cluster slot idle on a 20-tile grid. Prefetch
+    lost on every cell measured. FlashInfer's own autotuner picks this tactic
+    for the narrow-N shape at M = 64 and M = 128.
+
+    Two shape classes are declined, and the tier that keeps them was measured
+    ahead or level in the same sweep:
+
+    * long-K narrow-N (``k >= 8192`` with ``tiles_n <= 32``), which the C++
+      cascade's two-kernel split-K route owns to M = 128. With twenty weight
+      tiles and one K slice this kernel keeps twenty CTAs busy on 148 SMs for
+      the whole of a 9728-deep mainloop, while the cascade's split spreads the
+      same K over the machine and pays only a small reduce launch.
+    * short K (``k < MIN_WIDE_TOKEN_K``), where the one-slice mainloop is
+      shorter than the pipeline that fills it and the form is level with the
+      cuBLAS tier at best (see the constant).
+
+    The very wide shapes are NOT declined: on `gate_up` (152 weight tiles,
+    more than the 74 clusters of two the persistent scheduler keeps resident)
+    the form still beat cuBLAS below M = 64 and the cascade's 192-wide wave
+    tile at M = 64, second round of clusters and all.
+    """
+    if k >= 8192 and tiles_n <= 32:
+        return None
+    if k < MIN_WIDE_TOKEN_K:
+        return None
+    tile, cluster = (256, _WIDE_TOKEN_TILE), (2, 1)
+    ok = PK.can_implement(
+        cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, 32, cutlass.BFloat16,
+        tile, cluster, n, m, k, 1, "k", "k", "m")
+    if not ok:
+        return None
+    return (tile, cluster, True, 1)
 
 
 # ---------------------------------------------------------------------------

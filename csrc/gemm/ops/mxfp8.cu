@@ -13,6 +13,7 @@
 #include <torch/torch.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 
 #include <cuda_bf16.h>
@@ -48,11 +49,14 @@ cudaError_t launch_sm120_mxfp8_grouped_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3*
 // plus the slot-bound decode route it dispatches to).
 cudaError_t launch_sm100_mxfp8_grouped_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D,
     int32_t* SFA, int32_t* SFB, int32_t* masked_m, int num_groups, int m_cap, int N, int K,
-    int expected_m, int max_active_groups, int const* slot_to_expert, cudaStream_t stream);
+    int expected_m, int max_active_groups, int const* slot_to_expert, int32_t const* problem_shapes,
+    cudaStream_t stream);
 bool sm100_mxfp8_grouped_compiled();
 int sm100_mxfp8_grouped_slot_refusal(int m_cap, int N, int K, int groups, int max_active_groups);
-int sm100_mxfp8_grouped_slot_taken(int m_cap, int N, int K, int groups, int max_active_groups);
+int sm100_mxfp8_grouped_slot_taken(int m_cap, int N, int K, int groups, int max_active_groups, int fused_swiglu);
 int sm100_mxfp8_grouped_slot_tile_n();
+int sm100_mxfp8_grouped_problem_shapes_consumed(
+    int m_cap, int N, int K, int groups, int max_active_groups, int fused_swiglu);
 // Fused-SwiGLU FC1 (sm_100/sm_103) and the host-side router that says whether a
 // call should take it. Both grouped routes carry the fusion now -- the
 // pointer-array cascade and the swap-orientation slot kernel -- so the
@@ -60,7 +64,8 @@ int sm100_mxfp8_grouped_slot_tile_n();
 // b300_mxfp8_20260917/M-A2).
 cudaError_t launch_sm100_mxfp8_grouped_swiglu_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_fp8_e4m3* H,
     int32_t* SFH, int32_t* SFA, int32_t* SFB, int32_t* masked_m, int num_groups, int m_cap, int N, int K,
-    int expected_m, int max_active_groups, int const* slot_to_expert, cudaStream_t stream);
+    int expected_m, int max_active_groups, int const* slot_to_expert, int32_t const* problem_shapes,
+    cudaStream_t stream);
 int sm100_mxfp8_grouped_fused_fc1_route(int m_cap, int N, int K, int groups, int max_active_groups);
 int sm100_mxfp8_grouped_fused_fc1_available(int N, int K);
 void fp8bs_quantize_1x32_packed_grouped_gather(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
@@ -103,6 +108,51 @@ int const* check_slot_to_expert(std::optional<at::Tensor> const& slot_to_expert,
         "; it is moe_build_routing(..., with_slots=True)'s fourth output");
     TORCH_CHECK(t.device() == masked_m.device(), "slot_to_expert must be on the same device as masked_m");
     return reinterpret_cast<int const*>(t.data_ptr());
+}
+
+// Validate an optional caller-supplied per-group problem-shape array (run
+// b300_round3_20260922/M-A4) and return the device pointer the sm_100
+// dispatcher wants, or nullptr when none was given.
+//
+// The array is int32 [G, 3], one (rows, N, K) triple per group, and it is
+// `moe_build_routing(..., problem_shapes_for=[...])`'s output for THIS GEMM's
+// (N, K). The kernel that reads it -- CUTLASS's grouped tile scheduler -- has
+// no way to notice a triple built for another GEMM: a wrong N or K there
+// walks tiles that do not exist and reads past the operands, and a row count
+// above m_cap does the same on the activation slab. Shape, dtype, layout and
+// device are therefore checked here on every call, and the CONTENT can be
+// checked as well, at the cost of a device-to-host copy, by setting
+// FSO_CHECK_PROBLEM_SHAPES=1; that is a debugging aid, read on every call so
+// it can be switched on for one process without a rebuild, and it is never on
+// in a timed path.
+int32_t const* check_problem_shapes(std::optional<at::Tensor> const& problem_shapes, int G, int m_cap, int N, int K,
+    at::Tensor const& masked_m)
+{
+    if (!problem_shapes.has_value())
+        return nullptr;
+    at::Tensor const& t = *problem_shapes;
+    TORCH_CHECK(t.is_cuda() && t.dtype() == at::kInt, "problem_shapes must be a CUDA int32 tensor");
+    TORCH_CHECK(t.is_contiguous(), "problem_shapes must be contiguous");
+    TORCH_CHECK(t.dim() == 2 && t.size(0) == G && t.size(1) == 3,
+        "problem_shapes must be [G, 3] with G=", G, " (one (rows, N, K) triple per group), got ", t.sizes(),
+        "; it is one entry of moe_build_routing(..., problem_shapes_for=[(N, K), ...])'s last output");
+    TORCH_CHECK(t.device() == masked_m.device(), "problem_shapes must be on the same device as masked_m");
+    char const* check = std::getenv("FSO_CHECK_PROBLEM_SHAPES");
+    if (check && check[0] == '1')
+    {
+        at::Tensor const h = t.to(at::kCPU);
+        auto const acc = h.accessor<int32_t, 2>();
+        for (int g = 0; g < G; ++g)
+        {
+            TORCH_CHECK(acc[g][1] == N && acc[g][2] == K,
+                "FSO_CHECK_PROBLEM_SHAPES: problem_shapes[", g, "] = (", acc[g][0], ", ", acc[g][1], ", ",
+                acc[g][2], ") was built for another GEMM; this call has N=", N, " K=", K);
+            TORCH_CHECK(acc[g][0] >= 0 && acc[g][0] <= m_cap,
+                "FSO_CHECK_PROBLEM_SHAPES: problem_shapes[", g, "] has ", acc[g][0], " rows, outside [0, m_cap=",
+                m_cap, "]");
+        }
+    }
+    return reinterpret_cast<int32_t const*>(t.data_ptr());
 }
 
 } // anonymous namespace
@@ -362,10 +412,21 @@ at::Tensor linear_mxfp8_raw(at::Tensor x_fp8, at::Tensor w_fp8, at::Tensor sx_in
 // passes it here removes one launch per grouped GEMM. It is read only by that
 // route: on sm_120/121, and on any call the cascade serves, it is validated and
 // otherwise unused.
+//
+// problem_shapes is the fourth optional argument and the pointer-array route's
+// counterpart of the slot list (run b300_round3_20260922/M-A4): int32 [G, 3]
+// on device, the (rows, N, K) triple of every group for THIS GEMM's (N, K),
+// as `moe_build_routing(..., problem_shapes_for=[(N, K), ...])` writes it in
+// the pass that publishes `masked_m`. With it the sm_100/103 cascade launches
+// nothing but the GEMM: its routing-dependent argument was the only thing the
+// per-launch preparation kernel still had to compute, and the tensor-set
+// arrays it also rebuilt are now bound once per tensor set. Without it the
+// preparation kernel runs as before. sm_120/121 validates and ignores it, and
+// so does the sm_100 slot route.
 
 at::Tensor linear_mxfp8_grouped_masked(at::Tensor a_fp8, at::Tensor w_fp8, at::Tensor sa_int32,
     at::Tensor sw_int32, at::Tensor masked_m, int64_t expected_m, int64_t max_active_groups,
-    std::optional<at::Tensor> slot_to_expert)
+    std::optional<at::Tensor> slot_to_expert, std::optional<at::Tensor> problem_shapes)
 {
     TORCH_CHECK(a_fp8.is_cuda() && w_fp8.is_cuda(), "a/w must be on CUDA");
     TORCH_CHECK(a_fp8.dtype() == at::kFloat8_e4m3fn && w_fp8.dtype() == at::kFloat8_e4m3fn,
@@ -402,6 +463,7 @@ at::Tensor linear_mxfp8_grouped_masked(at::Tensor a_fp8, at::Tensor w_fp8, at::T
               : "sw_int32 must be [G, K/128, N] (per-group K-major packed scales)");
     TORCH_CHECK(sa_int32.is_contiguous() && sw_int32.is_contiguous(), "sa/sw must be contiguous");
     int const* const slot_ptr = check_slot_to_expert(slot_to_expert, G, masked_m);
+    int32_t const* const ps_ptr = check_problem_shapes(problem_shapes, G, m_cap, N, K, masked_m);
 
     auto y = at::empty({G, m_cap, N}, a_fp8.options().dtype(at::kBFloat16));
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -440,13 +502,14 @@ at::Tensor linear_mxfp8_grouped_masked(at::Tensor a_fp8, at::Tensor w_fp8, at::T
             reinterpret_cast<int32_t*>(sa_int32.data_ptr()),
             reinterpret_cast<int32_t*>(sw_int32.data_ptr()),
             reinterpret_cast<int32_t*>(masked_m.data_ptr()),
-            G, m_cap, N, K, static_cast<int>(expected_m), static_cast<int>(max_active_groups), slot_ptr, stream);
+            G, m_cap, N, K, static_cast<int>(expected_m), static_cast<int>(max_active_groups), slot_ptr, ps_ptr,
+            stream);
         TORCH_CHECK(err == cudaSuccess, "sm100 mxfp8 grouped kernel error: ", cudaGetErrorString(err));
         return y;
     }
-    // sm_120/121 has one grouped route, so neither max_active_groups nor the
-    // slot list carries information it can use; both are validated above and
-    // then ignored.
+    // sm_120/121 has one grouped route, so neither max_active_groups, the
+    // slot list nor the problem shapes carry information it can use; all
+    // three are validated above and then ignored.
     err = detail::launch_sm120_mxfp8_grouped_dispatch(
         reinterpret_cast<__nv_fp8_e4m3*>(a_fp8.data_ptr()),
         reinterpret_cast<__nv_fp8_e4m3*>(w_fp8.data_ptr()),
@@ -485,7 +548,7 @@ at::Tensor linear_mxfp8_grouped_masked(at::Tensor a_fp8, at::Tensor w_fp8, at::T
 // in every other op of this surface.
 std::tuple<at::Tensor, at::Tensor> linear_mxfp8_grouped_masked_swiglu(at::Tensor a_fp8, at::Tensor w13_fp8,
     at::Tensor sa_int32, at::Tensor sw13_int32, at::Tensor masked_m, int64_t expected_m, int64_t max_active_groups,
-    std::optional<at::Tensor> slot_to_expert)
+    std::optional<at::Tensor> slot_to_expert, std::optional<at::Tensor> problem_shapes)
 {
     TORCH_CHECK(is_sm100_family(),
         "linear_mxfp8_grouped_masked_swiglu is implemented only on sm_100/sm_103 (B200 / B300). The two fused "
@@ -530,6 +593,9 @@ std::tuple<at::Tensor, at::Tensor> linear_mxfp8_grouped_masked_swiglu(at::Tensor
         "sw13_int32 must be [G, 2*I * K/128] (per-group Sm1xx atom slab)");
     TORCH_CHECK(sa_int32.is_contiguous() && sw13_int32.is_contiguous(), "sa/sw13 must be contiguous");
     int const* const slot_ptr = check_slot_to_expert(slot_to_expert, G, masked_m);
+    // The fused FC1 is a GEMM of N = 2*I weight rows, so its triple carries
+    // that N, not the I columns it finally stores.
+    int32_t const* const ps_ptr = check_problem_shapes(problem_shapes, G, m_cap, N, K, masked_m);
 
     auto h = at::empty({G, m_cap, INTER}, a_fp8.options().dtype(at::kFloat8_e4m3fn));
     auto sh = at::empty({G, m_pad * (INTER / 128)}, a_fp8.options().dtype(at::kInt));
@@ -543,7 +609,8 @@ std::tuple<at::Tensor, at::Tensor> linear_mxfp8_grouped_masked_swiglu(at::Tensor
         reinterpret_cast<int32_t*>(sa_int32.data_ptr()),
         reinterpret_cast<int32_t*>(sw13_int32.data_ptr()),
         reinterpret_cast<int32_t*>(masked_m.data_ptr()),
-        G, m_cap, N, K, static_cast<int>(expected_m), static_cast<int>(max_active_groups), slot_ptr, stream);
+        G, m_cap, N, K, static_cast<int>(expected_m), static_cast<int>(max_active_groups), slot_ptr, ps_ptr,
+        stream);
     TORCH_CHECK(err == cudaSuccess, "sm100 fused-SwiGLU grouped mxfp8 kernel error: ", cudaGetErrorString(err));
     return {h, sh};
 }
@@ -603,14 +670,48 @@ bool mxfp8_grouped_swiglu_available(int64_t n_w, int64_t k)
 //
 // The verdict comes from the dispatcher's own `slot_route`, not from a
 // restatement of its rule, so the two cannot drift apart; FSO_GROUPED_SLOT
-// therefore steers this answer exactly as it steers the route.
+// therefore steers this answer exactly as it steers the route. `fused_swiglu`
+// says which kernel the call will land on: the fused-SwiGLU FC1
+// (`linear_mxfp8_grouped_masked_swiglu`) takes the slot route one step short
+// of the plain grouped GEMM — one 32-column epilogue chunk instead of the full
+// 64-wide token tile (run b300_round3_20260922/M-A3) — so a layer asks for its
+// FC1 with the flag set and for its FC2 with it clear.
 bool mxfp8_grouped_slot_possible(
-    int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups, int64_t max_active_groups)
+    int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups, int64_t max_active_groups, bool fused_swiglu)
 {
     if (!is_sm100_family() || !detail::sm100_mxfp8_grouped_compiled())
         return false;
     return detail::sm100_mxfp8_grouped_slot_taken(static_cast<int>(m_cap), static_cast<int>(n_w),
-               static_cast<int>(k), static_cast<int>(num_groups), static_cast<int>(max_active_groups))
+               static_cast<int>(k), static_cast<int>(num_groups), static_cast<int>(max_active_groups),
+               fused_swiglu ? 1 : 0)
+        != 0;
+}
+
+
+// mxfp8_grouped_problem_shapes_consumed: would a grouped GEMM of this shape
+// read a caller-supplied `problem_shapes` tensor? (run b300_round3_20260922/M-A4)
+//
+// The complement of `mxfp8_grouped_slot_possible` on sm_100/103: the
+// pointer-array cascade consumes the per-group (rows, N, K) triples and the
+// slot route does not. Asking `moe_build_routing` for the triples where no
+// kernel reads them costs the routing kernel a few stores per group for
+// nothing, so a layer asks this per GEMM and requests the shapes exactly
+// where they are consumed. Every architecture but sm_100/103 answers false:
+// sm_120/121 has no pointer-array route and accepts the tensor only so a
+// caller can pass the same arguments on every architecture. `fused_swiglu`
+// names the kernel the call will land on, exactly as for
+// `mxfp8_grouped_slot_possible`: the fused-SwiGLU FC1 leaves the slot route
+// one step earlier than the plain grouped GEMM, so the two queries are
+// complements only when both are asked with the same flag (a layer asks both
+// for its FC1 with the flag set and for its FC2 with it clear).
+bool mxfp8_grouped_problem_shapes_consumed(
+    int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups, int64_t max_active_groups, bool fused_swiglu)
+{
+    if (!is_sm100_family() || !detail::sm100_mxfp8_grouped_compiled())
+        return false;
+    return detail::sm100_mxfp8_grouped_problem_shapes_consumed(static_cast<int>(m_cap), static_cast<int>(n_w),
+               static_cast<int>(k), static_cast<int>(num_groups), static_cast<int>(max_active_groups),
+               fused_swiglu ? 1 : 0)
         != 0;
 }
 

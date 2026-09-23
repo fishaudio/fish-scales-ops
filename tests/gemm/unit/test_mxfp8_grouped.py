@@ -805,18 +805,37 @@ def moe_layer_fso_fused(hidden, w13i_fp8, sw13i, w2_fp8, sw2, topk_ids, topk_w,
     inter2 = w13i_fp8.shape[1]           # 2 * inter
     hidden_dim = w2_fp8.shape[1]
     inter = w2_fp8.shape[2]
+    # The FC1 here is always the fused op, so both queries are asked for it
+    # with `fused_swiglu=True` (run b300_round3_20260922/M-A3: the fused slot
+    # kernel stops one epilogue chunk short of the plain kernel's tile).
     want_slots = (
-        fso.gemm.mxfp8_grouped_slot_possible(m_cap, inter2, hidden_dim, G, max_active_groups)
+        fso.gemm.mxfp8_grouped_slot_possible(m_cap, inter2, hidden_dim, G, max_active_groups,
+                                             fused_swiglu=True)
         or fso.gemm.mxfp8_grouped_slot_possible(m_cap, hidden_dim, inter, G, max_active_groups))
-    routing = fso.gemm.moe_build_routing(topk_ids, G, m_cap, with_slots=want_slots)
+    # The pointer-array route's counterpart (run b300_round3_20260922/M-A4):
+    # wherever the cascade serves a GEMM, the routing kernel also emits that
+    # GEMM's per-group (rows, N, K) triples and the GEMM launches without its
+    # argument-preparation kernel. Asked per GEMM, like the slot list, and
+    # with the same kernel flag, so that per GEMM exactly one of the two is
+    # requested.
+    want_ps = [
+        fso.gemm.mxfp8_grouped_problem_shapes_consumed(m_cap, inter2, hidden_dim, G, max_active_groups,
+                                                       fused_swiglu=True),
+        fso.gemm.mxfp8_grouped_problem_shapes_consumed(m_cap, hidden_dim, inter, G, max_active_groups)]
+    ps_for = [nk for nk, want in zip([(inter2, hidden_dim), (hidden_dim, inter)], want_ps) if want]
+    routing = fso.gemm.moe_build_routing(topk_ids, G, m_cap, with_slots=want_slots,
+                                         problem_shapes_for=ps_for or None)
     masked_m, _row_map, slot_of_flat = routing[:3]
     slot_to_expert = routing[3] if want_slots else None
+    ps = list(routing[-1]) if ps_for else []
+    ps1 = ps.pop(0) if want_ps[0] else None
+    ps2 = ps.pop(0) if want_ps[1] else None
     topk = topk_ids.shape[1]
     hq, sh = fso.gemm.quantize_1x32_grouped_gather_fp8(hidden, slot_of_flat, topk, G, m_cap)
     dq, sd = fso.gemm.linear_mxfp8_grouped_masked_swiglu(
-        hq, w13i_fp8, sh, sw13i, masked_m, expected_m, max_active_groups, slot_to_expert)
+        hq, w13i_fp8, sh, sw13i, masked_m, expected_m, max_active_groups, slot_to_expert, ps1)
     dn = fso.gemm.linear_mxfp8_grouped_masked(dq, w2_fp8, sd, sw2, masked_m, expected_m,
-                                              max_active_groups, slot_to_expert)
+                                              max_active_groups, slot_to_expert, ps2)
     out.copy_(fso.gemm.moe_combine(dn, slot_of_flat, topk_w))
     return out
 
@@ -908,6 +927,90 @@ def test_fused_route_helper() -> None:
     print(f"  fused-route  FSO_FC1_FUSED={knob or '<unset>'}  m_cap=4/bound -> {decode}, "
           f"m_cap=1024 -> {prefill}, m_cap=4/no bound -> {no_bound}  OK")
 
+    # The route table at the token-tile edge (run b300_round3_20260922/M-A3).
+    # `mxfp8_grouped_slot_possible` is the dispatcher's own verdict: the
+    # fused-SwiGLU slot kernel is taken only while m_cap fits ONE 32-column
+    # epilogue chunk, the plain slot kernel up to the full 64-wide tile (also
+    # its legality bound), and either only while the live tiles
+    # S * ceil(N_w / 128) are at most fourteen waves of this device's SMs.
+    # Independent of FSO_FC1_FUSED; only meaningful with the slot knob unset.
+    if os.environ.get("FSO_GROUPED_SLOT") is None:
+        sms = torch.cuda.get_device_properties(0).multi_processor_count
+        q = fso.gemm.mxfp8_grouped_slot_possible
+        S = G                                   # every expert can hold a row
+        fc1_ok = S * ((n_w + 127) // 128) <= 14 * sms
+        fc2_ok = S * ((hidden + 127) // 128) <= 14 * sms
+        assert q(32, n_w, hidden, G, S, fused_swiglu=True) == fc1_ok, \
+            "fused FC1 at one epilogue chunk (m_cap=32) disagrees with the wave clause"
+        assert not q(36, n_w, hidden, G, S, fused_swiglu=True), \
+            "fused FC1 taken past one epilogue chunk (m_cap=36)"
+        assert q(64, n_w, hidden, G, S) == fc1_ok, \
+            "plain kernel at the full tile (m_cap=64, FC1 shape) disagrees with the wave clause"
+        assert q(64, hidden, inter, G, S) == fc2_ok, \
+            "plain kernel at the full tile (m_cap=64, FC2 shape) disagrees with the wave clause"
+        assert not q(68, hidden, inter, G, S), "past the token tile is illegal and must never be taken"
+        assert not q(64, hidden, inter, G, 0), "with no slot bound the route is unreachable"
+        print(f"  slot-table   fused FC1 m_cap 32 -> {fc1_ok}, 36 -> False; plain m_cap 64 -> "
+              f"FC1 {fc1_ok} / FC2 {fc2_ok}; m_cap 68 -> False; no bound -> False  OK")
+
+
+def test_layer_route_consistency() -> None:
+    """The layer's two host decisions agree at every published M.
+
+    A layer asks, per grouped GEMM, whether the slot route will read the
+    packed active-expert list (`mxfp8_grouped_slot_possible`) and whether the
+    pointer-array cascade will read routing-supplied problem shapes
+    (`mxfp8_grouped_problem_shapes_consumed`). Both come from the dispatcher's
+    `slot_route`, and the fused-SwiGLU FC1 has a shorter row-capacity clause
+    than the plain kernel (run b300_round3_20260922/M-A3), so the two answers
+    are complements only when both are asked with the same kernel flag. This
+    walks the bench's M grid for both families with the flag the bench would
+    pass (the fused op's own `fused_route` verdict for FC1, plain for FC2) and
+    requires that, per GEMM, exactly one of the two lists is requested — so
+    no GEMM of the shipped layer falls back to the C++ argument-preparation
+    kernel, and none is handed a list it does not read. It also states the
+    route per band as the documents describe it. Only meaningful with the
+    slot knob unset (a forced or disabled route changes both answers together
+    and the complement still holds, but the band statement does not)."""
+    grid = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+    knob_free = os.environ.get("FSO_GROUPED_SLOT") is None
+    fc1_off = os.environ.get("FSO_FC1_FUSED") == "0"
+    for fam, (G, topk, hidden, inter) in FUSED_FAMILIES.items():
+        n_w = 2 * inter
+        avail = fso.gemm.mxfp8_grouped_swiglu_available(n_w, hidden)
+        bands = []
+        for M in grid:
+            m_cap = (M + 3) // 4 * 4
+            mag = min(M * topk, G)
+            fc1_fused = avail and fso.gemm.mxfp8_grouped_swiglu_fused_route(m_cap, n_w, hidden, G, mag)
+            per_gemm = []
+            for name, (N, K, fused) in (("FC1", (n_w, hidden, bool(fc1_fused))),
+                                        ("FC2", (hidden, inter, False))):
+                slot = fso.gemm.mxfp8_grouped_slot_possible(m_cap, N, K, G, mag, fused_swiglu=fused)
+                ps = fso.gemm.mxfp8_grouped_problem_shapes_consumed(m_cap, N, K, G, mag,
+                                                                    fused_swiglu=fused)
+                assert slot != ps, (
+                    f"fam {fam} M={M} {name} (N={N}, K={K}, fused_swiglu={fused}): slot_possible={slot} "
+                    f"and problem_shapes_consumed={ps} — the layer would request "
+                    f"{'both lists' if slot else 'neither list'} for this GEMM")
+                per_gemm.append("slot" if slot else "ps")
+            bands.append((M, int(fc1_fused), per_gemm[0], per_gemm[1]))
+        if knob_free and not fc1_off:
+            # The published route: Family B FC1 on the slot route through M = 32
+            # and FC2 through M = 64; Family C both GEMMs on the cascade from
+            # M = 64 (FC2 already from M = 32, the wave clause). Everything the
+            # cascade serves reads the routing-supplied shapes.
+            by_m = {M: (f1, f2) for M, _, f1, f2 in bands}
+            if fam == "B":
+                assert by_m[32] == ("slot", "slot") and by_m[64] == ("ps", "slot") \
+                    and by_m[128] == ("ps", "ps"), f"Family B route per band changed: {bands}"
+            else:
+                assert by_m[16] == ("slot", "slot") and by_m[32] == ("slot", "ps") \
+                    and by_m[64] == ("ps", "ps"), f"Family C route per band changed: {bands}"
+        print(f"  route-consistency {fam}  " + "  ".join(
+            f"M{M}:{'F' if f else 'u'}/{a[0]}{b[0]}" for M, f, a, b in bands)
+            + "  (F=fused FC1, u=unfused; s=slot list, p=problem shapes)  OK")
+
 
 def test_fused_slot_persistent_skip(fam: str, M: int) -> None:
     """The fused FC1 on the slot route, at a grid with more tiles than the
@@ -969,6 +1072,359 @@ def run_fused_cases() -> None:
         print(r.stdout, end="")
         assert r.returncode == 0, \
             f"fused route case (FSO_FC1_FUSED={knob}) failed (exit {r.returncode}):\n{r.stderr}"
+
+
+# --- routing-supplied problem shapes (run b300_round3_20260922/M-A4) --------
+#
+# `moe_build_routing(..., problem_shapes_for=[(N, K), ...])` writes, in the
+# pass that publishes masked_m, the per-group (rows, N, K) triple of every
+# grouped GEMM the caller names, and a GEMM handed its triples launches on the
+# sm_100 pointer-array route without the argument-preparation kernel it used to
+# run ahead of itself. Four things need their own cases:
+#
+#  * the CONTRACT of the routing output: one [G, 3] int32 tensor per pair,
+#    equal to (masked_m[g], N, K) row for row, from both routing kernels (the
+#    single-CTA one below 4096 routed pairs and the multi-CTA one above), with
+#    the three original outputs and the slot list untouched by the request;
+#  * BIT-EXACTNESS against the prep-kernel launch on every defined row, for the
+#    plain GEMM and the fused FC1, below and above the 128-row scale-factor
+#    atom -- above it the launch-free path derives the activation scale layout
+#    from m_cap where the prep kernel derived it from masked_m[g], and the
+#    claim that both read the same bytes is what this checks;
+#  * the CAPTURE contract: the static arrays a captured GEMM reads are written
+#    outside the capture and pinned, so a graph must stay bit-exact after the
+#    process has bound and evicted many more eager tensor sets and captured a
+#    second graph;
+#  * VALIDATION: a tensor of the wrong shape is refused before any launch, and
+#    FSO_CHECK_PROBLEM_SHAPES=1 catches a triple built for another GEMM.
+
+PS_FAMILIES = {"B": (128, 8, 2048, 768), "C": (256, 8, 2048, 512)}
+
+
+def _ps_reference(masked_m: torch.Tensor, N: int, K: int) -> torch.Tensor:
+    return torch.stack([masked_m, torch.full_like(masked_m, N), torch.full_like(masked_m, K)], dim=1)
+
+
+def test_problem_shapes_contract(M: int, fam: str) -> None:
+    G, topk, hidden, inter = PS_FAMILIES[fam]
+    m_cap = (M + 3) // 4 * 4
+    topk_ids, _, _, _, _ = build_routing(M, G, topk, m_cap, seed=M * 13 + 7)
+    pairs = [(2 * inter, hidden), (hidden, inter)]
+
+    out = fso.gemm.moe_build_routing(topk_ids, G, m_cap, with_slots=True, problem_shapes_for=pairs)
+    assert len(out) == 5, f"problem_shapes_for + with_slots must return 5 items, got {len(out)}"
+    masked_m, row_map, slot_of_flat, slot_to_expert, ps = out
+    assert isinstance(ps, list) and len(ps) == len(pairs)
+    torch.cuda.synchronize()
+    for i, (N, K) in enumerate(pairs):
+        t = ps[i]
+        assert t.dtype == torch.int32 and t.is_cuda and t.is_contiguous() and tuple(t.shape) == (G, 3), \
+            f"problem_shapes[{i}]: dtype={t.dtype} shape={tuple(t.shape)} contiguous={t.is_contiguous()}"
+        assert torch.equal(t, _ps_reference(masked_m, N, K)), \
+            f"problem_shapes[{i}] != (masked_m, {N}, {K}) at M={M} fam={fam}"
+
+    # The request changes nothing else: same counts and same slot list as the
+    # call without it, and the default call keeps its arity.
+    ref = fso.gemm.moe_build_routing(topk_ids, G, m_cap, with_slots=True)
+    assert len(ref) == 4
+    assert torch.equal(ref[0], masked_m) and torch.equal(ref[3], slot_to_expert)
+    only = fso.gemm.moe_build_routing(topk_ids, G, m_cap, problem_shapes_for=pairs[:1])
+    assert len(only) == 4 and len(only[3]) == 1 and torch.equal(only[3][0], ps[0])
+    assert len(fso.gemm.moe_build_routing(topk_ids, G, m_cap)) == 3
+    kernel = "multi-CTA" if (torch.cuda.get_device_capability()[0] == 10 and M * topk >= 4096) else "single-CTA"
+    print(f"  ps-contract  M={M:>5} fam={fam}  {kernel} routing kernel  OK")
+
+
+def _ps_inputs(M: int, G: int, topk: int, N: int, K: int, seed: int):
+    torch.manual_seed(seed)
+    m_cap = (M + 3) // 4 * 4
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") * 0.1
+    w = torch.randn(G, N, K, dtype=torch.bfloat16, device="cuda") / (K ** 0.5)
+    topk_ids, _, _, _, _ = build_routing(M, G, topk, m_cap, seed=seed + 1)
+    masked_m, _rm, slot_of_flat, ps = fso.gemm.moe_build_routing(
+        topk_ids, G, m_cap, problem_shapes_for=[(N, K)])
+    a_fp8, sa = fso.gemm.quantize_1x32_grouped_gather_fp8(x, slot_of_flat, topk, G, m_cap)
+    expected_m = max(1, (M * topk + G - 1) // G)
+    return m_cap, masked_m, ps[0], a_fp8, sa, w, expected_m, min(M * topk, G)
+
+
+def _defined_rows(y: torch.Tensor, masked_m: torch.Tensor) -> torch.Tensor:
+    m_cap = y.shape[1]
+    keep = torch.arange(m_cap, device=y.device).view(1, -1) < masked_m.long().view(-1, 1)
+    return y[keep]
+
+
+def _defined_sf_words(sh: torch.Tensor, masked_m: torch.Tensor, m_cap: int, inter: int) -> torch.Tensor:
+    """The scale words of the defined rows of a fused-FC1 scale slab, in the
+    Sm1xx atom order `sf_word_index_grouped_atom` writes (see the docstring of
+    this file for the formula)."""
+    num_kp = inter // 128
+    m_pad = (m_cap + 127) // 128 * 128
+    rows = torch.arange(m_pad, device=sh.device)
+    r = rows % 128
+    base = (rows // 128) * (num_kp * 128) + (r % 32) * 4 + (r // 32)
+    idx = base[:, None] + torch.arange(num_kp, device=sh.device)[None, :] * 128
+    words = sh.reshape(sh.shape[0], -1)[:, idx.reshape(-1)].reshape(sh.shape[0], m_pad, num_kp)
+    live = torch.arange(m_pad, device=sh.device).view(1, -1) < masked_m.long().view(-1, 1)
+    return words[live]
+
+
+def test_problem_shapes_bit_exact(M: int, G: int, topk: int, N: int, K: int) -> None:
+    """Plain grouped GEMM: the launch with routing-supplied shapes must equal
+    the prep-kernel launch bit for bit on every defined row."""
+    m_cap, masked_m, ps, a_fp8, sa, w, expected_m, mag = _ps_inputs(M, G, topk, N, K, seed=M * 101 + N)
+    w_fp8, sw = fso.gemm.quantize_moe_weights_1x32_fp8(w)
+    assert fso.gemm.mxfp8_grouped_problem_shapes_consumed(m_cap, N, K, G, mag), \
+        "this cell must sit on the pointer-array route (m_cap >= the slot tile)"
+    y_prep = fso.gemm.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, expected_m, mag)
+    y_ps = fso.gemm.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, expected_m, mag, None, ps)
+    torch.cuda.synchronize()
+    assert torch.equal(_defined_rows(y_ps, masked_m), _defined_rows(y_prep, masked_m)), \
+        f"problem_shapes launch != prep launch at M={M} G={G} N={N} K={K} (m_cap={m_cap})"
+    print(f"  ps-bitexact  M={M:>5} G={G:>3} N={N:>4} K={K:>4} m_cap={m_cap:>4}  OK")
+
+
+def test_problem_shapes_bit_exact_fused(M: int, fam: str) -> None:
+    """Fused FC1: fp8 bytes and defined scale words, same comparison."""
+    G, topk, hidden, inter = PS_FAMILIES[fam]
+    N, K = 2 * inter, hidden
+    m_cap, masked_m, ps, a_fp8, sa, w13, expected_m, mag = _ps_inputs(M, G, topk, N, K, seed=M * 103 + 5)
+    w13i_fp8, sw13i = fso.gemm.quantize_moe_weights_1x32_fp8(w13, w13_interleave=True)
+    # Asked with the fused kernel's flag: the fused-SwiGLU slot kernel stops at
+    # one 32-column epilogue chunk, so from m_cap = 36 the fused FC1 is on the
+    # pointer-array route and reads the shapes (run b300_round3_20260922/M-A3).
+    assert fso.gemm.mxfp8_grouped_problem_shapes_consumed(m_cap, N, K, G, mag, fused_swiglu=True), \
+        "this fused FC1 cell must sit on the pointer-array route (m_cap past one epilogue chunk)"
+    h_prep, sh_prep = fso.gemm.linear_mxfp8_grouped_masked_swiglu(
+        a_fp8, w13i_fp8, sa, sw13i, masked_m, expected_m, mag)
+    h_ps, sh_ps = fso.gemm.linear_mxfp8_grouped_masked_swiglu(
+        a_fp8, w13i_fp8, sa, sw13i, masked_m, expected_m, mag, None, ps)
+    torch.cuda.synchronize()
+    assert torch.equal(_defined_rows(h_ps.view(torch.uint8), masked_m),
+                       _defined_rows(h_prep.view(torch.uint8), masked_m)), \
+        f"fused FC1 problem_shapes launch != prep launch (fp8 bytes) at M={M} fam={fam}"
+    assert torch.equal(_defined_sf_words(sh_ps, masked_m, m_cap, inter),
+                       _defined_sf_words(sh_prep, masked_m, m_cap, inter)), \
+        f"fused FC1 problem_shapes launch != prep launch (scale words) at M={M} fam={fam}"
+    print(f"  ps-bitexact  M={M:>5} fam={fam} fused FC1 m_cap={m_cap:>4}  OK")
+
+
+def test_problem_shapes_pinning(M: int = 64, fam: str = "B") -> None:
+    """A captured layer keeps reading its static argument block after the
+    process has bound many more eager tensor sets and captured another graph.
+
+    The eager calls draw fresh activations that are KEPT ALIVE, so the
+    allocator cannot hand the same addresses back and every call binds a new
+    key; the evictable blocks are churned through while the graph's pinned ones
+    must not move. The replay count is the brief's 200."""
+    G, topk, hidden, inter = PS_FAMILIES[fam]
+    torch.manual_seed(M * 1009 + 909)
+    m_cap = (M + 3) // 4 * 4
+    expected_m = max(1, (M * topk + G - 1) // G)
+    mag = min(M * topk, G)
+    x = torch.randn(M, hidden, dtype=torch.bfloat16, device="cuda") * 0.1
+    w13 = torch.randn(G, 2 * inter, hidden, dtype=torch.bfloat16, device="cuda") / (hidden ** 0.5)
+    w2 = torch.randn(G, hidden, inter, dtype=torch.bfloat16, device="cuda") / (inter ** 0.5)
+    w13i_fp8, sw13i = fso.gemm.quantize_moe_weights_1x32_fp8(w13, w13_interleave=True)
+    w2_fp8, sw2 = fso.gemm.quantize_moe_weights_1x32_fp8(w2)
+    topk_ids, topk_w, _, _, _ = build_routing(M, G, topk, m_cap, seed=M * 7 + 55)
+    out = torch.empty(M, hidden, device="cuda", dtype=torch.bfloat16)
+
+    def layer(o):
+        return moe_layer_fso_fused(x, w13i_fp8, sw13i, w2_fp8, sw2, topk_ids, topk_w,
+                                   m_cap, expected_m, o, G, mag)
+
+    layer(out)
+    torch.cuda.synchronize()
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            layer(out)
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+    eager_out = out.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=s):
+        layer(out)
+    for _ in range(200):
+        out.fill_(float("nan"))
+        graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager_out), "problem_shapes layer: replay != eager"
+    print(f"  ps-graph     M={M:>5} fam={fam}  200 replays bit-exact  OK")
+
+    # Churn: 96 eager FC2 calls whose activation slabs are drawn fresh and KEPT
+    # ALIVE, so no two calls can share an address and every call binds a new
+    # key (a layer call would not do: its intermediates are freed and the
+    # allocator hands the same addresses back). Then a second capture, at
+    # another M so its blocks are new keys too, then the first graph again.
+    keep = []
+    ids_c = build_routing(M, G, topk, m_cap, seed=M * 7 + 57)[0]
+    masked_c, _rm_c, sof_c, ps_c = fso.gemm.moe_build_routing(
+        ids_c, G, m_cap, problem_shapes_for=[(hidden, inter)])
+    for i in range(96):
+        xi = torch.randn(M, inter, dtype=torch.bfloat16, device="cuda") * 0.1
+        a_i, sa_i = fso.gemm.quantize_1x32_grouped_gather_fp8(xi, sof_c, topk, G, m_cap)
+        fso.gemm.linear_mxfp8_grouped_masked(a_i, w2_fp8, sa_i, sw2, masked_c, expected_m, mag, None, ps_c[0])
+        keep.append((a_i, sa_i))
+    M2 = 2 * M
+    m_cap2 = (M2 + 3) // 4 * 4
+    x2 = torch.randn(M2, hidden, dtype=torch.bfloat16, device="cuda") * 0.1
+    ids2, w_2, _, _, _ = build_routing(M2, G, topk, m_cap2, seed=M2 * 7 + 56)
+    out2 = torch.empty(M2, hidden, device="cuda", dtype=torch.bfloat16)
+    em2, mag2 = max(1, (M2 * topk + G - 1) // G), min(M2 * topk, G)
+
+    def layer2(o):
+        return moe_layer_fso_fused(x2, w13i_fp8, sw13i, w2_fp8, sw2, ids2, w_2, m_cap2, em2, o, G, mag2)
+
+    layer2(out2)
+    with torch.cuda.stream(s):
+        layer2(out2)
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+    eager_out2 = out2.clone()
+    graph2 = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph2, stream=s):
+        layer2(out2)
+    out2.fill_(float("nan"))
+    graph2.replay()
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out2, eager_out2), "second problem_shapes graph: replay != eager"
+    assert torch.equal(out, eager_out), \
+        "first problem_shapes graph: replay != eager after 96 eager tensor sets and a second capture"
+    del keep
+    print(f"  ps-pinning   M={M:>5} fam={fam}  first graph bit-exact after churn + second capture  OK")
+
+
+def test_problem_shapes_validation() -> None:
+    G, topk, hidden, inter = PS_FAMILIES["B"]
+    M, N, K = 64, hidden, inter
+    m_cap, masked_m, ps, a_fp8, sa, w, expected_m, mag = _ps_inputs(M, G, topk, N, K, seed=4242)
+    w_fp8, sw = fso.gemm.quantize_moe_weights_1x32_fp8(w)
+    bad = [ps[:, :2].contiguous(), ps.to(torch.int64), ps[:G // 2].contiguous(), ps.t().contiguous()]
+    for i, b in enumerate(bad):
+        try:
+            fso.gemm.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, expected_m, mag, None, b)
+        except RuntimeError as e:
+            assert "problem_shapes" in str(e), f"bad tensor {i}: unexpected message {e}"
+        else:
+            raise AssertionError(f"bad problem_shapes tensor {i} (shape {tuple(b.shape)}, {b.dtype}) was accepted")
+    try:
+        fso.gemm.moe_build_routing(a_fp8.new_zeros((4, 2), dtype=torch.int32), G, m_cap,
+                                   problem_shapes_for=[(1, 1)] * 5)
+    except RuntimeError as e:
+        assert "at most 4" in str(e), str(e)
+    else:
+        raise AssertionError("five problem-shape pairs were accepted")
+    # The content check: a triple built for the OTHER GEMM of the layer.
+    other_ids = build_routing(M, G, topk, m_cap, seed=4243)[0]
+    _, _, _, other = fso.gemm.moe_build_routing(other_ids, G, m_cap, problem_shapes_for=[(2 * inter, hidden)])
+    os.environ["FSO_CHECK_PROBLEM_SHAPES"] = "1"
+    try:
+        try:
+            fso.gemm.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, expected_m, mag, None, other[0])
+        except RuntimeError as e:
+            assert "built for another GEMM" in str(e), str(e)
+        else:
+            raise AssertionError("FSO_CHECK_PROBLEM_SHAPES=1 accepted the other GEMM's triples")
+        fso.gemm.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, expected_m, mag, None, ps)
+    finally:
+        del os.environ["FSO_CHECK_PROBLEM_SHAPES"]
+    torch.cuda.synchronize()
+    print("  ps-validate  wrong shape/dtype/length refused; other GEMM's triples caught under the check  OK")
+
+
+def test_problem_shapes_arena_full() -> None:
+    """Run under FSO_GROUPED_ARG_POOL_MB=1: captures of a 1024-expert GEMM
+    (about 106 KB of static arrays each) must pin blocks until the arena is
+    full, and the capture that finds it full must abort with the message that
+    names the variable rather than fall back to a launch inside the graph.
+    The process therefore does not return normally; the parent checks.
+    M = 68 is the first row capacity past the plain slot kernel's 64-wide
+    token tile, so the cell is on the pointer-array route (run
+    b300_round3_20260922/M-A3 runs the plain slot kernel up to the tile, and
+    this N, K pair has a slot instantiation)."""
+    G, topk, N, K, M = 1024, 8, 256, 256, 68
+    m_cap = (M + 3) // 4 * 4
+    torch.manual_seed(77)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") * 0.1
+    w = torch.randn(G, N, K, dtype=torch.bfloat16, device="cuda") / (K ** 0.5)
+    w_fp8, sw = fso.gemm.quantize_moe_weights_1x32_fp8(w)
+    topk_ids, _, _, _, _ = build_routing(M, G, topk, m_cap, seed=78)
+    mag = min(M * topk, G)
+
+    def call():
+        masked_m, _rm, sof, ps = fso.gemm.moe_build_routing(topk_ids, G, m_cap, problem_shapes_for=[(N, K)])
+        a_fp8, sa = fso.gemm.quantize_1x32_grouped_gather_fp8(x, sof, topk, G, m_cap)
+        return fso.gemm.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, 1, mag, None, ps[0])
+
+    assert fso.gemm.mxfp8_grouped_problem_shapes_consumed(m_cap, N, K, G, mag)
+    call()
+    torch.cuda.synchronize()
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        call()
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+    graphs = []
+    for i in range(40):
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            call()
+        graphs.append(g)
+        print(f"  arena-full   capture {i + 1} pinned", flush=True)
+    raise AssertionError("40 captures at 106 KB each fitted a 1 MB arena")
+
+
+def run_problem_shapes_cases() -> None:
+    import subprocess
+    here = os.path.abspath(__file__)
+
+    # Contract on both routing kernels: below and above the 4096-pair
+    # multi-CTA threshold (M = 512 is exactly 4096 pairs at top-8).
+    for fam in ("B", "C"):
+        for M in (8, 64, 512, 1024):
+            test_problem_shapes_contract(M, fam)
+    # Bit-exactness below and above the 128-row scale-factor atom, on the
+    # shapes of both families' FC2 and on a wide N.
+    # B down at m_cap=68: the first row capacity past the plain slot kernel's
+    # 64-wide token tile, i.e. the first cell of the pointer-array route (run
+    # b300_round3_20260922/M-A3 moved the plain kernel's bound to the tile).
+    test_problem_shapes_bit_exact(M=68, G=128, topk=8, N=2048, K=768)
+    test_problem_shapes_bit_exact(M=96, G=128, topk=8, N=2048, K=768)     # m_cap=96 < 128
+    test_problem_shapes_bit_exact(M=256, G=256, topk=8, N=2048, K=512)    # C down, m_cap=256
+    test_problem_shapes_bit_exact(M=1024, G=128, topk=8, N=2048, K=768)   # m_cap=1024
+    test_problem_shapes_bit_exact(M=96, G=8, topk=4, N=4096, K=2048)      # wide N
+    for fam in ("B", "C"):
+        for M in (64, 256, 1024):
+            test_problem_shapes_bit_exact_fused(M, fam)
+    test_problem_shapes_pinning(64, "B")
+    test_problem_shapes_pinning(1024, "C")
+    test_problem_shapes_validation()
+
+    # The arena size is read once per process, so the eviction and the
+    # exhaustion cases run in subprocesses with a 1 MB arena: the pinning case
+    # then really evicts (its 96 eager blocks exceed the arena), and the
+    # exhaustion case must abort with the message.
+    env = dict(os.environ, FSO_GROUPED_ARG_POOL_MB="1")
+    for k in ("FSO_GROUPED_SLOT", "FSO_FC1_FUSED"):
+        env.pop(k, None)
+    r = subprocess.run([sys.executable, here, "--ps-case", "pinning_small_arena"], env=env,
+                       capture_output=True, text=True)
+    print(r.stdout, end="")
+    assert r.returncode == 0, f"pinning under a 1 MB arena failed (exit {r.returncode}):\n{r.stderr[-1500:]}"
+    r = subprocess.run([sys.executable, here, "--ps-case", "arena_full"], env=env,
+                       capture_output=True, text=True)
+    assert r.returncode != 0, "a capture that found the arena full did not refuse"
+    assert "static argument arena" in r.stderr and "FSO_GROUPED_ARG_POOL_MB" in r.stderr, \
+        f"unexpected failure instead of the arena-full refusal:\n{r.stderr[-1500:]}"
+    n_pinned = r.stdout.count("pinned")
+    assert 5 <= n_pinned <= 12, f"expected about 9 captures to fit a 1 MB arena, got {n_pinned}"
+    print(f"  arena-full   {n_pinned} captures pinned in a 1 MB arena, then refused with a message  OK")
 
 
 # --- sm_100/103 slot-bound decode route -------------------------------------
@@ -1689,6 +2145,15 @@ def main() -> int:
               f"FSO_FC1_FUSED={os.environ.get('FSO_FC1_FUSED', '<unset>')}")
         test_fused_route_helper()
         return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "--ps-case":
+        case = sys.argv[2]
+        print(f"device: {torch.cuda.get_device_name()}  ps-case={case} "
+              f"FSO_GROUPED_ARG_POOL_MB={os.environ.get('FSO_GROUPED_ARG_POOL_MB', '<unset>')}")
+        if case == "pinning_small_arena":
+            test_problem_shapes_pinning(64, "B")
+        else:
+            test_problem_shapes_arena_full()
+        return 0
     if len(sys.argv) > 1 and sys.argv[1] == "--slot-case":
         case = sys.argv[2]
         print(f"device: {torch.cuda.get_device_name()}  case={case} "
@@ -1750,6 +2215,17 @@ def main() -> int:
     if major == 10:
         print("== sm_100/103 fused-SwiGLU FC1 ==")
         run_fused_cases()
+
+    # The routing kernel emits the shapes on every architecture; only the
+    # sm_100 pointer-array route reads them, so the GEMM-side cases are sm_100.
+    print("== routing-supplied problem shapes ==")
+    if major == 10:
+        run_problem_shapes_cases()
+        print("== layer route consistency (slot list vs problem shapes, per GEMM) ==")
+        test_layer_route_consistency()
+    else:
+        for M in (8, 64, 512):
+            test_problem_shapes_contract(M, "B")
 
     if major == 10:
         print("== sm_100/103 slot-bound decode route (subprocess per knob setting) ==")

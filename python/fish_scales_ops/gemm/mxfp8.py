@@ -65,7 +65,7 @@ def linear_mxfp8(
     """
     _require_mxfp8_arch()
     # sm_100/sm_103 (Blackwell datacenter) has a best-per-shape dispatch: an
-    # M <= 32 decode row of vendored CuTe-DSL kernels in front of three tiers
+    # M <= 64 decode row of vendored CuTe-DSL kernels in front of three tiers
     # — cuBLAS scaled_mm on the rest of the small-M band / DSL on
     # prefill+peak / C++ cascade for the narrow-N split-K and square cubic
     # paths. Full rationale in `_sm100_dispatch.py`.
@@ -177,6 +177,7 @@ def linear_mxfp8_grouped_masked(
     expected_m: int,
     max_active_groups: int = 0,
     slot_to_expert: torch.Tensor | None = None,
+    problem_shapes: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Grouped block-scaled MXFP8 GEMM over per-expert weights (masked).
 
@@ -212,17 +213,29 @@ def linear_mxfp8_grouped_masked(
             sm_100/103 slot-bound decode route reads it, and passing it saves
             that route the one-block launch it otherwise makes to build the
             same list. Omitting it changes nothing but that launch.
+        problem_shapes: optional int32 ``[G, 3]`` on device — the per-group
+            ``(rows, N, K)`` triples of THIS GEMM, i.e. the entry of
+            :func:`moe_build_routing`'s ``problem_shapes_for`` output that was
+            requested for ``(N, K)``. Only the sm_100/103 pointer-array route
+            reads it; with it that route launches the GEMM alone, without the
+            per-call argument-preparation kernel, because the triple was the
+            only routing-dependent argument that kernel still computed (the
+            tensor-set arrays are bound once per tensor set). Omitting it keeps
+            the preparation kernel. The slot route and sm_120/121 validate the
+            shape and ignore it. Ask :func:`mxfp8_grouped_problem_shapes_consumed`
+            whether a call would read it.
 
     Returns:
         bfloat16 ``[G, m_cap, N]``; rows ``>= masked_m[g]`` are undefined.
 
     Constraints: ``K % 128 == 0``, ``N % 128 == 0``, ``m_cap % 4 == 0``,
-    ``0 <= max_active_groups <= G``, and ``slot_to_expert`` (when given) int32
-    ``[G]``, contiguous, on ``masked_m``'s device.
+    ``0 <= max_active_groups <= G``, ``slot_to_expert`` (when given) int32
+    ``[G]`` and ``problem_shapes`` (when given) int32 ``[G, 3]``, both
+    contiguous and on ``masked_m``'s device.
     """
     _require_grouped_arch()
     return torch.ops.fish_scales_ops.linear_mxfp8_grouped_masked(
-        a_fp8, w_fp8, sa, sw, masked_m, expected_m, max_active_groups, slot_to_expert
+        a_fp8, w_fp8, sa, sw, masked_m, expected_m, max_active_groups, slot_to_expert, problem_shapes
     )
 
 
@@ -235,6 +248,7 @@ def linear_mxfp8_grouped_masked_swiglu(
     expected_m: int,
     max_active_groups: int = 0,
     slot_to_expert: torch.Tensor | None = None,
+    problem_shapes: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Grouped MoE FC1 with SwiGLU and the MXFP8 requantize fused into it.
 
@@ -268,6 +282,12 @@ def linear_mxfp8_grouped_masked_swiglu(
             ``moe_build_routing(..., with_slots=True)``'s fourth output. Passing
             it lets a decode-band call launch nothing but the GEMM; leaving it
             ``None`` costs a one-block builder launch.
+        problem_shapes: the per-group ``(rows, N, K)`` triples for this GEMM's
+            ``N = 2 * I`` weight rows, from :func:`moe_build_routing`'s
+            ``problem_shapes_for=[(2 * I, K), ...]`` output, exactly as for
+            :func:`linear_mxfp8_grouped_masked`. Passing it lets a
+            pointer-array-route call launch nothing but the GEMM; leaving it
+            ``None`` costs the per-call argument-preparation launch.
 
     Returns:
         ``(h_fp8 [G, m_cap, I], sh)`` — exactly the pair
@@ -289,7 +309,7 @@ def linear_mxfp8_grouped_masked_swiglu(
             "on sm_90 use the block-FP8 grouped surface."
         )
     return torch.ops.fish_scales_ops.linear_mxfp8_grouped_masked_swiglu(
-        a_fp8, w13_fp8, sa, sw13, masked_m, expected_m, max_active_groups, slot_to_expert
+        a_fp8, w13_fp8, sa, sw13, masked_m, expected_m, max_active_groups, slot_to_expert, problem_shapes
     )
 
 
@@ -352,6 +372,7 @@ def mxfp8_grouped_slot_possible(
     k: int,
     num_groups: int,
     max_active_groups: int = 0,
+    fused_swiglu: bool = False,
 ) -> bool:
     """Would a grouped GEMM of this shape take the slot-bound decode route?
 
@@ -382,10 +403,60 @@ def mxfp8_grouped_slot_possible(
         num_groups: G.
         max_active_groups: ``min(M * topk, G)``; ``0`` (not supplied) keeps the
             slot route off and so answers ``False``.
+        fused_swiglu: ``True`` when the call will be the fused-SwiGLU FC1
+            (:func:`linear_mxfp8_grouped_masked_swiglu`), ``False`` for the
+            plain grouped GEMM. The two land on different slot kernels with
+            different row-capacity clauses — one 32-column epilogue chunk for
+            the fused kernel, the full 64-wide token tile for the plain one
+            (run b300_round3_20260922/M-A3) — so a layer asks for its FC1 with
+            the flag set and for its FC2 with it clear.
     """
     return bool(
         torch.ops.fish_scales_ops.mxfp8_grouped_slot_possible(
-            m_cap, n_w, k, num_groups, max_active_groups
+            m_cap, n_w, k, num_groups, max_active_groups, fused_swiglu
+        )
+    )
+
+
+def mxfp8_grouped_problem_shapes_consumed(
+    m_cap: int,
+    n_w: int,
+    k: int,
+    num_groups: int,
+    max_active_groups: int = 0,
+    fused_swiglu: bool = False,
+) -> bool:
+    """Would a grouped GEMM of this shape read a ``problem_shapes`` tensor?
+
+    The pointer-array route's counterpart of :func:`mxfp8_grouped_slot_possible`.
+    On sm_100/103 the per-group ``(rows, N, K)`` triples
+    :func:`moe_build_routing` emits under ``problem_shapes_for`` are read by
+    the pointer-array cascade and by nothing else: the slot route sizes its
+    grid from ``masked_m`` and the slot list. Asking the routing kernel for the
+    triples where no kernel reads them costs it a few stores per group for
+    nothing, so a layer asks this per GEMM (FC1 ``n_w = 2 * INTER``,
+    ``k = HIDDEN``; FC2 ``n_w = HIDDEN``, ``k = INTER``) and requests the
+    shapes for the GEMMs that consume them, which is what the benches and the
+    layer test do. The verdict is the dispatcher's own ``slot_route``, so
+    ``FSO_GROUPED_SLOT`` steers it exactly as it steers the route.
+
+    ``fused_swiglu`` names the kernel the call will land on, exactly as for
+    :func:`mxfp8_grouped_slot_possible`: the fused-SwiGLU FC1
+    (:func:`linear_mxfp8_grouped_masked_swiglu`) leaves the slot route one
+    step earlier than the plain grouped GEMM (one 32-column epilogue chunk
+    against the full 64-wide token tile), so the two queries are complements
+    of each other only when both are asked with the same flag. A layer asks
+    both for its FC1 with the flag set to whether it will call the fused op,
+    and for its FC2 with it clear; then, per GEMM, exactly one of the slot
+    list and the problem shapes is requested and the GEMM launches nothing
+    but itself.
+
+    Returns ``False`` on every architecture but sm_100/sm_103; sm_120/121
+    accepts the tensor only so a caller can pass the same arguments everywhere.
+    """
+    return bool(
+        torch.ops.fish_scales_ops.mxfp8_grouped_problem_shapes_consumed(
+            m_cap, n_w, k, num_groups, max_active_groups, fused_swiglu
         )
     )
 
@@ -556,6 +627,7 @@ def moe_build_routing(
     m_cap: int,
     *,
     with_slots: bool = False,
+    problem_shapes_for: list[tuple[int, int]] | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """topk routing -> masked-layout index tensors, one kernel launch.
 
@@ -568,6 +640,17 @@ def moe_build_routing(
             holds, and it saves the sm_100/103 slot-bound grouped GEMM the
             one-block launch it otherwise makes per call to build the same
             list. Every architecture produces it; only that route reads it.
+        problem_shapes_for: ``[(N, K), ...]``, at most four pairs — one per
+            grouped GEMM the caller will run on this routing (a MoE layer's
+            FC1 is ``(2 * INTER, HIDDEN)`` and its FC2 ``(HIDDEN, INTER)``).
+            For each pair the kernel also writes the per-group CUTLASS problem
+            shape, the int32 triple ``(rows, N, K)`` with ``rows`` clamped to
+            ``m_cap``, in the same pass that writes ``masked_m``. That triple
+            is the only routing-dependent argument the sm_100/103
+            pointer-array grouped GEMM has, so handing the triples to the GEMM
+            lets it launch without its per-call argument-preparation kernel.
+            Every architecture produces them; only that route reads them, so
+            ask :func:`mxfp8_grouped_problem_shapes_consumed` per GEMM first.
 
     Returns:
         (masked_m ``[G]`` int32, row_map ``[G * m_cap]`` int32 — slot ->
@@ -577,15 +660,29 @@ def moe_build_routing(
         maps consistently. With ``with_slots=True`` a fourth tensor follows:
         slot_to_expert ``[G]`` int32, the ids of the experts holding at least
         one routed row in ascending order, then ``-1`` in every remaining
-        entry. Pass it to :func:`linear_mxfp8_grouped_masked`.
+        entry. Pass it to :func:`linear_mxfp8_grouped_masked`. With
+        ``problem_shapes_for`` a further element follows (after the slot list
+        when both are requested): a list with one int32 ``[G, 3]`` tensor per
+        requested pair, in the order given; pass entry ``i`` as
+        ``problem_shapes=`` to the GEMM whose ``(N, K)`` is pair ``i``.
     """
+    nk: list[int] = []
+    if problem_shapes_for:
+        for pair in problem_shapes_for:
+            n, k = pair
+            nk.extend((int(n), int(k)))
     # arch-agnostic glue (plain int32/bf16 + PDL, works on sm_90 and sm_120)
-    masked_m, row_map, slot_of_flat, slot_to_expert = (
-        torch.ops.fish_scales_ops.moe_build_routing(topk_ids, num_groups, m_cap, with_slots)
+    masked_m, row_map, slot_of_flat, slot_to_expert, problem_shapes = (
+        torch.ops.fish_scales_ops.moe_build_routing(topk_ids, num_groups, m_cap, with_slots, nk)
     )
+    out: tuple[torch.Tensor, ...] = (masked_m, row_map, slot_of_flat)
     if with_slots:
-        return masked_m, row_map, slot_of_flat, slot_to_expert
-    return masked_m, row_map, slot_of_flat
+        out = out + (slot_to_expert,)
+    if nk:
+        # Views of one [P, G, 3] allocation: each is a contiguous [G, 3]
+        # tensor, which is what the GEMM ops check for.
+        out = out + ([problem_shapes[i] for i in range(problem_shapes.shape[0])],)
+    return out
 
 
 def moe_build_sorted(
