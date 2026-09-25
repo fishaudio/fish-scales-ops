@@ -265,14 +265,39 @@ __global__ void moe_combine_kernel(
     {
         float4 raws[kMaxTopk];
         float ws[kMaxTopk];
+        int slots[kMaxTopk];
+        // Three unrolled phases so the topk slot / weight loads, then the topk LDG.128 row loads, issue
+        // back-to-back (two memory round trips per thread, as before masked entries were supported: a
+        // branch or select inside a single loop cost +1.4-1.7 us at M = 8). A masked padded-row entry
+        // (sorted layout, flat_to_sorted = -1) reads row 0, always allocated, and is zeroed afterwards.
 #pragma unroll
         for (int j = 0; j < kMaxTopk; ++j)
         {
             if (j < topk)
             {
-                int const slot = slot_of_flat[t * topk + j];
+                slots[j] = slot_of_flat[t * topk + j];
                 ws[j] = topk_w[t * topk + j];
-                raws[j] = *reinterpret_cast<float4 const*>(&dn[static_cast<int64_t>(slot) * H + h]);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < kMaxTopk; ++j)
+        {
+            if (j < topk)
+            {
+                int const src = slots[j] < 0 ? 0 : slots[j];
+                raws[j] = *reinterpret_cast<float4 const*>(&dn[static_cast<int64_t>(src) * H + h]);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < kMaxTopk; ++j)
+        {
+            if (j < topk && slots[j] < 0)
+            {
+                ws[j] = 0.f;
+                raws[j].x = 0.f;
+                raws[j].y = 0.f;
+                raws[j].z = 0.f;
+                raws[j].w = 0.f;
             }
         }
 #pragma unroll
@@ -296,9 +321,12 @@ __global__ void moe_combine_kernel(
         for (int j = 0; j < topk; ++j)
         {
             int const slot = slot_of_flat[t * topk + j];
-            float const w = topk_w[t * topk + j];
-            float4 const raw = *reinterpret_cast<float4 const*>(
-                &dn[static_cast<int64_t>(slot) * H + h]);
+            bool const valid = slot >= 0; // masked padded-row entry (sorted layout): no routed row
+            float const wl = topk_w[t * topk + j];
+            float const w = valid ? wl : 0.f;
+            float4 const rawl = *reinterpret_cast<float4 const*>(
+                &dn[static_cast<int64_t>(valid ? slot : 0) * H + h]);
+            float4 const raw = valid ? rawl : make_float4(0.f, 0.f, 0.f, 0.f);
             __nv_bfloat162 const* v2 = reinterpret_cast<__nv_bfloat162 const*>(&raw);
 #pragma unroll
             for (int p = 0; p < kVec / 2; ++p)
@@ -495,6 +523,12 @@ __global__ void moe_build_routing_multi_ps_kernel(
 //     for both intra-expert pad rows and trailing slack (gather/combine skip).
 //   num_padded_dev [1] : the actual padded length P_actual (triton's
 //     num_tokens_post_padded); the GEMM's device length gate reads it.
+// Expert ids outside [0, num_groups) are skipped: sglang masks the rows past
+// num_token_non_padded of a CUDA-graph / piecewise-graph bucket to -1 or to
+// num_experts (its moe_align overflow slot), and those pairs must cost no
+// expert compute. They get no sorted row (flat_to_sorted = -1); the gather,
+// SwiGLU-quant and combine kernels skip them, so a token whose entries are
+// all masked produces a zero output row.
 // The first row of every block is always real (nb=ceil(cnt/BLOCK_M) implies
 // (nb-1)*BLOCK_M < cnt), so grouped_layout read at a block's first row is
 // always a valid expert even before the pad rows are labelled.
@@ -511,17 +545,31 @@ __global__ void moe_build_sorted_kernel(
         if (threadIdx.x == 0)
             cudaTriggerProgrammaticLaunchCompletion();
     }
-    __shared__ int32_t cnt[kMaxGroups];  // per-expert routed count
-    __shared__ int32_t off[kMaxGroups];  // exclusive prefix of padded_e
-    __shared__ int32_t fill[kMaxGroups]; // per-expert scatter cursor
+    // +1: a dummy slot (index kMaxGroups) that masked padded-row entries (expert id outside
+    // [0, num_groups)) count and scatter into, keeping both pair loops branch-free; the prefix
+    // scan never reads it.
+    __shared__ int32_t cnt[kMaxGroups + 1];  // per-expert routed count
+    __shared__ int32_t off[kMaxGroups + 1];  // exclusive prefix of padded_e
+    __shared__ int32_t fill[kMaxGroups + 1]; // per-expert scatter cursor
     __shared__ int32_t s_p_actual;
 
     // Phase 1: histogram routed pairs per expert.
     for (int g = threadIdx.x; g < num_groups; g += blockDim.x)
         cnt[g] = 0;
+    if (threadIdx.x == 0)
+    {
+        cnt[kMaxGroups] = 0;
+        off[kMaxGroups] = 0;
+        fill[kMaxGroups] = 0;
+    }
     __syncthreads();
     for (int i = threadIdx.x; i < num_pairs; i += blockDim.x)
-        atomicAdd(&cnt[topk_ids[i]], 1);
+    {
+        // One unsigned min: a negative id lands on the dummy slot, an id in [num_groups, kMaxGroups)
+        // on a slot the prefix scan never reads (it only covers [0, num_groups)).
+        unsigned const ue = static_cast<unsigned>(topk_ids[i]);
+        atomicAdd(&cnt[min(ue, static_cast<unsigned>(kMaxGroups))], 1);
+    }
     __syncthreads();
 
     // Phase 2: exclusive prefix of padded_e = ceil(cnt/BM)*BM, done as a single
@@ -590,9 +638,11 @@ __global__ void moe_build_sorted_kernel(
     }
     for (int i = threadIdx.x; i < num_pairs; i += blockDim.x)
     {
-        int const e = topk_ids[i];
-        int const r = atomicAdd(&fill[e], 1);
-        flat_to_sorted[i] = off[e] + r;
+        unsigned const ue = static_cast<unsigned>(topk_ids[i]);
+        int const es = static_cast<int>(min(ue, static_cast<unsigned>(kMaxGroups))); // masked -> dummy slot
+        int const r = atomicAdd(&fill[es], 1);
+        // -1 for a masked padded-row entry (id outside [0, num_groups)): gather / combine skip it.
+        flat_to_sorted[i] = (ue < static_cast<unsigned>(num_groups)) ? off[es] + r : -1;
     }
 }
 

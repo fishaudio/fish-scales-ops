@@ -675,7 +675,9 @@ __global__ void silu_chunk_mul_quantize_1x128_fp32_grouped_kernel(
 // there is no O(P_max) memset. Padding rows of the output are left untouched:
 // the GroupedContiguous GEMM is row-independent, so a padding row only produces
 // a padding output row, which the combine drops (it reads only real rows via
-// flat_to_sorted). Each warp owns one (pair i, 128-K-block kb).
+// flat_to_sorted). Pairs whose flat_to_sorted entry is -1 (expert id outside
+// [0, E): sglang's masked padded rows) are skipped. Each warp owns one
+// (pair i, 128-K-block kb).
 __global__ void fp8bs_quantize_1x128_fp32_sorted_gather_kernel(
     __nv_fp8_e4m3* __restrict__ out_fp8,  // [P_max, K]
     float* __restrict__ out_sfa,          // [K/128, sfa_ld] = ColMajor[sfa_ld, K/128]
@@ -690,7 +692,8 @@ __global__ void fp8bs_quantize_1x128_fp32_sorted_gather_kernel(
     int const kb = warp_id % Kb;  // 128-K-block
     if (i >= n_pairs)
         return;
-    int const r = flat_to_sorted[i]; // sorted row
+    int const r = flat_to_sorted[i]; // sorted row (-1: masked padded-row entry, checked at the stores
+                                     // so the input loads below do not wait on this load)
     int const k_base = kb * 128;
     int const token = i / topk;
     uint64_t const xword = *reinterpret_cast<uint64_t const*>(
@@ -708,6 +711,8 @@ __global__ void fp8bs_quantize_1x128_fp32_sorted_gather_kernel(
     float const qs = 448.f / my_ax;
     float const dequant = my_ax * (1.f / 448.f);
     uint32_t const fp_word = fp8x4_from_floats(x0 * qs, x1 * qs, x2 * qs, x3 * qs);
+    if (r < 0) // masked padded-row entry (expert id outside [0, E)): no sorted row to write
+        return;
     *reinterpret_cast<uint32_t*>(&out_fp8[static_cast<int64_t>(r) * K + k_base + lane_id * 4]) = fp_word;
     if (lane_id == 0)
         out_sfa[static_cast<int64_t>(kb) * sfa_ld + r] = dequant;
@@ -728,6 +733,8 @@ __global__ void silu_chunk_mul_quantize_1x128_fp32_sorted_kernel(
     if (i >= n_pairs)
         return;
     int const r = flat_to_sorted[i];
+    if (r < 0) // masked padded-row entry: no sorted row
+        return;
     int const k_base = kb * 128;
     int64_t const stride_m_gu = 2 * static_cast<int64_t>(K);
     uint64_t const gate_word = *reinterpret_cast<uint64_t const*>(

@@ -714,7 +714,8 @@ at::Tensor linear_fp8_grouped_contiguous_swapab(at::Tensor a_fp8, at::Tensor w_f
     TORCH_CHECK(w_fp8.size(2) == K, "w_fp8 K must match a_fp8");
     TORCH_CHECK(sorted_expert_ids.numel() == P_max, "sorted_expert_ids must have P_max entries");
     TORCH_CHECK(K % 128 == 0 && N % 128 == 0, "N and K must be multiples of 128");
-    TORCH_CHECK(block_n == 16, "H4b swap-AB supports block_n = 16 only");
+    TORCH_CHECK(block_n == 16 || block_n == 32 || block_n == 64,
+        "swap-AB grouped GEMM: block_n must be 16, 32 or 64 (= the moe_build_sorted padding)");
 
     auto y = at::empty({P_max, N}, a_fp8.options().dtype(at::kBFloat16));
     auto stream = at::cuda::getCurrentCUDAStream();

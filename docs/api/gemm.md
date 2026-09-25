@@ -441,8 +441,8 @@ than all `E` experts. `P_max` (the padded row count) is rounded up and fixed per
 
 | step | function | in → out |
 |---|---|---|
-| unified entry | `moe_layer_fp8_sm90(hidden, w13_fp8, sw13, w2_fp8, sw2, topk_ids, topk_w)` | bf16 `[M, HIDDEN]`, per-expert fp8 weights with fp32 `[E, N/128, K/128]` scales, int32 `[M, topk]`, fp32 `[M, topk]` → bf16 `[M, HIDDEN]`; picks the swap-AB GEMMs for `M < MOE_SWAP_M_MAX` (= 256, a Python constant) and the block_m = 64 GEMMs otherwise, a host-side branch on the static `M` |
-| routing | `moe_build_sorted(topk_ids, num_groups, block_m)` | → (`sorted_expert_ids [P_max]` (−1 past the real length), `flat_to_sorted [M*topk]`, `num_padded [1]`) |
+| unified entry | `moe_layer_fp8_sm90(hidden, w13_fp8, sw13, w2_fp8, sw2, topk_ids, topk_w)` | bf16 `[M, HIDDEN]`, per-expert fp8 weights with fp32 `[E, N/128, K/128]` scales, int32 `[M, topk]`, fp32 `[M, topk]` → bf16 `[M, HIDDEN]`; picks the swap-AB GEMMs with an activation tile of 16 / 32 / 64 rows while the routed rows per active expert (`M * topk / E`) are at most 12 / 24 / 64 (`moe_swap_ab_block_n(M, E, topk)`; M <= 2048 on E=256/top-8) and the block_m = 64 GEMMs otherwise, a host-side branch on the static `M`; `topk_ids` entries outside [0, E) (sglang's masked rows past `num_token_non_padded`: −1 or `num_experts`) take no expert compute and a token whose entries are all masked gets a zero row |
+| routing | `moe_build_sorted(topk_ids, num_groups, block_m)` | → (`sorted_expert_ids [P_max]` (−1 past the real length), `flat_to_sorted [M*topk]` (−1 for entries whose expert id is outside [0, num_groups); the gather / SwiGLU-quant / combine kernels skip them), `num_padded [1]`) |
 | gather + quantize | `quantize_1x128_sorted_gather_sm90(x, flat_to_sorted, p_max, topk)` | → (fp8 `[P_max, K]`, fp32 `[K/128, align(P_max,4)]` K-major) |
 | GEMMs | `linear_fp8_grouped_contiguous(a, w, sa, sw, sorted_expert_ids, block_m, expected_m)` and `linear_fp8_grouped_contiguous_swapab(..., block_n, expected_m)` | → bf16 `[P_max, N]` in sorted order; `sorted_expert_ids` must have been built with the same block size |
 | SwiGLU + quantize | `silu_chunk_mul_quantize_1x128_sorted_sm90(gu, flat_to_sorted)` | → (fp8 `[P_max, INTER]`, fp32 `[INTER/128, align(P_max,4)]`) |
@@ -641,7 +641,10 @@ contract — the cascades already encode the measured picks.
 | `FSO_DISABLE_STREAMK=1` | sm_120 dense | single launch everywhere |
 | `FSO_STREAMK_POOL_MB=<n>` | sm_120 dense | Stream-K partial-sum scratch capacity (default 64 MB; allocated once, before capture) |
 | `FSO_DISABLE_PDL=1` | sm_120 MoE chain; sm_100/103 MoE chain, grouped argument-preparation kernel and grouped GEMM | drop the programmatic-dependent-launch attributes (kernel-side waits become no-ops). On sm_100/103 this also covers the split prep kernel and the CUTLASS grouped GEMM, which are launched with PDL by default and whose grid-dependency barriers are compiled in for the sm_100/103 device passes |
-| `FSO_SWAP_STAGES=<n>` | sm_90 swap-AB grouped GEMM | pipeline depth of the swap-AB kernel (clamped to the smem budget) |
+| `FSO_SWAP_BN=16|32|64|0` | sm_90 composed MoE layer | force the swap-AB activation tile (0 = the non-swap block_m = 64 path) instead of the rows-per-expert cascade |
+| `FSO_SWAP_STAGES=<n>` | sm_90 swap-AB grouped GEMM | pipeline depth of the single-CTA swap-AB kernel (clamped to the smem budget); two-CTA builds pick their own depth (the deepest count that fits twice and divides K, see `dispatch.cuh`) and ignore it |
+| `FSO_SWAPAB_CTAS_PER_SM=1|2` | sm_90 swap-AB grouped GEMM | resident CTAs per SM (default 2: the math warp-groups run on 96 registers and the grid is doubled; 1 restores the single persistent CTA with 232 registers) |
+| `FSO_JIT_EXTRA_FLAGS="-DFOO=1 ..."` | sm_90 | extra NVRTC flags appended to every deep_gemm JIT compile (developer A/B of kernel-side `#if` switches; the cubin cache key ignores them, so pair with a fresh `TRTLLM_DG_CACHE_DIR`) |
 | `FSO_JIT_INCLUDE_DIRS=a:b:c` | sm_90 | NVRTC include directories for the deep_gemm JIT (default baked at build time) |
 | `TRTLLM_DG_JIT_DEBUG=1`, `TRTLLM_DG_JIT_DUMP_CUBIN=1`, `TRTLLM_DG_JIT_USE_NVCC=1`, `TRTLLM_DG_NVCC_COMPILER=<path>`, `TRTLLM_DG_CACHE_DIR=<dir>` | sm_90 | deep_gemm JIT diagnostics: verbose compile, dump cubins, compile with nvcc instead of NVRTC, compiler path, dump directory |
 | `FSO_DISABLE_SMM=1`, `FSO_DISABLE_DSL=1` | sm_100/103 MXFP8 router | skip the cuBLAS `scaled_mm` tier / both CuTe-DSL rows, the M ≤ 64 decode row and the mid-band tier (both set = pure C++ cascade) |
@@ -712,4 +715,4 @@ sweep does not have to rebuild it.
 
 Build-time variables (`TORCH_CUDA_ARCH_LIST`, `CUDA_HOME`, `CUTLASS_DIR` /
 `BSGEMM_CUTLASS_DIR`) are documented in the README's Install section.
-`MOE_SWAP_M_MAX` is a Python constant (256), not an environment variable.
+The swap-AB tile / non-swap choice is the Python cascade `MOE_SWAP_BLOCK_N_CASCADE` on routed rows per active expert (`moe_swap_ab_block_n(M, E, topk)`); `FSO_SWAP_BN=16|32|64|0` forces one tile (0 = non-swap) for A/B runs.

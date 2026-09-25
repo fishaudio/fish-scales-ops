@@ -161,13 +161,15 @@ inline void gemm_dispatch_sm90_grouped_contiguous(void* mat_a, void* mat_b, void
 // Contiguous grouped block-scale FP8 on sm_90, swap-AB — H4b. For M >= 8 the
 // non-swap path pads each active expert's few rows to block_m = 64 (heavy
 // padding that tips the GEMM compute-bound). Swap-AB tiles the activation rows
-// by BLOCK_N = 16 instead (the weight becomes the A matrix, tiled by block_m
-// along N), matching triton's own M >= 8 strategy — 4x less activation padding.
-// Buffer layouts are identical to the non-swap path (the swap-AB descriptors
-// read the same bytes): A_sorted [P_max, K], SFA K-major, weights [G,N,K],
-// SFB [G,N/128,K/128], D [P_max, N]. The caller pads moe_build_sorted to
-// BLOCK_N = 16 (= the activation tiling), and grouped_layout provides the
-// per-block expert + the -1 length gate.
+// by BLOCK_N = block_n instead (the weight becomes the A matrix, tiled by
+// block_m along N), matching triton's own M >= 8 strategy. block_n is 16, 32
+// or 64: the caller picks it from the routed rows per active expert (the
+// swap-AB kernel re-streams an expert's weights once per activation tile, so
+// the tile grows with the rows an expert carries; see moe_layer_fp8_sm90) and
+// pads moe_build_sorted to the same value. Buffer layouts are identical to the
+// non-swap path (the swap-AB descriptors read the same bytes): A_sorted
+// [P_max, K], SFA K-major, weights [G,N,K], SFB [G,N/128,K/128], D [P_max, N];
+// grouped_layout provides the per-block expert + the -1 length gate.
 inline void gemm_dispatch_sm90_grouped_contiguous_swapab(void* mat_a_wgt, void* mat_b_act, void* mat_d, float* sfb_wgt,
     float* sfa_act, int* sorted_expert_ids, uint32_t num_groups, uint32_t p_max, uint32_t shape_n, uint32_t shape_k,
     uint32_t block_n, uint32_t expected_m, cudaStream_t stream, int num_device_sms = kNumDeviceSMs)
@@ -177,15 +179,16 @@ inline void gemm_dispatch_sm90_grouped_contiguous_swapab(void* mat_a_wgt, void* 
 
     constexpr uint32_t block_k = 128;
     (void) expected_m;
-    (void) block_n; // fixed to 16 below (= moe_build_sorted padding)
+    if (block_n != 16u && block_n != 32u && block_n != 64u)
+        TLLM_THROW("swap-AB grouped GEMM: block_n must be 16, 32 or 64 (= the moe_build_sorted padding), got %u", block_n);
 
     // Picker chooses block_m (weight-N tiling) + num_stages for the swap-AB
-    // shape; we then force block_n = 16 (activation tiling / padding) and
-    // recompute the swap-AB smem. shape_m for the picker is the weight N (large
-    // -> block_m = 128); shape_n is the activation extent.
+    // shape; we then force block_n to the caller's activation tiling / padding
+    // and recompute the swap-AB smem. shape_m for the picker is the weight N
+    // (large -> block_m = 128); shape_n is the activation extent.
     auto [bm, bn, ns, ntm, smem] = deep_gemm::jit::get_best_gemm_config(
         shape_n, p_max, shape_k, num_groups, num_device_sms, false, true);
-    bn = 16u;
+    bn = block_n;
     // Deepen the pipeline. The picker sizes num_stages for a large-tile GEMM,
     // but the swap GEMM's activation tile is only BLOCK_N=16 wide, so it is
     // latency- rather than smem-bound: a deeper prefetch (6 vs the picker's ~5)
@@ -200,22 +203,103 @@ inline void gemm_dispatch_sm90_grouped_contiguous_swapab(void* mat_a_wgt, void* 
             ns = static_cast<uint32_t>(s);
     }
     constexpr uint32_t kSm90MaxSmem = 227u * 1024u;
-    smem = static_cast<uint32_t>(deep_gemm::jit::get_smem_size(
-        static_cast<int>(ns), static_cast<int>(shape_k), static_cast<int>(bm), static_cast<int>(bn),
-        static_cast<int>(block_k), true));
-    while (ns > 1u && smem > kSm90MaxSmem)
+    // Two resident CTAs per SM: each CTA's math warp-groups only carry a BLOCK_N = 16 accumulator, so they
+    // fit in 96 registers and two CTAs share the register file; the second CTA's TMA stream covers the
+    // first's per-block epilogue and WGMMA-wait chain, which a single persistent CTA exposes on every block
+    // of the short-K down projection. The stage count is reduced until two CTAs' shared memory (plus the
+    // 1 KB the driver reserves per CTA) fits. FSO_SWAPAB_CTAS_PER_SM=1|2 overrides.
+    // Only when the sorted layout can feed both CTAs: p_max / 16 activation tiles times the weight tiles is
+    // the upper bound on real blocks, and below two per SM the doubled grid just adds idle CTAs (Family B
+    // M = 1 / M = 2 read +1.5-1.8 % with the doubled grid, neutral below the bound elsewhere).
+    uint32_t const max_blocks = (p_max / bn) * (shape_n / bm);
+    uint32_t ctas = max_blocks > 2u * static_cast<uint32_t>(num_device_sms) ? 2u : 1u;
+    if (char const* e = std::getenv("FSO_SWAPAB_CTAS_PER_SM"))
+    {
+        int const v = atoi(e);
+        if (v == 1 || v == 2)
+            ctas = static_cast<uint32_t>(v);
+    }
+    constexpr uint32_t kReservedSmemPerCta = 1024u;
+    // The kernel's TMA tiles use the 128-byte swizzle, whose pattern repeats every 1024 bytes, so every
+    // tile must sit at a 1024-byte-aligned shared-memory address. `extern __shared__ __align__(1024)` only
+    // fixes the offsets inside a CTA's allocation; the allocation itself starts where the previous resident
+    // CTA's ends. With one CTA per SM that base is 0. With two, the second CTA's base is the first CTA's
+    // dynamic size plus the driver's 1 KB reservation, so the dynamic size must itself be a multiple of
+    // 1024 bytes or the second CTA's tiles are written with one swizzle phase and read with another
+    // (measured: 4-9 of 20 layer outputs differed at M = 1024 before this rounding, none with one CTA).
+    auto fits = [&](uint32_t stages) -> uint32_t
+    {
+        uint32_t const bytes = static_cast<uint32_t>(deep_gemm::jit::get_smem_size(static_cast<int>(stages),
+            static_cast<int>(shape_k), static_cast<int>(bm), static_cast<int>(bn), static_cast<int>(block_k), true));
+        return (bytes + 1023u) / 1024u * 1024u;
+    };
+    smem = fits(ns);
+    while (ns > 1u && ctas * (smem + kReservedSmemPerCta) > kSm90MaxSmem)
     {
         --ns;
-        smem = static_cast<uint32_t>(deep_gemm::jit::get_smem_size(
-            static_cast<int>(ns), static_cast<int>(shape_k), static_cast<int>(bm), static_cast<int>(bn),
-            static_cast<int>(block_k), true));
+        smem = fits(ns);
     }
-    auto runtime = deep_gemm::jit::getGlobalCompiler().build(
-        shape_n, shape_k, bm, bn, block_k, num_groups, ns, ntm, deep_gemm::GemmType::GroupedContiguous, true);
+    if (ctas == 2u)
+    {
+        // With two resident CTAs the kernel's NotDivisibleK tail (a K extent that is not a multiple of
+        // num_stages x 128, handled by plain barrier arrivals on the unused stages) is not deterministic:
+        // 40-run bitwise tests at M = 1024 read 8-12 distinct layer outputs with 3 or 5 stages (tail path
+        // taken) and 40 identical ones with 4 stages (K = 512 and K = 2048 both divide), while one CTA per
+        // SM is bit-stable with any stage count (2026-09-25, det_test / det_localize: exactly one activation
+        // x weight tile of the FC1 GEMM differs per bad launch). The two-CTA mode therefore only uses stage
+        // counts that divide K, and falls back to the single-CTA build when none of 2..ns fits.
+        uint32_t const k_stages = shape_k / block_k;
+        while (ns > 1u && k_stages % ns != 0u)
+            --ns;
+        if (ns < 2u)
+            ctas = 1u;
+        else
+            smem = fits(ns);
+    }
+    if (ctas == 1u)
+    {
+        ns = ns < 6u ? 6u : ns;
+        if (char const* e = std::getenv("FSO_SWAP_STAGES"))
+        {
+            int const s = atoi(e);
+            if (s >= 1 && s <= 12)
+                ns = static_cast<uint32_t>(s);
+        }
+        smem = fits(ns);
+        while (ns > 1u && smem + kReservedSmemPerCta > kSm90MaxSmem)
+        {
+            --ns;
+            smem = fits(ns);
+        }
+    }
+    auto runtime = deep_gemm::jit::getGlobalCompiler().build(shape_n, shape_k, bm, bn, block_k, num_groups, ns, ntm,
+        deep_gemm::GemmType::GroupedContiguous, true, ctas);
     auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
+    if (ctas == 2u)
+    {
+        // The two-CTA kernel rebalances registers 40 / 96 around a compiled count of exactly 80 (see
+        // fp8_gemm_impl.cuh); a cubin ptxas compiled below 80 would deadlock the math warp-groups' increase.
+        int num_regs = 0;
+        if (cuKernelGetAttribute(&num_regs, CU_FUNC_ATTRIBUTE_NUM_REGS, reinterpret_cast<CUkernel>(kernel), 0)
+                != CUDA_SUCCESS
+            || num_regs != 80)
+        {
+            ctas = 1u;
+            ns = ns < 6u ? 6u : ns;
+            smem = fits(ns);
+            while (ns > 1u && smem + kReservedSmemPerCta > kSm90MaxSmem)
+            {
+                --ns;
+                smem = fits(ns);
+            }
+            runtime = deep_gemm::jit::getGlobalCompiler().build(shape_n, shape_k, bm, bn, block_k, num_groups, ns,
+                ntm, deep_gemm::GemmType::GroupedContiguous, true, 1u);
+            kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
+        }
+    }
     deep_gemm::runGemmSwapAB(kernel, mat_a_wgt, static_cast<int>(shape_k), mat_b_act, static_cast<int>(shape_k), mat_d,
         static_cast<int>(shape_n), sfb_wgt, sfa_act, shape_n, p_max, shape_k, bm, bn, block_k, num_groups, ntm,
-        deep_gemm::GemmType::GroupedContiguous, sorted_expert_ids, stream, num_device_sms,
+        deep_gemm::GemmType::GroupedContiguous, sorted_expert_ids, stream, static_cast<int>(num_device_sms * ctas),
         static_cast<uint32_t>(smem));
 }
 
