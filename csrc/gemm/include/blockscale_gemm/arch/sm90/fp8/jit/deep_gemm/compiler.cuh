@@ -350,7 +350,7 @@ public:
     // Build function
     Runtime* build(uint32_t const shape_n, uint32_t const shape_k, uint32_t const block_m, uint32_t const block_n,
         uint32_t const block_k, uint32_t const num_groups, uint32_t const num_stages, uint32_t const num_tma_multicast,
-        deep_gemm::GemmType const gemm_type, bool swapAB = false)
+        deep_gemm::GemmType const gemm_type, bool swapAB = false, uint32_t const ctas_per_sm = 1)
     {
         int sm_version = tensorrt_llm::common::getSMVersion();
         if (sm_version != 90)
@@ -366,7 +366,7 @@ public:
             + std::to_string(shape_k) + "_" + std::to_string(block_m) + "_" + std::to_string(block_n) + "_"
             + std::to_string(block_k) + "_" + std::to_string(num_groups) + "_" + std::to_string(num_stages)
             + std::to_string(num_groups) + "_" + std::to_string(num_stages) + "_" + std::to_string(num_tma_multicast)
-            + "_" + gemm_type_to_string(gemm_type);
+            + "_" + gemm_type_to_string(gemm_type) + (ctas_per_sm > 1 ? "_c" + std::to_string(ctas_per_sm) : "");
         std::filesystem::path path = getCacheDir() / name;
 
         // Check runtime cache or file system hit
@@ -386,6 +386,27 @@ public:
             = {"-std=c++17", "--gpu-architecture=sm_90a", "--ptxas-options=-allow-expensive-optimizations=true",
                 "--ptxas-options=--register-usage-level=10", "--diag-suppress=161,174,177,940",
                 "-D__FORCE_INCLUDE_CUDA_FP16_HPP_FROM_FP16_H__=1", "-D__FORCE_INCLUDE_CUDA_BF16_HPP_FROM_BF16_H__=1"};
+        if (ctas_per_sm > 1)
+            flags.push_back("-DFSO_SWAPAB_CTAS_PER_SM=" + std::to_string(ctas_per_sm));
+        // Developer passthrough: FSO_JIT_EXTRA_FLAGS="-DFOO=1 -DBAR=0" appends to every JIT compile. The
+        // cubin cache key does not see these flags, so pair them with a fresh TRTLLM_DG_CACHE_DIR.
+        if (char const* extra = std::getenv("FSO_JIT_EXTRA_FLAGS"))
+        {
+            std::string tok;
+            for (char const* c = extra;; ++c)
+            {
+                if (*c == ' ' || *c == '\0')
+                {
+                    if (!tok.empty())
+                        flags.push_back(tok);
+                    tok.clear();
+                    if (*c == '\0')
+                        break;
+                }
+                else
+                    tok.push_back(*c);
+            }
+        }
 
         if (kJitUseNvcc)
         {

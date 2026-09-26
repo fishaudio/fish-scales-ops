@@ -240,21 +240,51 @@ def linear_fp8_grouped_contiguous(a_fp8, w_fp8, sa, sw, sorted_expert_ids,
         a_fp8, w_fp8, sa, sw, sorted_expert_ids, block_m, expected_m)
 
 
-# M-dispatch threshold for the composed sm_90 MoE layer. Below it the layer is
-# memory-bound (decode / small batch) and the swap-AB block_n=16 path wins; at
-# or above it the layer turns compute-bound (prefill) and the non-swap
-# block_m=64 contiguous path wins — swap-AB's tiny activation tile regresses
-# hard there (measured H200: crossover ~M=224; M=4096 swap is 1.9x slower).
-MOE_SWAP_M_MAX = 256
+# Swap-AB / non-swap dispatch for the composed sm_90 MoE layer. The swap-AB
+# GEMMs tile the activation by block_n rows and stream an expert's weights
+# once per activation tile, so the right tile is set by the routed rows per
+# active expert (M * topk / E), not by M alone: a tile just wide enough to
+# hold an expert's rows keeps the weight traffic at one pass while padding
+# stays small. Cascade (rows per expert -> block_n): <= 12 -> 16, <= 24 -> 32,
+# <= 64 -> 64; above that the non-swap block_m=64 contiguous path takes over.
+# Measured 2026-09-25 (H200 locked at 1980 MHz, two-CTA swap-AB kernel,
+# Family C = E=256/top-8, us per layer, block_n 16 / 32 / 64 / non-swap):
+#   M=256  (8 rows)  230 / 241 / 264 / 285     M=384 (12 rows)  242 / 248 / 270 / 291
+#   M=512  (16 rows) 276 / 255 / 276 / 298     M=768 (24 rows)  334 / 270 / 288 / 311
+#   M=1024 (32 rows) 370 / 317 / 301 / 324     M=1536 (48 rows) 426 / 400 / 326 / 351
+#   M=2048 (64 rows) 529 / 458 / 399 / 430
+# FSO_SWAP_BN=16|32|64|0 forces one tile (0 = non-swap) for A/B runs.
+MOE_SWAP_BLOCK_N_CASCADE = ((12, 16), (24, 32), (64, 64))
+
+
+def moe_swap_ab_block_n(M, num_experts, topk):
+    """Activation tile of the swap-AB path for this routing, or ``None`` when
+    the layer takes the non-swap block_m=64 contiguous path."""
+    import os
+    forced = os.environ.get("FSO_SWAP_BN")
+    if forced is not None:
+        v = int(forced)
+        return None if v == 0 else v
+    rows = int(M) * int(topk) / float(num_experts)
+    for max_rows, block_n in MOE_SWAP_BLOCK_N_CASCADE:
+        if rows <= max_rows:
+            return block_n
+    return None
+
+
+def moe_swap_ab_max_m(num_experts, topk):
+    """Largest M the composed sm_90 layer still routes to the swap-AB GEMMs
+    (inclusive): M * topk <= 64 * E, the last step of the cascade."""
+    return (MOE_SWAP_BLOCK_N_CASCADE[-1][0] * int(num_experts)) // int(topk)
 
 
 def moe_layer_fp8_sm90(hidden, w13_fp8, sw13, w2_fp8, sw2, topk_ids, topk_w):
     """Complete sm_90 (H200) grouped-MoE layer, best GEMM path auto-selected by
     M behind a single stable interface. Composes the 6-kernel expert-sorted
     layer (build-sorted + gather-quant + gate_up + silu-quant + down + combine)
-    and routes decode / small batch (M < MOE_SWAP_M_MAX) to the swap-AB
-    block_n=16 GEMMs and prefill (M >= MOE_SWAP_M_MAX) to the non-swap
-    block_m=64 contiguous GEMMs — the measured best at every M.
+    and routes up to 64 routed rows per active expert (moe_swap_ab_block_n
+    picks block_n = 16 / 32 / 64 from that count) to the swap-AB GEMMs and
+    larger M to the non-swap block_m=64 contiguous GEMMs.
 
     The choice is a host-side branch on M (tensor shapes are static per shape),
     so each M captures into its own CUDA graph safely.
@@ -263,7 +293,11 @@ def moe_layer_fp8_sm90(hidden, w13_fp8, sw13, w2_fp8, sw2, topk_ids, topk_w):
         hidden:  bf16 [M, HIDDEN].
         w13_fp8: float8_e4m3fn [E, 2*INTER, HIDDEN]; sw13 fp32 [E, 2*INTER/128, HIDDEN/128].
         w2_fp8:  float8_e4m3fn [E, HIDDEN, INTER];   sw2  fp32 [E, HIDDEN/128, INTER/128].
-        topk_ids: int32 [M, topk]; topk_w: fp32 [M, topk].
+        topk_ids: int32 [M, topk]; topk_w: fp32 [M, topk]. Entries outside
+            [0, E) are skipped (sglang masks the rows past num_token_non_padded
+            of a graph bucket to -1 or to num_experts): they take no expert
+            compute and contribute nothing, and a token whose entries are all
+            masked gets a zero output row.
     Returns:
         bf16 [M, HIDDEN].
     """
@@ -275,8 +309,9 @@ def moe_layer_fp8_sm90(hidden, w13_fp8, sw13, w2_fp8, sw2, topk_ids, topk_w):
     E = int(w13_fp8.shape[0])
     topk = int(topk_ids.shape[1])
     expected_m = max(1, (M * topk + E - 1) // E)
-    use_swap = M < MOE_SWAP_M_MAX
-    block = 16 if use_swap else 64
+    block_n = moe_swap_ab_block_n(M, E, topk)
+    use_swap = block_n is not None
+    block = block_n if use_swap else 64
 
     se, fts, _ = ops.moe_build_sorted(topk_ids, E, block)
     p_max = int(se.shape[0])
@@ -295,10 +330,11 @@ def moe_layer_fp8_sm90(hidden, w13_fp8, sw13, w2_fp8, sw2, topk_ids, topk_w):
 
 def linear_fp8_grouped_contiguous_swapab(a_fp8, w_fp8, sa, sw, sorted_expert_ids,
                                          block_n, expected_m):
-    """sm_90 grouped contiguous GEMM, swap-AB (block_n=16 activation tiling for
-    M>=8). Same layout as linear_fp8_grouped_contiguous but the activation is
-    the swap-AB B matrix and the weight the A matrix; cuts per-expert padding
-    4x at M>=8. sorted_expert_ids must be built with padding = block_n.
+    """sm_90 grouped contiguous GEMM, swap-AB (block_n = 16 / 32 / 64 activation
+    tiling). Same layout as linear_fp8_grouped_contiguous but the activation is
+    the swap-AB B matrix and the weight the A matrix; an expert's weights are
+    streamed once per activation tile. sorted_expert_ids must be built with
+    padding = block_n.
     """
     from .._arch import sm_major
     if sm_major() != 9:

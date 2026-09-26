@@ -40,10 +40,10 @@ baseline.
 |---|---|---|---|---|---:|---:|
 | A Qwen3-4B | `gate_up` | 19456×2560 | M=1 | block-FP8 1×128 | 17.85 | 6 |
 | A Qwen3-4B | `gate_up` | 19456×2560 | M=4096 | block-FP8 1×128 | 360.42 | 1132 |
-| B Qwen3-30B-A3B | MoE layer (routed, E=128, top-8) | 1536×2048 + 2048×768 per expert | M=1 | block-FP8 1×128 | 19.8 | 3.8 |
-| B Qwen3-30B-A3B | MoE layer (routed, E=128, top-8) | 1536×2048 + 2048×768 per expert | M=2048 | block-FP8 1×128 | 421.4 | 366.9 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1 | block-FP8 1×128 | 33.1 | 1.7 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | block-FP8 1×128 | 456.1 | 254.3 |
+| B Qwen3-30B-A3B | MoE layer (routed, E=128, top-8) | 1536×2048 + 2048×768 per expert | M=1 | block-FP8 1×128 | 20.0 | 3.8 |
+| B Qwen3-30B-A3B | MoE layer (routed, E=128, top-8) | 1536×2048 + 2048×768 per expert | M=2048 | block-FP8 1×128 | 422.2 | 366.2 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1 | block-FP8 1×128 | 33.0 | 1.7 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | block-FP8 1×128 | 425.9 | 272.3 |
 
 ### sm_120 — NVIDIA RTX 5090 (170 SMs, 2400 MHz locked)
 

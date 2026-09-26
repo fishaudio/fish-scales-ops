@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """The composed sm_90 MoE layer entry moe_layer_fp8_sm90 with its internal
-M-dispatch (swap-AB block_n=16 for M < MOE_SWAP_M_MAX, non-swap contiguous
-block_m=64 at/above). Validates correctness on both sides of the threshold and
+dispatch (swap-AB with block_n = 16 / 32 / 64 chosen from the routed rows per
+active expert, non-swap contiguous block_m=64 above 64 rows per expert).
+Validates correctness at every cascade step and across the last threshold, and
 CUDA-graph capture safety for a decode M and a prefill M."""
 import sys, math
 import torch
@@ -43,18 +44,20 @@ def main():
     w2 = torch.randn(E, HIDDEN, INTER, device="cuda", dtype=torch.bfloat16) / math.sqrt(INTER)
     w13f, sw13 = fso.gemm.quantize_moe_weights_1x128_fp8_sm90(w13)
     w2f, sw2 = fso.gemm.quantize_moe_weights_1x128_fp8_sm90(w2)
-    thr = fso.gemm.MOE_SWAP_M_MAX
-    print(f"MOE_SWAP_M_MAX = {thr}")
+    thr = fso.gemm.moe_swap_ab_max_m(E, TOPK)  # inclusive upper M of the swap-AB path
+    print(f"moe_swap_ab_max_m(E={E}, topk={TOPK}) = {thr}")
+    # E=128/top-8: rows per expert = M/16 -> block_n 16 up to M=192, 32 up to 384, 64 up to 1024
 
     print("=== dispatch cos across the threshold ===")
-    for M in (1, 8, 64, thr - 1, thr, 512):
+    for M in (1, 8, 64, 192, 193, 384, 385, thr, thr + 1):
         hidden = torch.randn(M, HIDDEN, device="cuda", dtype=torch.bfloat16) * 0.1
         topk_ids = torch.stack([torch.randperm(E, device="cuda")[:TOPK] for _ in range(M)]).to(torch.int32)
         topk_w = torch.rand(M, TOPK, device="cuda", dtype=torch.float32)
         y = fso.gemm.moe_layer_fp8_sm90(hidden, w13f, sw13, w2f, sw2, topk_ids, topk_w)
-        path = "swap-AB" if M < thr else "contig"
+        bn = fso.gemm.moe_swap_ab_block_n(M, E, TOPK)
+        path = f"swap-AB/{bn}" if bn is not None else "contig"
         c = cos(y, moe_ref(hidden, w13, w2, topk_ids, topk_w))
-        print(f"M={M:4d} -> {path:8s} cos={c:.4f}  {'OK' if c > 0.995 else 'FAIL'}")
+        print(f"M={M:4d} -> {path:10s} cos={c:.4f}  {'OK' if c > 0.995 else 'FAIL'}")
         assert c > 0.995, f"cos {c} at M={M}"
 
     print("\n=== CUDA-graph capture + reroute (decode M=8, prefill M=256) ===")

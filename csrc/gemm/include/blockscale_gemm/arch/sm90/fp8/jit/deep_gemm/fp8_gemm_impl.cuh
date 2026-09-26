@@ -18,6 +18,16 @@
 #pragma once
 #include "mma_utils.cuh"
 #include "scheduler.cuh"
+
+// Resident CTAs per SM for the swap-AB kernel. The host passes 2 for grouped-contiguous (MoE) builds when two
+// CTAs' shared memory fits and sizes the grid to match (dispatch.cuh); dense builds keep 1. With BLOCK_N = 16
+// the math warp-groups hold only eight accumulators, so they run on 96 registers instead of 232 and two CTAs
+// share the register file: one CTA's TMA stream then covers the other's per-block epilogue and WGMMA-wait
+// chain, which a single persistent CTA exposes on every block of a short-K projection. The JIT compiler adds
+// the define and a "_c2" suffix to the cubin cache name.
+#ifndef FSO_SWAPAB_CTAS_PER_SM
+#define FSO_SWAPAB_CTAS_PER_SM 1
+#endif
 #include "tma_utils.cuh"
 #include "utils.cuh"
 
@@ -485,7 +495,8 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
 template <uint32_t SHAPE_M, uint32_t SHAPE_K, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K, uint32_t kNumGroups,
     uint32_t kNumStages, uint32_t kNumTMAThreads, uint32_t kNumMathThreadsPerGroup, uint32_t kNumTMAMulticast,
     typename SchedulerType, typename InputType>
-__global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M), 1)
+__global__ void __launch_bounds__(
+    get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M), FSO_SWAPAB_CTAS_PER_SM)
     fp8_gemm_kernel_swapAB(__nv_bfloat16* gmem_d, float* scales_a, InputType problem_input,
         const __grid_constant__ CUtensorMap tensor_map_a,        // weight (previously act)
         const __grid_constant__ CUtensorMap tensor_map_b,        // act (previously weight)
@@ -534,6 +545,12 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
     // Align to 1024 bytes for swizzle-128B
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
     DG_STATIC_ASSERT(SMEM_D_SIZE % 1024 == 0, "Shared memory of A/B must be aligned to 1024 bytes");
+    // The alignment attribute is a promise the launch has to keep: with more than one resident CTA per SM
+    // the allocation base is only 1024-aligned if the host rounded the dynamic size (dispatch.cuh). Trap
+    // rather than compute on a mis-phased swizzle.
+    if (threadIdx.x == 0)
+        DG_DEVICE_ASSERT((static_cast<uint32_t>(__cvta_generic_to_shared(smem_buffer)) & 1023u) == 0u
+            and "swap-AB smem base must be 1024-byte aligned");
 
     // Data on shared memory
     auto smem_d = reinterpret_cast<__nv_bfloat16*>(smem_buffer);
@@ -611,9 +628,16 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
         }
     };
 
-    // Register reconfigurations
+    // Register reconfigurations. setmaxnreg only redistributes the registers the CTA was launched with,
+    // so the TMA warp-group's release must cover the math warp-groups' increase:
+    //   (compiled - kNumTMARegisters) * 128 >= (kNumMathRegisters - compiled) * 256.
+    // One CTA per SM compiles to 168 registers (40 / 232 balance exactly, the DeepGEMM split). Two CTAs
+    // per SM cap the kernel at 80 registers (65536 / 768, rounded down to a multiple of 8); 40 / 96 then
+    // balances with 1024 registers to spare, and the swap-AB math warps (BLOCK_N = 16 -> 8 accumulators)
+    // compile without spills at 80. A larger math budget deadlocks the increase (measured with 104).
+    // The host refuses the two-CTA build if ptxas did not reach 80 registers (dispatch.cuh).
     constexpr int kNumTMARegisters = 40;
-    constexpr int kNumMathRegisters = 232;
+    constexpr int kNumMathRegisters = (FSO_SWAPAB_CTAS_PER_SM >= 2) ? 96 : 232;
 
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
@@ -702,6 +726,14 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
         // Each thread loads consecutive 2 scales
         const uint32_t scale_offset = (lane_idx % 4) * 2;
 
+        // Grouped-contiguous (MoE) builds read the per-block weight scales straight from global memory per
+        // stage (SHAPE_K_SCALES floats, L1-resident after the first touch) instead of staging them in
+        // shared memory behind a CTA-wide NamedBarrier at every block start. With BLOCK_N = 16 a block of
+        // the K = 512 down projection is only four pipeline stages of work, so that barrier was a visible
+        // part of the block loop (ncu: barrier 5.2 vs long_scoreboard 3.5 stalled warps per issue on that
+        // kernel; -5 % on it, bit-identical output). The dense and offset paths keep the smem staging.
+        constexpr bool kFsoRegScales = (SchedulerType::gemm_type == GemmType::GroupedContiguous);
+
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx))
         {
@@ -710,18 +742,21 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
             DG_STATIC_ASSERT(SHAPE_M % 8 == 0, "Invalid shape M");
             uint32_t num_scales_a = SHAPE_K_SCALES;
 
-            // Load A scales with math warp-groups (weight scales)
-            if (threadIdx.x >= 32)
+            auto const num_previous_lines
+                = scheduler.get_global_scales_a_idx(ceil_div(SHAPE_M, BLOCK_K), 0, 0, n_block_idx);
+            float const* const local_scales_a
+                = scales_a + (num_previous_lines + ((m_block_idx * BLOCK_M) / BLOCK_K)) * SHAPE_K_SCALES;
+            if constexpr (!kFsoRegScales)
             {
-                auto num_previous_lines
-                    = scheduler.get_global_scales_a_idx(ceil_div(SHAPE_M, BLOCK_K), 0, 0, n_block_idx);
-                auto local_scales_a
-                    = scales_a + (num_previous_lines + ((m_block_idx * BLOCK_M) / BLOCK_K)) * SHAPE_K_SCALES;
+                // Load A scales with math warp-groups (weight scales)
+                if (threadIdx.x >= 32)
+                {
 #pragma unroll
-                for (uint32_t i = threadIdx.x - 32; i < num_scales_a; i += kNumMathThreads - 32)
-                    st_shared(smem_scales_a + i, __ldg(local_scales_a + i));
+                    for (uint32_t i = threadIdx.x - 32; i < num_scales_a; i += kNumMathThreads - 32)
+                        st_shared(smem_scales_a + i, __ldg(local_scales_a + i));
+                }
+                cutlass::arch::NamedBarrier(kNumMathThreads).sync();
             }
-            cutlass::arch::NamedBarrier(kNumMathThreads).sync();
 
             // Accumulation for WGMMA or CUDA promotion
             float accum[WGMMA::kNumAccum], final_accum[WGMMA::kNumAccum] = {0};
@@ -752,7 +787,11 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
                     for (int s = 0; s < kNumInnerStages; ++s)
                     {
                         // Read weight scales (A scales)
-                        float scale_a_0 = ld_shared(smem_scales_a + k_iter * kNumStages + s);
+                        float scale_a_0;
+                        if constexpr (kFsoRegScales)
+                            scale_a_0 = __ldg(local_scales_a + k_iter * kNumStages + s);
+                        else
+                            scale_a_0 = ld_shared(smem_scales_a + k_iter * kNumStages + s);
 
                         // Wait TMA arrivals
                         full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
@@ -812,6 +851,19 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
                         empty_barrier_arrive(s);
                     }
                 });
+
+            if constexpr (kFsoRegScales)
+            {
+                // smem_d is single-buffered: the previous block's TMA store must have finished reading it
+                // before any math warp overwrites it below. The original kernel got this for free from the
+                // block-start NamedBarrier (thread 0 waited on the store before it), which the register-read
+                // scales removed; placing the wait here instead gives the store the whole mainloop to drain.
+                // Without this, two resident CTAs per SM produced one corrupted 16 x 128 D tile every few
+                // launches at M >= 512 (found 2026-09-25, det_localize).
+                if (threadIdx.x == 0)
+                    cute::tma_store_wait<0>();
+                cutlass::arch::NamedBarrier(kNumMathThreads).sync();
+            }
 
             // Write back to shared memory using STSM
             DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");
@@ -898,11 +950,19 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
                     cute::SM90_TMA_STORE_2D::copy(
                         &tensor_map_d, smem_d, m_block_idx * BLOCK_M, scheduler.get_global_n_idx(n_block_idx));
                     cute::tma_store_arrive();
-                    cute::tma_store_wait<0>();
+                    if constexpr (!kFsoRegScales)
+                        cute::tma_store_wait<0>();
+                    // reg-scales builds wait right before the next block's STSM (see above) and at exit
                 }
             }
 
             __syncwarp();
+        }
+        if constexpr (kFsoRegScales)
+        {
+            // Drain the last block's TMA store before the CTA releases its shared memory.
+            if (threadIdx.x == 0)
+                cute::tma_store_wait<0>();
         }
     }
 #else

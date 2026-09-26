@@ -949,12 +949,12 @@ def run_worker(cell):
             # fso sm_90 (H200) block-scale FP8 grouped layer via the single
             # moe_layer_fp8_sm90 dispatch entry: expert-sorted (contiguous)
             # 6-kernel layer, auto-routed by M (swap-AB block_n=16 for
-            # M < MOE_SWAP_M_MAX, non-swap block_m=64 above). Same timed
+            # block_n 16/32/64 by routed rows per expert, non-swap block_m=64 above 64). Same timed
             # boundary (routing derived from topk_ids on device in the graph).
             import fish_scales_ops as fso
             w13_fp8, sw13 = fso.gemm.quantize_moe_weights_1x128_fp8_sm90(w13)
             w2_fp8, sw2 = fso.gemm.quantize_moe_weights_1x128_fp8_sm90(w2)
-            result["swap"] = int(M < fso.gemm.MOE_SWAP_M_MAX)
+            result["swap"] = int(fso.gemm.moe_swap_ab_block_n(M, E, TOPK) is not None)
 
             def layer_fn():
                 return fso.gemm.moe_layer_fp8_sm90(
