@@ -20,6 +20,8 @@ On sm_90 (Hopper) both ops raise ``NotImplementedError``. Use
 """
 from __future__ import annotations
 
+import os
+
 import torch
 
 from .._arch import sm_major
@@ -559,9 +561,10 @@ def quantize_1x32_grouped_gather_fp8(
     Indexed over the flat routed-pair space (host-static ``M * topk``): pair
     ``i`` reads source row ``i // topk`` of ``x`` (bf16 ``[M, K]``) and
     writes destination slot ``slot_of_flat[i]`` (= ``g * m_cap + m_in``,
-    from :func:`moe_build_routing`). One launch, no dead warps — the
-    original padded ``G * m_cap`` iteration burned ~27 µs of early-outs at
-    M=512.
+    from :func:`moe_build_routing`). A pair whose entry is ``-1`` was skipped
+    (padded graph row, or an expert another rank owns) and writes nothing. One
+    launch, no dead warps — the original padded ``G * m_cap`` iteration burned
+    ~27 µs of early-outs at M=512.
 
     Returns:
         (a_fp8 ``[G, m_cap, K]``, sa int32 opaque per-group scales — sm_120
@@ -584,7 +587,8 @@ def silu_chunk_mul_quantize_1x32_grouped_fp8(
 
     ``gu`` is the grouped gate_up output (bf16 ``[G, m_cap, 2*INTER]``). Each
     routed pair processes its own row (``slot_of_flat[i]``) in place; rows no
-    pair maps to stay undefined.
+    pair maps to stay undefined, and a pair whose entry is ``-1`` was skipped
+    and has no row to process.
 
     Args:
         gu: the grouped gate_up output.
@@ -632,7 +636,15 @@ def moe_build_routing(
     """topk routing -> masked-layout index tensors, one kernel launch.
 
     Args:
-        topk_ids: int32 ``[M, topk]``, no-replacement expert ids.
+        topk_ids: int32 ``[M, topk]``, no-replacement expert ids. An id outside
+            ``[0, num_groups)`` is skipped: it is counted into no group, it
+            occupies no slot, and its ``slot_of_flat`` entry is ``-1``, which
+            every consumer of that array (the gather-quantize, the SwiGLU
+            requantize and the combine) reads as "no routed row". That is what a
+            serving engine needs for the padding rows of a CUDA-graph bucket,
+            which carry the id ``num_experts`` or ``-1``, and for the entries an
+            expert-parallel dispatcher rewrites to ``-1`` because another rank
+            owns the expert.
         num_groups: G (<= 1024).
         m_cap: per-group row capacity (multiple of 4, >= M).
         with_slots: also return the packed active-expert list. It costs a
@@ -655,7 +667,8 @@ def moe_build_routing(
     Returns:
         (masked_m ``[G]`` int32, row_map ``[G * m_cap]`` int32 — slot ->
         source token, slots at or beyond masked_m[g] uninitialised by
-        design, slot_of_flat ``[M * topk]`` int32). Slot order within a
+        design, slot_of_flat ``[M * topk]`` int32, ``-1`` where the pair was
+        skipped). Slot order within a
         group is atomic-arrival order; every consumer goes through these
         maps consistently. With ``with_slots=True`` a fourth tensor follows:
         slot_to_expert ``[G]`` int32, the ids of the experts holding at least
@@ -683,6 +696,90 @@ def moe_build_routing(
         # tensor, which is what the GEMM ops check for.
         out = out + ([problem_shapes[i] for i in range(problem_shapes.shape[0])],)
     return out
+
+
+def moe_topk_from_logits(
+    logits: torch.Tensor,
+    topk: int,
+    *,
+    renormalize: bool = True,
+    with_shared_gate: bool = False,
+    num_token_non_padded: torch.Tensor | None = None,
+    expert_map: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Router logits -> ``(topk_ids, topk_w, shared_gate)``, one kernel launch.
+
+    Takes everything a serving MoE block does between the router GEMM and the
+    expert layer: the softmax over experts, the top-k selection, the
+    renormalisation of the selected probabilities, the padded-row sentinel of a
+    CUDA-graph bucket, the expert-parallel global-to-local id remap, and
+    optionally the shared expert's sigmoid gate. sglang spends four or five
+    launches on that sequence; at decode each one costs about as much as a layer
+    kernel.
+
+    Args:
+        logits: ``[M, num_experts]`` bf16, fp16 or fp32, with a contiguous
+            expert dimension (a row-major slice is fine). With
+            ``with_shared_gate`` the width is ``num_experts + 1`` and column
+            ``num_experts`` is the shared expert's gate logit.
+        topk: experts per token, at most 8.
+        renormalize: divide the selected probabilities by their own sum, which
+            is sglang's ``renormalize=True``. With ``False`` the weights are the
+            plain softmax over all experts.
+        num_token_non_padded: int32 ``[1]`` on device. The tokens at or past it
+            are the padding rows of a graph bucket: their ids become the
+            sentinel ``num_experts`` (mapped through ``expert_map`` when given)
+            and their weights zero, which the grouped layer skips at no expert
+            cost.
+        expert_map: int32 ``[num_experts + 1]`` on device, the table an
+            expert-parallel rank builds once — its own experts mapped into
+            ``[0, num_local_experts)``, every remote expert and the sentinel to
+            a value outside that range. Applying it here saves the gather launch
+            the dispatcher would otherwise run.
+
+    Returns:
+        (topk_ids int32 ``[M, topk]``, topk_w fp32 ``[M, topk]``, shared_gate
+        fp32 ``[M]`` — empty unless ``with_shared_gate``). Ids come out in
+        descending weight order, ties broken toward the lower expert id.
+    """
+    return torch.ops.fish_scales_ops.moe_topk_from_logits(
+        logits, int(topk), bool(renormalize), bool(with_shared_gate),
+        num_token_non_padded, expert_map,
+    )
+
+
+def moe_router_topk(
+    hidden: torch.Tensor,
+    router_weight: torch.Tensor,
+    topk: int,
+    *,
+    renormalize: bool = True,
+    with_shared_gate: bool = False,
+    num_token_non_padded: torch.Tensor | None = None,
+    expert_map: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The whole router in two launches: the logit GEMM, then
+    :func:`moe_topk_from_logits`.
+
+    The GEMM stays with cuBLAS on purpose. The gate matrix is
+    ``num_experts * hidden * 2`` bytes — 1 MB at 256 experts and hidden 2048 —
+    and a hand-written per-token form has one CTA read all of it, which is far
+    from the DRAM roofline the library GEMM reaches at every token count worth
+    having; the launch this would save is not worth the memory it wastes.
+
+    Args:
+        hidden: bf16 ``[M, HIDDEN]``.
+        router_weight: bf16 ``[num_experts, HIDDEN]``, or
+            ``[num_experts + 1, HIDDEN]`` with ``with_shared_gate``, where the
+            last row is the shared expert's gate. Concatenating that row once at
+            load time is what makes the gate free here.
+        The remaining arguments are :func:`moe_topk_from_logits`'s.
+    """
+    logits = torch.nn.functional.linear(hidden, router_weight)
+    return moe_topk_from_logits(
+        logits, topk, renormalize=renormalize, with_shared_gate=with_shared_gate,
+        num_token_non_padded=num_token_non_padded, expert_map=expert_map,
+    )
 
 
 def moe_build_sorted(
@@ -715,13 +812,31 @@ def moe_combine(
     dn: torch.Tensor,
     slot_of_flat: torch.Tensor,
     topk_w: torch.Tensor,
+    *,
+    bias: torch.Tensor | None = None,
+    bias_scale: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Weighted combine of routed expert outputs, one kernel launch.
 
-    ``out[t] = sum_j topk_w[t, j] * dn.view(-1, H)[slot_of_flat[t*topk+j]]``.
+    ``out[t] = sum_j topk_w[t, j] * dn.view(-1, H)[slot_of_flat[t*topk+j]]``,
+    with the entries whose slot is ``-1`` (skipped pairs — see
+    :func:`moe_build_routing`) left out of the sum, so a token whose every entry
+    is skipped gets an all-zero row.
+
+    Args:
+        bias: bf16 ``[M, H]`` added on top of the weighted sum — a model's
+            shared-expert output. Folding it in here replaces an elementwise
+            pass that reads and writes the whole block twice.
+        bias_scale: fp32 ``[M]`` per-token factor applied to ``bias``, which is
+            where a sigmoid shared-expert gate goes
+            (:func:`moe_topk_from_logits` produces it).
+        out: bf16 ``[M, H]`` destination. A data-parallel or reduce-scatter path
+            already owns the buffer the result must land in; writing straight
+            into it saves the copy.
     """
     # arch-agnostic glue (works on sm_90 and sm_120)
-    return torch.ops.fish_scales_ops.moe_combine(dn, slot_of_flat, topk_w)
+    return torch.ops.fish_scales_ops.moe_combine(dn, slot_of_flat, topk_w, bias, bias_scale, out)
 
 
 def moe_combine_sorted(
@@ -810,3 +925,552 @@ def quantize_moe_weights_1x32_fp8(
         # order equals the [K/128, N] slab the grouped kernel expects.
         sw[g].copy_(s.t().view(kp, N))
     return w_fp8, sw
+
+
+# Optional cap on the transient slabs of one composed sm_120 MoE layer call, in
+# MiB, from FSO_MOE_SLAB_BUDGET_MB. Unset means no cap: one call per layer,
+# whatever the token count. Setting it trades speed for peak memory, and
+# `moe_layer_mxfp8_sm120` documents that trade.
+_moe_slab_budget_bytes_cache: int = -1
+
+
+def _moe_slab_budget_bytes() -> int:
+    """The per-call transient-slab cap in bytes, read from the environment once;
+    zero when no cap is set."""
+    global _moe_slab_budget_bytes_cache
+    if _moe_slab_budget_bytes_cache < 0:
+        mb = 0
+        raw = os.environ.get("FSO_MOE_SLAB_BUDGET_MB", "").strip()
+        if raw:
+            try:
+                parsed = int(raw)
+            except ValueError:
+                parsed = 0
+            if parsed > 0:
+                mb = parsed
+        _moe_slab_budget_bytes_cache = mb * 1024 * 1024
+    return _moe_slab_budget_bytes_cache
+
+
+def moe_layer_slab_bytes_per_token_sm120(
+    num_experts: int, hidden: int, inter: int
+) -> int:
+    """Bytes of transient slab the composed sm_120 MoE layer holds per row of
+    per-expert capacity, i.e. per unit of ``m_cap``.
+
+    The masked-slab layout gives every expert its own ``m_cap``-row window in
+    each intermediate tensor, so the five tensors a layer call allocates all
+    scale with ``num_experts * m_cap`` and not with the number of routed rows.
+    This function returns their summed per-``m_cap`` cost, which is what a caller
+    sizing a graph bucket needs and what
+    :func:`moe_layer_chunk_tokens_sm120` divides an optional slab cap by:
+
+    * the FP8 activation slab ``[E, m_cap, HIDDEN]`` and its scale words,
+    * the bf16 gate/up intermediate ``[E, m_cap, 2 * INTER]``,
+    * the FP8 SwiGLU output ``[E, m_cap, INTER]`` and its scale words,
+    * the bf16 down-projection output ``[E, m_cap, HIDDEN]``.
+
+    Args:
+        num_experts: the expert count the layer sees (under expert parallelism
+            the rank-local count, not the model's).
+        hidden: model hidden size.
+        inter: per-expert intermediate size.
+    """
+    per_row = (
+        hidden + 4 * (hidden // 128)     # FP8 activation row + one int32 scale word per 128 columns
+        + 2 * (2 * inter)                # bf16 gate/up row
+        + inter + 4 * (inter // 128)     # FP8 SwiGLU row + its scale words
+        + 2 * hidden                     # bf16 down-projection row
+    )
+    return num_experts * per_row
+
+
+def moe_layer_chunk_tokens_sm120(m: int, num_experts: int, hidden: int, inter: int) -> int:
+    """Tokens per layer call that :func:`moe_layer_mxfp8_sm120` will use for a
+    bucket of ``m`` tokens: ``m`` itself unless ``FSO_MOE_SLAB_BUDGET_MB`` caps
+    the transient slabs, in which case the fewest chunks that fit the cap, made
+    as equal as a multiple of four allows.
+
+    Splitting the token dimension evenly over the resulting chunk count, rather
+    than filling each chunk to the cap, keeps the last chunk from being a stub:
+    8192 tokens under a cap of 1908 run as five calls of 1640 rather than four of
+    1908 and one of 560, and a 560-row call reaches a smaller share of the GEMM's
+    peak than a 1640-row one. A cap too small for even four tokens degrades to
+    four-token chunks instead of raising.
+
+    Chunking is a memory decision with a real cost, which is why it is off unless
+    asked for: each call walks every expert's weights once, so n chunks read the
+    expert weights n times. Measured on the RTX 5090 (Qwen3.5-35B-A3B routed
+    layer, E = 256), two chunks at 1024 tokens cost +80 % and five chunks at 4096
+    tokens +209 % against the single call, and the same layer's values are
+    bit-identical either way.
+    """
+    budget = _moe_slab_budget_bytes()
+    if budget <= 0:
+        return m
+    per_token_slot = moe_layer_slab_bytes_per_token_sm120(num_experts, hidden, inter)
+    cap = int(budget // max(1, per_token_slot)) // 4 * 4
+    if cap < 4:
+        cap = 4
+    if m <= cap:
+        return m
+    n_chunks = (m + cap - 1) // cap
+    return min(cap, ((m + n_chunks - 1) // n_chunks + 3) // 4 * 4)
+
+
+# The M1-era private name, kept because the bench and the tests referred to it.
+_moe_chunk_tokens_sm120 = moe_layer_chunk_tokens_sm120
+
+
+def _moe_layer_mxfp8_sm120_one(
+    hidden: torch.Tensor,
+    w13_fp8: torch.Tensor,
+    sw13: torch.Tensor,
+    w2_fp8: torch.Tensor,
+    sw2: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_w: torch.Tensor,
+    num_experts: int,
+    topk: int,
+    bias: torch.Tensor | None = None,
+    bias_scale: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    join=None,
+) -> torch.Tensor:
+    """One masked-slab layer call over all rows of `hidden`. Six kernels, no
+    host-visible dependence on the routing result.
+
+    `join` is an internal hook the block entry uses: it is called after the down
+    projection and before the combine, which is the latest point at which work
+    issued on another stream (the shared expert) has to be waited for, and
+    therefore the point that leaves that work the whole layer to overlap with.
+    """
+    ops = torch.ops.fish_scales_ops
+    m = int(hidden.shape[0])
+    # A group receives at most one row per token (top-k draws without
+    # replacement), so a capacity of M rows per expert can never overflow. The
+    # routing op enforces exactly this bound.
+    m_cap = (m + 3) // 4 * 4
+    rows = m * topk
+    # Both hints are host-static functions of (M, topk, num_experts): the tile
+    # cascade reads `expected_m`, and `max_active_groups` bounds the number of
+    # experts that can hold a row. A captured graph therefore bakes one value of
+    # each per bucket.
+    expected_m = max(1, (rows + num_experts - 1) // num_experts)
+    max_active_groups = min(rows, num_experts)
+    # sm_120 has neither the slot-bound decode route nor the pointer-array
+    # cascade of sm_100/103, so no kernel here reads the packed active-expert
+    # list or the per-group problem shapes and the routing kernel is not asked
+    # for either (mxfp8_grouped_slot_possible and
+    # mxfp8_grouped_problem_shapes_consumed both answer False on this arch).
+    masked_m, _row_map, slot_of_flat, _slots, _shapes = ops.moe_build_routing(
+        topk_ids, num_experts, m_cap)
+    hq, sh = ops.quantize_1x32_grouped_gather(hidden, slot_of_flat, topk, num_experts, m_cap)
+    gu = ops.linear_mxfp8_grouped_masked(
+        hq, w13_fp8, sh, sw13, masked_m, expected_m, max_active_groups)
+    dq, sd = ops.silu_chunk_mul_quantize_1x32_grouped(gu, slot_of_flat)
+    dn = ops.linear_mxfp8_grouped_masked(
+        dq, w2_fp8, sd, sw2, masked_m, expected_m, max_active_groups)
+    if join is not None:
+        join()
+    return ops.moe_combine(dn, slot_of_flat, topk_w, bias, bias_scale, out)
+
+
+def moe_layer_mxfp8_sm120(
+    hidden: torch.Tensor,
+    w13_fp8: torch.Tensor,
+    sw13: torch.Tensor,
+    w2_fp8: torch.Tensor,
+    sw2: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_w: torch.Tensor,
+    *,
+    chunk_tokens: int | None = None,
+    bias: torch.Tensor | None = None,
+    bias_scale: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    join=None,
+) -> torch.Tensor:
+    """Complete sm_120/121 (RTX 5090 / RTX PRO 6000) grouped-MoE layer behind a
+    single stable interface — the MXFP8 masked-slab twin of
+    :func:`~fish_scales_ops.gemm.moe_layer_fp8_sm90`.
+
+    One call runs the six kernels of the layer: the routing builder, the fused
+    token-gather + MXFP8 quantize, the grouped gate/up GEMM, the fused SwiGLU +
+    MXFP8 requantize, the grouped down GEMM, and the weighted combine. The
+    routing is derived on the device from ``topk_ids``; the host never reads a
+    routing result, nothing allocates on a graph replay, and every shape is a
+    function of the argument shapes alone, so a caller can capture the call per
+    graph bucket.
+
+    Expert-parallel-local ids. ``num_experts = w13_fp8.shape[0]`` is the expert
+    count this call sees, which under expert parallelism is the rank-local count
+    and not the model's. Every routed entry whose id falls outside
+    ``[0, num_experts)`` is skipped at no expert cost: that covers the padding
+    rows of a CUDA-graph or piecewise-graph bucket, which sglang labels with the
+    id ``num_experts`` (its moe_align overflow slot) or ``-1``, and the entries
+    an expert-parallel dispatcher rewrites to ``-1`` because another rank owns
+    the expert. A skipped entry contributes nothing to its token's output row,
+    and a token whose every entry is skipped gets an all-zero row, which is the
+    identity for the cross-rank sum the caller performs afterwards.
+
+    Capacity and chunking. The masked-slab layout gives each expert its own
+    ``m_cap``-row window, and with top-k drawn without replacement one expert
+    can receive as many rows as there are tokens, so the layer sizes
+    ``m_cap = align(tokens, 4)`` — the smallest capacity that cannot overflow
+    for any routing. Top-k without replacement is a precondition rather than a
+    convenience: a token that named one expert twice would give that expert two
+    rows, an expert could then hold more rows than there are tokens, and the
+    routing builder would place the overflow in the next expert's window (past
+    the slab, for the last expert). Every router produces distinct ids per token,
+    and ``num_experts`` duplicated ids are not the same thing as the skipped ids
+    above, which take no row at all. The transient slabs therefore cost
+    ``num_experts * m_cap`` rows in five tensors at once
+    (:func:`moe_layer_slab_bytes_per_token_sm120` gives the per-row total: about
+    1.1 MB per token at 128 local experts, hidden 2048 and inter 512). A
+    prefill bucket of 8192 tokens therefore asks for roughly 9 GB of them, which
+    does not fit next to the weights on a 32 GB card.
+
+    The default is nevertheless one call per layer, at any token count, because
+    the alternative is expensive rather than merely different: a call walks every
+    expert's weights once, so splitting a bucket into n chunks reads the expert
+    weights n times. Measured on the RTX 5090, two chunks at 1024 tokens cost
+    +80 % and five chunks at 4096 tokens +209 % on the Qwen3.5-35B-A3B routed
+    layer. A caller that has to bound the peak instead of the latency asks for
+    chunking explicitly, with ``chunk_tokens`` or by capping the slabs with
+    ``FSO_MOE_SLAB_BUDGET_MB`` (:func:`moe_layer_chunk_tokens_sm120` answers what
+    a given bucket would do); chunking is exact rather than an approximation,
+    since a token's output depends only on its own row and on the expert weights,
+    so the rows of a chunk are bit-identical to what one call produces. Both
+    settings are host-side decisions taken from shapes, so a captured bucket's
+    chunk count is fixed at capture. Above the point where the slabs stop fitting,
+    the real answer is a contiguous (expert-sorted) sm_120 entry that sizes its
+    activation by the routed rows instead of by capacity; that entry does not
+    exist yet, and this one raises the allocator's out-of-memory error rather
+    than quietly running several times slower.
+
+    Weights. ``w13_fp8`` / ``w2_fp8`` are the per-expert 1×32 MXFP8 weights and
+    ``sw13`` / ``sw2`` their opaque scale handles, as
+    :func:`quantize_moe_weights_1x32_fp8` produces them **on this
+    architecture** (the scale layout is arch-specific and not portable). The
+    row order of ``w13`` is the checkpoint's own ``[gate; up]`` — pass
+    ``w13_interleave=False``, which is the only accepted value on sm_120,
+    because this architecture has no fused-FC1 kernel to consume the
+    interleaved order. A serving artifact that ships block-scaled 128×128 FP8
+    experts has to be requantized from its bf16 master with that op on a
+    sm_120 device; there is no in-place converter between the two formats.
+
+    Args:
+        hidden: bf16 ``[M, HIDDEN]``.
+        w13_fp8: float8_e4m3fn ``[num_experts, 2 * INTER, HIDDEN]``; ``sw13``
+            its int32 scale handle.
+        w2_fp8: float8_e4m3fn ``[num_experts, HIDDEN, INTER]``; ``sw2`` its
+            int32 scale handle.
+        topk_ids: int32 or int64 ``[M, topk]``; ids outside
+            ``[0, num_experts)`` are skipped (see above).
+        topk_w: float32 ``[M, topk]`` combine weights.
+        chunk_tokens: tokens per layer call, overriding the budget rule.
+        bias: bf16 ``[M, HIDDEN]`` added to the combine — a shared expert's
+            output, folded in so the block does not pay another pass over the
+            result (see :func:`moe_combine`).
+        bias_scale: fp32 ``[M]`` per-token factor on ``bias``, e.g. a sigmoid
+            shared-expert gate.
+        out: bf16 ``[M, HIDDEN]`` destination, for a caller that already owns the
+            buffer the result has to land in.
+
+    Returns:
+        bf16 ``[M, HIDDEN]`` — ``out`` itself when it was given.
+    """
+    _require_grouped_arch()
+    if sm_major() != 12:
+        raise NotImplementedError(
+            f"moe_layer_mxfp8_sm120 is the sm_120/121 grouped MXFP8 MoE layer; this device is "
+            f"sm_{sm_major()}0. On sm_90 (Hopper) use moe_layer_fp8_sm90. On sm_100/sm_103 compose "
+            f"the grouped ops directly: that architecture serves the decode band from a slot-bound "
+            f"route and the rest from a pointer-array cascade, and the two read routing tensors "
+            f"(the packed active-expert list, the per-group problem shapes) that this entry does "
+            f"not ask the routing kernel for."
+        )
+    if hidden.dim() != 2 or hidden.dtype != torch.bfloat16:
+        raise ValueError("hidden must be bf16 [M, HIDDEN]")
+    if w13_fp8.dim() != 3 or w2_fp8.dim() != 3:
+        raise ValueError("w13_fp8 must be [E, 2*INTER, HIDDEN] and w2_fp8 [E, HIDDEN, INTER]")
+    if topk_ids.dim() != 2 or topk_w.dim() != 2:
+        raise ValueError("topk_ids and topk_w must be [M, topk]")
+    num_experts = int(w13_fp8.shape[0])
+    two_inter = int(w13_fp8.shape[1])
+    hidden_size = int(hidden.shape[1])
+    inter = int(w2_fp8.shape[2])
+    if w2_fp8.shape[0] != num_experts:
+        raise ValueError("w13_fp8 and w2_fp8 must hold the same expert count")
+    if two_inter != 2 * inter:
+        raise ValueError("w13_fp8 must have 2*INTER rows per expert, INTER from w2_fp8")
+    if w13_fp8.shape[2] != hidden_size or w2_fp8.shape[1] != hidden_size:
+        raise ValueError("w13_fp8 and w2_fp8 must both be contracted over HIDDEN")
+    m = int(hidden.shape[0])
+    topk = int(topk_ids.shape[1])
+    if int(topk_w.shape[0]) != m or int(topk_ids.shape[0]) != m:
+        raise ValueError("topk_ids and topk_w must have one row per token of hidden")
+    if int(topk_w.shape[1]) != topk:
+        raise ValueError("topk_ids and topk_w must have the same topk")
+    if topk_ids.dtype not in (torch.int32, torch.int64):
+        raise ValueError("topk_ids must be int32 or int64")
+
+    # Argument conditioning, all of it host-side: int64 ids (torch.topk's own
+    # dtype) are narrowed, weights are taken to fp32, and non-contiguous inputs
+    # are made contiguous. Each is a no-op when the caller already passes the
+    # expected form, which is what a serving stack does after the first call.
+    ids = topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
+    ids = ids.contiguous()
+    wts = topk_w if topk_w.dtype == torch.float32 else topk_w.to(torch.float32)
+    wts = wts.contiguous()
+    x = hidden if hidden.is_contiguous() else hidden.contiguous()
+    if bias is not None and (bias.dim() != 2 or bias.shape[0] != m or bias.shape[1] != hidden_size):
+        raise ValueError("bias must be [M, HIDDEN]")
+    if bias_scale is not None and bias_scale.numel() != m:
+        raise ValueError("bias_scale must have one entry per token")
+    if out is not None and (out.dim() != 2 or out.shape[0] != m or out.shape[1] != hidden_size
+                            or out.dtype != torch.bfloat16):
+        raise ValueError("out must be bf16 [M, HIDDEN]")
+    if m == 0:
+        return out if out is not None else torch.empty_like(x)  # an empty bucket: nothing to route
+
+    chunk = int(chunk_tokens) if chunk_tokens else moe_layer_chunk_tokens_sm120(
+        m, num_experts, hidden_size, inter)
+    if chunk < 1:
+        raise ValueError("chunk_tokens must be positive")
+    if chunk >= m:
+        return _moe_layer_mxfp8_sm120_one(
+            x, w13_fp8, sw13, w2_fp8, sw2, ids, wts, num_experts, topk, bias, bias_scale, out, join)
+    # Chunked: each call writes its own rows of the destination, so a caller that
+    # supplied `out` pays no copy at all and one that did not pays the same single
+    # copy per chunk it would have paid for the concatenation.
+    dst = out if out is not None else torch.empty_like(x)
+    for start in range(0, m, chunk):
+        end = min(start + chunk, m)
+        _moe_layer_mxfp8_sm120_one(
+            x[start:end], w13_fp8, sw13, w2_fp8, sw2, ids[start:end], wts[start:end],
+            num_experts, topk,
+            None if bias is None else bias[start:end],
+            None if bias_scale is None else bias_scale[start:end],
+            dst[start:end],
+            join if start == 0 else None)  # one join, before the first combine
+    return dst
+
+
+# One side stream per process for the block's shared expert. It is created on
+# first use and never again, like the grouped argument pool and the routing
+# scratch, because creating a stream or an event inside a CUDA-graph capture
+# would put host-side setup in the middle of the capture.
+_moe_block_side_stream = None
+
+
+def _moe_block_side_stream_get():
+    global _moe_block_side_stream
+    if _moe_block_side_stream is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "moe_block_mxfp8_sm120 wants to run the shared expert on a side stream, and the "
+                "first call of the process creates that stream, which cannot happen inside a CUDA "
+                "graph capture. Call the block once eagerly before capturing, or pass "
+                "overlap_shared=False (FSO_MOE_BLOCK_OVERLAP=0 disables it process-wide)."
+            )
+        _moe_block_side_stream = torch.cuda.Stream()
+    return _moe_block_side_stream
+
+
+_moe_block_overlap_default: bool | None = None
+
+
+def _moe_block_overlap_enabled() -> bool:
+    """Whether the block overlaps its shared expert by default, read once."""
+    global _moe_block_overlap_default
+    if _moe_block_overlap_default is None:
+        raw = os.environ.get("FSO_MOE_BLOCK_OVERLAP", "").strip()
+        _moe_block_overlap_default = raw != "0"
+    return _moe_block_overlap_default
+
+
+def _shared_expert_mxfp8_sm120(hidden, w13_fp8, sw13, w2_fp8, sw2):
+    """The always-on dense expert of a MoE block, MXFP8, four kernels: quantize,
+    gate/up, fused SwiGLU + requantize, down."""
+    ops = torch.ops.fish_scales_ops
+    xq, sx = ops.quantize_1x32_packed(hidden, True)
+    gu = ops.linear_mxfp8_raw(xq, w13_fp8, sx, sw13)
+    hq, sh = ops.silu_chunk_mul_quantize_1x32(gu, True)
+    return ops.linear_mxfp8_raw(hq, w2_fp8, sh, sw2)
+
+
+def moe_block_mxfp8_sm120(
+    hidden: torch.Tensor,
+    router_weight: torch.Tensor,
+    w13_fp8: torch.Tensor,
+    sw13: torch.Tensor,
+    w2_fp8: torch.Tensor,
+    sw2: torch.Tensor,
+    *,
+    topk: int,
+    renormalize: bool = True,
+    num_token_non_padded: torch.Tensor | None = None,
+    expert_map: torch.Tensor | None = None,
+    shared_w13_fp8: torch.Tensor | None = None,
+    shared_sw13: torch.Tensor | None = None,
+    shared_w2_fp8: torch.Tensor | None = None,
+    shared_sw2: torch.Tensor | None = None,
+    shared_gate_in_router: bool = False,
+    shared_out: torch.Tensor | None = None,
+    shared_gate: torch.Tensor | None = None,
+    overlap_shared: bool | None = None,
+    out: torch.Tensor | None = None,
+    chunk_tokens: int | None = None,
+) -> torch.Tensor:
+    """A whole sm_120/121 MoE block in one capture-safe call: the router, the
+    routed experts, the shared expert, and the gated add that joins them.
+
+    This is the shape a serving stack's block has — sglang's
+    ``Qwen2MoeSparseMoeBlock`` / ``Qwen3MoeSparseMoeBlock`` — minus the
+    collective at the end, which stays with the caller because a library has no
+    business owning the process group. What it replaces, per layer:
+
+    * the router GEMM, the softmax top-k, the padded-row masking and (under
+      expert parallelism) the id remap: 4-5 launches become 2, of which one is
+      the GEMM (see :func:`moe_router_topk`);
+    * the routed expert layer: as :func:`moe_layer_mxfp8_sm120`, 6 kernels;
+    * the shared expert: 4 kernels, its sigmoid gate computed in the router for
+      free when its weight row is concatenated onto the router's;
+    * the gated add of the two outputs: folded into the combine, so the block
+      does not read and write the whole ``[M, HIDDEN]`` result twice more.
+
+    Parallelism. The block is written for every form the 5090 family serves.
+    *Tensor parallel* shards the experts along the intermediate dimension, so
+    ``INTER`` here is the per-rank size and has to stay a multiple of 128 (the
+    scale layout's block); with ``INTER = 512`` that admits tp 1, 2 and 4, and
+    tp 8 is refused with a message rather than silently mis-scaled. The block's
+    output is the rank's partial sum, which the caller all-reduces exactly as it
+    does today. *Expert parallel* gives the rank a subset of the experts: pass
+    ``expert_map`` (int32 ``[num_experts + 1]``, the dispatcher's global-to-local
+    table, remote experts and the padded-row sentinel mapped outside
+    ``[0, num_local_experts)``) and the block routes over all experts, computes
+    the local ones, and leaves every other entry at zero cost. *Data parallel*
+    attention hands the block a padded token buffer whose valid length is a
+    device value: pass ``num_token_non_padded`` and the padded rows cost nothing
+    and come out zero, and pass ``out`` to write straight into the buffer the
+    scatter or reduce-scatter already owns.
+
+    Args:
+        hidden: bf16 ``[M, HIDDEN]``.
+        router_weight: bf16 ``[num_experts, HIDDEN]``, or
+            ``[num_experts + 1, HIDDEN]`` with ``shared_gate_in_router``, whose
+            last row is the shared expert's gate.
+        w13_fp8, sw13, w2_fp8, sw2: the rank-local routed experts, exactly as
+            :func:`moe_layer_mxfp8_sm120` takes them.
+        topk, renormalize: the router's selection, matching sglang's ``TopK``.
+        num_token_non_padded: int32 ``[1]`` on device (see above).
+        expert_map: int32 ``[num_experts + 1]`` on device (see above). Without
+            it the router's ids are global, so the local expert count must equal
+            ``num_experts``.
+        shared_w13_fp8, shared_sw13, shared_w2_fp8, shared_sw2: the shared
+            expert's MXFP8 weights (``[2*INTER_s, HIDDEN]`` and
+            ``[HIDDEN, INTER_s]``). Omit them and the block is routed-only.
+        shared_gate_in_router: the router weight carries the shared expert's
+            gate row, so its sigmoid comes out of the router kernel.
+        shared_out: a shared-expert output the caller computed itself, bf16
+            ``[M, HIDDEN]``. A caller that already overlaps its shared expert
+            with the routed path on a second stream keeps that overlap and still
+            gets the fused add; it is an error to pass both this and the shared
+            weights.
+        shared_gate: fp32 ``[M]`` gate for ``shared_out``, when the caller
+            computed that too.
+        overlap_shared: run the shared expert on a side stream so it overlaps the
+            routed path, joining just before the combine that adds it. On by
+            default when the block owns the shared expert;
+            ``FSO_MOE_BLOCK_OVERLAP=0`` turns it off process-wide and
+            ``overlap_shared=False`` per call. The output is bit-identical either
+            way — the join is a stream dependency, not a change of arithmetic —
+            and the side stream is created on the first call, so that call has to
+            be eager, like the first call of any other pool in this library.
+        out: bf16 ``[M, HIDDEN]`` destination.
+        chunk_tokens: as :func:`moe_layer_mxfp8_sm120`.
+
+    Returns:
+        bf16 ``[M, HIDDEN]`` — ``out`` itself when it was given.
+    """
+    _require_grouped_arch()
+    if sm_major() != 12:
+        raise NotImplementedError(
+            f"moe_block_mxfp8_sm120 is the sm_120/121 MoE block; this device is sm_{sm_major()}0. "
+            f"See moe_layer_mxfp8_sm120 for the architecture note."
+        )
+    if hidden.dim() != 2 or hidden.dtype != torch.bfloat16:
+        raise ValueError("hidden must be bf16 [M, HIDDEN]")
+    if router_weight.dim() != 2 or router_weight.dtype != torch.bfloat16:
+        raise ValueError("router_weight must be bf16 [num_experts(+1), HIDDEN]")
+    if router_weight.shape[1] != hidden.shape[1]:
+        raise ValueError("router_weight must contract over HIDDEN")
+    has_shared_weights = shared_w13_fp8 is not None
+    if has_shared_weights and shared_out is not None:
+        raise ValueError(
+            "pass either the shared expert's weights (the block runs it) or shared_out "
+            "(the caller ran it), not both"
+        )
+    if has_shared_weights and (shared_sw13 is None or shared_w2_fp8 is None or shared_sw2 is None):
+        raise ValueError("the shared expert needs all four of its weight and scale tensors")
+    num_experts = int(router_weight.shape[0]) - (1 if shared_gate_in_router else 0)
+    num_local = int(w13_fp8.shape[0])
+    if expert_map is None and num_local != num_experts:
+        raise ValueError(
+            f"the router selects over {num_experts} experts but this rank holds {num_local}; "
+            f"an expert-parallel rank must pass expert_map (int32 [num_experts + 1]) so the ids "
+            f"are remapped to its own range"
+        )
+    inter = int(w2_fp8.shape[2])
+    if inter % 128 != 0:
+        raise ValueError(
+            f"INTER per rank is {inter}, which is not a multiple of 128: the 1x32 scale layout "
+            f"blocks the K dimension by 128, so a tensor-parallel split has to keep INTER/tp a "
+            f"multiple of 128 (at INTER=512 that is tp <= 4)"
+        )
+    m = int(hidden.shape[0])
+    x = hidden if hidden.is_contiguous() else hidden.contiguous()
+
+    ids, weights, gate = moe_router_topk(
+        x, router_weight, topk, renormalize=renormalize,
+        with_shared_gate=shared_gate_in_router,
+        num_token_non_padded=num_token_non_padded, expert_map=expert_map,
+    )
+    if shared_gate_in_router:
+        shared_gate = gate
+    join = None
+    if has_shared_weights and m > 0:
+        overlap = _moe_block_overlap_enabled() if overlap_shared is None else bool(overlap_shared)
+        if overlap:
+            # The shared expert depends only on the block's input, so it is issued
+            # on a side stream and waited for at the latest point that needs it:
+            # after the routed layer's down projection, just before the combine
+            # that adds it. The two branches then run concurrently, in eager mode
+            # and inside a captured graph alike -- `wait_stream` records an event
+            # on each side, which is what capture follows to build the two
+            # branches. sglang's block does the same thing from the model side
+            # with an alt stream; a caller that already does can pass shared_out
+            # and keep its own arrangement.
+            current = torch.cuda.current_stream()
+            side = _moe_block_side_stream_get()
+            side.wait_stream(current)
+            with torch.cuda.stream(side):
+                shared_out = _shared_expert_mxfp8_sm120(
+                    x, shared_w13_fp8, shared_sw13, shared_w2_fp8, shared_sw2)
+            # The combine reads it on the current stream, so the allocator must
+            # know not to reuse the block before that read (a no-op under
+            # capture, where the graph's pool owns it).
+            shared_out.record_stream(current)
+            join = lambda: current.wait_stream(side)  # noqa: E731
+        else:
+            shared_out = _shared_expert_mxfp8_sm120(
+                x, shared_w13_fp8, shared_sw13, shared_w2_fp8, shared_sw2)
+    if shared_out is None and shared_gate is not None:
+        raise ValueError("shared_gate needs a shared expert output to scale")
+
+    return moe_layer_mxfp8_sm120(
+        x, w13_fp8, sw13, w2_fp8, sw2, ids, weights,
+        chunk_tokens=chunk_tokens, bias=shared_out, bias_scale=shared_gate, out=out, join=join,
+    )

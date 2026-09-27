@@ -617,6 +617,8 @@ __global__ void fp8bs_quantize_1x128_fp32_grouped_gather_kernel(
     float const qs = 448.f / my_ax;         // quant scale
     float const dequant = my_ax * (1.f / 448.f);
     uint32_t const fp_word = fp8x4_from_floats(x0 * qs, x1 * qs, x2 * qs, x3 * qs);
+    if (slot < 0) // skipped pair (see moe_build_routing): no slot to write
+        return;
     *reinterpret_cast<uint32_t*>(
         &out_fp8[static_cast<int64_t>(slot) * K + k_base + lane_id * 4]) = fp_word;
     if (lane_id == 0)
@@ -636,6 +638,8 @@ __global__ void silu_chunk_mul_quantize_1x128_fp32_grouped_kernel(
     if (i >= n_pairs)
         return;
     int const slot = slot_of_flat[i];
+    if (slot < 0) // skipped pair (see moe_build_routing): no slot was written by the FC1
+        return;
     int const g = slot / m_cap;
     int const m_in = slot % m_cap;
     int64_t const stride_m_gu = 2 * static_cast<int64_t>(K);
@@ -898,7 +902,12 @@ __global__ void fp8bs_quantize_1x32_packed_grouped_gather_kernel(
     int const kg = warp_id % k_groups;
     if (i >= n_pairs)
         return;
-    int const slot = slot_of_flat[i];   // g * m_cap + m_in
+    int const slot = slot_of_flat[i];   // g * m_cap + m_in, or -1 for a skipped pair
+    // A skipped pair (expert id outside [0, G): a graph padding row, or an expert
+    // another rank owns under expert parallelism) has no slot in the activation
+    // slab. The quantize below still runs on its source row -- the stores are what
+    // is suppressed -- so the slot load never stands in front of the input loads.
+    bool const store = slot >= 0;
     int const g = slot / m_cap;
     int const m_in = slot % m_cap;
     int const src = i / topk;           // source token row
@@ -934,8 +943,11 @@ __global__ void fp8bs_quantize_1x32_packed_grouped_gather_kernel(
         e8m0_from_amax<USE_UE8M0>(my_ax, qs, byte_v);
 
         uint32_t const fp_word = fp8x4_from_floats(x0 * qs, x1 * qs, x2 * qs, x3 * qs);
-        *reinterpret_cast<uint32_t*>(
-            &out_fp8[static_cast<int64_t>(slot) * K + k_base + lane_id * 4]) = fp_word;
+        if (store)
+        {
+            *reinterpret_cast<uint32_t*>(
+                &out_fp8[static_cast<int64_t>(slot) * K + k_base + lane_id * 4]) = fp_word;
+        }
 
         uint32_t const b0 = byte_v;
         uint32_t const b1 = __shfl_sync(0xFFFFFFFFu, byte_v, 8);
@@ -946,7 +958,7 @@ __global__ void fp8bs_quantize_1x32_packed_grouped_gather_kernel(
         }
     }
 
-    if (lane_id == 0) {
+    if (store && lane_id == 0) {
 #pragma unroll
         for (int p = 0; p < K_BLOCKS_PER_WARP / 4; ++p) {
             if constexpr (SM1XX_SF) {
@@ -964,8 +976,11 @@ __global__ void fp8bs_quantize_1x32_packed_grouped_gather_kernel(
 // Precondition. `slot_of_flat` is dense and token-major: moe_build_routing
 // writes exactly one entry per routed pair at index i = token * topk + j, so
 // the topk destinations of token `src` are the contiguous entries
-// slot_of_flat[src * topk .. src * topk + topk - 1], and every one of them is
-// a valid slot (there is no "unrouted pair" sentinel in this space).
+// slot_of_flat[src * topk .. src * topk + topk - 1]. An entry of -1 is a
+// skipped pair (expert id outside [0, G): a graph padding row, or an expert
+// another rank owns under expert parallelism); it names no slot and the store
+// to it is dropped, so a token whose every entry is skipped writes nothing at
+// all into the activation slab.
 //
 // What the pair-space kernel above does. It gives one warp to each
 // (routed pair, K-chunk), so for a token routed to topk experts the SAME
@@ -1091,6 +1106,8 @@ __global__ void fp8bs_quantize_1x32_packed_grouped_scatter_kernel(
     // One destination: the same stores the pair-space kernel performs for the
     // pair that owns this slot, from values that were computed once.
     auto store_slot = [&](int slot) {
+        if (slot < 0) // skipped pair: no slot in the activation slab
+            return;
 #pragma unroll
         for (int it = 0; it < kNumIters; ++it) {
             int const k_base = (kg * K_BLOCKS_PER_WARP + it * kIterKBlocks) * kVec;
@@ -1181,6 +1198,8 @@ __global__ void silu_chunk_mul_quantize_1x32_packed_grouped_kernel(
     if (i >= n_pairs)
         return;
     int const slot = slot_of_flat[i];
+    if (slot < 0) // skipped pair (see moe_build_routing): no slot was written by the FC1
+        return;
     int const g = slot / m_cap;
     int const m_in = slot % m_cap;
 

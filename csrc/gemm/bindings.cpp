@@ -55,6 +55,9 @@ at::Tensor linear_mxfp8_raw(at::Tensor x_fp8, at::Tensor w_fp8,
 at::Tensor linear_mxfp8_grouped_masked(at::Tensor a_fp8, at::Tensor w_fp8, at::Tensor sa_int32,
     at::Tensor sw_int32, at::Tensor masked_m, int64_t expected_m, int64_t max_active_groups,
     std::optional<at::Tensor> slot_to_expert, std::optional<at::Tensor> problem_shapes);
+std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_topk_from_logits(at::Tensor logits, int64_t topk,
+    bool renormalize, bool with_shared_gate, std::optional<at::Tensor> num_token_non_padded,
+    std::optional<at::Tensor> expert_map);
 std::tuple<at::Tensor, at::Tensor> quantize_1x32_grouped_gather(
     at::Tensor x, at::Tensor slot_of_flat, int64_t topk, int64_t num_groups,
     int64_t m_cap, bool use_ue8m0);
@@ -82,7 +85,8 @@ bool mxfp8_grouped_problem_shapes_consumed(
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_build_routing(
     at::Tensor topk_ids, int64_t num_groups, int64_t m_cap, bool with_slots,
     std::vector<int64_t> problem_shapes_nk);
-at::Tensor moe_combine(at::Tensor dn, at::Tensor slot_of_flat, at::Tensor topk_w);
+at::Tensor moe_combine(at::Tensor dn, at::Tensor slot_of_flat, at::Tensor topk_w,
+    std::optional<at::Tensor> bias, std::optional<at::Tensor> bias_scale, std::optional<at::Tensor> out);
 std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_build_sorted(
     at::Tensor topk_ids, int64_t num_groups, int64_t block_m);
 at::Tensor moe_combine_sorted(
@@ -147,7 +151,11 @@ TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
         &blockscale_gemm::mxfp8_grouped_problem_shapes_consumed);
     m.def("moe_build_routing(Tensor topk_ids, int num_groups, int m_cap, bool with_slots=False, "
                              "int[] problem_shapes_nk=[]) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
-    m.def("moe_combine(Tensor dn, Tensor slot_of_flat, Tensor topk_w) -> Tensor");
+    m.def("moe_combine(Tensor dn, Tensor slot_of_flat, Tensor topk_w, Tensor? bias=None, "
+                       "Tensor? bias_scale=None, Tensor? out=None) -> Tensor");
+    m.def("moe_topk_from_logits(Tensor logits, int topk, bool renormalize=True, "
+                                "bool with_shared_gate=False, Tensor? num_token_non_padded=None, "
+                                "Tensor? expert_map=None) -> (Tensor, Tensor, Tensor)");
     m.def("moe_build_sorted(Tensor topk_ids, int num_groups, int block_m) "
           "-> (Tensor, Tensor, Tensor)");
     m.def("moe_combine_sorted(Tensor dn, Tensor flat_to_sorted, Tensor topk_w) -> Tensor");
@@ -181,6 +189,7 @@ TORCH_LIBRARY_IMPL(fish_scales_ops, CUDA, m)
     m.impl("linear_mxfp8_grouped_masked_swiglu", &blockscale_gemm::linear_mxfp8_grouped_masked_swiglu);
     m.impl("moe_build_routing", &blockscale_gemm::moe_build_routing);
     m.impl("moe_combine", &blockscale_gemm::moe_combine);
+    m.impl("moe_topk_from_logits", &blockscale_gemm::moe_topk_from_logits);
     m.impl("moe_build_sorted", &blockscale_gemm::moe_build_sorted);
     m.impl("moe_combine_sorted", &blockscale_gemm::moe_combine_sorted);
 }

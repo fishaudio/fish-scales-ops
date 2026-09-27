@@ -31,12 +31,14 @@
 #include <torch/torch.h>
 
 #include <cstdint>
+#include <optional>
 #include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
 #include <vector>
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 namespace blockscale_gemm
 {
@@ -167,9 +169,15 @@ __device__ __forceinline__ void moe_build_routing_body(
             cudaTriggerProgrammaticLaunchCompletion();
         }
     }
-    __shared__ int32_t cnt[kMaxGroups];
+    // +1: the dummy histogram slot that a routed pair with an expert id outside
+    // [0, num_groups) counts into, so the pair loop below keeps one atomic per
+    // pair with no divergent path around it. The prefix over the real groups
+    // never reads it.
+    __shared__ int32_t cnt[kMaxGroups + 1];
     for (int g = threadIdx.x; g < num_groups; g += blockDim.x)
         cnt[g] = 0;
+    if (threadIdx.x == 0)
+        cnt[kMaxGroups] = 0;
     if (slot_to_expert != nullptr)
     {
         for (int s = threadIdx.x; s < num_groups; s += blockDim.x)
@@ -177,13 +185,38 @@ __device__ __forceinline__ void moe_build_routing_body(
     }
     __syncthreads();
 
+    // Expert ids outside [0, num_groups) are skipped, which is what a serving
+    // engine needs from this builder on two counts. A CUDA-graph or
+    // piecewise-graph bucket is captured for a fixed token count and padded
+    // with rows that carry no real token; sglang gives those rows the expert id
+    // `num_experts` (its moe_align overflow slot) or -1. Under expert
+    // parallelism the dispatcher also rewrites every expert this rank does not
+    // own to -1, so a rank sees ids outside its own local range on real tokens
+    // too. Such a pair must cost no expert compute and must contribute nothing
+    // to the token's output. It therefore gets no slot: the histogram entry
+    // goes to the dummy slot, `row_map` is left alone, and `slot_of_flat` is set
+    // to -1, which the gather, the SwiGLU-requantize and the combine all read as
+    // "no routed row". A token whose every entry is skipped produces a zero
+    // output row. Without this the pair indexed cnt[e] and wrote
+    // row_map[e * m_cap + r] with e negative or past the last group, which is a
+    // shared-memory and a global out-of-bounds write (the same fault the sm_90
+    // sorted builder was fixed for in b1bbda2).
     for (int i = threadIdx.x; i < num_pairs; i += blockDim.x)
     {
-        int const e = topk_ids[i];
+        unsigned const ue = static_cast<unsigned>(topk_ids[i]);
+        bool const valid = ue < static_cast<unsigned>(num_groups);
+        int const e = valid ? static_cast<int>(ue) : kMaxGroups; // dummy slot
         int const r = atomicAdd(&cnt[e], 1);
-        int const slot = e * m_cap + r;
-        row_map[slot] = i / topk; // source token row
-        slot_of_flat[i] = slot;
+        if (valid)
+        {
+            int const slot = e * m_cap + r;
+            row_map[slot] = i / topk; // source token row
+            slot_of_flat[i] = slot;
+        }
+        else
+        {
+            slot_of_flat[i] = -1; // skipped: padded row, or an expert another rank owns
+        }
     }
     __syncthreads();
 
@@ -226,11 +259,19 @@ __global__ void moe_build_routing_ps_kernel(
         num_pairs, topk, num_groups, m_cap, pdl);
 }
 
+// kBias adds a per-token row on top of the weighted expert sum, optionally
+// scaled by a per-token factor: that is a MoE block's shared expert and its
+// sigmoid gate, which every other layout pays a separate elementwise pass for.
+// With kBias false the body is what it was, instruction for instruction, so the
+// layers that have no shared expert keep the kernel they had on every arch.
+template <bool kBias>
 __global__ void moe_combine_kernel(
     __nv_bfloat16 const* __restrict__ dn, // [G * m_cap, H]
     int32_t const* __restrict__ slot_of_flat, // [M * topk]
     float const* __restrict__ topk_w,     // [M, topk]
     __nv_bfloat16* __restrict__ out,      // [M, H]
+    __nv_bfloat16 const* __restrict__ bias,   // [M, H] or nullptr (read iff kBias)
+    float const* __restrict__ bias_scale,     // [M] or nullptr: per-token factor on bias
     int M, int topk, int H, bool pdl)
 {
     // PDL entry (see moe_build_routing_kernel).
@@ -338,6 +379,20 @@ __global__ void moe_combine_kernel(
         }
     }
 
+    if constexpr (kBias)
+    {
+        float const bs = (bias_scale != nullptr) ? bias_scale[t] : 1.f;
+        float4 const raw = *reinterpret_cast<float4 const*>(&bias[static_cast<int64_t>(t) * H + h]);
+        __nv_bfloat162 const* v2 = reinterpret_cast<__nv_bfloat162 const*>(&raw);
+#pragma unroll
+        for (int p = 0; p < kVec / 2; ++p)
+        {
+            float2 const f = __bfloat1622float2(v2[p]);
+            acc[2 * p] += bs * f.x;
+            acc[2 * p + 1] += bs * f.y;
+        }
+    }
+
     __nv_bfloat162 packed[kVec / 2];
 #pragma unroll
     for (int p = 0; p < kVec / 2; ++p)
@@ -410,9 +465,14 @@ __device__ __forceinline__ void moe_build_routing_multi_body(
         }
     }
 
-    __shared__ int32_t cnt[kMaxGroups];
-    __shared__ int32_t base[kMaxGroups];
-    __shared__ int32_t fill[kMaxGroups];
+    // +1 in all three arrays: the dummy slot that pairs with an expert id
+    // outside [0, num_groups) count and reserve into, so both pair loops keep
+    // one atomic per pair. See the single-CTA body above for why those pairs
+    // exist (graph padding rows and, under expert parallelism, experts another
+    // rank owns) and what the -1 in `slot_of_flat` means to the consumers.
+    __shared__ int32_t cnt[kMaxGroups + 1];
+    __shared__ int32_t base[kMaxGroups + 1];
+    __shared__ int32_t fill[kMaxGroups + 1];
     __shared__ int32_t s_last;
 
     for (int g = threadIdx.x; g < num_groups; g += blockDim.x)
@@ -420,13 +480,22 @@ __device__ __forceinline__ void moe_build_routing_multi_body(
         cnt[g] = 0;
         fill[g] = 0;
     }
+    if (threadIdx.x == 0)
+    {
+        cnt[kMaxGroups] = 0;
+        base[kMaxGroups] = 0;
+        fill[kMaxGroups] = 0;
+    }
     __syncthreads();
 
     int const stride = gridDim.x * blockDim.x;
     int const start = blockIdx.x * blockDim.x + threadIdx.x;
 
     for (int i = start; i < num_pairs; i += stride)
-        atomicAdd(&cnt[topk_ids[i]], 1);
+    {
+        unsigned const ue = static_cast<unsigned>(topk_ids[i]);
+        atomicAdd(&cnt[ue < static_cast<unsigned>(num_groups) ? static_cast<int>(ue) : kMaxGroups], 1);
+    }
     __syncthreads();
 
     for (int g = threadIdx.x; g < num_groups; g += blockDim.x)
@@ -435,10 +504,20 @@ __device__ __forceinline__ void moe_build_routing_multi_body(
 
     for (int i = start; i < num_pairs; i += stride)
     {
-        int const e = topk_ids[i];
-        int const slot = e * m_cap + base[e] + atomicAdd(&fill[e], 1);
-        row_map[slot] = i / topk;
-        slot_of_flat[i] = slot;
+        unsigned const ue = static_cast<unsigned>(topk_ids[i]);
+        bool const valid = ue < static_cast<unsigned>(num_groups);
+        int const e = valid ? static_cast<int>(ue) : kMaxGroups; // dummy slot
+        int const r = atomicAdd(&fill[e], 1);
+        if (valid)
+        {
+            int const slot = e * m_cap + base[e] + r;
+            row_map[slot] = i / topk;
+            slot_of_flat[i] = slot;
+        }
+        else
+        {
+            slot_of_flat[i] = -1; // skipped: padded row, or an expert another rank owns
+        }
     }
 
     __threadfence();
@@ -646,6 +725,231 @@ __global__ void moe_build_sorted_kernel(
     }
 }
 
+// -----------------------------------------------------------------------
+// Router top-k: softmax selection, padded-row sentinel, expert-parallel remap
+// and the shared expert's gate, in one launch.
+//
+// What a serving MoE block runs ahead of the experts. sglang's block computes
+// the router logits with a replicated bf16 GEMM, takes a softmax over the
+// expert dimension, selects the top k, renormalises the k probabilities, masks
+// the rows past `num_token_non_padded` of a CUDA-graph bucket to a sentinel
+// expert id, gathers the ids through a global-to-local expert map under expert
+// parallelism, and -- for a model with a shared expert -- computes that
+// expert's sigmoid gate from a second replicated weight. That is four or five
+// launches ahead of a layer whose own kernels cost a few microseconds each at
+// decode, which is the launch economics this file exists to fix.
+//
+// This kernel takes everything except the GEMM. The GEMM stays with the caller
+// because cuBLAS already does it in one launch and at the DRAM roofline at
+// every token count: the gate matrix is E*H*2 bytes (1 MB at E=256, H=2048)
+// and a hand-written per-token form would have one CTA pull all of it, which
+// measured far worse than the library GEMM at every M worth having.
+//
+// The shared expert's gate rides along as one extra logit column: a caller that
+// concatenates its shared-gate weight row onto the router weight once at load
+// time gets `sigmoid(hidden . shared_gate_w)` per token for free here, and the
+// selection still runs over the first E columns only.
+//
+// Numerics. The renormalised softmax over the selected k does not need the full
+// softmax denominator: dividing the k selected exp(l_j - max) by their own sum
+// is algebraically the renormalised softmax whatever the shift, which is what
+// sglang's `renormalize=True` path produces. Without renormalisation the full
+// denominator is summed over all E experts first. The selection is a descending
+// sequence of warp-wide maxima, so the ids come out in torch.topk's order
+// (descending weight, and on an exact tie the lower expert id first) and the
+// first selected value is the row maximum the softmax shifts by.
+constexpr int kRouterMaxTopk = 8;
+constexpr int kRouterSlotsSmall = 8;  // E <= 256:  8 experts per lane
+constexpr int kRouterSlotsLarge = 32; // E <= 1024: 32 experts per lane
+constexpr int kRouterThreads = 128;   // 4 warps = 4 tokens per CTA
+
+// Explicit widening, so the kernel does not depend on whether the build leaves
+// the __CUDA_NO_*_CONVERSIONS__ guards defined.
+__device__ __forceinline__ float router_to_float(__nv_bfloat16 v)
+{
+    return __bfloat162float(v);
+}
+
+__device__ __forceinline__ float router_to_float(__half v)
+{
+    return __half2float(v);
+}
+
+__device__ __forceinline__ float router_to_float(float v)
+{
+    return v;
+}
+
+// Select the top `topk` of the logits this warp holds and write the ids and
+// their softmax weights. `v[s]` is the logit of expert `lane + 32*s` (-inf past
+// E); the array is consumed, winners being masked out as they are selected.
+// `full_denom` is read only when `renormalize` is false, where it must be
+// sum(exp(l - max)) over all E experts.
+template <int kSlots>
+__device__ __forceinline__ void router_select_topk(float (&v)[kSlots], int E, int topk, bool renormalize,
+    float full_denom, int lane, int32_t const* __restrict__ expert_map, bool masked, int sentinel,
+    int32_t* __restrict__ out_ids, float* __restrict__ out_w)
+{
+    if (masked)
+    {
+        // A padded row of a graph bucket: no expert runs for it. The sentinel is
+        // the id the caller's engine gives those rows (its num_experts), passed
+        // through the same expert map as a real id so an expert-parallel rank
+        // sees the local out-of-range value its layer skips.
+        if (lane == 0)
+        {
+            int const id = expert_map != nullptr ? expert_map[sentinel] : sentinel;
+            for (int j = 0; j < topk; ++j)
+            {
+                out_ids[j] = id;
+                out_w[j] = 0.f;
+            }
+        }
+        return;
+    }
+    float best_v[kRouterMaxTopk];
+    int best_e[kRouterMaxTopk];
+    for (int j = 0; j < topk; ++j)
+    {
+        float bv = -INFINITY;
+        int be = 0x7FFFFFFF;
+#pragma unroll
+        for (int s = 0; s < kSlots; ++s)
+        {
+            int const e = lane + 32 * s;
+            // Strictly greater, scanned in ascending expert order, so a tie
+            // inside one lane keeps the lower id.
+            if (e < E && v[s] > bv)
+            {
+                bv = v[s];
+                be = e;
+            }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+        {
+            float const ov = __shfl_xor_sync(0xFFFFFFFFu, bv, off);
+            int const oe = __shfl_xor_sync(0xFFFFFFFFu, be, off);
+            if (ov > bv || (ov == bv && oe < be))
+            {
+                bv = ov;
+                be = oe;
+            }
+        }
+        best_v[j] = bv;
+        best_e[j] = be;
+        // Mask the winner out of the owning lane's slots for the next pass.
+        if ((be & 31) == lane)
+        {
+            int const sw = be >> 5;
+#pragma unroll
+            for (int s = 0; s < kSlots; ++s)
+            {
+                if (s == sw)
+                    v[s] = -INFINITY;
+            }
+        }
+    }
+    if (lane != 0)
+        return;
+    float const shift = best_v[0]; // the row maximum: the selection is descending
+    float ex[kRouterMaxTopk];
+    float denom = 0.f;
+    for (int j = 0; j < topk; ++j)
+    {
+        ex[j] = expf(best_v[j] - shift);
+        denom += ex[j]; // summed in the order torch sums its topk output
+    }
+    if (!renormalize)
+        denom = full_denom;
+    float const inv = 1.f / denom;
+    for (int j = 0; j < topk; ++j)
+    {
+        int const id = best_e[j];
+        out_ids[j] = expert_map != nullptr ? expert_map[id] : id;
+        out_w[j] = ex[j] * inv;
+    }
+}
+
+// sum(exp(l - max)) over all E experts, needed only when the caller does not
+// renormalise over the selected k.
+template <int kSlots>
+__device__ __forceinline__ float router_full_denom(float const (&v)[kSlots], int E, int lane)
+{
+    float m = -INFINITY;
+#pragma unroll
+    for (int s = 0; s < kSlots; ++s)
+    {
+        int const e = lane + 32 * s;
+        if (e < E)
+            m = fmaxf(m, v[s]);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        m = fmaxf(m, __shfl_xor_sync(0xFFFFFFFFu, m, off));
+    float acc = 0.f;
+#pragma unroll
+    for (int s = 0; s < kSlots; ++s)
+    {
+        int const e = lane + 32 * s;
+        if (e < E)
+            acc += expf(v[s] - m);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+    return acc;
+}
+
+template <typename TLogit, int kSlots>
+__global__ void moe_topk_from_logits_kernel(TLogit const* __restrict__ logits, // [M, ld]
+    int32_t const* __restrict__ n_valid,                                       // [1] or nullptr
+    int32_t const* __restrict__ expert_map,                                    // [E + 1] or nullptr
+    int32_t* __restrict__ topk_ids,                                            // [M, topk]
+    float* __restrict__ topk_w,                                                // [M, topk]
+    float* __restrict__ shared_gate,                                           // [M] or nullptr
+    int M, int E, int ld, int topk, int sentinel, bool renormalize, bool pdl)
+{
+    if (pdl)
+    {
+        cudaGridDependencySynchronize();
+        if (threadIdx.x == 0)
+        {
+            cudaTriggerProgrammaticLaunchCompletion();
+        }
+    }
+    int const lane = threadIdx.x & 31;
+    int const token = static_cast<int>(blockIdx.x) * (kRouterThreads >> 5) + static_cast<int>(threadIdx.x >> 5);
+    if (token >= M)
+        return;
+    int64_t const row = static_cast<int64_t>(token) * ld;
+    // The shared expert's gate is logit column E, when the caller concatenated
+    // that weight row onto the router's. A padded row still gets a value (the
+    // block multiplies it by a zero-valued shared output), so it is written
+    // before the mask check.
+    if (shared_gate != nullptr && lane == 0)
+    {
+        float const l = router_to_float(logits[row + E]);
+        shared_gate[token] = 1.f / (1.f + expf(-l));
+    }
+    bool const masked = (n_valid != nullptr) && (token >= *n_valid);
+    float v[kSlots];
+    float full_denom = 0.f;
+    if (!masked)
+    {
+#pragma unroll
+        for (int s = 0; s < kSlots; ++s)
+        {
+            int const e = lane + 32 * s;
+            v[s] = (e < E) ? router_to_float(logits[row + e]) : -INFINITY;
+        }
+        if (!renormalize)
+            full_denom = router_full_denom<kSlots>(v, E, lane);
+    }
+    router_select_topk<kSlots>(v, E, topk, renormalize, full_denom, lane, expert_map, masked, sentinel,
+        topk_ids + static_cast<int64_t>(token) * topk, topk_w + static_cast<int64_t>(token) * topk);
+}
+
 } // anonymous namespace
 
 
@@ -830,6 +1134,13 @@ constexpr int kRoutingMultiMaxCtas = 132;
 // moe_build_routing: topk_ids [M, topk] int32 -> (masked_m [G] int32,
 // row_map [G * m_cap] int32, slot_of_flat [M * topk] int32), one launch.
 //
+// An expert id outside [0, num_groups) is skipped: no group counts it, it
+// occupies no slot, its row_map entry is not written and its slot_of_flat entry
+// is -1, which the gather-quantize, the SwiGLU requantize and the combine all
+// read as "no routed row". The two kernel bodies above say why a serving engine
+// produces such ids (graph padding rows, and experts another rank owns under
+// expert parallelism) and what it costs to skip them.
+//
 // With `with_slots` it also returns `slot_to_expert` [G] int32: the ids of the
 // experts that hold at least one routed row, ascending, in the low entries, and
 // -1 in the rest. That is exactly the list the sm_100 slot-bound grouped MXFP8
@@ -987,7 +1298,17 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_build_sorted(
 
 // moe_combine: dn [G, m_cap, H] bf16 + slot_of_flat [M*topk] + topk_w [M,topk]
 // fp32 -> out [M, H] bf16 (weighted sum over the topk routed rows).
-at::Tensor moe_combine(at::Tensor dn, at::Tensor slot_of_flat, at::Tensor topk_w)
+//
+// Three optional arguments let a whole MoE block end in this one kernel.
+// `bias` is a per-token row added on top of the weighted expert sum -- a
+// model's shared-expert output -- and `bias_scale` a per-token factor on it,
+// which is where a sigmoid shared-expert gate goes. Adding them here replaces
+// an elementwise pass that reads and writes the whole [M, H] block twice.
+// `out` is a caller-supplied destination: a data-parallel or reduce-scatter
+// path already owns the buffer the result has to land in, and writing straight
+// into it saves the copy.
+at::Tensor moe_combine(at::Tensor dn, at::Tensor slot_of_flat, at::Tensor topk_w,
+    std::optional<at::Tensor> bias, std::optional<at::Tensor> bias_scale, std::optional<at::Tensor> out_opt)
 {
     TORCH_CHECK(dn.is_cuda() && dn.dtype() == at::kBFloat16, "dn must be CUDA bf16");
     TORCH_CHECK(dn.dim() == 3 && dn.is_contiguous(), "dn must be contiguous [G, m_cap, H]");
@@ -1002,18 +1323,58 @@ at::Tensor moe_combine(at::Tensor dn, at::Tensor slot_of_flat, at::Tensor topk_w
     TORCH_CHECK(slot_of_flat.numel() == static_cast<int64_t>(M) * topk,
         "slot_of_flat must have M*topk entries");
 
-    auto out = at::empty({M, H}, dn.options());
+    __nv_bfloat16 const* bias_ptr = nullptr;
+    if (bias.has_value() && bias->numel() > 0)
+    {
+        auto const& b = bias.value();
+        TORCH_CHECK(b.is_cuda() && b.dtype() == at::kBFloat16 && b.is_contiguous(),
+            "bias must be a contiguous CUDA bf16 tensor");
+        TORCH_CHECK(b.dim() == 2 && b.size(0) == M && b.size(1) == H, "bias must be [M, H]");
+        bias_ptr = reinterpret_cast<__nv_bfloat16 const*>(b.data_ptr());
+    }
+    float const* bias_scale_ptr = nullptr;
+    if (bias_scale.has_value() && bias_scale->numel() > 0)
+    {
+        auto const& bs = bias_scale.value();
+        TORCH_CHECK(bs.is_cuda() && bs.dtype() == at::kFloat && bs.is_contiguous(),
+            "bias_scale must be a contiguous CUDA fp32 tensor");
+        TORCH_CHECK(bs.numel() == M, "bias_scale must have one entry per token");
+        TORCH_CHECK(bias_ptr != nullptr, "bias_scale needs a bias to scale");
+        bias_scale_ptr = reinterpret_cast<float const*>(bs.data_ptr());
+    }
+    at::Tensor out;
+    if (out_opt.has_value() && out_opt->numel() > 0)
+    {
+        out = out_opt.value();
+        TORCH_CHECK(out.is_cuda() && out.dtype() == at::kBFloat16 && out.is_contiguous(),
+            "out must be a contiguous CUDA bf16 tensor");
+        TORCH_CHECK(out.dim() == 2 && out.size(0) == M && out.size(1) == H, "out must be [M, H]");
+    }
+    else
+    {
+        out = at::empty({M, H}, dn.options());
+    }
     int const threads = 256;
     int64_t const total = static_cast<int64_t>(M) * (H / 8);
     int const grid = static_cast<int>((total + threads - 1) / threads);
     auto stream = at::cuda::getCurrentCUDAStream();
     bool const pdl = fso_pdl_enabled() && static_cast<unsigned>(grid) <= kFsoPdlMaxGridCtas;
-    fso_pdl_launch(moe_combine_kernel, dim3(grid), dim3(threads), stream, pdl,
-        reinterpret_cast<__nv_bfloat16 const*>(dn.data_ptr()),
-        reinterpret_cast<int32_t const*>(slot_of_flat.data_ptr()),
-        reinterpret_cast<float const*>(topk_w.data_ptr()),
-        reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
-        M, topk, H);
+    if (bias_ptr != nullptr)
+    {
+        fso_pdl_launch(moe_combine_kernel<true>, dim3(grid), dim3(threads), stream, pdl,
+            reinterpret_cast<__nv_bfloat16 const*>(dn.data_ptr()),
+            reinterpret_cast<int32_t const*>(slot_of_flat.data_ptr()),
+            reinterpret_cast<float const*>(topk_w.data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), bias_ptr, bias_scale_ptr, M, topk, H);
+    }
+    else
+    {
+        fso_pdl_launch(moe_combine_kernel<false>, dim3(grid), dim3(threads), stream, pdl,
+            reinterpret_cast<__nv_bfloat16 const*>(dn.data_ptr()),
+            reinterpret_cast<int32_t const*>(slot_of_flat.data_ptr()),
+            reinterpret_cast<float const*>(topk_w.data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), nullptr, nullptr, M, topk, H);
+    }
     return out;
 }
 
@@ -1044,13 +1405,107 @@ at::Tensor moe_combine_sorted(at::Tensor dn, at::Tensor flat_to_sorted, at::Tens
     int const grid = static_cast<int>((total + threads - 1) / threads);
     auto stream = at::cuda::getCurrentCUDAStream();
     bool const pdl = fso_pdl_enabled() && static_cast<unsigned>(grid) <= kFsoPdlMaxGridCtas;
-    fso_pdl_launch(moe_combine_kernel, dim3(grid), dim3(threads), stream, pdl,
+    fso_pdl_launch(moe_combine_kernel<false>, dim3(grid), dim3(threads), stream, pdl,
         reinterpret_cast<__nv_bfloat16 const*>(dn.data_ptr()),
         reinterpret_cast<int32_t const*>(flat_to_sorted.data_ptr()),
         reinterpret_cast<float const*>(topk_w.data_ptr()),
-        reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
-        M, topk, H);
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), nullptr, nullptr, M, topk, H);
     return out;
+}
+
+// moe_topk_from_logits: router logits -> (topk_ids, topk_w [, shared_gate]),
+// one launch. See the kernel above for what it replaces and why the GEMM that
+// produces the logits stays with the caller.
+//
+// `logits` is [M, E] bf16 / fp16 / fp32, or [M, E+1] with `with_shared_gate`,
+// where column E is the shared expert's gate logit and the returned third
+// tensor is its sigmoid. Only the first E columns are selected over, and E is
+// taken from the tensor's width, so the sentinel this kernel writes into padded
+// rows is the caller's own `num_experts` -- the value sglang's
+// `_mask_topk_ids_padded_region` uses.
+//
+// `num_token_non_padded` is the device int32 [1] a graph bucket carries: the
+// rows at or past it get the sentinel id and a zero weight, which the grouped
+// layer skips at no expert cost. `expert_map` is the int32 [E+1] global-to-local
+// expert table an expert-parallel rank builds once (its own experts mapped to
+// [0, E_local), every other expert and the sentinel to a value outside that
+// range); applying it here saves the gather launch the dispatcher would run.
+std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_topk_from_logits(at::Tensor logits, int64_t topk,
+    bool renormalize, bool with_shared_gate, std::optional<at::Tensor> num_token_non_padded,
+    std::optional<at::Tensor> expert_map)
+{
+    TORCH_CHECK(logits.is_cuda() && logits.dim() == 2, "logits must be a CUDA [M, E] tensor");
+    TORCH_CHECK(logits.stride(1) == 1, "logits must have a contiguous expert dimension");
+    TORCH_CHECK(logits.dtype() == at::kBFloat16 || logits.dtype() == at::kHalf || logits.dtype() == at::kFloat,
+        "logits must be bf16, fp16 or fp32");
+    int const M = static_cast<int>(logits.size(0));
+    int const width = static_cast<int>(logits.size(1));
+    int const E = width - (with_shared_gate ? 1 : 0);
+    TORCH_CHECK(E >= 1 && E <= kMaxGroups, "num_experts must be in [1, ", kMaxGroups, "], got ", E);
+    TORCH_CHECK(topk >= 1 && topk <= kRouterMaxTopk && topk <= E, "topk must be in [1, min(",
+        kRouterMaxTopk, ", num_experts)], got ", topk);
+    int32_t const* n_valid = nullptr;
+    if (num_token_non_padded.has_value() && num_token_non_padded->numel() > 0)
+    {
+        auto const& nv = num_token_non_padded.value();
+        TORCH_CHECK(nv.is_cuda() && nv.dtype() == at::kInt && nv.numel() == 1,
+            "num_token_non_padded must be a CUDA int32 tensor with one element");
+        n_valid = reinterpret_cast<int32_t const*>(nv.data_ptr());
+    }
+    int32_t const* map_ptr = nullptr;
+    if (expert_map.has_value() && expert_map->numel() > 0)
+    {
+        auto const& em = expert_map.value();
+        TORCH_CHECK(em.is_cuda() && em.dtype() == at::kInt && em.is_contiguous(),
+            "expert_map must be a contiguous CUDA int32 tensor");
+        TORCH_CHECK(em.numel() >= static_cast<int64_t>(E) + 1,
+            "expert_map must have num_experts + 1 entries (the last one maps the padded-row sentinel)");
+        map_ptr = reinterpret_cast<int32_t const*>(em.data_ptr());
+    }
+
+    auto ids = at::empty({M, topk}, logits.options().dtype(at::kInt));
+    auto weights = at::empty({M, topk}, logits.options().dtype(at::kFloat));
+    auto shared_gate = at::empty({with_shared_gate ? M : 0}, logits.options().dtype(at::kFloat));
+    if (M == 0)
+        return {ids, weights, shared_gate};
+    float* gate_ptr = with_shared_gate ? reinterpret_cast<float*>(shared_gate.data_ptr()) : nullptr;
+    int const ld = static_cast<int>(logits.stride(0));
+    int const tokens_per_cta = kRouterThreads / 32;
+    int const grid = (M + tokens_per_cta - 1) / tokens_per_cta;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    bool const pdl = fso_pdl_enabled() && static_cast<unsigned>(grid) <= kFsoPdlMaxGridCtas;
+
+#define FSO_ROUTER_LAUNCH(TLOGIT, SLOTS, PTR)                                                                          \
+    fso_pdl_launch(moe_topk_from_logits_kernel<TLOGIT, SLOTS>, dim3(grid), dim3(kRouterThreads), stream, pdl, PTR,      \
+        n_valid, map_ptr, reinterpret_cast<int32_t*>(ids.data_ptr()), reinterpret_cast<float*>(weights.data_ptr()),     \
+        gate_ptr, M, E, ld, static_cast<int>(topk), E, renormalize)
+
+    if (logits.dtype() == at::kBFloat16)
+    {
+        auto const* p = reinterpret_cast<__nv_bfloat16 const*>(logits.data_ptr());
+        if (E <= 256)
+            FSO_ROUTER_LAUNCH(__nv_bfloat16, kRouterSlotsSmall, p);
+        else
+            FSO_ROUTER_LAUNCH(__nv_bfloat16, kRouterSlotsLarge, p);
+    }
+    else if (logits.dtype() == at::kHalf)
+    {
+        auto const* p = reinterpret_cast<__half const*>(logits.data_ptr());
+        if (E <= 256)
+            FSO_ROUTER_LAUNCH(__half, kRouterSlotsSmall, p);
+        else
+            FSO_ROUTER_LAUNCH(__half, kRouterSlotsLarge, p);
+    }
+    else
+    {
+        auto const* p = reinterpret_cast<float const*>(logits.data_ptr());
+        if (E <= 256)
+            FSO_ROUTER_LAUNCH(float, kRouterSlotsSmall, p);
+        else
+            FSO_ROUTER_LAUNCH(float, kRouterSlotsLarge, p);
+    }
+#undef FSO_ROUTER_LAUNCH
+    return {ids, weights, shared_gate};
 }
 
 } // namespace blockscale_gemm

@@ -21,7 +21,7 @@ routing itself is CUDA-graph safe):
 | arch | block-FP8 1×128 | MXFP8 1×32 | grouped MoE |
 |---|---|---|---|
 | sm_90 (H200) | deep_gemm WGMMA kernels, NVRTC-JIT-compiled in-process at first call; FP32 scales | not available (`NotImplementedError`) | block-FP8, expert-sorted contiguous layout (`moe_layer_fp8_sm90`) and a masked-layout variant |
-| sm_120 / sm_121 (RTX 5090, RTX PRO 6000) | CUTLASS `Sm120BlockScaledKernel`; UE8M0 scales packed into int32 words | CUTLASS `Sm120BlockScaledKernel` | MXFP8, masked slab layout |
+| sm_120 / sm_121 (RTX 5090, RTX PRO 6000) | CUTLASS `Sm120BlockScaledKernel`; UE8M0 scales packed into int32 words | CUTLASS `Sm120BlockScaledKernel` | MXFP8, masked slab layout (`moe_layer_mxfp8_sm120`) |
 | sm_100 / sm_103 (B200 / B300) | since 2026-09-05: the MXFP8 tcgen05 path with each 1×128 UE8M0 scale byte replicated into its four 32-wide slots (same kernels, same bytes as MXFP8) | CUTLASS tcgen05 BlockScaled behind a router: an M ≤ 64 decode row (vendored NVIDIA CuTe-DSL split-K / persistent kernels, swap-AB, 8/16/32-wide token tile to M = 32 and a 64-wide token tile on the 2-CTA 256-row weight tile above it, long-K narrow-N cells above M = 32 excepted) in front of three tiers (cuBLAS `scaled_mm`, CuTe DSL persistent kernel, C++ cascade) | MXFP8, masked slab layout — same Python surface as sm_120, CUTLASS pointer-array (grouped) tcgen05 kernels |
 
 Scale tensors are **arch-native and opaque**. Quantize on the device arch the
@@ -58,11 +58,20 @@ if sm in (10, 12):
 # ---- MoE layer, sm_90 --------------------------------------------------------
 # w13/w2 quantized offline per expert with quantize_moe_weights_1x128_fp8_sm90.
 out = fso.gemm.moe_layer_fp8_sm90(hidden, w13_fp8, sw13, w2_fp8, sw2, topk_ids, topk_w)
+
+# ---- MoE layer, sm_120 -------------------------------------------------------
+# w13/w2 quantized offline per expert with quantize_moe_weights_1x32_fp8 ON THIS
+# ARCH (the scale layout is arch-native). w13 keeps the checkpoint's [gate; up]
+# row order. topk_ids may carry ids outside [0, E) for padded graph rows and for
+# experts another expert-parallel rank owns; they are skipped.
+out = fso.gemm.moe_layer_mxfp8_sm120(hidden, w13_fp8, sw13, w2_fp8, sw2, topk_ids, topk_w)
 ```
 
-The sm_120 MoE layer is composed from the masked-layout ops listed under
-*Grouped MoE*; `bench/gemm/python/bench_moe_qwen3_30a3.py` (`fso_mxfp8_layer`)
-is the reference composition.
+Both MoE layer entries compose the per-step ops listed under *Grouped MoE*, and
+those ops stay public: `bench/gemm/python/bench_moe_qwen3_30a3.py`
+(`fso_mxfp8_layer`) drives them directly, which is how the sm_100/103
+composition — with its fused FC1 and its slot-bound decode route — is exercised,
+since the composed entry above is sm_120/121 only.
 
 ## Ops
 
@@ -124,12 +133,16 @@ opaque scale byte layout differs (see the two `grouped MXFP8 … scales` rows in
 
 | step | function | in → out |
 |---|---|---|
-| routing | `moe_build_routing(topk_ids, num_groups, m_cap, with_slots=False, problem_shapes_for=None)` | int32 `[M, topk]` → (`masked_m [G]`, `row_map [G*m_cap]`, `slot_of_flat [M*topk]`), plus `slot_to_expert [G]` when `with_slots=True`, plus a list of int32 `[G, 3]` per-group `(rows, N, K)` tensors, one per `(N, K)` pair in `problem_shapes_for`; `G <= 1024`, `m_cap % 4 == 0`, `m_cap >= M`. Ask for `with_slots` only when `mxfp8_grouped_slot_possible(…)` says a GEMM of this layer's shape would take the sm_100/103 slot route, which is the list's only reader, and for `problem_shapes_for` only the pairs for which `mxfp8_grouped_problem_shapes_consumed(…)` answers `True` (see *the slot-bound decode route* and *routing-supplied problem shapes* below) |
+| whole block (sm_120/121) | `moe_block_mxfp8_sm120(hidden, router_weight, w13_fp8, sw13, w2_fp8, sw2, topk=…, renormalize=True, num_token_non_padded=None, expert_map=None, shared_*=None, shared_gate_in_router=False, shared_out=None, shared_gate=None, out=None, chunk_tokens=None)` | bf16 `[M, HIDDEN]` + the router weight + the routed experts (+ the shared expert) → bf16 `[M, HIDDEN]`; the router, the routed experts, the shared expert and the gated add that joins them, in one capture-safe call. See *the composed sm_120 block* below |
+| router | `moe_router_topk(hidden, router_weight, topk, renormalize=True, with_shared_gate=False, num_token_non_padded=None, expert_map=None)` | bf16 `[M, HIDDEN]` × bf16 `[num_experts(+1), HIDDEN]` → (int32 `[M, topk]`, fp32 `[M, topk]`, fp32 `[M]`); the logit GEMM (cuBLAS) followed by the kernel below |
+| router, logits given | `moe_topk_from_logits(logits, topk, renormalize=True, with_shared_gate=False, num_token_non_padded=None, expert_map=None)` | `[M, num_experts(+1)]` bf16/fp16/fp32 → the same three tensors, one launch: softmax, top-k, renormalise, the padded-row sentinel, the expert-parallel id remap and the shared expert's sigmoid gate |
+| unified entry (sm_120/121) | `moe_layer_mxfp8_sm120(hidden, w13_fp8, sw13, w2_fp8, sw2, topk_ids, topk_w, chunk_tokens=None)` | bf16 `[M, HIDDEN]`, per-expert fp8 weights with their opaque int32 scales, int32 or int64 `[M, topk]`, fp32 `[M, topk]` → bf16 `[M, HIDDEN]`; runs the six kernels below with every host-side decision taken from the argument shapes, so one call captures per graph bucket. See *the composed sm_120 layer* below for the expert-parallel id contract, the `m_cap` rule and the optional token chunking |
+| routing | `moe_build_routing(topk_ids, num_groups, m_cap, with_slots=False, problem_shapes_for=None)` | int32 `[M, topk]` → (`masked_m [G]`, `row_map [G*m_cap]`, `slot_of_flat [M*topk]`), plus `slot_to_expert [G]` when `with_slots=True`, plus a list of int32 `[G, 3]` per-group `(rows, N, K)` tensors, one per `(N, K)` pair in `problem_shapes_for`; `G <= 1024`, `m_cap % 4 == 0`, `m_cap >= M`. An entry of `topk_ids` outside [0, `num_groups`) is skipped: no group counts it, it takes no slab row, and its `slot_of_flat` entry is −1, which the gather-quantize, the SwiGLU requantize and the combine all read as "no routed row". Ask for `with_slots` only when `mxfp8_grouped_slot_possible(…)` says a GEMM of this layer's shape would take the sm_100/103 slot route, which is the list's only reader, and for `problem_shapes_for` only the pairs for which `mxfp8_grouped_problem_shapes_consumed(…)` answers `True` (see *the slot-bound decode route* and *routing-supplied problem shapes* below) |
 | gather + quantize | `quantize_1x32_grouped_gather_fp8(x, slot_of_flat, topk, num_groups, m_cap)` | bf16 `[M, K]` → (fp8 `[G, m_cap, K]`, int32 `[G, K/128, m_cap]`) |
 | gate_up | `linear_mxfp8_grouped_masked(a_fp8, w13_fp8, sa, sw13, masked_m, expected_m, max_active_groups=0, slot_to_expert=None, problem_shapes=None)` | → bf16 `[G, m_cap, 2*INTER]` |
 | SwiGLU + quantize | `silu_chunk_mul_quantize_1x32_grouped_fp8(gu, slot_of_flat)` | → (fp8 `[G, m_cap, INTER]`, int32 `[G, INTER/128, m_cap]`) |
 | down | `linear_mxfp8_grouped_masked(h_fp8, w2_fp8, sh, sw2, masked_m, expected_m, max_active_groups=0, slot_to_expert=None, problem_shapes=None)` | → bf16 `[G, m_cap, HIDDEN]` |
-| combine | `moe_combine(dn, slot_of_flat, topk_w)` | → bf16 `[M, HIDDEN]`, `out[t] = Σ_j topk_w[t,j] · dn[slot_of_flat[t*topk+j]]` |
+| combine | `moe_combine(dn, slot_of_flat, topk_w, bias=None, bias_scale=None, out=None)` | → bf16 `[M, HIDDEN]`, `out[t] = Σ_j topk_w[t,j] · dn[slot_of_flat[t*topk+j]] + bias_scale[t] · bias[t]`. `bias` is a shared-expert output and `bias_scale` its per-token gate, folded in so the block does not pay another read-modify-write of the whole result; `out` is a caller-owned destination (a data-parallel or reduce-scatter buffer) |
 | weights (offline) | `quantize_moe_weights_1x32_fp8(w)` | bf16 `[G, N, K]` → (fp8 `[G, N, K]`, int32 `[G, K/128, N]`); `N % 128 == 0`, `K % 128 == 0` |
 
 `expected_m` is a **host-side static hint** (`ceil(M * topk / G)`) used only for
@@ -147,6 +160,154 @@ runs from `topk` to `G` — and on sm_100/103 it is what lets the dispatcher siz
 the slot-bound decode route described below. Like `expected_m` it must be a
 plain `int` and must not vary between a capture and its replays. It is
 constrained to `0 <= max_active_groups <= G`. sm_120/121 accept and ignore it.
+
+**The composed sm_120 layer.** `moe_layer_mxfp8_sm120` is the serving-shaped
+entry: one call, the six kernels above, and no host-visible dependence on the
+routing. It is the sm_120/121 twin of `moe_layer_fp8_sm90` and refuses on any
+other architecture, naming it — sm_100/103 serves its decode band from a
+slot-bound route and the rest from a pointer-array cascade, and both read routing
+tensors (the packed active-expert list, the per-group problem shapes) that this
+entry does not ask the routing kernel for, so composing the steps directly is
+still the right thing to do there.
+
+*Expert-parallel-local ids.* The expert count the call sees is
+`num_experts = w13_fp8.shape[0]`, which under expert parallelism is the
+rank-local count and not the model's. Every routed entry whose id falls outside
+`[0, num_experts)` is skipped at no expert cost. Two kinds of entry need that.
+A serving engine captures one graph per token bucket and pads the rows a bucket
+does not use; sglang labels the padded rows with the id `num_experts` (the
+overflow slot of its `moe_align` kernel) or with −1. An expert-parallel
+dispatcher additionally rewrites every expert another rank owns to −1, which
+lands on individual top-k entries of real tokens rather than on whole trailing
+rows. A skipped entry contributes nothing to its token's output row, and a token
+whose every entry is skipped gets an all-zero row, which is the identity for the
+cross-rank sum the caller performs afterwards.
+
+*Static hints.* `expected_m` is `ceil(M · topk / num_experts)` and
+`max_active_groups` is `min(M · topk, num_experts)`; both are functions of the
+argument shapes alone, so each captured bucket bakes one value of each and no
+replay can invalidate them.
+
+*Capacity, and the memory it costs.* The masked slab gives every expert its own
+`m_cap`-row window, and with top-k drawn without replacement a single expert can
+receive one row per token, so the layer sizes `m_cap = align(tokens, 4)` — the
+smallest capacity that cannot overflow for any routing, which is also what
+`moe_build_routing` enforces. Top-k without replacement is a precondition of that
+bound: a token naming one expert twice gives that expert two rows, so an expert
+could hold more rows than there are tokens and the builder would place the
+overflow in the next expert's window, or past the slab for the last expert.
+(Duplicated ids are not the same case as the skipped ids above, which take no row
+at all.) The consequence is that the transient slabs cost `num_experts · m_cap`
+rows in five tensors at once, about 1.1 MB per token at 128 local experts with
+hidden 2048 and inter 512
+(`moe_layer_slab_bytes_per_token_sm120(num_experts, hidden, inter)` returns the
+exact per-row figure). A prefill bucket of 8192 tokens therefore asks for roughly
+9 GB of scratch, which does not fit beside the weights on a 32 GB card.
+
+*Chunking is available and off by default.* The entry can split the token
+dimension and run the layer once per chunk, which bounds the peak at the chunk's
+slabs, and the result is bit-identical to the single call — a token's output row
+depends only on its own activation row and on the expert weights, which
+`tests/gemm/unit/test_moe_layer_determinism_sm120.py` asserts across chunk counts.
+It is off unless asked for because the cost is not small: each call walks every
+expert's weights once, so n chunks read the expert weights n times, and on the
+RTX 5090 two chunks at 1024 tokens measured +80 % and five chunks at 4096 tokens
++209 % on the Qwen3.5-35B-A3B routed layer. A caller that must bound the peak
+asks for it with `chunk_tokens=` or by capping the slabs with
+`FSO_MOE_SLAB_BUDGET_MB`, and `moe_layer_chunk_tokens_sm120(M, num_experts,
+hidden, inter)` answers what a given bucket would then do; both are host-side
+decisions taken from shapes, so a captured bucket's chunk count is fixed at
+capture. Without a cap a bucket whose slabs do not fit raises the allocator's
+out-of-memory error instead of quietly running several times slower. The real
+answer above that point is a contiguous (expert-sorted) sm_120 entry that sizes
+its activation by the routed rows rather than by capacity, as the sm_90 layer
+does; it does not exist yet, which is also why
+[`docs/perf/layer/sm120.md`](../perf/layer/sm120.md) has no M = 8192 fso cell.
+
+*Weights.* `w13_fp8` / `w2_fp8` and their scale handles are what
+`quantize_moe_weights_1x32_fp8` produces **on this architecture** — scale
+layouts are arch-native and opaque, so a set quantized on sm_100/103 is not
+valid here. The `w13` row order is the checkpoint's own `[gate; up]`:
+`w13_interleave=True` raises on sm_120/121, because the interleaved order exists
+only for the sm_100/103 fused FC1 and this architecture has no such kernel. A
+serving artifact that ships block-scaled 128×128 FP8 experts has to be
+requantized to 1×32 MXFP8 from its bf16 master on a sm_120 device; there is no
+converter between the two quantized formats.
+
+**The composed sm_120 block.** `moe_block_mxfp8_sm120` is the next surface out:
+the router, the routed experts, the shared expert and the gated add that joins
+them, in one capture-safe call. It is the shape a serving stack's MoE block has
+— sglang's `Qwen2MoeSparseMoeBlock` / `Qwen3MoeSparseMoeBlock` — minus the
+collective at the end, which stays with the caller because a library has no
+business owning the process group. Per layer it replaces:
+
+- the router GEMM, the softmax top-k with renormalisation, the padded-row
+  masking and, under expert parallelism, the id remap: five launches become two,
+  of which one is the GEMM (`moe_router_topk`; `moe_topk_from_logits` is the
+  fused half for a caller that computes its own logits);
+- the routed expert layer, as `moe_layer_mxfp8_sm120`;
+- the shared expert, four kernels, whose sigmoid gate the router computes for
+  free when its weight row is concatenated onto the router weight
+  (`shared_gate_in_router=True`, which makes the router weight
+  `[num_experts + 1, HIDDEN]`);
+- the gated add of the two outputs, folded into the combine, so the block does
+  not read and write the whole `[M, HIDDEN]` result twice more.
+
+When the block owns the shared expert it runs it on a side stream, so it overlaps
+the routed path instead of queueing behind it: the shared expert depends only on
+the block's input, and the routed path needs its result only at the combine, so
+the join sits after the down projection and the two branches run concurrently —
+eagerly and inside a captured graph alike, since `wait_stream` records the events
+capture follows to build the two branches. sglang does the same thing from the
+model side with an alt stream. The output is bit-identical either way, because a
+stream dependency is not a change of arithmetic. The side stream is created on the
+first call, which therefore has to be eager, exactly like the first call of the
+multi-CTA routing scratch or the grouped argument pool; a first call inside a
+capture aborts with a message naming the knob. `overlap_shared=False` per call, or
+`FSO_MOE_BLOCK_OVERLAP=0` process-wide, keeps the sequential order.
+
+A caller that already overlaps its shared expert with the routed path on its own
+second stream keeps that arrangement and passes the result as `shared_out` (with
+`shared_gate` if it gated it); the fused add still applies. Passing both the
+shared weights and `shared_out` is an error, since only one of them can be the
+shared expert.
+
+*Tensor parallel.* The experts are sharded along the intermediate dimension, so
+the `INTER` this entry sees is the per-rank size, and it has to stay a multiple
+of 128 — the 1×32 scale layout blocks the K dimension of the FC2 by 128. With
+`INTER = 512` that admits tp 1, 2 and 4; tp 8 leaves 64 and is refused, by the
+weight quantizer at load time and by the block per call, both naming the reason.
+The block's output is the rank's partial sum, which the caller all-reduces
+exactly as it does with any other runner.
+
+*Expert parallel.* The rank holds a subset of the experts, so pass `expert_map`,
+the int32 `[num_experts + 1]` table the dispatcher already builds: this rank's
+experts mapped into `[0, num_local_experts)`, every remote expert and the
+padded-row sentinel mapped outside it. The router then selects over the whole
+expert set (its weight is replicated, so it must), the map is applied inside the
+router kernel rather than in a separate gather, and every entry this rank does
+not own costs nothing and contributes nothing — the skip described above. Without
+`expert_map` the router's ids are global, so the local expert count must equal
+`num_experts`, which the entry checks and says.
+
+*Data parallel.* Attention under data parallelism hands the block a padded token
+buffer whose valid length is a device value, which is exactly what
+`num_token_non_padded` takes: the padded rows get the sentinel id inside the
+router kernel, cost no expert compute, and come out zero. `out` writes the result
+straight into the buffer the scatter or reduce-scatter already owns, which also
+holds for a chunked call, where each chunk writes its own rows.
+
+*Determinism.* Run-to-run bit-identical output, graph replay equal to eager, and
+chunked equal to unchunked are asserted for both shape families and both
+expert-parallel forms by `tests/gemm/unit/test_moe_layer_determinism_sm120.py`;
+`tests/gemm/unit/test_moe_layer_padded_ids_sm120.py` covers the skipped ids
+end to end and `tests/gemm/unit/test_moe_routing_masked_ids.py` covers the
+routing builders and the gather on every architecture. The block's own plumbing,
+the three parallel forms and its determinism are in
+`tests/gemm/unit/test_moe_block_sm120.py`, and the router against the torch
+reference (both logit dtypes, renormalisation on and off, padded rows, the expert
+map, the shared gate, graph replay) in
+`tests/gemm/unit/test_moe_router_topk.py`, which runs on every architecture.
 
 On sm_100/103 the GEMM is a CUTLASS pointer-array (grouped) tcgen05
 block-scaled kernel. Its per-group problem shapes, base pointers, strides and
@@ -518,7 +679,8 @@ layout. `moe_build_routing`, `moe_build_sorted`, `moe_combine` and
 | Blackwell datacenter (sm_100/103) | `linear_mxfp8` with `quantize_1x32_fp8`; block-FP8 checkpoints run through `linear_fp8` on the same kernels |
 | SwiGLU MLP on Blackwell | `silu_chunk_mul_quantize_1x32_fp8` between the two GEMMs (no BF16 intermediate) |
 | MoE layer on sm_90 | `moe_layer_fp8_sm90` |
-| MoE layer on sm_120 | the six masked-layout ops above |
+| MoE layer on sm_120 | `moe_layer_mxfp8_sm120` |
+| MoE layer on sm_100/103 | the six masked-layout ops above, composed as `bench/gemm/python/bench_moe_qwen3_30a3.py` does |
 | both operands change every call | `linear_bf16` |
 | BF16 activation, cached FP8 weight, one op (sm_90 / sm_120) | `linear_qx` |
 
@@ -641,6 +803,8 @@ contract — the cascades already encode the measured picks.
 | `FSO_DISABLE_STREAMK=1` | sm_120 dense | single launch everywhere |
 | `FSO_STREAMK_POOL_MB=<n>` | sm_120 dense | Stream-K partial-sum scratch capacity (default 64 MB; allocated once, before capture) |
 | `FSO_DISABLE_PDL=1` | sm_120 MoE chain; sm_100/103 MoE chain, grouped argument-preparation kernel and grouped GEMM | drop the programmatic-dependent-launch attributes (kernel-side waits become no-ops). On sm_100/103 this also covers the split prep kernel and the CUTLASS grouped GEMM, which are launched with PDL by default and whose grid-dependency barriers are compiled in for the sm_100/103 device passes |
+| `FSO_MOE_BLOCK_OVERLAP=0` | sm_120/121 composed MoE block | run the shared expert on the current stream instead of the side stream, i.e. sequentially with the routed path. The result is unchanged; this is the A/B knob for the overlap |
+| `FSO_MOE_SLAB_BUDGET_MB=<n>` | sm_120/121 composed MoE layer | cap on the transient slabs of one layer call, in MiB. Unset (the default) means one call per layer at any token count. Set, the entry splits the token dimension into as few chunks as fit the cap, which bounds the peak and costs one extra pass over the expert weights per chunk (+80 % at two chunks, +209 % at five on the 5090 Family C layer). The chunk count is a host-side decision fixed at capture |
 | `FSO_SWAP_BN=16|32|64|0` | sm_90 composed MoE layer | force the swap-AB activation tile (0 = the non-swap block_m = 64 path) instead of the rows-per-expert cascade |
 | `FSO_SWAP_STAGES=<n>` | sm_90 swap-AB grouped GEMM | pipeline depth of the single-CTA swap-AB kernel (clamped to the smem budget); two-CTA builds pick their own depth (the deepest count that fits twice and divides K, see `dispatch.cuh`) and ignore it |
 | `FSO_SWAPAB_CTAS_PER_SM=1|2` | sm_90 swap-AB grouped GEMM | resident CTAs per SM (default 2: the math warp-groups run on 96 registers and the grid is doubled; 1 restores the single persistent CTA with 232 registers) |

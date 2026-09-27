@@ -118,8 +118,18 @@ if sm >= 10:
     xqm, sxm = fso.gemm.quantize_1x32_fp8(x_bf16)
     ym = fso.gemm.linear_mxfp8(xqm, wqm, sxm, swm)
 
-# ----- MoE layer, sm_90 (per-expert weights quantized offline) ------------------
-out = fso.gemm.moe_layer_fp8_sm90(hidden, w13_fp8, sw13, w2_fp8, sw2, topk_ids, topk_w)
+# ----- MoE layer (per-expert weights quantized offline, on the target arch) -----
+out = fso.gemm.moe_layer_fp8_sm90(hidden, w13_fp8, sw13, w2_fp8, sw2, topk_ids, topk_w)    # sm_90
+out = fso.gemm.moe_layer_mxfp8_sm120(hidden, w13_fp8, sw13, w2_fp8, sw2, topk_ids, topk_w) # sm_120
+
+# ----- MoE block, sm_120: router + routed experts + shared expert, one call ----
+# router_weight is [E, H] bf16, or [E+1, H] with the shared expert's gate row
+# appended; expert_map / num_token_non_padded carry the expert- and
+# data-parallel contracts (docs/api/gemm.md).
+out = fso.gemm.moe_block_mxfp8_sm120(
+    hidden, router_weight, w13_fp8, sw13, w2_fp8, sw2, topk=8,
+    shared_w13_fp8=s13, shared_sw13=ss13, shared_w2_fp8=s2, shared_sw2=ss2,
+    shared_gate_in_router=True)
 
 # ----- Attention -------------------------------------------------------------
 o = fso.attention.flash_attn_fwd(q, k, v, causal=True)      # torch SDPA on every arch
@@ -128,8 +138,9 @@ o = sm120_mxfp8.mxfp8_fwd(q_fp8, q_sc, k_fp8, k_sc, v_fp8, v_sc, causal=True)   
 ```
 
 `fso.gemm` and `fso.attention` are independent namespaces with no top-level
-re-exports. The sm_120 MoE layer is composed from six masked-layout ops; the
-contracts, scale layouts and constraints of every op are in
+re-exports. Both MoE layer entries compose six per-step ops that stay public,
+which is how the sm_100/103 layer — with its fused FC1 and its slot-bound decode
+route — is driven; the contracts, scale layouts and constraints of every op are in
 [`docs/api/gemm.md`](docs/api/gemm.md) and
 [`docs/api/attention.md`](docs/api/attention.md).
 
@@ -139,7 +150,7 @@ contracts, scale layouts and constraints of every op are in
 |---|---|---|---|
 | block-FP8 1×128 GEMM | ✓ deep_gemm WGMMA, NVRTC JIT, FP32 scales | ✓ CUTLASS `Sm120BlockScaledKernel`, UE8M0 scales | ✓ since 2026-09-05, on the MXFP8 tcgen05 path with replicated scales |
 | MXFP8 1×32 GEMM | — | ✓ CUTLASS block-scaled | ✓ three tiers: cuBLAS `scaled_mm`, CuTe DSL, C++ cascade |
-| grouped MoE layer | ✓ expert-sorted contiguous layout with swap-AB decode path (`moe_layer_fp8_sm90`) | ✓ masked slab layout, MXFP8, six ops | ✓ since 2026-09-15 (milestone M3): masked slab layout, MXFP8, CUTLASS pointer-array kernel |
+| grouped MoE layer | ✓ expert-sorted contiguous layout with swap-AB decode path (`moe_layer_fp8_sm90`) | ✓ masked slab layout, MXFP8, composed layer and whole-block entries (`moe_layer_mxfp8_sm120`, `moe_block_mxfp8_sm120`) | ✓ since 2026-09-15 (milestone M3): masked slab layout, MXFP8, CUTLASS pointer-array kernel |
 | BF16 attention | torch SDPA | torch SDPA | torch SDPA |
 | MXFP8 attention prefill | — | ✓ D ∈ {32, 64, 128, 256}, native GQA | — |
 | MXFP8 paged prefill (extend) | — | ✓ page_size a multiple of 32 | — |
@@ -197,7 +208,12 @@ python tests/gemm/unit/test_mxfp8_correctness.py
 python tests/gemm/unit/test_fp8_k128_sm120.py          # sm_100 / sm_120
 python tests/gemm/unit/test_mxfp8_grouped.py           # sm_120
 python tests/gemm/unit/test_moe_routing_threads.py     # sm_100 / sm_103: multi-CTA routing builder under two threads / two streams
+python tests/gemm/unit/test_moe_routing_masked_ids.py  # every arch: expert ids outside [0, E) through the builders and the gather
+python tests/gemm/unit/test_moe_router_topk.py         # every arch: fused router top-k vs the torch reference
+python tests/gemm/unit/test_moe_block_sm120.py         # RTX 5090: the composed block and its tp / ep / dp contracts
+python tests/gemm/unit/test_moe_layer_determinism_sm120.py tests/gemm/unit/test_moe_layer_padded_ids_sm120.py   # RTX 5090
 python tests/gemm/unit/test_fp8_grouped_sm90.py tests/gemm/unit/test_moe_layer_dispatch_sm90.py   # H200
+python tests/gemm/unit/test_moe_layer_determinism_sm90.py tests/gemm/unit/test_moe_layer_padded_ids_sm90.py     # H200
 python tests/gemm/unit/test_cuda_graph.py
 # Attention (sm_120)
 python -m pytest tests/attention/

@@ -86,8 +86,16 @@ KERNEL_IMPLS = ("dg_fp8_cont", "dg_bf16_cont", "dg_fp8_masked", "dg_bf16_masked"
                 "fso_mxfp8_grouped")
 LAYER_IMPLS = ("triton_bf16", "triton_fp8b", "dg_fp8_layer", "fso_mxfp8_layer",
                "fso_bsfp8_layer", "fso_mxfp8_layer_shared", "fso_bsfp8_layer_shared",
+               "fso_mxfp8_layer_op",
                "torch_smm_mxfp8_layer", "torch_grouped_bf16_layer",
                "torch_smm_mxfp8_layer_shared", "torch_grouped_bf16_layer_shared")
+# `fso_mxfp8_layer_op` is the opt-in A/B arm of the composed sm_120/121 library
+# entry `moe_layer_mxfp8_sm120` against `fso_mxfp8_layer`, which builds the same
+# six-kernel chain inline in this file. The two must land on the same kernels, so
+# a difference between their cells is glue cost (argument conditioning, the
+# chunking decision, the extra output copy when a call is chunked) and nothing
+# else. It is not part of the published grid: set FSO_BENCH_LAYER_OP=1 to add its
+# cells. Off sm_120/121 the entry raises and the cells record the error.
 # torch-native layer baselines (torch >= 2.11): `torch.nn.functional.
 # scaled_grouped_mm` (MXFP8 1x32, blocked scales) and `torch._grouped_mm`
 # (bf16). Neither needs deep_gemm, sglang or fso. They are the same-device
@@ -145,6 +153,8 @@ def make_cells():
     cells += [dict(impl="dg_fp8_layer", proj="layer", M=m) for m in DECODE_M]
     cells += [dict(impl="fso_mxfp8_layer", proj="layer", M=m) for m in FSO_M]
     cells += [dict(impl="fso_bsfp8_layer", proj="layer", M=m) for m in FSO_SM90_M]
+    if os.environ.get("FSO_BENCH_LAYER_OP") == "1":
+        cells += [dict(impl="fso_mxfp8_layer_op", proj="layer", M=m) for m in FSO_M]
     torch_impls = torch_impls_for_device()
     for impl in torch_impls:
         cells += [dict(impl=impl, proj="layer", M=m) for m in M_GRID]
@@ -933,6 +943,36 @@ def run_worker(cell):
                         dq, w2_fp8, sd, sw2, masked_dev, expected_m,
                         max_active_groups, slot_to_expert, ps2)
                     return fso.gemm.moe_combine(dn, slot_of_flat, topk_w)
+
+            out_holder = {}
+            if shared_fn is not None:
+                routed_fn = layer_fn
+
+                def layer_fn():
+                    return routed_fn() + shared_fn(hidden)
+            def fn():
+                out_holder["out"] = layer_fn()
+            fn()
+            torch.cuda.synchronize()
+            result["cos"] = cos_sim(out_holder["out"], ref)
+        elif base_impl == "fso_mxfp8_layer_op":
+            # The same chain as `fso_mxfp8_layer`, driven through the composed
+            # library entry instead of being built here: one call, the routing
+            # derived on the device inside the timed graph, every host-side
+            # decision (m_cap, expected_m, max_active_groups, the chunk count)
+            # taken by the library from the argument shapes. sm_120/121 only.
+            import fish_scales_ops as fso
+            w13_fp8, sw13 = fso.gemm.quantize_moe_weights_1x32_fp8(w13)
+            w2_fp8, sw2 = fso.gemm.quantize_moe_weights_1x32_fp8(w2)
+            m_cap = (M + 3) // 4 * 4
+            result["m_cap"] = m_cap
+            chunk = fso.gemm.moe_layer_chunk_tokens_sm120(M, E, HIDDEN, INTER)
+            result["chunks"] = (M + chunk - 1) // chunk
+            result["chunk_tokens"] = chunk
+
+            def layer_fn():
+                return fso.gemm.moe_layer_mxfp8_sm120(
+                    hidden, w13_fp8, sw13, w2_fp8, sw2, topk_ids, topk_w)
 
             out_holder = {}
             if shared_fn is not None:
