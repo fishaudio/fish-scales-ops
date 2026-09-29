@@ -468,7 +468,9 @@ struct ArgPool
 // first. Memory therefore grows with the number of distinct (capture, GEMM)
 // pairs a host thread creates, at `block_bytes(groups)` each (about 13 KB at
 // 128 experts, 106 KB at the 1024 cap); the arena is one allocation of
-// FSO_GROUPED_ARG_POOL_MB megabytes (default 16), made on the first eager
+// FSO_GROUPED_ARG_POOL_MB megabytes (default 128: a serving boot captures
+// tens of graph buckets over every MoE layer, up to ~1,840 pairs at 256
+// experts, which the earlier 16 MB default could not hold), made on the first eager
 // call of the thread and never grown. A capture that finds the arena full
 // aborts with a message naming the variable, because the alternative is to
 // fall back to the prep launch inside the graph and silently give back the
@@ -530,7 +532,7 @@ struct StaticArena
         static std::size_t const v = []
         {
             char const* e = std::getenv("FSO_GROUPED_ARG_POOL_MB");
-            long mb = (e && *e) ? std::atol(e) : 16;
+            long mb = (e && *e) ? std::atol(e) : 128;
             if (mb < 1)
                 mb = 1;
             return static_cast<std::size_t>(mb) << 20;

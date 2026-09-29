@@ -139,7 +139,7 @@ __device__ inline void fso_emit_slot_list(
 // b300_round3_20260922/M-A4); with it false the body is the pre-existing
 // kernel's, instruction for instruction, so callers that never ask for the
 // shapes keep the kernel they had, on every architecture.
-template <bool kShapes>
+template <bool kShapes, bool kWeights>
 __device__ __forceinline__ void moe_build_routing_body(
     int32_t const* __restrict__ topk_ids, // [M * topk]
     int32_t* __restrict__ masked_m,       // [G]
@@ -148,6 +148,8 @@ __device__ __forceinline__ void moe_build_routing_body(
     int32_t* __restrict__ slot_to_expert, // [G] or nullptr (see fso_emit_slot_list)
     int32_t* __restrict__ problem_shapes, // [P * G * 3] (see fso_emit_problem_shapes), read iff kShapes
     ProblemShapeList const& ps,
+    float const* __restrict__ topk_w,     // [M * topk], read iff kWeights
+    float* __restrict__ weight_of_slot,   // [G * m_cap] at valid slots, written iff kWeights
     int num_pairs, int topk, int num_groups, int m_cap, bool pdl)
 {
     // PDL: order the topk_ids read behind the parent (upstream layer /
@@ -212,6 +214,13 @@ __device__ __forceinline__ void moe_build_routing_body(
             int const slot = e * m_cap + r;
             row_map[slot] = i / topk; // source token row
             slot_of_flat[i] = slot;
+            if constexpr (kWeights)
+            {
+                // The combine weight indexed by SLOT rather than by pair: the
+                // fused FC2 epilogue knows which row it holds, not which pair
+                // produced it. Padding slots are left alone, like row_map's.
+                weight_of_slot[slot] = topk_w[i];
+            }
         }
         else
         {
@@ -239,8 +248,22 @@ __global__ void moe_build_routing_kernel(
     int32_t* __restrict__ slot_to_expert, // [G] or nullptr (see fso_emit_slot_list)
     int num_pairs, int topk, int num_groups, int m_cap, bool pdl)
 {
-    moe_build_routing_body<false>(topk_ids, masked_m, row_map, slot_of_flat, slot_to_expert, nullptr,
-        ProblemShapeList{}, num_pairs, topk, num_groups, m_cap, pdl);
+    moe_build_routing_body<false, false>(topk_ids, masked_m, row_map, slot_of_flat, slot_to_expert, nullptr,
+        ProblemShapeList{}, nullptr, nullptr, num_pairs, topk, num_groups, m_cap, pdl);
+}
+
+// The same builder, also publishing each slot's combine weight, which is what the
+// fused FC2 epilogue needs to add its rows straight into the layer output. Its own
+// instantiation, so the two kernels above stay byte-identical for every caller
+// that does not ask for it.
+__global__ void moe_build_routing_w_kernel(
+    int32_t const* __restrict__ topk_ids, int32_t* __restrict__ masked_m, int32_t* __restrict__ row_map,
+    int32_t* __restrict__ slot_of_flat, int32_t* __restrict__ slot_to_expert,
+    float const* __restrict__ topk_w, float* __restrict__ weight_of_slot,
+    int num_pairs, int topk, int num_groups, int m_cap, bool pdl)
+{
+    moe_build_routing_body<false, true>(topk_ids, masked_m, row_map, slot_of_flat, slot_to_expert, nullptr,
+        ProblemShapeList{}, topk_w, weight_of_slot, num_pairs, topk, num_groups, m_cap, pdl);
 }
 
 // The same builder, also emitting the per-group problem shapes of every GEMM
@@ -255,8 +278,8 @@ __global__ void moe_build_routing_ps_kernel(
     ProblemShapeList ps,
     int num_pairs, int topk, int num_groups, int m_cap, bool pdl)
 {
-    moe_build_routing_body<true>(topk_ids, masked_m, row_map, slot_of_flat, slot_to_expert, problem_shapes, ps,
-        num_pairs, topk, num_groups, m_cap, pdl);
+    moe_build_routing_body<true, false>(topk_ids, masked_m, row_map, slot_of_flat, slot_to_expert, problem_shapes,
+        ps, nullptr, nullptr, num_pairs, topk, num_groups, m_cap, pdl);
 }
 
 // kBias adds a per-token row on top of the weighted expert sum, optionally
@@ -274,27 +297,16 @@ __global__ void moe_combine_kernel(
     float const* __restrict__ bias_scale,     // [M] or nullptr: per-token factor on bias
     int M, int topk, int H, bool pdl)
 {
-    // PDL entry (see moe_build_routing_kernel).
-    if (pdl)
-    {
-        cudaGridDependencySynchronize();
-        if (threadIdx.x == 0)
-        {
-            cudaTriggerProgrammaticLaunchCompletion();
-        }
-    }
     constexpr int kVec = 8; // 8 bf16 = 16 bytes per thread
     int const tid = blockIdx.x * blockDim.x + threadIdx.x;
     int const num_hvec = H / kVec;
+    // A thread past the end has nothing to load and nothing to wait for. Thread 0
+    // of every CTA is in range (the grid is ceil(total / blockDim)), so every CTA
+    // still reaches the PDL trigger below.
     if (tid >= M * num_hvec)
         return;
     int const t = tid / num_hvec;
     int const h = (tid % num_hvec) * kVec;
-
-    float acc[kVec];
-#pragma unroll
-    for (int v = 0; v < kVec; ++v)
-        acc[v] = 0.f;
 
     // Prefetch all topk routed rows before reducing so the scattered LDG.128
     // latencies overlap. At M=1 this kernel is a single latency-bound CTA and
@@ -302,15 +314,24 @@ __global__ void moe_combine_kernel(
     // Fast path unrolls a fixed bound (covers the common MoE topk); larger topk
     // falls back to the sequential loop.
     constexpr int kMaxTopk = 8;
-    if (topk <= kMaxTopk)
+    bool const fast = topk <= kMaxTopk;
+    float ws[kMaxTopk];
+    int slots[kMaxTopk];
+    if (fast)
     {
-        float4 raws[kMaxTopk];
-        float ws[kMaxTopk];
-        int slots[kMaxTopk];
         // Three unrolled phases so the topk slot / weight loads, then the topk LDG.128 row loads, issue
         // back-to-back (two memory round trips per thread, as before masked entries were supported: a
         // branch or select inside a single loop cost +1.4-1.7 us at M = 8). A masked padded-row entry
         // (sorted layout, flat_to_sorted = -1) reads row 0, always allocated, and is zeroed afterwards.
+        //
+        // The first phase runs BEFORE the PDL wait below. slot_of_flat and topk_w are routing outputs,
+        // written four launches upstream of this kernel in every MoE chain of this library, so they are
+        // grandparent-or-older data like everything a kernel of the chain reads before its wait; only
+        // the dn rows come from the parent (the FC2). A CTA that is resident before the FC2 ends, which
+        // the 128-thread launch in moe_combine() makes the common case at decode, has its first round
+        // trip done when the wait returns. Direct callers inherit the chain's precondition: neither
+        // input may be written by the kernel launched immediately before this one. Measured in run
+        // sm120_r2_p1_20260929 (REPORT.md, part 2).
 #pragma unroll
         for (int j = 0; j < kMaxTopk; ++j)
         {
@@ -320,6 +341,27 @@ __global__ void moe_combine_kernel(
                 ws[j] = topk_w[t * topk + j];
             }
         }
+    }
+
+    // PDL entry (see moe_build_routing_kernel): the wait orders every dn read behind the parent,
+    // and the trigger follows the wait as in every kernel of the chain.
+    if (pdl)
+    {
+        cudaGridDependencySynchronize();
+        if (threadIdx.x == 0)
+        {
+            cudaTriggerProgrammaticLaunchCompletion();
+        }
+    }
+
+    float acc[kVec];
+#pragma unroll
+    for (int v = 0; v < kVec; ++v)
+        acc[v] = 0.f;
+
+    if (fast)
+    {
+        float4 raws[kMaxTopk];
 #pragma unroll
         for (int j = 0; j < kMaxTopk; ++j)
         {
@@ -443,7 +485,7 @@ __global__ void moe_combine_kernel(
 // GEMM's argument pool does.
 // Body shared by the two multi-CTA kernels below, on the same `kShapes`
 // footing as the single-CTA body above.
-template <bool kShapes>
+template <bool kShapes, bool kWeights>
 __device__ __forceinline__ void moe_build_routing_multi_body(
     int32_t const* __restrict__ topk_ids, // [M * topk]
     int32_t* __restrict__ masked_m,       // [G]
@@ -454,6 +496,8 @@ __device__ __forceinline__ void moe_build_routing_multi_body(
     int32_t* __restrict__ slot_to_expert, // [G] or nullptr (see fso_emit_slot_list)
     int32_t* __restrict__ problem_shapes, // [P * G * 3] (see fso_emit_problem_shapes), read iff kShapes
     ProblemShapeList const& ps,
+    float const* __restrict__ topk_w,     // [M * topk], read iff kWeights
+    float* __restrict__ weight_of_slot,   // [G * m_cap] at valid slots, written iff kWeights
     int num_pairs, int topk, int num_groups, int m_cap, bool pdl)
 {
     if (pdl)
@@ -513,6 +557,8 @@ __device__ __forceinline__ void moe_build_routing_multi_body(
             int const slot = e * m_cap + base[e] + r;
             row_map[slot] = i / topk;
             slot_of_flat[i] = slot;
+            if constexpr (kWeights)
+                weight_of_slot[slot] = topk_w[i]; // see the single-CTA body
         }
         else
         {
@@ -564,8 +610,20 @@ __global__ void moe_build_routing_multi_kernel(
     int32_t* __restrict__ slot_to_expert, // [G] or nullptr (see fso_emit_slot_list)
     int num_pairs, int topk, int num_groups, int m_cap, bool pdl)
 {
-    moe_build_routing_multi_body<false>(topk_ids, masked_m, row_map, slot_of_flat, gcnt, gdone, slot_to_expert,
-        nullptr, ProblemShapeList{}, num_pairs, topk, num_groups, m_cap, pdl);
+    moe_build_routing_multi_body<false, false>(topk_ids, masked_m, row_map, slot_of_flat, gcnt, gdone,
+        slot_to_expert, nullptr, ProblemShapeList{}, nullptr, nullptr, num_pairs, topk, num_groups, m_cap, pdl);
+}
+
+// The multi-CTA twin of moe_build_routing_w_kernel.
+__global__ void moe_build_routing_multi_w_kernel(
+    int32_t const* __restrict__ topk_ids, int32_t* __restrict__ masked_m, int32_t* __restrict__ row_map,
+    int32_t* __restrict__ slot_of_flat, int32_t* __restrict__ gcnt, int32_t* __restrict__ gdone,
+    int32_t* __restrict__ slot_to_expert, float const* __restrict__ topk_w, float* __restrict__ weight_of_slot,
+    int num_pairs, int topk, int num_groups, int m_cap, bool pdl)
+{
+    moe_build_routing_multi_body<false, true>(topk_ids, masked_m, row_map, slot_of_flat, gcnt, gdone,
+        slot_to_expert, nullptr, ProblemShapeList{}, topk_w, weight_of_slot, num_pairs, topk, num_groups, m_cap,
+        pdl);
 }
 
 __global__ void moe_build_routing_multi_ps_kernel(
@@ -580,8 +638,8 @@ __global__ void moe_build_routing_multi_ps_kernel(
     ProblemShapeList ps,
     int num_pairs, int topk, int num_groups, int m_cap, bool pdl)
 {
-    moe_build_routing_multi_body<true>(topk_ids, masked_m, row_map, slot_of_flat, gcnt, gdone, slot_to_expert,
-        problem_shapes, ps, num_pairs, topk, num_groups, m_cap, pdl);
+    moe_build_routing_multi_body<true, false>(topk_ids, masked_m, row_map, slot_of_flat, gcnt, gdone,
+        slot_to_expert, problem_shapes, ps, nullptr, nullptr, num_pairs, topk, num_groups, m_cap, pdl);
 }
 
 
@@ -1001,6 +1059,37 @@ static bool moe_glue_is_sm100_family()
     return v;
 }
 
+// Does this launch take the multi-CTA routing builder below instead of the
+// single-CTA one?
+//
+// The multi-CTA kernel is arch-neutral C++ (a shared-memory histogram, one
+// global atomic per (CTA, expert), and a last-CTA publish behind a threadfence),
+// but until 2026-09-28 it was ON for sm_100/103 only, where it was written. The
+// single-CTA builder does all of an M = 4096 Family C launch -- 32768 routed
+// pairs, as many scattered row_map writes -- from one SM out of the 5090's 170,
+// and an nsys timeline of the layer measured it at 30.4 us there, 3.3 % of the
+// whole layer and more than the gather-quantize next to it. With the multi-CTA
+// builder that kernel becomes 3.6 us and the Family C layer drops 0.49 % at
+// M = 512, 1.13 % at M = 1024 and 4.36 % at M = 4096, so sm_120 now takes it too.
+// The decode band is untouched either way: the path needs n_pairs >= 4096, which
+// at top-8 means M >= 512, and below that the single CTA is the right shape
+// because the cost there is the launch and not the arithmetic.
+// FSO_MOE_ROUTING_MULTI=0 restores the single-CTA builder on any arch.
+static bool moe_glue_routing_multi_enabled()
+{
+    static int const forced = []
+    {
+        char const* e = std::getenv("FSO_MOE_ROUTING_MULTI");
+        return (e != nullptr && *e != '\0') ? (std::atoi(e) != 0 ? 1 : 0) : -1;
+    }();
+    if (forced >= 0)
+    {
+        return forced != 0;
+    }
+    auto const* prop = at::cuda::getCurrentDeviceProperties();
+    return prop->major == 10 || prop->major == 12;
+}
+
 // Scratch for moe_build_routing_multi_kernel: per expert-group global counters
 // plus one arrival counter, zero on entry and zero again on exit because the
 // last CTA restores them.
@@ -1163,8 +1252,9 @@ constexpr int kRoutingMultiMaxCtas = 132;
 // existing callers are unaffected. Like the slot list this is
 // architecture-independent glue: every architecture produces it and only the
 // sm_100/103 cascade reads it.
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_build_routing(
-    at::Tensor topk_ids, int64_t num_groups, int64_t m_cap, bool with_slots, std::vector<int64_t> problem_shapes_nk)
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_build_routing(
+    at::Tensor topk_ids, int64_t num_groups, int64_t m_cap, bool with_slots, std::vector<int64_t> problem_shapes_nk,
+    std::optional<at::Tensor> topk_w)
 {
     TORCH_CHECK(topk_ids.is_cuda() && topk_ids.dtype() == at::kInt,
         "topk_ids must be CUDA int32");
@@ -1205,10 +1295,31 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_build
     int32_t* const slot_ptr = with_slots ? reinterpret_cast<int32_t*>(slot_to_expert.data_ptr()) : nullptr;
     auto problem_shapes = at::empty({num_ps, num_groups, 3}, opts);
     int32_t* const ps_ptr = num_ps > 0 ? reinterpret_cast<int32_t*>(problem_shapes.data_ptr()) : nullptr;
+    // Per-slot combine weights, asked for by passing topk_w: the fused FC2
+    // epilogue adds its rows into the layer output itself and needs the weight of
+    // the row it holds, which the pair-indexed topk_w cannot give it. Off by
+    // default; the returned tensor is then empty and the builders that do not
+    // publish it are the ones they always were.
+    bool const want_w = topk_w.has_value() && topk_w->numel() > 0;
+    float const* w_in = nullptr;
+    if (want_w)
+    {
+        auto const& tw = topk_w.value();
+        TORCH_CHECK(tw.is_cuda() && tw.dtype() == at::kFloat && tw.is_contiguous(),
+            "topk_w must be a contiguous CUDA fp32 tensor");
+        TORCH_CHECK(tw.numel() == static_cast<int64_t>(M) * topk,
+            "topk_w must have M * topk entries, matching topk_ids");
+        TORCH_CHECK(num_ps == 0,
+            "moe_build_routing: the per-group problem shapes (sm_100/103 pointer-array route) and the per-slot "
+            "combine weights (sm_120 fused FC2 epilogue) are never both consumed; ask for one");
+        w_in = reinterpret_cast<float const*>(tw.data_ptr());
+    }
+    auto weight_of_slot = at::empty({want_w ? num_groups * m_cap : 0}, topk_ids.options().dtype(at::kFloat));
+    float* const w_ptr = want_w ? reinterpret_cast<float*>(weight_of_slot.data_ptr()) : nullptr;
 
     auto stream = at::cuda::getCurrentCUDAStream();
     int const n_pairs = M * topk;
-    if (moe_glue_is_sm100_family() && n_pairs >= kRoutingMultiMinPairs)
+    if (moe_glue_routing_multi_enabled() && n_pairs >= kRoutingMultiMinPairs)
     {
         int32_t* scratch = RoutingScratch::instance().acquire(stream);
         if (scratch != nullptr)
@@ -1220,7 +1331,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_build
                 blocks = 1;
             // The pre-existing kernel when no shapes were asked for, so such
             // callers launch exactly the code they launched before.
-            if (ps_ptr == nullptr)
+            if (want_w)
+                fso_pdl_launch(moe_build_routing_multi_w_kernel, dim3(blocks), dim3(kRoutingMultiThreads), stream,
+                    fso_pdl_enabled(), reinterpret_cast<int32_t const*>(topk_ids.data_ptr()),
+                    reinterpret_cast<int32_t*>(masked_m.data_ptr()),
+                    reinterpret_cast<int32_t*>(row_map.data_ptr()),
+                    reinterpret_cast<int32_t*>(slot_of_flat.data_ptr()), scratch, scratch + kMaxGroups, slot_ptr,
+                    w_in, w_ptr, n_pairs, topk, static_cast<int>(num_groups), static_cast<int>(m_cap));
+            else if (ps_ptr == nullptr)
                 fso_pdl_launch(moe_build_routing_multi_kernel, dim3(blocks), dim3(kRoutingMultiThreads), stream,
                     fso_pdl_enabled(), reinterpret_cast<int32_t const*>(topk_ids.data_ptr()),
                     reinterpret_cast<int32_t*>(masked_m.data_ptr()),
@@ -1234,10 +1352,17 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_build
                     reinterpret_cast<int32_t*>(row_map.data_ptr()),
                     reinterpret_cast<int32_t*>(slot_of_flat.data_ptr()), scratch, scratch + kMaxGroups, slot_ptr,
                     ps_ptr, ps, n_pairs, topk, static_cast<int>(num_groups), static_cast<int>(m_cap));
-            return {masked_m, row_map, slot_of_flat, slot_to_expert, problem_shapes};
+            return {masked_m, row_map, slot_of_flat, slot_to_expert, problem_shapes, weight_of_slot};
         }
     }
-    if (ps_ptr == nullptr)
+    if (want_w)
+        fso_pdl_launch(moe_build_routing_w_kernel, dim3(1), dim3(kRoutingThreads), stream, fso_pdl_enabled(),
+            reinterpret_cast<int32_t const*>(topk_ids.data_ptr()),
+            reinterpret_cast<int32_t*>(masked_m.data_ptr()),
+            reinterpret_cast<int32_t*>(row_map.data_ptr()),
+            reinterpret_cast<int32_t*>(slot_of_flat.data_ptr()), slot_ptr, w_in, w_ptr,
+            n_pairs, topk, static_cast<int>(num_groups), static_cast<int>(m_cap));
+    else if (ps_ptr == nullptr)
         fso_pdl_launch(moe_build_routing_kernel, dim3(1), dim3(kRoutingThreads), stream, fso_pdl_enabled(),
             reinterpret_cast<int32_t const*>(topk_ids.data_ptr()),
             reinterpret_cast<int32_t*>(masked_m.data_ptr()),
@@ -1251,7 +1376,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_build
             reinterpret_cast<int32_t*>(row_map.data_ptr()),
             reinterpret_cast<int32_t*>(slot_of_flat.data_ptr()), slot_ptr, ps_ptr, ps,
             n_pairs, topk, static_cast<int>(num_groups), static_cast<int>(m_cap));
-    return {masked_m, row_map, slot_of_flat, slot_to_expert, problem_shapes};
+    return {masked_m, row_map, slot_of_flat, slot_to_expert, problem_shapes, weight_of_slot};
 }
 
 
@@ -1354,8 +1479,26 @@ at::Tensor moe_combine(at::Tensor dn, at::Tensor slot_of_flat, at::Tensor topk_w
     {
         out = at::empty({M, H}, dn.options());
     }
-    int const threads = 256;
     int64_t const total = static_cast<int64_t>(M) * (H / 8);
+    // Block size: 128 threads on sm_120 while the grid is small, 256 otherwise.
+    // Under PDL the combine starts early only if one of its CTAs fits on an SM
+    // beside the FC2's resident CTAs. The Family B decode FC2, the 2-CTA
+    // (16,128,2) grouped instance, has used 69 registers (72 allocated) since the
+    // prologue round: two of its 384-thread CTAs hold 55,296 of the SM's 65,536
+    // registers, and the 10,240 left take a 128-thread combine CTA at 64 registers
+    // (8,192) but not a 256-thread one (16,384). Run sm120_r2_p1_20260929 measured
+    // this launch: the combine enters at the FC2's release again, its critical-path
+    // increment falls 0.4-1.4 us at Family B M = 4-128, and the layer is 0.1-0.8 %
+    // faster at Family B M = 1-128 and up to 1.0 % at Family C, bit-identically
+    // (each thread reduces its own 8 columns over top-k in the same order). Grids
+    // above 256 CTAs of 128 threads (M > 128 at H = 2048, the prefill band) keep
+    // the 256-thread launch, and so do the other arches, whose FC2 kernels have
+    // other register footprints and were not measured with this launch.
+    constexpr int kSmallGridThreads = 128;
+    constexpr int64_t kSmallGridMaxCtas = 256;
+    bool const small_grid = at::cuda::getCurrentDeviceProperties()->major == 12
+        && total <= kSmallGridMaxCtas * kSmallGridThreads;
+    int const threads = small_grid ? kSmallGridThreads : 256;
     int const grid = static_cast<int>((total + threads - 1) / threads);
     auto stream = at::cuda::getCurrentCUDAStream();
     bool const pdl = fso_pdl_enabled() && static_cast<unsigned>(grid) <= kFsoPdlMaxGridCtas;

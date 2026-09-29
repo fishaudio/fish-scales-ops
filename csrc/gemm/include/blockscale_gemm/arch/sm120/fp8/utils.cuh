@@ -482,14 +482,42 @@ struct SM120BlockScaledScheduler
     // the decode GEMM work itself.
     bool layout_is_cumsum = false;
     int32_t total_m_blocks = 0;
+    // Slot -> group map. The walk below is over SLOTS, in blocks of group_block
+    // consecutive experts taken group_perm blocks apart:
+    //
+    //   block   = slot / group_block          local = slot % group_block
+    //   group   = ((block * group_perm) % num_blocks) * group_block + local
+    //
+    // group_perm = 1 makes slot and group the same thing, which is the expert-id
+    // order this scheduler has always used. A larger stride decorrelates schedule
+    // position from expert id; a group_block above 1 keeps runs of that many
+    // experts adjacent so the weight and activation streams stay sequential
+    // across them. See the prologue in gemm_1d1d.cuh, which builds the m-block
+    // prefix over the same map, and the dispatcher, which resolves both numbers.
+    int32_t group_perm = 1;
+    int32_t group_block = 1;
 
-    __device__ __forceinline__ explicit SM120BlockScaledScheduler(
-        int shape_m, int shape_n, int num_groups_, int* grouped_layout_, bool layout_is_cumsum_ = false)
+    __device__ __forceinline__ int32_t group_of_slot(int32_t slot) const
+    {
+        if (group_perm == 1)
+        {
+            return slot;
+        }
+        int32_t const num_blocks = num_groups / group_block;
+        int32_t const block = slot / group_block;
+        int32_t const local = slot - block * group_block;
+        return ((block * group_perm) % num_blocks) * group_block + local;
+    }
+
+    __device__ __forceinline__ explicit SM120BlockScaledScheduler(int shape_m, int shape_n, int num_groups_,
+        int* grouped_layout_, bool layout_is_cumsum_ = false, int group_perm_ = 1, int group_block_ = 1)
         : num_m_blocks((shape_m + BlockM - 1) / BlockM)
         , num_n_blocks((shape_n + BlockN - 1) / BlockN)
         , num_groups(num_groups_)
         , grouped_layout(grouped_layout_)
         , layout_is_cumsum(layout_is_cumsum_)
+        , group_perm(group_perm_)
+        , group_block(group_block_)
     {
         if (layout_is_cumsum)
         {
@@ -531,7 +559,10 @@ struct SM120BlockScaledScheduler
                 else
                     lo = mid + 1;
             }
-            current_group_idx = lo;
+            // lo is the SLOT the block falls in; the group holding it follows the
+            // permutation. Every factor is < num_groups <= 512, so the products
+            // stay inside int32.
+            current_group_idx = group_of_slot(lo);
             int const cum_before = (lo > 0) ? grouped_layout[lo - 1] : 0;
             num_m_blocks = grouped_layout[lo] - cum_before;
             get_swizzle_block_idx(next_block_idx - cum_before * num_n_blocks);

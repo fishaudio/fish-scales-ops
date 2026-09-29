@@ -36,26 +36,26 @@ baseline.
 
 ### sm_90 — NVIDIA H200 (132 SMs, 1830 MHz locked)
 
-| family | op | shape | M / S | dtype | µs | TFLOPS |
-|---|---|---|---|---|---:|---:|
-| A Qwen3-4B | `gate_up` | 19456×2560 | M=1 | block-FP8 1×128 | 17.85 | 6 |
-| A Qwen3-4B | `gate_up` | 19456×2560 | M=4096 | block-FP8 1×128 | 360.42 | 1132 |
-| B Qwen3-30B-A3B | MoE layer (routed, E=128, top-8) | 1536×2048 + 2048×768 per expert | M=1 | block-FP8 1×128 | 20.0 | 3.8 |
-| B Qwen3-30B-A3B | MoE layer (routed, E=128, top-8) | 1536×2048 + 2048×768 per expert | M=2048 | block-FP8 1×128 | 422.2 | 366.2 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1 | block-FP8 1×128 | 33.0 | 1.7 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | block-FP8 1×128 | 425.9 | 272.3 |
+| family            | op                                             | shape                                                        | M / S  | dtype           |     µs | TFLOPS |
+|-------------------|------------------------------------------------|--------------------------------------------------------------|--------|-----------------|-------:|-------:|
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | block-FP8 1×128 |  17.78 |      6 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 402.72 |   1013 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | block-FP8 1×128 |   22.3 |    3.4 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | block-FP8 1×128 |  421.6 |  366.8 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | block-FP8 1×128 |   34.6 |    1.6 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | block-FP8 1×128 |  424.7 |  273.1 |
 
 ### sm_120 — NVIDIA RTX 5090 (170 SMs, 2400 MHz locked)
 
-| family | op | shape | M / S | dtype | µs | TFLOPS |
-|---|---|---|---|---|---:|---:|
-| A Qwen3-4B | `gate_up` | 19456×2560 | M=1 | MXFP8 1×32 | 18.52 | 5 |
-| A Qwen3-4B | `gate_up` | 19456×2560 | M=4096 | MXFP8 1×32 | 704.21 | 579 |
-| A Qwen3-4B | `gate_up` | 19456×2560 | M=4096 | block-FP8 1×128 | 682.94 | 597 |
-| B Qwen3-30B-A3B | MoE layer (routed, E=128, top-8) | 1536×2048 + 2048×768 per expert | M=1 | MXFP8 1×32 | 22.6 | 3.3 |
-| B Qwen3-30B-A3B | MoE layer (routed, E=128, top-8) | 1536×2048 + 2048×768 per expert | M=2048 | MXFP8 1×32 | 643.3 | 240.3 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1 | MXFP8 1×32 | 34.9 | 1.6 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | MXFP8 1×32 | 794.6 | 145.9 |
+| family            | op                                             | shape                                                        | M / S  | dtype           |     µs | TFLOPS |
+|-------------------|------------------------------------------------|--------------------------------------------------------------|--------|-----------------|-------:|-------:|
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | MXFP8 1×32      |  35.75 |      3 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | MXFP8 1×32      | 719.72 |    567 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 702.92 |    580 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | MXFP8 1×32      |   32.5 |    2.3 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | MXFP8 1×32      |  577.1 |  267.9 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | MXFP8 1×32      |   38.7 |    1.5 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | MXFP8 1×32      |  717.3 |  161.7 |
 
 Row selection rule: per SM, one decode point and one prefill point per shape
 family for GEMM, one prefill and one decode row for attention where a native
@@ -118,9 +118,9 @@ if sm >= 10:
     xqm, sxm = fso.gemm.quantize_1x32_fp8(x_bf16)
     ym = fso.gemm.linear_mxfp8(xqm, wqm, sxm, swm)
 
-# ----- MoE layer (per-expert weights quantized offline, on the target arch) -----
-out = fso.gemm.moe_layer_fp8_sm90(hidden, w13_fp8, sw13, w2_fp8, sw2, topk_ids, topk_w)    # sm_90
-out = fso.gemm.moe_layer_mxfp8_sm120(hidden, w13_fp8, sw13, w2_fp8, sw2, topk_ids, topk_w) # sm_120
+# ----- MoE layer, every arch: prepare once per layer, then one call per batch ---
+experts = fso.moe.prepare_experts(w13, w2, format="bsfp8", sw13=sw13, sw2=sw2)  # or format="mxfp8" (bf16 experts)
+out = fso.moe.layer(hidden, experts, topk_ids, topk_w)    # the arch dispatch is inside the torch op
 
 # ----- MoE block, sm_120: router + routed experts + shared expert, one call ----
 # router_weight is [E, H] bf16, or [E+1, H] with the shared expert's gate row
@@ -137,12 +137,14 @@ from fish_scales_ops.attention.backends import sm120_mxfp8   # sm_120 MXFP8 kern
 o = sm120_mxfp8.mxfp8_fwd(q_fp8, q_sc, k_fp8, k_sc, v_fp8, v_sc, causal=True)   # pre-quantized inputs
 ```
 
-`fso.gemm` and `fso.attention` are independent namespaces with no top-level
-re-exports. Both MoE layer entries compose six per-step ops that stay public,
-which is how the sm_100/103 layer — with its fused FC1 and its slot-bound decode
-route — is driven; the contracts, scale layouts and constraints of every op are in
-[`docs/api/gemm.md`](docs/api/gemm.md) and
-[`docs/api/attention.md`](docs/api/attention.md).
+`fso.gemm`, `fso.moe` and `fso.attention` are independent namespaces with no
+top-level re-exports. `fso.moe` is the MoE layer surface for every architecture:
+`prepare_experts` converts a layer's local experts for this device at load time,
+and `layer` is one torch custom op whose body runs the architecture's chain — the
+per-arch entries `fso.gemm.moe_layer_fp8_sm90` and `fso.gemm.moe_layer_mxfp8_sm120`
+and the per-step ops they compose, all of which stay public. The contracts, scale
+layouts and constraints of every op are in [`docs/api/gemm.md`](docs/api/gemm.md)
+and [`docs/api/attention.md`](docs/api/attention.md).
 
 ## Status
 
@@ -150,6 +152,7 @@ route — is driven; the contracts, scale layouts and constraints of every op ar
 |---|---|---|---|
 | block-FP8 1×128 GEMM | ✓ deep_gemm WGMMA, NVRTC JIT, FP32 scales | ✓ CUTLASS `Sm120BlockScaledKernel`, UE8M0 scales | ✓ since 2026-09-05, on the MXFP8 tcgen05 path with replicated scales |
 | MXFP8 1×32 GEMM | — | ✓ CUTLASS block-scaled | ✓ three tiers: cuBLAS `scaled_mm`, CuTe DSL, C++ cascade |
+| MoE layer surface `fso.moe` | ✓ block-FP8 experts (`format="bsfp8"`) | ✓ block-FP8 experts, requantized to MXFP8 at load, and bf16 experts (`format="mxfp8"`) | the same code path as sm_120 with the sm_100 routing extras; validation on the B300 pending |
 | grouped MoE layer | ✓ expert-sorted contiguous layout with swap-AB decode path (`moe_layer_fp8_sm90`) | ✓ masked slab layout, MXFP8, composed layer and whole-block entries (`moe_layer_mxfp8_sm120`, `moe_block_mxfp8_sm120`) | ✓ since 2026-09-15 (milestone M3): masked slab layout, MXFP8, CUTLASS pointer-array kernel |
 | BF16 attention | torch SDPA | torch SDPA | torch SDPA |
 | MXFP8 attention prefill | — | ✓ D ∈ {32, 64, 128, 256}, native GQA | — |
@@ -210,6 +213,7 @@ python tests/gemm/unit/test_mxfp8_grouped.py           # sm_120
 python tests/gemm/unit/test_moe_routing_threads.py     # sm_100 / sm_103: multi-CTA routing builder under two threads / two streams
 python tests/gemm/unit/test_moe_routing_masked_ids.py  # every arch: expert ids outside [0, E) through the builders and the gather
 python tests/gemm/unit/test_moe_router_topk.py         # every arch: fused router top-k vs the torch reference
+python tests/gemm/unit/test_moe_unified.py             # every arch: fso.moe against the per-arch entries, the bsfp8 double quantization, the refusals
 python tests/gemm/unit/test_moe_block_sm120.py         # RTX 5090: the composed block and its tp / ep / dp contracts
 python tests/gemm/unit/test_moe_layer_determinism_sm120.py tests/gemm/unit/test_moe_layer_padded_ids_sm120.py   # RTX 5090
 python tests/gemm/unit/test_fp8_grouped_sm90.py tests/gemm/unit/test_moe_layer_dispatch_sm90.py   # H200

@@ -39,9 +39,21 @@ reader of the tables needs.
 
 - **One process per cell.** Each `(shape, M)` cell runs in its own subprocess
   so env knobs and JIT/autotune caches cannot leak between cells.
-- **CUDA-graph replay median.** Per cell: eager warmup → side-stream warmup →
-  `torch.cuda.graph` capture → replay batches timed with CUDA events; report
-  the median. The reported `µs` is the graph-replay cost (what a production
+- **CUDA-graph replay median, cold weights.** Per cell: eager warmup →
+  side-stream warmup → `torch.cuda.graph` capture → replay batches timed with
+  CUDA events; report the median. Since 2026-09-28 the captured graph holds
+  R copies of the cell over R copies of its weights (same values, distinct
+  memory, every quantized form built per copy), with R × active weight bytes
+  at least twice the device's L2 (R ∈ [2, 256]; the cap was 16 until
+  2026-09-29, which left the 1–2 MB shared-expert projections warm on every
+  device and `wo` / `wqkv` at 1–1.9 × L2 on the B300), and the reported `µs` is the
+  replay time / R: each copy's weights have been evicted by the others before
+  the graph returns to it, as a serving step evicts every layer's weights by
+  streaming the next layers' through. Activations, routing and the
+  intermediate slabs stay warm, as they do in a model. Rows carry
+  `weight_copies`; files measured before that date (every sm_90 and sm_100
+  table, and the sm_120 dense tables until they are rerun) replayed one warm
+  copy and overstate the M ≤ 128 rows — their provenance says which. The reported `µs` is the graph-replay cost (what a production
   decode/prefill loop pays), never eager single-call time.
 - **Locked clocks** (section 5). A run on an unlocked device is labelled as such
   in the environment block and is not comparable across commits.
@@ -162,21 +174,43 @@ sweeps) are allowed in sweeps and A/Bs through the benches' `--Ms` argument;
 they are not baseline rows and do not appear in the tables. The benches'
 default grids equal this table.
 
-## 5. Devices and clock locks
+## 5. Devices and clocks
 
-Official numbers are taken with the clock locked at the no-boost frequency so
-that runs are comparable across days and commits. CUDA 13 toolchain everywhere.
+Since 2026-09-29 (stone): only gaming cards get a clock lock. The RTX 5090 is
+locked at its no-boost frequency so that its runs are comparable across days
+and commits, because a gaming card's boost behaviour depends on temperature,
+power and the neighbouring cards' load. Datacenter cards (H200, B300 and
+their MIG forms) run at their natural clock, as they do in serving, with a
+clock sampler recording what the card actually did; their published numbers
+are natural-clock numbers, and the power cap is part of the device. CUDA 13
+toolchain everywhere.
 
-| SM | device | SMs | lock command | sustained clock | notes |
+| SM | device | SMs | clock policy | what the sampler reads under load | notes |
 |---|---|---|---|---|---|
-| sm_90 | NVIDIA H200 | 132 | `nvidia-smi -lgc 1980` | 1830 MHz | |
-| sm_120 | NVIDIA GeForce RTX 5090 | 170 | `nvidia-smi -lgc 2407` | 2400 MHz | primary sm_120 device |
-| sm_120 | NVIDIA RTX PRO 6000 Blackwell | 188 | `nvidia-smi -lgc 2430` | 2400 MHz | optional section |
-| sm_103 | NVIDIA B300 | 148 | no lock available | ~2032 MHz flat under load | needs `FSO_BENCH_WARM_MS=300` — the dense bench, the MLP-layer forward bench (`bench_qwen3_4b_mlp_forward.py`, knob added 2026-09-15) and the MoE bench all honour it; label rows "unlocked" and read them with §8's B300 caveats |
+| sm_90 | NVIDIA H200 | 132 | **natural clock, no lock** (`nvidia-smi -rgc` before a run; until 2026-09-29 the tables were taken under `-lgc 1980`) | up to 1980 MHz; the 700 W power cap holds the heaviest dense cells at 1275–1800 MHz | |
+| sm_120 | NVIDIA GeForce RTX 5090 | 170 | `nvidia-smi -lgc 2407` | 2392–2400 MHz; the SW power-cap flag appears on prefill cells at 67–365 W of 575 W and lowers absolute prefill numbers a few percent | primary sm_120 device; release the lock (`-rgc`) when the run ends |
+| sm_120 | NVIDIA RTX PRO 6000 Blackwell | 188 | `nvidia-smi -lgc 2430` (a gaming-class board) | 2400 MHz | optional section |
+| sm_103 | NVIDIA B300 | 148 | natural clock (the pod cannot lock; it never could) | ~2032 MHz flat on the MoE tables; the 1100 W power cap holds a third of the dense tables' busy samples at 1087–1999 MHz | needs `FSO_BENCH_WARM_MS=300` — the dense bench, the MLP-layer forward bench (`bench_qwen3_4b_mlp_forward.py`, knob added 2026-09-15) and the MoE layer bench all honour it |
 
-Verify the lock took effect (`clocks.sm` reads the locked value under load)
-before every run; record driver, CUDA, torch and the fso commit in the file's
-environment block.
+Before every run: on the 5090 verify the lock took effect (`clocks.sm` reads
+the locked value under load); on a datacenter card verify no lock is left
+from an earlier session (`clocks.applications.graphics` / `-rgc`); run a
+sampler (`nvidia-smi --query-gpu=timestamp,clocks.sm,power.draw,clocks_event_reasons.active
+-lms 1000`) next to the chain and keep its csv in the run directory; record
+driver, CUDA, torch and the fso commit in the file's environment block.
+
+Power cap. On the H200 and the B300 the cold protocol (§2) streams the
+weights from HBM for R times longer per replay than the warm one did, and
+the heaviest dense cells run into the board's power limit: on the H200
+(run `h200_cold_20260929`, then locked) 34 of 263 busy samples sat between
+1275 and 1800 MHz with the SW power-cap flag, concentrated in the dense
+prefill rows (`wqkv` / `wo` at M = 8192, the cubic cells), while every MoE
+layer row ran at the sustained clock; on the B300 a third of each dense
+pass's busy samples read 1087–1999 MHz and the M ≥ 1024 dense rows differ by
+up to 12 % between two passes of the same run. Those dense rows are
+power-bound numbers: sample the clock on both arms before accepting or
+rejecting a change on them, and prefer the MoE tables or the decode band for
+a verdict (`gemm/sm90.md`, `gemm/sm100.md`, Environment).
 
 ## 6. dtype matrix per SM
 
@@ -206,6 +240,35 @@ the tables (provenance, readings) is edited by hand in the same commit.
 4. Copy the accepted jsonl to `tests/baselines/` and regenerate the table file;
    update the README hot-shape rows from the same data; commit together.
 
+## 7b. Regenerating baselines, tables and reports from a run directory
+
+Every perf run leaves its raw jsonl files in a run directory outside the git
+tree; the path from there to the published numbers is one tool,
+`bench/gemm/python/perf_report.py`, and never a hand-written script:
+`merge --run <dir>` builds the canonical baseline files (the fso rows as they
+are, the layer-level comparators merged into `ref_moe_*`, the kernel-level ones
+into `ref_kern_moe_*`, the dense files copied; cells without a µs are listed
+with their reason), `diff --a baselines --b <dir>` prints every shared cell's
+delta with decode (M ≤ 128) and prefill (M > 128) medians and the cells beyond
+a threshold — the A/B of any change — `report [--run <dir>]` prints the
+comparison tables with ×fso and band geometric means, and `install --run <dir>`
+does merge → diff → copy into `tests/baselines/` → `render_perf_docs.py`
+(→ `--check`). The docstring carries the raw-file manifest. `report` and
+`diff` never read a merged file that is lying in a run directory: a directory
+that was installed once keeps its `ref_moe_*` / `ref_kern_moe_*` from that
+install next to any raw files added later, so both commands rebuild the merged
+files from the raw ones in a scratch copy first (`merged_view`) — otherwise one
+run's fso rows get paired with an earlier run's comparators (found on
+2026-09-28: a `down` M = 1 comparator cell read from the stale merge was the
+half-warm number of the earlier protocol). A comparator file whose name is
+not in the manifest is never merged. `merge` (and so `install`) also checks
+every row that carries `weight_copies` against the cold protocol's target and
+prints the rows whose copies × weight bytes fall short of 2 × the device's L2
+(`COLD-PROTOCOL: …`); such rows were served from L2 for part of their replay
+and must not be published as cold (the 16-copy cap of 2026-09-28 produced
+exactly those rows for the 1–2 MB shared-expert projections and for the Family
+C `down` kernel cell at M = 1).
+
 ## 8. Reading the tables
 
 Verified measurement effects that change how a row is read. The tuning
@@ -224,15 +287,28 @@ only what a reader of the tables needs.
   and the kernel table records the consequence. `FSO_FORCE_TILE` together with
   `FSO_FORCE_TILE_K=<K>` forces one projection's tile inside the captured layer
   for such sweeps.
-- **Small-M graph-replay cells are L2-resident.** Replay re-runs one cell's
-  kernels with the same weights and the bench does not flush L2, so at
-  M ≤ 128 the active weights (10–50 MB) stay in the RTX 5090's 96 MB, the
-  H200's 60 MB or the B300's 126.5 MiB L2 and the µs undercut the DRAM floor. A `weight GB/s` above the
-  device's DRAM bandwidth means the cell is L2-fed. These rows bound the
-  kernel, not the serving cost, which rotates every layer's weights through
-  DRAM.
+- **Warm-L2 small-M cells overstate the kernel; the protocol rotates weights
+  since 2026-09-28.** Replaying one cell's graph with the same weights keeps
+  the M ≤ 128 active set (10–50 MB) in the RTX 5090's 96 MB, the H200's 60 MB
+  or the B300's 126.5 MiB L2, and the µs undercut the DRAM floor — a
+  `weight GB/s` above the device's DRAM bandwidth is the tell. A serving step
+  streams every layer's weights through in turn, so no layer finds its
+  weights in L2; the bench now rotates ≥ 2 × L2 of weight copies inside the
+  captured graph (§2). Rows without `weight_copies` were taken warm and their
+  small-M values bound the kernel, not the serving cost: on the RTX 5090 the
+  Family B M = 1 layer reads 22.7 µs warm and 35.2 µs cold.
+- **A cell whose active weight footprint lands within a few MB of the L2 is
+  sensitive to the routing draw, not just to the code.** Family C M = 4 on the
+  5090 holds 30 active experts, 94 MB of weights against a 96 MB L2: re-drawing
+  the routing with six seeds moved one A/B's verdict from −9.4 % to +21.4 % and
+  the absolute time from 39 to 59 µs, with the active count barely changing
+  (30–32). The affected 5090 cells are Family C M = 4–5 and Family B M = 3–4.
+  Average over draws before calling such a cell a regression (2026-09-28).
 - **Small-M graph µs on the RTX 5090 quantise in ~2 µs steps** (12.4 / 14.4 /
-  16.5 …). One cell moving by one step between runs is not a signal. The
+  16.5 …). One cell moving by one step between runs is not a signal. Measured
+  again 2026-09-28 at M = 1: 24 points of a width sweep landed on six distinct
+  values spaced 2.05 µs apart, so an M = 1 layer cell cannot resolve better
+  than 9 % of itself. The
   warm-vs-warm noise floor on both devices is about 0.1 % on the median and
   up to ±5 % on isolated cells, which is why acceptance is judged on every
   affected cell against the ±1 % band and a single outlier is re-run, not

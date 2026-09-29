@@ -2,10 +2,12 @@
 """Two-thread / two-stream stress test for the `moe_build_routing` builders.
 
 One entry point, two device kernels. `moe_build_routing_kernel` is a single
-CTA and is what every architecture launches; on sm_100 / sm_103 only, a
-routing call with at least `kRoutingMultiMinPairs` = 4096 routed pairs is
-handed to `moe_build_routing_multi_kernel` instead (the selection lives in
-`csrc/gemm/ops/moe_glue.cu`). The multi-CTA kernel needs a small global
+CTA and is what every architecture launches; on sm_100 / sm_103 and, since
+2026-09-28, on sm_120 / sm_121, a routing call with at least
+`kRoutingMultiMinPairs` = 4096 routed pairs is handed to
+`moe_build_routing_multi_kernel` instead (the selection lives in
+`moe_glue_routing_multi_enabled()`, `csrc/gemm/ops/moe_glue.cu`, and
+FSO_MOE_ROUTING_MULTI forces either kernel on any architecture). The multi-CTA kernel needs a small global
 scratch (per-expert counters plus an arrival counter) which must be zero when
 a launch starts and which the launch restores to zero before it exits, so two
 launches that can execute at the same time must never be handed the same
@@ -18,11 +20,15 @@ This file therefore has two sections.
      - sm_90, sm_120 and sm_100 alike - takes `moe_build_routing_kernel`.
      It is driven under the same two-thread / two-stream stress as section 2,
      over three kinds of routing draw, and every call asks for the packed
-     active-expert list. On sm_90 and sm_120 this is the ONLY coverage the
-     routing builder gets, because the multi-CTA kernel is never selected
-     there.
-  2. MULTI-CTA, runs only where that kernel is selected, i.e. sm_100 /
-     sm_103. Skipped elsewhere with the reason printed.
+     active-expert list. On sm_90 this is the ONLY coverage the routing
+     builder gets, because the multi-CTA kernel is not selected there.
+  2. MULTI-CTA, runs where that kernel is selected, i.e. sm_100 / sm_103 and
+     sm_120 / sm_121 (or wherever FSO_MOE_ROUTING_MULTI forces it). Skipped
+     elsewhere with the reason printed. Before its stress, every draw runs once
+     un-threaded under CUPTI and is compared with the single-CTA builder on the
+     same draw, run in a child process with FSO_MOE_ROUTING_MULTI=0 (the knob is
+     read once per process); the CUPTI records show that this process launched
+     the multi-CTA kernel and the child the single-CTA one.
 
 Both sections issue their calls in bursts with no host synchronisation inside
 a burst, and the two threads are released into each burst by a barrier,
@@ -59,7 +65,11 @@ always names which sections ran and which were skipped. Exit 0 therefore
 means the routing builder was exercised on this device, not merely that the
 file reached its end.
 """
+import os
+import re
+import subprocess
 import sys
+import tempfile
 import threading
 
 import torch
@@ -254,6 +264,106 @@ def stress(draws, m_cap, topk, rounds, burst):
     return failures
 
 
+def multi_cta_selected(major):
+    """(selected, reason): the mirror of moe_glue_routing_multi_enabled(). A set
+    FSO_MOE_ROUTING_MULTI forces the multi-CTA builder on or off on any
+    architecture (read like the C++ side's atoi); unset, sm_100/103 and sm_120/121
+    select it."""
+    env = os.environ.get("FSO_MOE_ROUTING_MULTI", "")
+    if env != "":
+        lead = re.match(r"\s*[+-]?\d+", env)
+        on = lead is not None and int(lead.group(0)) != 0
+        return on, f"FSO_MOE_ROUTING_MULTI={env} forces it {'on' if on else 'off'}"
+    if major in (10, 12):
+        return True, f"selected on sm_{major}x"
+    return False, f"not selected on sm_{major}x; sm_100/103 and sm_120/121 select it"
+
+
+def routing_call(ids, e, m_cap, with_slots):
+    """One moe_build_routing call under CUPTI: the host copies of (masked_m,
+    row_map, slot_of_flat, slot_to_expert or None) and the names of the routing
+    kernels it launched."""
+    from torch.profiler import ProfilerActivity, profile
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        out = fso.gemm.moe_build_routing(ids, e, m_cap, with_slots=with_slots)
+        torch.cuda.synchronize()
+    names = sorted({ev.key for ev in prof.key_averages() if "moe_build_routing" in ev.key})
+    ste = out[3].cpu() if with_slots else None
+    return (out[0].cpu(), out[1].cpu(), out[2].cpu(), ste), names
+
+
+def single_cta_reference(cases):
+    """routing_call() of every (ids, e, m_cap, with_slots) case in a child process
+    run with FSO_MOE_ROUTING_MULTI=0, i.e. through the single-CTA builder. Call it
+    before this process opens its CUDA context: on a card in exclusive-process
+    compute mode the child cannot open one while the parent holds one."""
+    with tempfile.TemporaryDirectory() as d:
+        src, dst = os.path.join(d, "cases.pt"), os.path.join(d, "reference.pt")
+        torch.save([(ids.cpu(), e, m_cap, ws) for ids, e, m_cap, ws in cases], src)
+        env = dict(os.environ, FSO_MOE_ROUTING_MULTI="0")
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), "--single-cta-reference", src, dst],
+                           env=env, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError("single-CTA reference process failed:\n" + r.stdout[-2000:] + r.stderr[-2000:])
+        return torch.load(dst)
+
+
+def write_single_cta_reference(src, dst):
+    """The child side of single_cta_reference()."""
+    torch.save([routing_call(ids.cuda(), e, m_cap, ws) for ids, e, m_cap, ws in torch.load(src)], dst)
+    return 0
+
+
+def same_routing(e, m_cap, a, b):
+    """What two builders must agree on for one draw: masked_m, the packed expert
+    list, and, expert by expert, the multiset of source tokens its rows name. The
+    row a pair gets inside its expert's block is a free permutation that the two
+    kernels assign in different orders, so slot_of_flat is not compared."""
+    (ma, ra, _sa, ea), (mb, rb, _sb, eb) = a, b
+    if not torch.equal(ma, mb):
+        return ["masked_m differs"]
+    bad = []
+    if not torch.equal(ea, eb):
+        bad.append("slot_to_expert differs")
+    valid = torch.arange(m_cap).unsqueeze(0) < ma.to(torch.int64).unsqueeze(1)
+    big = torch.iinfo(torch.int32).max
+    ta = torch.where(valid, ra.view(e, m_cap), big).sort(dim=1).values
+    tb = torch.where(valid, rb.view(e, m_cap), big).sort(dim=1).values
+    if not torch.equal(ta, tb):
+        bad.append("some expert's rows name a different set of source tokens")
+    return bad
+
+
+def multi_cta_draws(device):
+    """The multi-CTA section's draws, thread id -> [(label, topk_ids, E)]."""
+    return {t: [(f"random E={E} seed{i}",
+                 make_routing(M, E, TOPK, 20260917 + 1000 * t + i, device), E)
+                for i in range(DRAWS)] for t in (0, 1)}
+
+
+def multi_cta_anchor(draws, reference, m_cap, topk):
+    """Each multi-CTA draw once, un-threaded: the routing contract, the kernel the
+    call launched (the multi-CTA kernel, not the single-CTA fallback a call takes
+    when no scratch buffer is available), and agreement with the single-CTA
+    builder's result on the same draw (FSO_MOE_ROUTING_MULTI=0, child process)."""
+    failures = []
+    for (label, ids, e), (rout, rnames) in zip(draws, reference):
+        out, names = routing_call(ids, e, m_cap, True)
+        masked, row_map, slot, ste = out
+        bad = check(ids.cpu(), masked, row_map, slot, e, m_cap, topk, ste)
+        if not names or not all("moe_build_routing_multi" in n for n in names):
+            bad.append(f"this process launched {names or 'no recorded routing kernel'}, not the multi-CTA kernel")
+        if not rnames or any("moe_build_routing_multi" in n for n in rnames):
+            bad.append(f"the FSO_MOE_ROUTING_MULTI=0 process launched {rnames or 'no recorded routing kernel'}")
+        bad += [f"vs single-CTA: {b}" for b in same_routing(e, m_cap, out, rout)]
+        if bad:
+            failures.append(f"anchor {label}: " + "; ".join(bad))
+            print(f"  FAIL anchor {label:26s} " + "; ".join(bad))
+        else:
+            print(f"  anchor {label:26s} multi-CTA kernel, contract OK, same routing as the single-CTA builder")
+    return failures
+
+
 def section_single_cta(dev):
     """The arch-independent section. Returns the list of failure strings."""
     m_cap = (SINGLE_M + 3) // 4 * 4
@@ -267,13 +377,14 @@ def section_single_cta(dev):
     return failures
 
 
-def section_multi_cta(dev):
-    """The sm_100 / sm_103 section. Returns the list of failure strings."""
+def section_multi_cta(dev, reference):
+    """The multi-CTA section (sm_100/103, sm_120/121). `reference` is the
+    single-CTA builder's result on every draw, thread 0's draws first. Returns the
+    list of failure strings."""
     m_cap = (M + 3) // 4 * 4
-    draws = {t: [(f"random E={E} seed{i}",
-                  make_routing(M, E, TOPK, 20260917 + 1000 * t + i, dev), E)
-                 for i in range(DRAWS)] for t in (0, 1)}
-    failures = stress(draws, m_cap, TOPK, ROUNDS, BURST)
+    draws = multi_cta_draws(dev)
+    failures = multi_cta_anchor(draws[0] + draws[1], reference, m_cap, TOPK)
+    failures += stress(draws, m_cap, TOPK, ROUNDS, BURST)
     if not failures:
         print(f"  2 threads x 2 streams x {ROUNDS * BURST} calls at M={M} "
               f"({M * TOPK} routed pairs, bursts of {BURST})  OK")
@@ -291,6 +402,16 @@ def main():
     dev = torch.device("cuda")
     major, minor = torch.cuda.get_device_capability(0)
 
+    # The multi-CTA section's single-CTA reference comes first. It runs in a child
+    # process (FSO_MOE_ROUTING_MULTI is read once per process), and on a card in
+    # exclusive-process compute mode that child can only open a CUDA context while
+    # this process holds none, i.e. before anything below touches the device.
+    multi, why = multi_cta_selected(major)
+    if multi:
+        cpu_draws = multi_cta_draws("cpu")
+        reference = single_cta_reference([(ids, e, (M + 3) // 4 * 4, True)
+                                          for _, ids, e in cpu_draws[0] + cpu_draws[1]])
+
     print(f"== {SEC_SINGLE} routing builder (every arch; device is "
           f"sm_{major}{minor}) ==")
     bad = section_single_cta(dev)
@@ -298,18 +419,15 @@ def main():
     if bad:
         failures += [f"{SEC_SINGLE}: {b}" for b in bad]
 
-    print(f"== {SEC_MULTI} routing builder (sm_100 / sm_103 only) ==")
-    if major == 10:
-        bad = section_multi_cta(dev)
+    print(f"== {SEC_MULTI} routing builder (sm_100 / sm_103, sm_120 / sm_121; {why}) ==")
+    if multi:
+        bad = section_multi_cta(dev, reference)
         ran.append(SEC_MULTI)
         if bad:
             failures += [f"{SEC_MULTI}: {b}" for b in bad]
-        skip_note = None
     else:
-        skip_note = (f"multi-CTA routing builder is sm_100/sm_103 only "
-                     f"(device is sm_{major}x)")
-        print(f"  SKIP: {skip_note}")
-        skipped.append(f"{SEC_MULTI} ({skip_note})")
+        print(f"  SKIP: {why}")
+        skipped.append(f"{SEC_MULTI} ({why})")
 
     for f in failures[:10]:
         print("FAIL " + f)
@@ -327,4 +445,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == "--single-cta-reference":
+        sys.exit(write_single_cta_reference(sys.argv[2], sys.argv[3]))
     sys.exit(main())

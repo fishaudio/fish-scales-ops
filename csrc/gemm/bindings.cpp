@@ -82,9 +82,12 @@ bool mxfp8_grouped_slot_possible(
 // only when asked with the same flag.
 bool mxfp8_grouped_problem_shapes_consumed(
     int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups, int64_t max_active_groups, bool fused_swiglu);
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_build_routing(
+at::Tensor linear_mxfp8_grouped_masked_combine(at::Tensor a_fp8, at::Tensor w2_fp8, at::Tensor sa_int32,
+    at::Tensor sw2_int32, at::Tensor masked_m, at::Tensor row_map, at::Tensor weight_of_slot, at::Tensor out,
+    int64_t expected_m, int64_t max_active_groups);
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_build_routing(
     at::Tensor topk_ids, int64_t num_groups, int64_t m_cap, bool with_slots,
-    std::vector<int64_t> problem_shapes_nk);
+    std::vector<int64_t> problem_shapes_nk, std::optional<at::Tensor> topk_w);
 at::Tensor moe_combine(at::Tensor dn, at::Tensor slot_of_flat, at::Tensor topk_w,
     std::optional<at::Tensor> bias, std::optional<at::Tensor> bias_scale, std::optional<at::Tensor> out);
 std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_build_sorted(
@@ -150,7 +153,12 @@ TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
                                                  "int max_active_groups, bool fused_swiglu=False) -> bool",
         &blockscale_gemm::mxfp8_grouped_problem_shapes_consumed);
     m.def("moe_build_routing(Tensor topk_ids, int num_groups, int m_cap, bool with_slots=False, "
-                             "int[] problem_shapes_nk=[]) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
+                             "int[] problem_shapes_nk=[], Tensor? topk_w=None) "
+                             "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
+    m.def("linear_mxfp8_grouped_masked_combine(Tensor a_fp8, Tensor w2_fp8, Tensor sa_int32, "
+                                              "Tensor sw2_int32, Tensor masked_m, Tensor row_map, "
+                                              "Tensor weight_of_slot, Tensor(a!) out, int expected_m, "
+                                              "int max_active_groups=0) -> Tensor(a!)");
     m.def("moe_combine(Tensor dn, Tensor slot_of_flat, Tensor topk_w, Tensor? bias=None, "
                        "Tensor? bias_scale=None, Tensor? out=None) -> Tensor");
     m.def("moe_topk_from_logits(Tensor logits, int topk, bool renormalize=True, "
@@ -188,6 +196,7 @@ TORCH_LIBRARY_IMPL(fish_scales_ops, CUDA, m)
     m.impl("silu_chunk_mul_quantize_1x32_grouped", &blockscale_gemm::silu_chunk_mul_quantize_1x32_grouped);
     m.impl("linear_mxfp8_grouped_masked_swiglu", &blockscale_gemm::linear_mxfp8_grouped_masked_swiglu);
     m.impl("moe_build_routing", &blockscale_gemm::moe_build_routing);
+    m.impl("linear_mxfp8_grouped_masked_combine", &blockscale_gemm::linear_mxfp8_grouped_masked_combine);
     m.impl("moe_combine", &blockscale_gemm::moe_combine);
     m.impl("moe_topk_from_logits", &blockscale_gemm::moe_topk_from_logits);
     m.impl("moe_build_sorted", &blockscale_gemm::moe_build_sorted);

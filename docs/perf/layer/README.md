@@ -39,24 +39,37 @@ other comparators in `sm100.md`.
 | `block µs` | graph-replay median of the whole block at `M` tokens |
 | `model ms` | `block µs × layers / 1000` — the block's share of one forward step over the whole model (A: 36 layers, B: 48, C: 40). It is what the block costs per token step at that batch; attention and everything else come on top. |
 | `TFLOPS` | `FLOPs / µs × 1e-6` with FLOPs = GEMM FLOPs of the block: A `2·M·(19456·2560 + 2560·9728)`; B `2·M·8·(1536·2048 + 2048·768)`; C routed `2·M·8·(1024·2048 + 2048·512)` plus shared `2·M·(1024·2048 + 2048·512)` when the shared expert is included. Quantize, silu, routing and combine add time but no FLOPs — on purpose: the block number is what serving pays. |
-| `weight GB/s` (B, C) | active-expert FP8 weight bytes (plus shared-expert weights for C) per block / time; above the device's DRAM bandwidth means L2-fed (`../README.md` §8) |
+| `weight GB/s` (B, C) | active-expert FP8 weight bytes (plus shared-expert weights for C) per block / time; above the device's DRAM bandwidth means the row was measured warm (`../README.md` §8) |
 | `cos` | cosine similarity vs the reference output of the whole block |
 
 ## Reading the tables
 
-- Small-M rows are L2-resident numbers (the bench does not flush L2); see the
-  caveat in each `gemm/` file. `model ms` inherits that optimism.
+- Rows that carry `weight_copies` (the sm_120 MoE tables since 2026-09-28)
+  were measured with cold weights — the graph rotates ≥ 2 × L2 of weight
+  copies, as a serving step evicts every layer's weights (`../README.md` §2);
+  rows without it replayed one warm copy and their small-M values are
+  L2-resident optimism, `model ms` included. See each file's provenance.
 - Family C rows come in two flavours: routed-only and routed + shared. The
   difference is the price of the shared expert at that M (a K=512 `down` and a
   narrow `gate_up`, both poorly amortised — see the dense rows in `gemm/`).
-- The masked-slab MoE layout on sm_120 and sm_100/103 stops at M = 4096, since
-  the `G × m_cap` slab no longer fits; sm_90's contiguous layout runs the full
-  grid to M = 8192. Comparator columns are published at M = 8192 where they were
-  measured, next to an empty fso cell.
+- The masked-slab MoE layout's transient slabs scale with `G × m_cap`, so the
+  bench asks `moe_layer_slab_bytes_per_token_sm120` whether a grid point fits
+  instead of capping M: on the RTX 5090 the sm_120 tables run the full grid to
+  M = 8192 (since 2026-09-28, once the fused FC1 dropped the gate/up slab), the
+  sm_100/103 tables still stop at M = 4096, and sm_90's contiguous layout has
+  always run to M = 8192. Comparator columns are published at M = 8192 where they
+  were measured, next to an empty fso cell if that device has none.
 - Comparator columns differ per device and are not comparable across files: the
-  sm_90 and sm_120 files carry sglang triton (and deep_gemm on sm_90), the
-  B300 file carries torch `scaled_grouped_mm` and `_grouped_mm`, because
-  neither sglang nor deep_gemm is installed on that pod. Each file's
-  environment block records the versions and the caveats.
+  sm_90 file carries sglang triton and deep_gemm; the sm_120 file carries the MoE
+  implementations a torch or serving-stack user gets on that card — vLLM triton
+  `fused_experts`, sglang triton `fused_experts`, TensorRT-LLM's CUTLASS fused
+  MoE (JIT-built for sm_120 through the FlashInfer wheel), torch's own
+  `_grouped_mm` (eager, plain and `torch.compile`d; it cannot be graph-captured
+  on sm_120) —
+  plus a kernel-level section that puts fso's grouped GEMM next to the Triton
+  grouped GEMM those stacks run per projection; the B300 file carries torch
+  `scaled_grouped_mm` and `_grouped_mm`, because neither sglang nor vLLM is
+  installed on that pod. Each file's environment block records the versions and
+  the caveats (untuned default tile configs, eager timings).
 - Every B300 row is an unlocked-clock number; read it with the caveats in
   `../README.md` §8 before comparing it with anything.

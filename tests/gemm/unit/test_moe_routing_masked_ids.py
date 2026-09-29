@@ -31,9 +31,19 @@ What is checked, against the routing contract:
 
 Both builder kernels are covered where the dispatcher selects them: the
 single-CTA kernel on every architecture, and the multi-CTA kernel (at least
-4096 routed pairs) on sm_100/103, where it is selected. The last line names
-which ran."""
+4096 routed pairs) on sm_100/103 and, since 2026-09-28, on sm_120/121, which is
+what moe_glue_routing_multi_enabled() selects when FSO_MOE_ROUTING_MULTI is
+unset (the knob forces either builder on any architecture, and this file follows
+it). In the multi-CTA section every case is also compared with the single-CTA
+builder on the same draw, run in a child process with FSO_MOE_ROUTING_MULTI=0
+because the knob is read once per process, and a CUPTI record of each side shows
+which kernel it launched: the multi-CTA kernel here, the single-CTA one in the
+child. The last line names which sections ran."""
+import os
+import re
+import subprocess
 import sys
+import tempfile
 
 import torch
 
@@ -108,6 +118,115 @@ def gather_bytes_check(hidden, ids, e, m_cap, topk, slot):
     return []
 
 
+def multi_cta_selected(sm):
+    """(selected, reason): the mirror of moe_glue_routing_multi_enabled(). A set
+    FSO_MOE_ROUTING_MULTI forces the multi-CTA builder on or off on any
+    architecture (read like the C++ side's atoi); unset, sm_100/103 and sm_120/121
+    select it."""
+    env = os.environ.get("FSO_MOE_ROUTING_MULTI", "")
+    if env != "":
+        lead = re.match(r"\s*[+-]?\d+", env)
+        on = lead is not None and int(lead.group(0)) != 0
+        return on, f"FSO_MOE_ROUTING_MULTI={env} forces it {'on' if on else 'off'}"
+    if sm in (10, 12):
+        return True, f"selected on sm_{sm}x"
+    return False, f"not selected on sm_{sm}x; sm_100/103 and sm_120/121 select it"
+
+
+def multi_cta_cases(m, e):
+    """The multi-CTA section's draws, built on the host (see main() for why)."""
+    base = draw(m, e, TOPK, 999, "cpu")
+    cases = []
+    for fill in (e, -1):
+        ids = base.clone()
+        ids[m // 2:] = fill
+        cases.append((f"trailing fill={fill}", ids))
+    wide = draw(m, 2 * e, TOPK, 1999, "cpu")
+    cases.append(("EP draw (half the experts remote)",
+                  torch.where(wide < e, wide, torch.full_like(wide, -1))))
+    cases.append(("all skipped", torch.full_like(base, -1)))
+    return cases
+
+
+def routing_call(ids, e, m_cap, with_slots):
+    """One moe_build_routing call under CUPTI: the host copies of (masked_m,
+    row_map, slot_of_flat, slot_to_expert or None) and the names of the routing
+    kernels it launched."""
+    from torch.profiler import ProfilerActivity, profile
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        out = fso.gemm.moe_build_routing(ids, e, m_cap, with_slots=with_slots)
+        torch.cuda.synchronize()
+    names = sorted({ev.key for ev in prof.key_averages() if "moe_build_routing" in ev.key})
+    ste = out[3].cpu() if with_slots else None
+    return (out[0].cpu(), out[1].cpu(), out[2].cpu(), ste), names
+
+
+def single_cta_reference(cases):
+    """routing_call() of every (ids, e, m_cap, with_slots) case in a child process
+    run with FSO_MOE_ROUTING_MULTI=0, i.e. through the single-CTA builder. Call it
+    before this process opens its CUDA context: on a card in exclusive-process
+    compute mode the child cannot open one while the parent holds one."""
+    with tempfile.TemporaryDirectory() as d:
+        src, dst = os.path.join(d, "cases.pt"), os.path.join(d, "reference.pt")
+        torch.save([(ids.cpu(), e, m_cap, ws) for ids, e, m_cap, ws in cases], src)
+        env = dict(os.environ, FSO_MOE_ROUTING_MULTI="0")
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), "--single-cta-reference", src, dst],
+                           env=env, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError("single-CTA reference process failed:\n" + r.stdout[-2000:] + r.stderr[-2000:])
+        return torch.load(dst)
+
+
+def write_single_cta_reference(src, dst):
+    """The child side of single_cta_reference()."""
+    torch.save([routing_call(ids.cuda(), e, m_cap, ws) for ids, e, m_cap, ws in torch.load(src)], dst)
+    return 0
+
+
+def same_routing(e, m_cap, a, b):
+    """What two builders must agree on for one draw: masked_m, which pairs are
+    skipped, the packed expert list, and, expert by expert, the multiset of source
+    tokens its rows name. The row a pair gets inside its expert's block is a free
+    permutation that the two kernels assign in different orders, so slot_of_flat
+    is compared only through its -1 pattern."""
+    (ma, ra, sa, ea), (mb, rb, sb, eb) = a, b
+    if not torch.equal(ma, mb):
+        return ["masked_m differs"]
+    bad = []
+    if not torch.equal(sa < 0, sb < 0):
+        bad.append("the skipped pairs differ")
+    if (ea is None) != (eb is None) or (ea is not None and not torch.equal(ea, eb)):
+        bad.append("slot_to_expert differs")
+    valid = torch.arange(m_cap).unsqueeze(0) < ma.to(torch.int64).unsqueeze(1)
+    big = torch.iinfo(torch.int32).max
+    ta = torch.where(valid, ra.view(e, m_cap), big).sort(dim=1).values
+    tb = torch.where(valid, rb.view(e, m_cap), big).sort(dim=1).values
+    if not torch.equal(ta, tb):
+        bad.append("some expert's rows name a different set of source tokens")
+    return bad
+
+
+def compare_with_single_cta(cases, reference, e, m_cap):
+    """Every multi-CTA case against the single-CTA builder's result on the same
+    draw, with the kernel each side launched checked from its CUPTI record (a
+    routing call falls back to the single-CTA kernel when no scratch buffer is
+    available, so the name is what shows the production path ran)."""
+    failures = []
+    for (label, ids), (rout, rnames) in zip(cases, reference):
+        out, names = routing_call(ids, e, m_cap, True)
+        bad = []
+        if not names or not all("moe_build_routing_multi" in n for n in names):
+            bad.append(f"this process launched {names or 'no recorded routing kernel'}, not the multi-CTA kernel")
+        if not rnames or any("moe_build_routing_multi" in n for n in rnames):
+            bad.append(f"the FSO_MOE_ROUTING_MULTI=0 process launched {rnames or 'no recorded routing kernel'}")
+        bad += same_routing(e, m_cap, out, rout)
+        print(f"  vs single-CTA builder {label:34s} {'OK' if not bad else 'FAIL'}")
+        for b in bad:
+            print(f"      {b}")
+        failures += [f"{label} vs single-CTA: {b}" for b in bad]
+    return failures
+
+
 def run_case(label, ids, e, hidden, with_slots, want_multi):
     m = int(ids.shape[0])
     m_cap = (m + 3) // 4 * 4
@@ -141,6 +260,19 @@ def main():
     failures = []
     ran = []
 
+    # The multi-CTA section's draws and their single-CTA reference come first. The
+    # reference runs in a child process (FSO_MOE_ROUTING_MULTI is read once per
+    # process), and on a card in exclusive-process compute mode that child can only
+    # open a CUDA context while this process holds none, i.e. before anything below
+    # touches the device.
+    m_multi = 1024
+    m_cap_multi = (m_multi + 3) // 4 * 4
+    multi, why = multi_cta_selected(sm)
+    run_multi = multi and m_multi * TOPK >= MULTI_MIN_PAIRS
+    if run_multi:
+        cases = multi_cta_cases(m_multi, E)
+        reference = single_cta_reference([(ids, E, m_cap_multi, True) for _, ids in cases])
+
     # Section 1: the single-CTA builder, which every architecture launches.
     # M * topk stays below the multi-CTA threshold.
     ran.append("single-CTA")
@@ -162,29 +294,25 @@ def main():
         # (c) every entry skipped: no expert runs at all.
         failures += run_case("all skipped", torch.full_like(base, -1), E, hidden, True, False)
 
-    # Section 2: the multi-CTA builder, selected on sm_100/103 from 4096 pairs.
-    m = 1024
-    if sm == 10 and m * TOPK >= MULTI_MIN_PAIRS:
+    # Section 2: the multi-CTA builder, where the dispatcher selects it from 4096
+    # routed pairs: sm_100/103, and sm_120/121 since 2026-09-28.
+    if run_multi:
         ran.append("multi-CTA")
-        print("multi-CTA builder (sm_100/103):")
+        print(f"multi-CTA builder ({why}):")
         g = torch.Generator(device=dev).manual_seed(99)
-        hidden = torch.randn(m, HIDDEN, device=dev, dtype=torch.bfloat16, generator=g)
-        base = draw(m, E, TOPK, 999, dev)
-        for fill in (E, -1):
-            ids = base.clone()
-            ids[m // 2:] = fill
-            failures += run_case(f"trailing fill={fill}", ids, E, hidden, True, True)
-        wide = draw(m, 2 * E, TOPK, 1999, dev)
-        failures += run_case("EP draw (half the experts remote)",
-                             torch.where(wide < E, wide, torch.full_like(wide, -1)),
-                             E, hidden, True, True)
-        failures += run_case("all skipped", torch.full_like(base, -1), E, hidden, True, True)
+        hidden = torch.randn(m_multi, HIDDEN, device=dev, dtype=torch.bfloat16, generator=g)
+        cases = [(label, ids.to(dev)) for label, ids in cases]
+        for label, ids in cases:
+            failures += run_case(label, ids, E, hidden, True, True)
+        failures += compare_with_single_cta(cases, reference, E, m_cap_multi)
     else:
-        print(f"multi-CTA builder: skipped (selected on sm_100/103 only; device is sm_{sm}x)")
+        print(f"multi-CTA builder: skipped ({why})")
 
     print(f"\nran: {', '.join(ran)}; " + ("ALL PASS" if not failures else f"{len(failures)} FAILURES"))
     return 1 if failures else 0
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == "--single-cta-reference":
+        sys.exit(write_single_cta_reference(sys.argv[2], sys.argv[3]))
     sys.exit(main())

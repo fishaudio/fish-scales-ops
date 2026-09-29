@@ -2215,6 +2215,13 @@ def main() -> int:
     if major == 10:
         print("== sm_100/103 fused-SwiGLU FC1 ==")
         run_fused_cases()
+    elif major == 12:
+        # The sm_120 fused FC1 has its own suite; the interleave helper's
+        # layout claim is arch-specific (K-major scale words here, Sm1xx atom
+        # slabs on sm_100), so it is asserted on every arch that offers it.
+        print("== sm_120/121 interleave helper ==")
+        for fam in ("B", "C"):
+            test_fused_interleave_bit_exact(fam)
 
     # The routing kernel emits the shapes on every architecture; only the
     # sm_100 pointer-array route reads them, so the GEMM-side cases are sm_100.

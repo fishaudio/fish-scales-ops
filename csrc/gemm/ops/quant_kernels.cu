@@ -1503,12 +1503,11 @@ void fp8bs_silu_chunk_mul_quantize_1x32_packed_grouped(__nv_fp8_e4m3* x_q, int32
         if (K % 256 == 0) launch(std::integral_constant<int, 8>{}, ue8m0T, sfAtomT, pairT);
         else              launch(std::integral_constant<int, 4>{}, ue8m0T, sfAtomT, pairT);
     };
-    // The interleaved (pairwise) row order only arises from the sm_100 fused
-    // FC1's weight layout, so it is instantiated in the sm_100 scale-layout
-    // branch alone. Nesting it here rather than as a fourth top-level
-    // dimension is what keeps the sm_120 branch's instantiation set — and
-    // therefore its device code — exactly what it was. The ATen op refuses
-    // pairwise=true on any other architecture before reaching this point.
+    // The interleaved (pairwise) row order arises from a fused FC1's weight
+    // layout, which sm_100/103 and (since the sm_120 fused epilogue) sm_120/121
+    // both have, so both scale-layout branches carry it. It stays nested under
+    // the layout rather than becoming a fourth top-level dimension so that each
+    // branch instantiates only the two forms it can reach; sm_90 reaches neither.
     auto launch_sf = [&](auto ue8m0T) {
         if (sm1xx_sf_layout)
         {
@@ -1517,7 +1516,8 @@ void fp8bs_silu_chunk_mul_quantize_1x32_packed_grouped(__nv_fp8_e4m3* x_q, int32
         }
         else
         {
-            launch_k(ue8m0T, std::false_type{}, std::false_type{});
+            if (pairwise) launch_k(ue8m0T, std::false_type{}, std::true_type{});
+            else          launch_k(ue8m0T, std::false_type{}, std::false_type{});
         }
     };
     if (use_ue8m0) launch_sf(std::true_type{});

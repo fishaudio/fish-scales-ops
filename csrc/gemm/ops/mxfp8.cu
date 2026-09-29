@@ -42,9 +42,16 @@ void repack_ue8m0_scales_for_sm120(int32_t* dst, float const* src, int M_pad, in
     cudaStream_t stream);
 // Grouped (MoE, masked layout) variants — see quant_kernels.cu and
 // mxfp8_kernel.cu for the layout contracts.
+cudaError_t launch_sm120_mxfp8_grouped_combine_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B,
+    __nv_bfloat16* out_tokens, int32_t* SFA, int32_t* SFB, int32_t* masked_m, int32_t const* row_map,
+    float const* weight_of_slot, int num_groups, int m_cap, int N, int K, int expected_m, int max_active_groups,
+    cudaStream_t stream);
+cudaError_t launch_sm120_mxfp8_grouped_swiglu_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_fp8_e4m3* out_fp8,
+    int32_t* out_sf, int32_t* SFA, int32_t* SFB, int32_t* masked_m, int num_groups, int m_cap, int N, int K,
+    int expected_m, int max_active_groups, cudaStream_t stream);
 cudaError_t launch_sm120_mxfp8_grouped_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D,
     int32_t* SFA, int32_t* SFB, int32_t* masked_m, int num_groups, int m_cap, int N, int K,
-    int expected_m, cudaStream_t stream);
+    int expected_m, int max_active_groups, cudaStream_t stream);
 // In mxfp8_sm100_grouped_kernel.cu (sm_100/sm_103 tcgen05 pointer-array path
 // plus the slot-bound decode route it dispatches to).
 cudaError_t launch_sm100_mxfp8_grouped_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D,
@@ -86,6 +93,20 @@ bool is_sm100_family()
 {
     auto const* prop = at::cuda::getCurrentDeviceProperties();
     return prop->major == 10;
+}
+
+// FSO_FC1_FUSED: 0 never uses the fused FC1 (so a caller driven by
+// mxfp8_grouped_swiglu_available also keeps the stacked weight layout), unset
+// applies the arch's rule, 1 uses it wherever legal. Read once per process; the
+// sm_100/103 path reads the same variable inside its own dispatcher.
+bool fso_fc1_fused_enabled()
+{
+    static bool const v = []
+    {
+        char const* e = std::getenv("FSO_FC1_FUSED");
+        return !(e != nullptr && e[0] == '0');
+    }();
+    return v;
 }
 
 // Validate an optional caller-supplied slot list and return the device pointer
@@ -401,7 +422,9 @@ at::Tensor linear_mxfp8_raw(at::Tensor x_fp8, at::Tensor w_fp8, at::Tensor sx_in
 // expected_m is 1 for every M up to 16, while the number of groups that can
 // hold rows runs from 8 to 128 — and the sm_100 slot-bound decode route needs
 // it to size its slot list and its grid. Default 0 means "not supplied", which
-// keeps that route switched off. sm_120/121 ignore the argument.
+// keeps that route switched off. sm_120/121 read it for the decode tile rule
+// (the solo route's tile count, see gemm_dispatch_sm120_mxfp8_grouped); 0 keeps
+// that cascade's m_cap-only gate.
 //
 // slot_to_expert is the third optional argument and it is a device tensor, not
 // a hint. The sm_100 slot-bound route needs the packed list of experts that
@@ -507,9 +530,10 @@ at::Tensor linear_mxfp8_grouped_masked(at::Tensor a_fp8, at::Tensor w_fp8, at::T
         TORCH_CHECK(err == cudaSuccess, "sm100 mxfp8 grouped kernel error: ", cudaGetErrorString(err));
         return y;
     }
-    // sm_120/121 has one grouped route, so neither max_active_groups, the
-    // slot list nor the problem shapes carry information it can use; all
-    // three are validated above and then ignored.
+    // sm_120/121 has one grouped route, so neither the slot list nor the
+    // problem shapes carry information it can use; both are validated above
+    // and then ignored. max_active_groups bounds the decode route's tile count
+    // and is passed on to the cascade.
     err = detail::launch_sm120_mxfp8_grouped_dispatch(
         reinterpret_cast<__nv_fp8_e4m3*>(a_fp8.data_ptr()),
         reinterpret_cast<__nv_fp8_e4m3*>(w_fp8.data_ptr()),
@@ -517,7 +541,7 @@ at::Tensor linear_mxfp8_grouped_masked(at::Tensor a_fp8, at::Tensor w_fp8, at::T
         reinterpret_cast<int32_t*>(sa_int32.data_ptr()),
         reinterpret_cast<int32_t*>(sw_int32.data_ptr()),
         reinterpret_cast<int32_t*>(masked_m.data_ptr()),
-        G, m_cap, N, K, static_cast<int>(expected_m), stream);
+        G, m_cap, N, K, static_cast<int>(expected_m), static_cast<int>(max_active_groups), stream);
     TORCH_CHECK(err == cudaSuccess, "sm120 mxfp8 grouped kernel error: ", cudaGetErrorString(err));
     return y;
 }
@@ -550,11 +574,65 @@ std::tuple<at::Tensor, at::Tensor> linear_mxfp8_grouped_masked_swiglu(at::Tensor
     at::Tensor sa_int32, at::Tensor sw13_int32, at::Tensor masked_m, int64_t expected_m, int64_t max_active_groups,
     std::optional<at::Tensor> slot_to_expert, std::optional<at::Tensor> problem_shapes)
 {
-    TORCH_CHECK(is_sm100_family(),
-        "linear_mxfp8_grouped_masked_swiglu is implemented only on sm_100/sm_103 (B200 / B300). The two fused "
-        "FC1 epilogues are clones of CUTLASS sm_100 NoSmem epilogues, which exist only on that architecture; "
-        "sm_120/121 drives a different grouped kernel and sm_90 has no MXFP8 hardware at all. Use "
-        "linear_mxfp8_grouped_masked + silu_chunk_mul_quantize_1x32_grouped there.");
+    // Shape checks common to both architectures first, then the arch's own
+    // scale-slab layout and launch.
+    auto const* prop = at::cuda::getCurrentDeviceProperties();
+    bool const sm120 = prop->major == 12;
+    TORCH_CHECK(is_sm100_family() || sm120,
+        "linear_mxfp8_grouped_masked_swiglu needs sm_100/sm_103 (B200 / B300) or sm_120/121; sm_90 has no MXFP8 "
+        "hardware at all. Use linear_mxfp8_grouped_masked + silu_chunk_mul_quantize_1x32_grouped there.");
+    if (sm120)
+    {
+        TORCH_CHECK(a_fp8.is_cuda() && w13_fp8.is_cuda(), "a/w13 must be on CUDA");
+        TORCH_CHECK(a_fp8.dtype() == at::kFloat8_e4m3fn && w13_fp8.dtype() == at::kFloat8_e4m3fn,
+            "a_fp8 / w13_fp8 must be float8_e4m3fn");
+        TORCH_CHECK(sa_int32.dtype() == at::kInt && sw13_int32.dtype() == at::kInt,
+            "sa / sw13 must be int32 (packed UE8M0)");
+        TORCH_CHECK(masked_m.dtype() == at::kInt && masked_m.is_cuda(), "masked_m must be CUDA int32");
+        TORCH_CHECK(a_fp8.dim() == 3 && w13_fp8.dim() == 3, "a_fp8 [G,m_cap,K] / w13_fp8 [G,2*I,K] must be 3D");
+        TORCH_CHECK(a_fp8.is_contiguous() && w13_fp8.is_contiguous() && masked_m.is_contiguous(),
+            "a/w13/masked_m must be contiguous");
+        TORCH_CHECK(!slot_to_expert.has_value() || slot_to_expert->numel() == 0,
+            "the sm_120/121 grouped path has no slot-bound route, so it reads no active-expert list");
+        TORCH_CHECK(!problem_shapes.has_value() || problem_shapes->numel() == 0,
+            "the sm_120/121 grouped path has no pointer-array route, so it reads no per-group problem shapes");
+        int const G = a_fp8.size(0);
+        int const m_cap = a_fp8.size(1);
+        int const K = a_fp8.size(2);
+        int const N = w13_fp8.size(1);
+        int const INTER = N / 2;
+        TORCH_CHECK(w13_fp8.size(0) == G && w13_fp8.size(2) == K, "w13_fp8 must be [G, 2*I, K] matching a_fp8");
+        TORCH_CHECK(masked_m.numel() == G, "masked_m must have G entries");
+        TORCH_CHECK(K % 128 == 0, "K must be a multiple of 128");
+        TORCH_CHECK(N % 2 == 0 && INTER % 128 == 0,
+            "w13_fp8.size(1) must be 2*I with I a multiple of 128 (a 1x32 output scale block must not straddle "
+            "the packed int32 word), got N=", N);
+        TORCH_CHECK(m_cap % 4 == 0, "m_cap must be a multiple of 4 (per-group scale padding)");
+        TORCH_CHECK(expected_m >= 1, "expected_m must be >= 1");
+        TORCH_CHECK(G <= 1024, "the grouped MXFP8 path supports at most 1024 experts, got ", G);
+        TORCH_CHECK(max_active_groups >= 0 && max_active_groups <= G,
+            "max_active_groups must be in [0, G]; got ", max_active_groups, " with G=", G);
+        int64_t const kp = K / 128;
+        TORCH_CHECK(sa_int32.numel() == static_cast<int64_t>(G) * m_cap * kp,
+            "sa_int32 must be [G, K/128, m_cap] (per-group K-major packed scales)");
+        TORCH_CHECK(sw13_int32.numel() == static_cast<int64_t>(G) * kp * N,
+            "sw13_int32 must be [G, K/128, 2*I] (per-group K-major packed scales)");
+        TORCH_CHECK(sa_int32.is_contiguous() && sw13_int32.is_contiguous(), "sa/sw13 must be contiguous");
+        auto h = at::empty({G, m_cap, INTER}, a_fp8.options().dtype(at::kFloat8_e4m3fn));
+        auto sh = at::empty({G, INTER / 128, m_cap}, a_fp8.options().dtype(at::kInt));
+        auto stream = at::cuda::getCurrentCUDAStream();
+        cudaError_t const err = detail::launch_sm120_mxfp8_grouped_swiglu_dispatch(
+            reinterpret_cast<__nv_fp8_e4m3*>(a_fp8.data_ptr()),
+            reinterpret_cast<__nv_fp8_e4m3*>(w13_fp8.data_ptr()),
+            reinterpret_cast<__nv_fp8_e4m3*>(h.data_ptr()),
+            reinterpret_cast<int32_t*>(sh.data_ptr()),
+            reinterpret_cast<int32_t*>(sa_int32.data_ptr()),
+            reinterpret_cast<int32_t*>(sw13_int32.data_ptr()),
+            reinterpret_cast<int32_t*>(masked_m.data_ptr()),
+            G, m_cap, N, K, static_cast<int>(expected_m), static_cast<int>(max_active_groups), stream);
+        TORCH_CHECK(err == cudaSuccess, "sm120 fused-SwiGLU grouped mxfp8 kernel error: ", cudaGetErrorString(err));
+        return {h, sh};
+    }
     TORCH_CHECK(detail::sm100_mxfp8_grouped_compiled(),
         "linear_mxfp8_grouped_masked_swiglu on sm_100/sm_103 requires the extension to be built with CUDA >= 12.8 "
         "and TORCH_CUDA_ARCH_LIST including 10.0f (family target for B200 + B300).");
@@ -616,6 +694,81 @@ std::tuple<at::Tensor, at::Tensor> linear_mxfp8_grouped_masked_swiglu(at::Tensor
 }
 
 
+// linear_mxfp8_grouped_masked_combine: the grouped FC2 (down projection) with the
+// weighted combine in its epilogue (sm_120/121).
+//
+// Instead of storing a bf16 [G, m_cap, HIDDEN] slab for moe_combine to read back
+// and sum, each row is scaled by its combine weight and added into its token's row
+// of `out`. The slab and the combine launch both disappear; the cost is that the
+// adds are atomic, so the accumulation order -- and therefore the last bits of
+// each output element -- depends on how the CTAs interleave.
+//
+// `out` is ACCUMULATED into: the caller fills it first (zero, or a shared
+// expert's gated output), which is also what makes a token whose every routed
+// entry was skipped come out as whatever the caller put there. `row_map` and
+// `weight_of_slot` come from moe_build_routing (the latter by passing topk_w).
+//
+// Size is the reason this is a separate op rather than the default: run
+// sm120_fusion_20260927 measured the scatter at 101 us against 261 us for the
+// store-plus-read pair at M = 4096, where the slab is 134 MB and exceeds the
+// card's 96 MB L2, but at M <= 1024 both slabs are L2-resident and the pair is
+// cheaper. The host decides; this op does what it is told.
+at::Tensor linear_mxfp8_grouped_masked_combine(at::Tensor a_fp8, at::Tensor w2_fp8, at::Tensor sa_int32,
+    at::Tensor sw2_int32, at::Tensor masked_m, at::Tensor row_map, at::Tensor weight_of_slot, at::Tensor out,
+    int64_t expected_m, int64_t max_active_groups)
+{
+    auto const* prop = at::cuda::getCurrentDeviceProperties();
+    TORCH_CHECK(prop->major == 12,
+        "linear_mxfp8_grouped_masked_combine is the sm_120/121 fused-combine FC2; sm_100/103 serves this band "
+        "from its own routes and sm_90 has no MXFP8 hardware.");
+    TORCH_CHECK(a_fp8.is_cuda() && w2_fp8.is_cuda() && out.is_cuda(), "a/w2/out must be on CUDA");
+    TORCH_CHECK(a_fp8.dtype() == at::kFloat8_e4m3fn && w2_fp8.dtype() == at::kFloat8_e4m3fn,
+        "a_fp8 / w2_fp8 must be float8_e4m3fn");
+    TORCH_CHECK(sa_int32.dtype() == at::kInt && sw2_int32.dtype() == at::kInt, "sa / sw2 must be int32");
+    TORCH_CHECK(masked_m.dtype() == at::kInt && masked_m.is_cuda(), "masked_m must be CUDA int32");
+    TORCH_CHECK(row_map.dtype() == at::kInt && row_map.is_cuda() && row_map.is_contiguous(),
+        "row_map must be contiguous CUDA int32");
+    TORCH_CHECK(weight_of_slot.dtype() == at::kFloat && weight_of_slot.is_cuda() && weight_of_slot.is_contiguous(),
+        "weight_of_slot must be contiguous CUDA fp32 (moe_build_routing with topk_w)");
+    TORCH_CHECK(out.dtype() == at::kBFloat16 && out.dim() == 2 && out.is_contiguous(),
+        "out must be a contiguous bf16 [M, HIDDEN] tensor, pre-filled with what the layer adds to");
+    TORCH_CHECK(a_fp8.dim() == 3 && w2_fp8.dim() == 3 && a_fp8.is_contiguous() && w2_fp8.is_contiguous(),
+        "a_fp8 [G,m_cap,INTER] / w2_fp8 [G,HIDDEN,INTER] must be contiguous 3D");
+    int const G = a_fp8.size(0);
+    int const m_cap = a_fp8.size(1);
+    int const K = a_fp8.size(2);
+    int const N = w2_fp8.size(1);
+    TORCH_CHECK(w2_fp8.size(0) == G && w2_fp8.size(2) == K, "w2_fp8 must be [G, HIDDEN, INTER] matching a_fp8");
+    TORCH_CHECK(masked_m.numel() == G, "masked_m must have G entries");
+    TORCH_CHECK(out.size(1) == N, "out must have HIDDEN columns matching w2_fp8.size(1)");
+    TORCH_CHECK(K % 128 == 0 && N % 128 == 0, "K and N must be multiples of 128");
+    TORCH_CHECK(m_cap % 4 == 0, "m_cap must be a multiple of 4");
+    TORCH_CHECK(expected_m >= 1, "expected_m must be >= 1");
+    TORCH_CHECK(row_map.numel() >= static_cast<int64_t>(G) * m_cap && weight_of_slot.numel() >= static_cast<int64_t>(G) * m_cap,
+        "row_map and weight_of_slot must have G * m_cap entries");
+    int64_t const kp = K / 128;
+    TORCH_CHECK(sa_int32.numel() == static_cast<int64_t>(G) * m_cap * kp,
+        "sa_int32 must be [G, K/128, m_cap] (per-group K-major packed scales)");
+    TORCH_CHECK(sw2_int32.numel() == static_cast<int64_t>(G) * kp * N,
+        "sw2_int32 must be [G, K/128, HIDDEN]");
+    TORCH_CHECK(max_active_groups >= 0 && max_active_groups <= G,
+        "max_active_groups must be in [0, G]; got ", max_active_groups, " with G=", G);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    cudaError_t const err = detail::launch_sm120_mxfp8_grouped_combine_dispatch(
+        reinterpret_cast<__nv_fp8_e4m3*>(a_fp8.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3*>(w2_fp8.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+        reinterpret_cast<int32_t*>(sa_int32.data_ptr()),
+        reinterpret_cast<int32_t*>(sw2_int32.data_ptr()),
+        reinterpret_cast<int32_t*>(masked_m.data_ptr()),
+        reinterpret_cast<int32_t const*>(row_map.data_ptr()),
+        reinterpret_cast<float const*>(weight_of_slot.data_ptr()),
+        G, m_cap, N, K, static_cast<int>(expected_m), static_cast<int>(max_active_groups), stream);
+    TORCH_CHECK(err == cudaSuccess, "sm120 fused-combine grouped mxfp8 kernel error: ", cudaGetErrorString(err));
+    return out;
+}
+
+
 // mxfp8_grouped_swiglu_fused_route: the host-side router a caller uses to
 // decide, ONCE per shape, whether to build its FC1 out of the fused op or out
 // of the old pair.
@@ -626,9 +779,21 @@ std::tuple<at::Tensor, at::Tensor> linear_mxfp8_grouped_masked_swiglu(at::Tensor
 // negation of the sm_100 slot-route verdict: the fused FC1 lives only on the
 // pointer-array route. Every non-sm_100 device answers false, which is the
 // same answer as "this architecture has no fused FC1".
+bool mxfp8_grouped_swiglu_available(int64_t n_w, int64_t k); // defined below
+
 bool mxfp8_grouped_swiglu_fused_route(
     int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups, int64_t max_active_groups)
 {
+    auto const* prop = at::cuda::getCurrentDeviceProperties();
+    if (prop->major == 12)
+    {
+        // One grouped route on this architecture, so every call that may use the
+        // fused FC1 does: the per-call answer is the load-time one.
+        (void) m_cap;
+        (void) num_groups;
+        (void) max_active_groups;
+        return mxfp8_grouped_swiglu_available(n_w, k);
+    }
     if (!is_sm100_family() || !detail::sm100_mxfp8_grouped_compiled())
         return false;
     return detail::sm100_mxfp8_grouped_fused_fc1_route(static_cast<int>(m_cap), static_cast<int>(n_w),
@@ -648,6 +813,17 @@ bool mxfp8_grouped_swiglu_fused_route(
 // it. Both read the same knob out of the same static.
 bool mxfp8_grouped_swiglu_available(int64_t n_w, int64_t k)
 {
+    auto const* prop = at::cuda::getCurrentDeviceProperties();
+    if (prop->major == 12)
+    {
+        // sm_120/121: the fused FC1 is the grouped kernel's own epilogue, so it
+        // is available for every shape the grouped path serves whose INTER is a
+        // multiple of 128 (a 1x32 output scale block must not straddle the packed
+        // int32 word) and whose K is a multiple of 128. The knob is the same one.
+        if (!fso_fc1_fused_enabled())
+            return false;
+        return n_w % 2 == 0 && (n_w / 2) % 128 == 0 && k % 128 == 0;
+    }
     if (!is_sm100_family() || !detail::sm100_mxfp8_grouped_compiled())
         return false;
     return detail::sm100_mxfp8_grouped_fused_fc1_available(static_cast<int>(n_w), static_cast<int>(k)) != 0;
@@ -796,14 +972,13 @@ std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x32_grouped(
 
     int const kp = INTER / 128;
     bool const sm1xx = is_sm100_family();
-    // The pairwise form is instantiated only in the sm_100 scale-layout
-    // combination, because the layout it serves only arises from the sm_100
-    // fused FC1's interleaved weights. Refusing it elsewhere is what keeps the
-    // sm_90 and sm_120 device code byte-identical to what it was.
-    TORCH_CHECK(!pairwise || sm1xx,
-        "silu_chunk_mul_quantize_1x32_grouped(pairwise=True) exists only on sm_100/sm_103: the interleaved "
-        "gate/up row order it reads is produced by the sm_100 fused FC1 weight layout, which no other "
-        "architecture has.");
+    // The interleaved row order arises from a fused FC1's weight layout, which
+    // sm_100/103 and sm_120/121 both have; sm_90 has neither MXFP8 nor a fused
+    // FC1, so its device code keeps exactly the instantiations it had.
+    auto const* prop_pw = at::cuda::getCurrentDeviceProperties();
+    TORCH_CHECK(!pairwise || sm1xx || prop_pw->major == 12,
+        "silu_chunk_mul_quantize_1x32_grouped(pairwise=True) reads the interleaved gate/up row order a fused "
+        "FC1 produces, which exists on sm_100/sm_103 and sm_120/121 only.");
     auto x_q = at::empty({G, m_cap, INTER}, gu.options().dtype(at::kFloat8_e4m3fn));
     auto packed = sm1xx
         ? at::empty({G, static_cast<int64_t>((m_cap + 127) / 128 * 128) * kp}, gu.options().dtype(at::kInt))

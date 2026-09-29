@@ -6,7 +6,7 @@ Targets (only the first table after each known heading is rewritten; prose is le
   docs/perf/gemm/sm120.md   Family A / B / C dense sections, Family B / C grouped kernel tables
   docs/perf/gemm/sm100.md   same structure as sm120.md, from the B300 baselines
   docs/perf/layer/sm90.md   Family A MLP block, Family B MoE layer, Family C MoE block (+ comparators)
-  docs/perf/layer/sm120.md  same for the RTX 5090
+  docs/perf/layer/sm120.md  same for the RTX 5090, plus the grouped GEMM kernel-level comparison tables
   docs/perf/layer/sm100.md  same for the B300 (torch scaled_grouped_mm / _grouped_mm comparators)
   README.md                 the two hot-shape tables (sm_90, sm_120) — no comparisons, by policy
 
@@ -131,6 +131,7 @@ def dims(rows):
 
 # ----------------------------------------------------------------------------- grouped kernel table (sm_120)
 def grouped_kernel_table(name):
+    """gemm/sm120.md: the per-projection grouped GEMM cells, fso only (rule 2: no comparison columns in gemm/)."""
     hdr = ["| op | M | m_cap | MXFP8 µs | TFLOPS | weight GB/s | cos |", "|---|---:|---:|---:|---:|---:|---:|"]
     body = []
     for proj in ("gate_up", "down"):
@@ -138,6 +139,39 @@ def grouped_kernel_table(name):
         for (impl, M), r in sorted(rows.items(), key=lambda kv: kv[0][1]):
             if impl == "fso_mxfp8_grouped":
                 body.append(f"| `moe.{proj}` | {M} | {r['m_cap']} | {f1(r['us'])} | {f1(r['tflops'])} | {f0(r['w_gbps'])} | {f4(r['cos'])} |")
+    return hdr, body
+
+
+# ----------------------------------------------------------------------------- grouped kernel comparison (layer/sm120.md)
+# The Triton block-scaled grouped GEMM that sglang's and vLLM's fused_experts run per
+# projection, on moe_align-sorted rows with no routing weight, so the cell is one grouped
+# GEMM over exactly the rows the fso cell computes. Read from `ref_kern_<same suffix>`
+# next to the fso perf file; rendered into layer/sm120.md, the one place comparisons are
+# allowed (docs/README.md rule 2), under its "Grouped GEMM kernel-level comparison" section.
+KERN_CMP = [("fi_cudnn_grouped_mxfp8", "FlashInfer cuDNN MXFP8 1×32 µs"),
+            ("sgl_triton_grouped_fp8b", "sglang triton FP8 w8a8-block µs"),
+            ("vllm_triton_grouped_fp8b", "vLLM triton FP8 w8a8-block µs"),
+            ("fi_cudnn_grouped_bf16", "FlashInfer cuDNN BF16 µs"),
+            ("sgl_triton_grouped_bf16", "sglang triton BF16 µs"),
+            ("vllm_triton_grouped_bf16", "vLLM triton BF16 µs")]
+
+
+def grouped_kernel_cmp_table(name):
+    kern = name.replace("perf_moe_", "ref_kern_moe_", 1)
+    cmp = {}
+    for r in load(kern):
+        if r.get("kind") != "meta" and r.get("us") is not None:
+            cmp[(r["impl"], r["proj"], r["M"])] = r
+    cols = [c for c in KERN_CMP if any(k[0] == c[0] for k in cmp)]
+    hdr = ["| op | M | m_cap | fso MXFP8 µs | TFLOPS | cos |" + "".join(f" {t} |" for _, t in cols),
+           "|---|---:|---:|---:|---:|---:|" + "---:|" * len(cols)]
+    body = []
+    for proj in ("gate_up", "down"):
+        rows = moe_rows(name, proj=proj)
+        for (impl, M), r in sorted(rows.items(), key=lambda kv: kv[0][1]):
+            if impl == "fso_mxfp8_grouped":
+                extra = "".join(f" {f1(cmp[(c, proj, M)]['us']) if (c, proj, M) in cmp else DASH} |" for c, _ in cols)
+                body.append(f"| `moe.{proj}` | {M} | {r['m_cap']} | {f1(r['us'])} | {f1(r['tflops'])} | {f4(r['cos'])} |" + extra)
     return hdr, body
 
 
@@ -227,12 +261,44 @@ def moe_block_table(fso, routed_impl, shared_impl, cmp, cmp_suffix=" (routed)"):
 
 
 # ----------------------------------------------------------------------------- document surgery
+def align(table):
+    """Pad every cell to its column width so the markdown source reads as a table.
+
+    Renderers elsewhere leave the source ragged, which is valid markdown but makes
+    a 10-column perf table unreadable in a diff or an editor. The separator row's
+    markers decide the direction: `---:` is a right-aligned column, so its cells
+    are padded on the left, everything else on the right. Rows with a different
+    cell count than the header (there are none today) are left untouched rather
+    than silently reflowed.
+    """
+    split = [[c.strip() for c in row.strip().strip("|").split("|")] for row in table]
+    ncol = len(split[0])
+    if any(len(r) != ncol for r in split):
+        return table
+    sep = split[1] if len(split) > 1 else []
+    right = [i < len(sep) and sep[i].endswith(":") and not sep[i].startswith(":") for i in range(ncol)]
+    # The separator cells themselves are dashes; they stretch to the column width.
+    width = [max(len(r[i]) for j, r in enumerate(split) if j != 1) for i in range(ncol)]
+    out = []
+    for j, row in enumerate(split):
+        cells = []
+        for i, c in enumerate(row):
+            w = width[i]
+            if j == 1:
+                cells.append(("-" * (w + 1) + ":") if right[i] else ("-" * (w + 2)))
+            else:
+                cells.append(" " + (c.rjust(w) if right[i] else c.ljust(w)) + " ")
+        out.append("|" + "|".join(cells) + "|")
+    return out
+
+
 def replace_table_after(lines, pred, table, start=0):
     h = next(i for i in range(start, len(lines)) if pred(lines[i]))
     t0 = next(i for i in range(h + 1, len(lines)) if lines[i].startswith("|"))
     t1 = t0
     while t1 < len(lines) and lines[t1].startswith("|"):
         t1 += 1
+    table = align(table)
     lines[t0:t1] = table
     return t0 + len(table)
 
@@ -310,6 +376,22 @@ def layer_comparators(sm, shared=False):
     cmp = [("triton_bf16", "sglang triton BF16 µs"), ("triton_fp8b", "sglang triton FP8 w8a8-block µs")]
     if sm == 90:
         cmp.append(("dg_fp8_layer", "deep_gemm masked pipeline FP8 µs"))
+    if sm == 120:
+        # 2026-09-28, torch 2.13 base environment: the same-device MoE implementations a
+        # torch or vLLM user gets on this card. vLLM's triton fused_experts (no tuned json
+        # for the RTX 5090 at these shapes, so its default tile config; stated in the
+        # provenance) and torch's own _grouped_mm, which has no fused sm_120 kernel and
+        # runs a host loop over experts -- it cannot be captured, so its cells are eager
+        # timings, and the whole-layer torch.compile form is shown beside it as the dense
+        # tables show the compiled quantize.
+        # TensorRT-LLM's CUTLASS fused MoE, JIT-built for sm_120 by the FlashInfer
+        # wheel (the `tensorrt_llm` wheel pins torch <= 2.10): BF16 on its Ampere
+        # kernels, per-tensor FP8 on its SM89 fallback kernels; tactics autotuned.
+        cmp = [("vllm_bf16", "vLLM triton BF16 µs"), ("vllm_fp8b", "vLLM triton FP8 w8a8-block µs"),
+               ("trtllm_cutlass_bf16", "TRT-LLM CUTLASS fused MoE BF16 µs"),
+               ("trtllm_cutlass_fp8", "TRT-LLM CUTLASS fused MoE FP8 per-tensor µs")] + cmp + [
+            ("torch_grouped_bf16_layer", "torch _grouped_mm BF16 µs (eager)"),
+            ("torch_grouped_bf16_layer_compiled", "torch _grouped_mm BF16 + torch.compile µs (eager)")]
     return cmp
 
 
@@ -319,7 +401,8 @@ def render_layer(lines, sm):
     check_device(sm, f"gemm_sm{sm}_qwen3_4b_mlp_fwd.jsonl", f"perf_moe_qwen3_30a3_{sfx}.jsonl",
                  f"ref_moe_qwen3_30a3_{sfx}.jsonl", f"perf_moe_qwen3_35a3_{sfx}.jsonl",
                  f"perf_moe_qwen3_35a3_shared_{sfx}.jsonl", f"ref_moe_qwen3_35a3_{sfx}.jsonl",
-                 f"ref_moe_qwen3_35a3_shared_{sfx}.jsonl")
+                 f"ref_moe_qwen3_35a3_shared_{sfx}.jsonl", f"ref_kern_moe_qwen3_30a3_{sfx}.jsonl",
+                 f"ref_kern_moe_qwen3_35a3_{sfx}.jsonl")
     h, b = mlp_table(f"gemm_sm{sm}_qwen3_4b_mlp_fwd.jsonl", sm)
     pos = replace_table_after(lines, starts("## Family A — Qwen3-4B dense MLP block"), h + b)
     fsoB = moe_rows(f"perf_moe_qwen3_30a3_{sfx}.jsonl")
@@ -336,7 +419,12 @@ def render_layer(lines, sm):
         h, b = moe_block_table(fsoC, f"fso_{dt}_layer", f"fso_{dt}_layer_shared", cmpC, cmp_suffix="")
     else:
         h, b = moe_block_table(fsoC, f"fso_{dt}_layer", f"fso_{dt}_layer_shared", layer_comparators(sm))
-    replace_table_after(lines, starts("## Family C — Qwen3.5-35B-A3B MoE block"), h + b, pos)
+    pos = replace_table_after(lines, starts("## Family C — Qwen3.5-35B-A3B MoE block"), h + b, pos)
+    for fam, letter in (("30a3", "B"), ("35a3", "C")):
+        name = f"perf_moe_qwen3_{fam}_{sfx}.jsonl"
+        if os.path.exists(os.path.join(BASE, name.replace("perf_moe_", "ref_kern_moe_", 1))):
+            h, b = grouped_kernel_cmp_table(name)
+            pos = replace_table_after(lines, starts(f"### Family {letter} — `moe.gate_up` / `moe.down` against the Triton grouped GEMM"), h + b, pos)
 
 
 # ----------------------------------------------------------------------------- README hot rows (no comparisons)

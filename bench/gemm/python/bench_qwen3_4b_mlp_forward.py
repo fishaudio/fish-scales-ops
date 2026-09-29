@@ -39,6 +39,7 @@ import os
 import statistics
 import sys
 
+import math
 import torch
 import torch.nn.functional as F
 
@@ -245,6 +246,13 @@ def bench_worker(M):
     # at most a few percent (Inductor can fuse silu·gate and pick a
     # Triton matmul autotune), and that win does not change kernel-side
     # tuning decisions, which is what this bench is meant to inform.
+    # Cold-L2 protocol (2026-09-28): the captured graph runs the block over R
+    # independent weight copies (`_build_mlp_fn` seeds the same values into fresh
+    # memory each time, quantized forms included), R * weight bytes >= 2 x L2,
+    # and reports replay time / R -- each copy's weights are evicted by the
+    # others before the graph returns to them, as a serving step evicts every
+    # layer's weights. One warm copy served the M <= 128 rows from L2.
+    l2 = torch.cuda.get_device_properties(0).L2_cache_size
     for dtype in ("bf16", "bsfp8", "mxfp8", "smm", "smm_fast"):
         fn = _build_mlp_fn(dtype, sm_major)
         if fn is None:
@@ -253,7 +261,18 @@ def bench_worker(M):
         try:
             y = fn(x_bf)
             record["cos"] = float(F.cosine_similarity(y.float().flatten(), y_ref.float().flatten(), dim=0).item())
-            record["graph_us"] = _time_graph(lambda: fn(x_bf)) * 1000.0
+            wbytes = (2 * INTERMEDIATE * HIDDEN + HIDDEN * INTERMEDIATE) * (2 if dtype == "bf16" else 1)
+            mult = float(os.environ.get("FSO_BENCH_L2_MULT", "2"))
+            R = max(2, min(16, int(math.ceil(mult * l2 / wbytes))))
+            if os.environ.get("FSO_BENCH_WEIGHT_COPIES"):
+                R = max(1, int(os.environ["FSO_BENCH_WEIGHT_COPIES"]))
+            fns = [fn] + [_build_mlp_fn(dtype, sm_major) for _ in range(R - 1)]
+
+            def call_all(fns=fns):
+                for f in fns:
+                    f(x_bf)
+            record["weight_copies"] = R
+            record["graph_us"] = _time_graph(call_all) * 1000.0 / R
         except Exception as e:
             record["error"] = f"{type(e).__name__}: {str(e)[:120]}"
         out[dtype] = record

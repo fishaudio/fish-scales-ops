@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace tensorrt_llm
 {
@@ -121,6 +122,108 @@ inline bool force_tile_applies(ForcedTile const& forced, uint32_t shape_k) noexc
         return (e && *e) ? std::atoi(e) : 0;
     }();
     return forced.active() && (s_k <= 0 || s_k == static_cast<int>(shape_k));
+}
+
+// FSO_MOE_GROUP_ORDER -- the order the grouped MoE scheduler visits experts in.
+//   unset / 0 / 1   expert-id order (the default, and what every measurement
+//                   before 2026-09-27 was taken with)
+//   "auto"          a stride of about a quarter of the walk, so four consecutive
+//                   steps come from four different quarters of the expert set
+//   <n>             that exact stride, if it is coprime with the number of steps
+// FSO_MOE_GROUP_BLOCK=<w> -- how many CONSECUTIVE experts one step of that walk
+// carries (default 1). The permutation applies to blocks of w experts and the
+// experts inside a block stay in id order, so the weight and activation streams
+// stay sequential for w slots at a time while the blocks themselves are spread
+// across the set. w must divide the expert count.
+//
+// The stride must be coprime with the number of blocks or the walk would repeat
+// some of them and miss others; `sm120_group_perm_for` below enforces that and
+// falls back to expert-id order (with a warning) when it cannot.
+//
+// Why this knob exists: the layer is bound by expert weight traffic, and an
+// expert costs its whole weight matrix however few rows it holds. A contiguous
+// run of low-row experts therefore becomes a phase of the launch with too little
+// arithmetic to cover those loads. Measured on Family C at M=1024, moving the
+// high-row experts from a leading block to every fourth id took the skew penalty
+// from +4.46 % to +1.37 % with the row counts unchanged. This knob is the kernel
+// side of the same idea: it decorrelates schedule position from expert id, so it
+// helps exactly when the counts are correlated with the id and is a no-op
+// otherwise.
+inline int read_group_order_env() noexcept
+{
+    static int const s_cache = []
+    {
+        char const* e = std::getenv("FSO_MOE_GROUP_ORDER");
+        if (!e || !*e)
+            return 1;
+        if (std::strcmp(e, "auto") == 0)
+            return -1;
+        int const v = std::atoi(e);
+        return v <= 0 ? 1 : v;
+    }();
+    return s_cache;
+}
+
+inline int read_group_block_env() noexcept
+{
+    static int const s_cache = []
+    {
+        char const* e = std::getenv("FSO_MOE_GROUP_BLOCK");
+        int const v = (e && *e) ? std::atoi(e) : 1;
+        return v < 1 ? 1 : v;
+    }();
+    return s_cache;
+}
+
+// The resolved walk: `block` consecutive experts per step, `stride` steps apart.
+// stride == 1 means expert-id order, whatever the block size.
+struct GroupOrder
+{
+    int stride{1};
+    int block{1};
+};
+
+inline GroupOrder sm120_group_perm_for(int num_groups) noexcept
+{
+    int const req = read_group_order_env();
+    if (req == 1 || num_groups < 8)
+        return {};
+    int const w = read_group_block_env();
+    if (w < 1 || num_groups % w != 0)
+    {
+        std::fprintf(stderr, "[fso] FSO_MOE_GROUP_BLOCK=%d does not divide %d experts; using expert-id order\n", w,
+            num_groups);
+        return {};
+    }
+    int const nb = num_groups / w; // the permutation runs over blocks, not experts
+    if (nb < 8)
+    {
+        std::fprintf(stderr, "[fso] FSO_MOE_GROUP_BLOCK=%d leaves only %d blocks of %d experts; using expert-id order\n",
+            w, nb, num_groups);
+        return {};
+    }
+    auto coprime = [](int a, int b)
+    {
+        while (b)
+        {
+            int const t = a % b;
+            a = b;
+            b = t;
+        }
+        return a == 1;
+    };
+    if (req > 1)
+    {
+        if (req < nb && coprime(req, nb))
+            return {req, w};
+        std::fprintf(stderr, "[fso] FSO_MOE_GROUP_ORDER=%d is not coprime with %d blocks; using expert-id order\n", req,
+            nb);
+        return {};
+    }
+    for (int a = nb / 4 + 1; a < nb; ++a)
+        if (coprime(a, nb))
+            return {a, w};
+    return {};
 }
 
 // Reads FSO_DISABLE_OVERRIDES once. Returns true when the dispatcher
