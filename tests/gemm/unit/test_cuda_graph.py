@@ -40,7 +40,7 @@ def _check_graph_op(name, eager_call, graph_call):
     memory → no tolerance slack).
 
     `graph_call()` must be a no-arg lambda that returns the captured output
-    tensor (e.g. `lambda: fso.gemm.linear_bf16(x, w)`). The tensor is allocated
+    tensor (e.g. `lambda: fso.compat.linear_bf16(x, w)`). The tensor is allocated
     in the graph's private mempool; its data_ptr stays valid across
     replays and gets overwritten by each replay.
     """
@@ -94,28 +94,36 @@ def _make_inputs(M, N, K):
 def test_linear_bf16(M, N, K):
     x, w = _make_inputs(M, N, K)
     _check_graph_op("linear_bf16",
-        eager_call=lambda: fso.gemm.linear_bf16(x, w),
-        graph_call=lambda: fso.gemm.linear_bf16(x, w))
+        eager_call=lambda: fso.compat.linear_bf16(x, w),
+        graph_call=lambda: fso.compat.linear_bf16(x, w))
     print(f"  linear_bf16       {_shape_str(M, N, K)}  OK")
 
 
-def test_linear_fp8(M, N, K):
+def test_linear_fp8(M, N, K, prepack=True):
     """BS-FP8 (1×128). Pre-quantize OUTSIDE the capture (mirrors production:
-    weight quant happens at module init, the captured op is just the GEMM)."""
+    weight quant happens at module init, the captured op is just the GEMM).
+
+    `prepack=False` hands the op the FP32 scales of the quantizers, which it
+    packs inside every call. On sm_100/103 that per-call packing used to run
+    the checked repack, whose power-of-two check copies a flag to the host:
+    every call synchronized the device and the capture failed. It now packs
+    without the check, so the call must capture and replay like the int32
+    form."""
     sm = torch.cuda.get_device_capability(0)[0]
     x_bf, w_bf = _make_inputs(M, N, K)
-    xq, sxq = fso.gemm.quantize_1x128_fp8(x_bf, use_ue8m0=(sm >= 12))
-    wq, swq = fso.gemm.quantize_128x128_fp8(w_bf)
-    if sm >= 12:
-        sxqp = fso.gemm.repack_fp8_act_scales(sxq)
-        swqp = fso.gemm.repack_fp8_wgt_scales(swq)
+    xq, sxq = fso.compat.quantize_1x128_fp8(x_bf)
+    wq, swq = fso.compat.quantize_128x128_fp8(w_bf)
+    if sm >= 10 and prepack:
+        sxqp = fso.compat.repack_fp8_act_scales(sxq)
+        swqp = fso.compat.repack_fp8_wgt_scales(swq)
     else:
         sxqp, swqp = sxq, swq
 
-    _check_graph_op("linear_fp8",
-        eager_call=lambda: fso.gemm.linear_fp8(xq, wq, sxqp, swqp),
-        graph_call=lambda: fso.gemm.linear_fp8(xq, wq, sxqp, swqp))
-    print(f"  linear_fp8        {_shape_str(M, N, K)}  OK")
+    _check_graph_op("linear_fp8" + ("" if prepack else " (fp32 scales)"),
+        eager_call=lambda: fso.compat.linear_fp8(xq, wq, sxqp, swqp),
+        graph_call=lambda: fso.compat.linear_fp8(xq, wq, sxqp, swqp))
+    form = "int32 scales" if (sm >= 10 and prepack) else "fp32 scales"
+    print(f"  linear_fp8        {_shape_str(M, N, K)}  {form:<12}  OK")
 
 
 def test_linear_mxfp8(M, N, K):
@@ -128,19 +136,19 @@ def test_linear_mxfp8(M, N, K):
     is itself a plain kernel launch and captures fine — covered by the
     quantize-in-graph variant below)."""
     x_bf, w_bf = _make_inputs(M, N, K)
-    xq, sxq = fso.gemm.quantize_1x32_fp8(x_bf)
-    wq, swq = fso.gemm.quantize_1x32_fp8(w_bf)
+    xq, sxq = fso.compat.quantize_1x32_fp8(x_bf)
+    wq, swq = fso.compat.quantize_1x32_fp8(w_bf)
 
     _check_graph_op("linear_mxfp8",
-        eager_call=lambda: fso.gemm.linear_mxfp8(xq, wq, sxq, swq),
-        graph_call=lambda: fso.gemm.linear_mxfp8(xq, wq, sxq, swq))
+        eager_call=lambda: fso.compat.linear_mxfp8(xq, wq, sxq, swq),
+        graph_call=lambda: fso.compat.linear_mxfp8(xq, wq, sxq, swq))
     print(f"  linear_mxfp8      {_shape_str(M, N, K)}  OK")
 
     # Quantize + GEMM inside one capture (decode-loop pattern: activation
     # quantize is part of the captured forward).
     def quant_gemm():
-        xq2, sxq2 = fso.gemm.quantize_1x32_fp8(x_bf)
-        return fso.gemm.linear_mxfp8(xq2, wq, sxq2, swq)
+        xq2, sxq2 = fso.compat.quantize_1x32_fp8(x_bf)
+        return fso.compat.linear_mxfp8(xq2, wq, sxq2, swq)
 
     _check_graph_op("quantize_1x32+linear_mxfp8",
         eager_call=quant_gemm,
@@ -166,7 +174,7 @@ def _slot_layer_inputs():
     m_cap = (SLOT_M + 3) // 4 * 4
     x = torch.randn(SLOT_M, SLOT_K, dtype=torch.bfloat16, device="cuda") * 0.1
     w = torch.randn(SLOT_G, SLOT_N, SLOT_K, dtype=torch.bfloat16, device="cuda") / (SLOT_K ** 0.5)
-    w_fp8, sw = fso.gemm.quantize_moe_weights_1x32_fp8(w)
+    w_fp8, sw = fso.compat.quantize_moe_weights_1x32_fp8(w)
     g = torch.Generator(device="cpu").manual_seed(7)
     topk_ids = torch.stack(
         [torch.randperm(SLOT_G, generator=g)[:SLOT_TOPK] for _ in range(SLOT_M)]
@@ -185,14 +193,14 @@ def _slot_call(x, w_fp8, sw, topk_ids, m_cap, with_slots=False):
     the route launches no prep kernel of its own -- so the slot-list pool is
     never touched and a capture needs no eager warm-up for it."""
     if with_slots:
-        masked_m, _, slot_of_flat, slot_to_expert = fso.gemm.moe_build_routing(
+        masked_m, _, slot_of_flat, slot_to_expert = fso.compat.moe_build_routing(
             topk_ids, SLOT_G, m_cap, with_slots=True)
     else:
-        masked_m, _, slot_of_flat = fso.gemm.moe_build_routing(topk_ids, SLOT_G, m_cap)
+        masked_m, _, slot_of_flat = fso.compat.moe_build_routing(topk_ids, SLOT_G, m_cap)
         slot_to_expert = None
-    a_fp8, sa = fso.gemm.quantize_1x32_grouped_gather_fp8(
+    a_fp8, sa = fso.compat.quantize_1x32_grouped_gather_fp8(
         x, slot_of_flat, SLOT_TOPK, SLOT_G, m_cap)
-    return fso.gemm.linear_mxfp8_grouped_masked(
+    return fso.compat.linear_mxfp8_grouped_masked(
         a_fp8, w_fp8, sa, sw, masked_m, 1, min(SLOT_M * SLOT_TOPK, SLOT_G),
         slot_to_expert), masked_m
 
@@ -345,7 +353,7 @@ def _ps_layer_inputs():
     m_cap = (PS_M + 3) // 4 * 4
     x = torch.randn(PS_M, PS_K, dtype=torch.bfloat16, device="cuda") * 0.1
     w = torch.randn(PS_G, PS_N, PS_K, dtype=torch.bfloat16, device="cuda") / (PS_K ** 0.5)
-    w_fp8, sw = fso.gemm.quantize_moe_weights_1x32_fp8(w)
+    w_fp8, sw = fso.compat.quantize_moe_weights_1x32_fp8(w)
     g = torch.Generator(device="cpu").manual_seed(9)
     topk_ids = torch.stack(
         [torch.randperm(PS_G, generator=g)[:PS_TOPK] for _ in range(PS_M)]
@@ -357,19 +365,19 @@ def _ps_call(x, w_fp8, sw, topk_ids, m_cap):
     """Routing (with the shapes) -> gather-quant -> pointer-array GEMM handed
     the shapes, all on device; a replay follows whatever ids the buffer holds."""
     mag = min(PS_M * PS_TOPK, PS_G)
-    assert fso.gemm.mxfp8_grouped_problem_shapes_consumed(m_cap, PS_N, PS_K, PS_G, mag), \
+    assert fso.compat.mxfp8_grouped_problem_shapes_consumed(m_cap, PS_N, PS_K, PS_G, mag), \
         "this cell must sit on the pointer-array route"
-    masked_m, row_map, slot_of_flat, ps = fso.gemm.moe_build_routing(
+    masked_m, row_map, slot_of_flat, ps = fso.compat.moe_build_routing(
         topk_ids, PS_G, m_cap, problem_shapes_for=[(PS_N, PS_K)])
-    a_fp8, sa = fso.gemm.quantize_1x32_grouped_gather_fp8(x, slot_of_flat, PS_TOPK, PS_G, m_cap)
-    y = fso.gemm.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, 4, mag, None, ps[0])
+    a_fp8, sa = fso.compat.quantize_1x32_grouped_gather_fp8(x, slot_of_flat, PS_TOPK, PS_G, m_cap)
+    y = fso.compat.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, 4, mag, None, ps[0])
     return y, masked_m, row_map
 
 
 def _rows_by_token(y, masked_m, row_map):
     """The defined rows of every group, ordered by SOURCE TOKEN rather than by
     slot. `moe_build_routing` assigns a group's slots in atomic-arrival order
-    (docs/api/gemm.md, "Slot order is a free permutation"), and at 512 routed
+    (docs/api/compat.md, "Slot order is a free permutation"), and at 512 routed
     pairs over sixteen warps two runs of it really do produce different
     permutations, so two per-slot tensors from two routing calls are not
     comparable row for row even when both are correct. Sorting each group's
@@ -488,7 +496,7 @@ def _fused_layer_inputs():
     x = torch.randn(FUSED_M, FUSED_K, dtype=torch.bfloat16, device="cuda") * 0.1
     w13 = torch.randn(FUSED_G, 2 * FUSED_INTER, FUSED_K, dtype=torch.bfloat16,
                       device="cuda") / (FUSED_K ** 0.5)
-    w13i_fp8, sw13i = fso.gemm.quantize_moe_weights_1x32_fp8(w13, w13_interleave=True)
+    w13i_fp8, sw13i = fso.compat.quantize_moe_weights_1x32_fp8(w13, w13_interleave=True)
     return x, w13i_fp8, sw13i, m_cap
 
 
@@ -511,7 +519,7 @@ def _fused_routing(m_cap, seed):
     topk_ids = torch.stack(
         [torch.randperm(FUSED_G, generator=g)[:FUSED_TOPK] for _ in range(FUSED_M)]
     ).to("cuda", torch.int32)
-    masked_m, _row_map, slot_of_flat = fso.gemm.moe_build_routing(topk_ids, FUSED_G, m_cap)
+    masked_m, _row_map, slot_of_flat = fso.compat.moe_build_routing(topk_ids, FUSED_G, m_cap)
     torch.cuda.synchronize()
     return masked_m.clone(), slot_of_flat.clone()
 
@@ -519,10 +527,10 @@ def _fused_routing(m_cap, seed):
 def _fused_call(x, w13i_fp8, sw13i, masked_m, slot_of_flat, m_cap):
     """Gather-quantise + fused FC1 against a routing the caller supplies. Both
     buffers are read on the device, so a replay follows whatever they hold."""
-    a_fp8, sa = fso.gemm.quantize_1x32_grouped_gather_fp8(
+    a_fp8, sa = fso.compat.quantize_1x32_grouped_gather_fp8(
         x, slot_of_flat, FUSED_TOPK, FUSED_G, m_cap)
     expected_m = max(1, (FUSED_M * FUSED_TOPK + FUSED_G - 1) // FUSED_G)
-    return fso.gemm.linear_mxfp8_grouped_masked_swiglu(
+    return fso.compat.linear_mxfp8_grouped_masked_swiglu(
         a_fp8, w13i_fp8, sa, sw13i, masked_m, expected_m, min(FUSED_M * FUSED_TOPK, FUSED_G))
 
 
@@ -608,9 +616,9 @@ def test_fused_pool_refuses_capture():
     be the fused launcher's own workspace pool."""
     x, w13i_fp8, sw13i, m_cap = _fused_layer_inputs()
     masked_m, slot_of_flat = _fused_routing(m_cap, seed=11)
-    a_fp8, sa = fso.gemm.quantize_1x32_grouped_gather_fp8(
+    a_fp8, sa = fso.compat.quantize_1x32_grouped_gather_fp8(
         x, slot_of_flat, FUSED_TOPK, FUSED_G, m_cap)
-    fso.gemm.linear_mxfp8_grouped_masked(a_fp8, w13i_fp8, sa, sw13i, masked_m, 4, 0)
+    fso.compat.linear_mxfp8_grouped_masked(a_fp8, w13i_fp8, sa, sw13i, masked_m, 4, 0)
     torch.cuda.synchronize()
 
     s = torch.cuda.Stream()
@@ -696,17 +704,23 @@ def main():
         (   1, 19456, 2560),  # gate_up M=1 (decode row, persistent kernel)
     ]
 
-    # BSFP8 (1×128) paths exist on sm_90 (DeepGEMM JIT) and sm_120
-    # (Sm120BlockScaledKernel) only; sm_100/103 serves MXFP8 exclusively.
-    if sm[0] in (9, 12):
+    # Block-FP8 1×128 on every architecture with it: sm_90 (DeepGEMM JIT),
+    # sm_120 (Sm120BlockScaledKernel) and sm_100/103 (the MXFP8 tcgen05 kernels
+    # with replicated scales). On sm_100/103 linear_bf16 and linear_fp8 with FP32
+    # scales pack their scales inside every call; that packing used to run the
+    # checked repack, a device sync a capture refuses, and these cases are what
+    # proves it no longer does.
+    if sm[0] in (9, 10, 12):
         print("== linear_bf16 ==")
         for M, N, K in shapes: test_linear_bf16(M, N, K)
         print()
 
         print("== linear_fp8 (1×128) ==")
         for M, N, K in shapes: test_linear_fp8(M, N, K)
+        if sm[0] == 10:
+            for M, N, K in shapes: test_linear_fp8(M, N, K, prepack=False)
     else:
-        print("== linear_bf16 / linear_fp8: skipped (BSFP8 1×128 is sm_90/sm_120-only) ==")
+        print("== linear_bf16 / linear_fp8: skipped (no block-FP8 1×128 on this arch) ==")
 
     if sm[0] in (10, 12):
         print("\n== linear_mxfp8 (1×32) ==")

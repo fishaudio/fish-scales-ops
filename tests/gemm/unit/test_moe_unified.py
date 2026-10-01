@@ -223,28 +223,28 @@ def bench_chain_sm100(hidden, ex, ids32, wts, bias=None, bias_scale=None):
     expected_m = max(1, (M * TOPK + E - 1) // E)
     mag = min(M * TOPK, E)
     n_w = 2 * I
-    fc1_fused = ex.w13_interleaved and fso.gemm.mxfp8_grouped_swiglu_fused_route(m_cap, n_w, H, E, mag)
-    want_slots = (fso.gemm.mxfp8_grouped_slot_possible(m_cap, n_w, H, E, mag, fused_swiglu=fc1_fused)
-                  or fso.gemm.mxfp8_grouped_slot_possible(m_cap, H, I, E, mag))
-    want_ps = [fso.gemm.mxfp8_grouped_problem_shapes_consumed(m_cap, n_w, H, E, mag, fused_swiglu=fc1_fused),
-               fso.gemm.mxfp8_grouped_problem_shapes_consumed(m_cap, H, I, E, mag)]
+    fc1_fused = ex.w13_interleaved and fso.compat.mxfp8_grouped_swiglu_fused_route(m_cap, n_w, H, E, mag)
+    want_slots = (fso.compat.mxfp8_grouped_slot_possible(m_cap, n_w, H, E, mag, fused_swiglu=fc1_fused)
+                  or fso.compat.mxfp8_grouped_slot_possible(m_cap, H, I, E, mag))
+    want_ps = [fso.compat.mxfp8_grouped_problem_shapes_consumed(m_cap, n_w, H, E, mag, fused_swiglu=fc1_fused),
+               fso.compat.mxfp8_grouped_problem_shapes_consumed(m_cap, H, I, E, mag)]
     ps_for = [nk for nk, want in zip([(n_w, H), (H, I)], want_ps) if want]
-    r = fso.gemm.moe_build_routing(ids32, E, m_cap, with_slots=want_slots, problem_shapes_for=ps_for or None)
+    r = fso.compat.moe_build_routing(ids32, E, m_cap, with_slots=want_slots, problem_shapes_for=ps_for or None)
     ps = list(r[-1]) if ps_for else []
     ps1 = ps.pop(0) if want_ps[0] else None
     ps2 = ps.pop(0) if want_ps[1] else None
     masked, slot_of_flat = r[0], r[2]
     slot_to_expert = r[3] if want_slots else None
-    hq, sh = fso.gemm.quantize_1x32_grouped_gather_fp8(hidden, slot_of_flat, TOPK, E, m_cap)
+    hq, sh = fso.compat.quantize_1x32_grouped_gather_fp8(hidden, slot_of_flat, TOPK, E, m_cap)
     if fc1_fused:
-        dq, sd = fso.gemm.linear_mxfp8_grouped_masked_swiglu(
+        dq, sd = fso.compat.linear_mxfp8_grouped_masked_swiglu(
             hq, ex.w13, sh, ex.sw13, masked, expected_m, mag, slot_to_expert, ps1)
     else:
-        gu = fso.gemm.linear_mxfp8_grouped_masked(
+        gu = fso.compat.linear_mxfp8_grouped_masked(
             hq, ex.w13, sh, ex.sw13, masked, expected_m, mag, slot_to_expert, ps1)
-        dq, sd = fso.gemm.silu_chunk_mul_quantize_1x32_grouped_fp8(gu, slot_of_flat, pairwise=ex.w13_interleaved)
-    dn = fso.gemm.linear_mxfp8_grouped_masked(dq, ex.w2, sd, ex.sw2, masked, expected_m, mag, slot_to_expert, ps2)
-    return fso.gemm.moe_combine(dn, slot_of_flat, wts, bias=bias, bias_scale=bias_scale)
+        dq, sd = fso.compat.silu_chunk_mul_quantize_1x32_grouped_fp8(gu, slot_of_flat, pairwise=ex.w13_interleaved)
+    dn = fso.compat.linear_mxfp8_grouped_masked(dq, ex.w2, sd, ex.sw2, masked, expected_m, mag, slot_to_expert, ps2)
+    return fso.compat.moe_combine(dn, slot_of_flat, wts, bias=bias, bias_scale=bias_scale)
 
 
 def graph_case(label, ex, M, E, TOPK, H, seed):
@@ -293,12 +293,12 @@ def case_a(major: int) -> None:
     for fam, (E, TOPK, H, I) in FAMILIES.items():
         w13, w2 = make_weights(E, H, I, seed=11 + E + I)
         ex = fso.moe.prepare_experts(w13, w2, format="mxfp8")
-        interleave = fso.gemm.mxfp8_grouped_swiglu_available(2 * I, H)
+        interleave = fso.compat.mxfp8_grouped_swiglu_available(2 * I, H)
         _check(ex.kind == "mxfp8" and ex.arch // 10 == major and ex.num_experts == E and ex.hidden == H
                and ex.inter == I and ex.w13_interleaved == interleave,
                f"{fam}: prepare_experts(format='mxfp8') returned {ex!r}")
-        w13q, s13 = fso.gemm.quantize_moe_weights_1x32_fp8(w13, w13_interleave=interleave)
-        w2q, s2 = fso.gemm.quantize_moe_weights_1x32_fp8(w2)
+        w13q, s13 = fso.compat.quantize_moe_weights_1x32_fp8(w13, w13_interleave=interleave)
+        w2q, s2 = fso.compat.quantize_moe_weights_1x32_fp8(w2)
         same_w = (torch.equal(ex.w13.view(torch.uint8), w13q.view(torch.uint8)) and torch.equal(ex.sw13, s13)
                   and torch.equal(ex.w2.view(torch.uint8), w2q.view(torch.uint8)) and torch.equal(ex.sw2, s2))
         _check(same_w, f"{fam}: prepared MXFP8 weights differ from quantize_moe_weights_1x32_fp8's")
@@ -315,7 +315,7 @@ def case_a(major: int) -> None:
                 for mode in BIAS_MODES:
                     kw = bias_kwargs(mode, bias, bscale)
                     if major == 12:
-                        ref = fso.gemm.moe_layer_mxfp8_sm120(
+                        ref = fso.compat.moe_layer_mxfp8_sm120(
                             hidden, w13q, s13, w2q, s2, ids32, wts, w13_interleaved=interleave, **kw)
                     else:
                         ref = bench_chain_sm100(hidden, ex, ids32, wts, **kw)
@@ -352,7 +352,7 @@ def a2_inputs():
 
 def case_a2() -> None:
     E, TOPK, H, I, M, w13, w2, hidden, ids, wts, bias, bscale = a2_inputs()
-    engages = fso.gemm.moe_layer_fused_combine_engages_sm120(M, TOPK, H)
+    engages = fso.compat.moe_layer_fused_combine_engages_sm120(M, TOPK, H)
     _check(engages, f"a2: the fused-combine rule does not engage at M={M}; pick a larger M")
     ex = fso.moe.prepare_experts(w13, w2, format="mxfp8")
     interleave = ex.w13_interleaved
@@ -364,7 +364,7 @@ def case_a2() -> None:
            "the default case needs it unset")
     for mode in ("none", "bias+scale"):
         kw = bias_kwargs(mode, bias, bscale)
-        det = fso.gemm.moe_layer_mxfp8_sm120(hidden, ex.w13, ex.sw13, ex.w2, ex.sw2, ids32, wts,
+        det = fso.compat.moe_layer_mxfp8_sm120(hidden, ex.w13, ex.sw13, ex.w2, ex.sw2, ids32, wts,
                                              w13_interleaved=interleave, **kw)
         u = fso.moe.layer(hidden, ex, ids, wts, **kw)
         torch.cuda.synchronize()
@@ -386,9 +386,9 @@ def case_a2() -> None:
         _check(fso.moe._fused_combine_allowed(), "a2: FSO_MOE_FUSED_COMBINE=1 did not enable the fused combine")
         for mode in ("none", "bias+scale"):
             kw = bias_kwargs(mode, bias, bscale)
-            det = fso.gemm.moe_layer_mxfp8_sm120(hidden, ex.w13, ex.sw13, ex.w2, ex.sw2, ids32, wts,
+            det = fso.compat.moe_layer_mxfp8_sm120(hidden, ex.w13, ex.sw13, ex.w2, ex.sw2, ids32, wts,
                                                  w13_interleaved=interleave, **kw)
-            fc = fso.gemm.moe_layer_mxfp8_sm120(hidden, ex.w13, ex.sw13, ex.w2, ex.sw2, ids32, wts,
+            fc = fso.compat.moe_layer_mxfp8_sm120(hidden, ex.w13, ex.sw13, ex.w2, ex.sw2, ids32, wts,
                                                 w13_interleaved=interleave, fused_combine=True, **kw)
             u1 = fso.moe.layer(hidden, ex, ids, wts, **kw)
             u2 = fso.moe.layer(hidden, ex, ids, wts, **kw)
@@ -466,7 +466,7 @@ def case_c() -> None:
             two_round_max = 0.0
             for ids_name, ids64 in (("clean", ids), ("skipped", skip)):
                 ids32 = ids64.to(torch.int32)
-                ref = fso.gemm.moe_layer_fp8_sm90(hidden, q13, s13, q2, s2, ids32, wts)
+                ref = fso.compat.moe_layer_fp8_sm90(hidden, q13, s13, q2, s2, ids32, wts)
                 # The fold is one fused elementwise pass, so ref + bias_scale * bias is
                 # rounded once in fp32 (as an FMA) and then to bf16. The reference
                 # therefore evaluates ref + bias_scale[:, None] * bias exactly (in fp64,
@@ -500,7 +500,7 @@ def case_c() -> None:
             y = fso.moe.layer(hidden, ex, ids, wts)
             ref32 = ref_layer(hidden, ids, wts, lambda e: block_dequantize(q13, s13, e),
                               lambda e: block_dequantize(q2, s2, e), E)
-            bn = fso.gemm.moe_swap_ab_block_n(M, E, TOPK)
+            bn = fso.compat.moe_swap_ab_block_n(M, E, TOPK)
             path = f"swap-AB/{bn}" if bn is not None else "contig"
             n_dead = int(((skip < 0) | (skip >= E)).all(dim=1).sum())
             print(f"  equal   {fam:8s} M={M:5d} {path:10s}: {n_eq}/{n_all} torch.equal (moe_layer_fp8_sm90; bias "

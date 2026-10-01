@@ -50,7 +50,7 @@
 // `Sm1xxBlockScaledConfig<32>` K-major atom, applied *per group*. Group g's
 // activation scales occupy a slab describing a (pad(m_cap,128), K) tensor and
 // group g's weight scales a slab describing (N, K). See the layout note in
-// `quant_kernels.cu` and docs/api/gemm.md.
+// `quant_kernels.cu` and docs/api/compat.md.
 
 #pragma once
 
@@ -228,7 +228,7 @@ struct Sm100MxFP8GroupedGemmConfig
 //     holds; the long form is in fused_swiglu_store.cuh. Fed the usual
 //     [gate; up] stacking the kernel computes silu(gate_j) * gate_{j+I/2}-ish
 //     nonsense and reports no error, which is why the op that drives it says so
-//     in its docstring and in docs/api/gemm.md.
+//     in its docstring and in docs/api/compat.md.
 //   * the output width I = N/2 is a multiple of 128, so a 1x32 scale block
 //     never straddles the atom slab's 128-column block boundary.
 //

@@ -41,9 +41,9 @@ M = {M}
 torch.manual_seed(0)
 x = torch.randn(M, M, dtype=torch.bfloat16, device="cuda") * 0.1
 w = torch.randn(M, M, dtype=torch.bfloat16, device="cuda") / (M ** 0.5)
-xq, sx = fso.gemm.quantize_1x32_fp8(x)
-wq, sw = fso.gemm.quantize_1x32_fp8(w)
-fn = lambda: fso.gemm.linear_mxfp8(xq, wq, sx, sw)
+xq, sx = fso.compat.quantize_1x32_fp8(x)
+wq, sw = fso.compat.quantize_1x32_fp8(w)
+fn = lambda: fso.compat.linear_mxfp8(xq, wq, sx, sw)
 for _ in range(15): fn()
 torch.cuda.synchronize()
 s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())

@@ -17,6 +17,8 @@
 
 #pragma once
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -31,29 +33,44 @@
 namespace deep_gemm::jit
 {
 
-static bool kJitDebugging = []()
+// The JIT's environment knobs carry fish_scales_ops names (FSO_JIT_*). The TensorRT-LLM names this subtree was
+// vendored with (TRTLLM_DG_*) stay honoured as deprecated aliases until fish-scales-ops 0.3.0: an alias is read only when its
+// FSO_JIT_* name is unset, and when it is what supplied the value a notice names it on stderr. Every knob is read
+// once per process (the flags below at load time, the cache directory and the nvcc path on first use), so each
+// notice prints once.
+inline char const* getJitEnv(char const* name, char const* legacyName)
 {
-    char const* env_var = getenv("TRTLLM_DG_JIT_DEBUG");
-    return env_var && (std::string(env_var) == "1" || std::string(env_var) == "true");
-}();
+    if (char const* value = std::getenv(name))
+        return value;
+    char const* value = std::getenv(legacyName);
+    if (value != nullptr)
+        std::fprintf(stderr,
+            "[fish_scales_ops] %s is deprecated and will be removed in fish-scales-ops 0.3.0; set %s instead\n",
+            legacyName, name);
+    return value;
+}
 
-static bool kJitUseNvcc = []()
+inline bool getJitEnvFlag(char const* name, char const* legacyName)
 {
-    char const* env_var = getenv("TRTLLM_DG_JIT_USE_NVCC");
-    return env_var && (std::string(env_var) == "1" || std::string(env_var) == "true");
-}();
+    char const* value = getJitEnv(name, legacyName);
+    return value && (std::string(value) == "1" || std::string(value) == "true");
+}
 
-static bool kJitDumpCubin = []()
-{
-    char const* env_var = getenv("TRTLLM_DG_JIT_DUMP_CUBIN");
-    return env_var && (std::string(env_var) == "1" || std::string(env_var) == "true");
-}();
+// FSO_JIT_DEBUG: verbose compile / cache log on stderr.
+inline bool const kJitDebugging = getJitEnvFlag("FSO_JIT_DEBUG", "TRTLLM_DG_JIT_DEBUG");
 
-static std::string kKernelName = kJitUseNvcc ? "nvcc_kernel.cubin" : "nvrtc_kernel.cubin";
+// FSO_JIT_USE_NVCC: compile with nvcc instead of NVRTC; nvcc's output always goes through the disk cache.
+inline bool const kJitUseNvcc = getJitEnvFlag("FSO_JIT_USE_NVCC", "TRTLLM_DG_JIT_USE_NVCC");
+
+// FSO_JIT_DUMP_CUBIN: also write every NVRTC-compiled cubin to the disk cache (and load from it).
+inline bool const kJitDumpCubin = getJitEnvFlag("FSO_JIT_DUMP_CUBIN", "TRTLLM_DG_JIT_DUMP_CUBIN");
+
+inline std::string const kKernelName = kJitUseNvcc ? "nvcc_kernel.cubin" : "nvrtc_kernel.cubin";
 
 /**
  * C++ implementation of the Runtime class from runtime.py
- * Loads and executes JIT-compiled kernels
+ * Loads and executes JIT-compiled kernels. With a non-empty cubin the kernel comes from memory and `path` is only a
+ * label; with an empty one it is read from `path`/kKernelName (a disk-cache directory) on the first getKernel().
  */
 class Runtime
 {
@@ -139,8 +156,10 @@ private:
 };
 
 /**
- * C++ implementation of the RuntimeCache class from runtime.py
- * Caches Runtime instances by path
+ * In-memory cache of the process's Runtime instances, keyed by the kernel name Compiler::build derives from its
+ * template arguments. Lookups never touch the file system: the content-keyed disk cache (FSO_JIT_DUMP_CUBIN /
+ * FSO_JIT_USE_NVCC only) is consulted by Compiler::build on an in-memory miss, with the GEMM type taken from the
+ * build call rather than parsed back out of a path.
  */
 class RuntimeCache
 {
@@ -151,58 +170,16 @@ public:
         return instance;
     }
 
-    Runtime* operator[](std::string const& path)
+    // The per-launch hit path of every sm_90 GEMM: one map lookup.
+    Runtime* find(std::string const& name) const
     {
-        // Check if already in cache
-        auto it = cache_.find(path);
-        if (it != cache_.end())
-        {
-            return it->second.get();
-        }
-
-        // Check if already compiled
-        if (Runtime::isPathValid(path))
-        {
-            // Parse path to get gemm type
-            std::string gemm_type_str = path.substr(path.find_last_of('_') + 1);
-            deep_gemm::GemmType gemm_type;
-            if (gemm_type_str == "Normal")
-            {
-                gemm_type = deep_gemm::GemmType::Normal;
-            }
-            else if (gemm_type_str == "GroupedWithOffset")
-            {
-                gemm_type = deep_gemm::GemmType::GroupedWithOffset;
-            }
-            else if (gemm_type_str == "GroupedMasked")
-            {
-                gemm_type = deep_gemm::GemmType::GroupedMasked;
-            }
-            else if (gemm_type_str == "GroupedContiguous")
-            {
-                gemm_type = deep_gemm::GemmType::GroupedContiguous;
-            }
-            else if (gemm_type_str == "StridedBatched")
-            {
-                gemm_type = deep_gemm::GemmType::StridedBatched;
-            }
-            else
-            {
-                throw std::runtime_error("Unsupported gemm type: " + gemm_type_str);
-            }
-
-            auto runtime = std::make_unique<Runtime>(path, std::vector<char>(), gemm_type);
-            Runtime* result = runtime.get();
-            cache_[path] = std::move(runtime);
-            return result;
-        }
-
-        return nullptr;
+        auto it = cache_.find(name);
+        return it != cache_.end() ? it->second.get() : nullptr;
     }
 
-    void set(std::string const& path, std::unique_ptr<Runtime>&& runtime)
+    void set(std::string const& name, std::unique_ptr<Runtime>&& runtime)
     {
-        cache_[path] = std::move(runtime);
+        cache_[name] = std::move(runtime);
     }
 
 private:

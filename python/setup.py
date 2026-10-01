@@ -2,15 +2,20 @@
 
 One CUDAExtension (`fish_scales_ops._C`) for both domains:
 
-  csrc/gemm/      — FP8 1×128 / 128×128 (sm_90 deep_gemm JIT + sm_120
-                    CUTLASS Sm120BlockScaledKernel) and MXFP8 1×32
-                    (sm_120 only). Registers torch.ops under
-                    `fish_scales_ops` via TORCH_LIBRARY_FRAGMENT.
-  csrc/attention/ — SM120 MXFP8 attention forward + paged decode
-                    (`mxfp8_attn_fwd`, `mxfp8_decode_paged`).
+  csrc/gemm/      — block-FP8 1×128 / 128×128 (sm_90 deep_gemm JIT, sm_120
+                    CUTLASS Sm120BlockScaledKernel, sm_100/sm_103 on the
+                    MXFP8 tcgen05 kernels) and MXFP8 1×32 (sm_100/sm_103 and
+                    sm_120/sm_121), dense and grouped MoE. Registers torch.ops
+                    under `fish_scales_ops` via TORCH_LIBRARY_FRAGMENT.
+  csrc/attention/ — SM120 MXFP8 attention: contiguous prefill, paged decode
+                    and paged prefill (`mxfp8_attn_fwd`, `mxfp8_decode_paged`,
+                    `mxfp8_attn_fwd_paged`).
 
-Default archs: 9.0a + 12.0a (Hopper + Blackwell consumer). Override via:
-    export TORCH_CUDA_ARCH_LIST="12.0a"
+Default archs: 9.0a + 12.0a (Hopper + Blackwell consumer). B200 / B300
+(sm_100 / sm_103) need the 10.0f family target in the list, which the default
+omits; without it the extension carries no kernels for those devices.
+Override via:
+    export TORCH_CUDA_ARCH_LIST="9.0a;10.0f;12.0a"
 
 CUTLASS root: defaults to `../3rdparty/cutlass` (the repo submodule).
 Override with `CUTLASS_DIR` env var.

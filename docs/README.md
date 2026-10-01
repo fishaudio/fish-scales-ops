@@ -7,8 +7,8 @@ migrated. The staging area `doc_review/` was moved out of the repository on
 2026-09-15 to `../fso-doc_review-backup-20260915/` (a sibling directory of the
 repository, not under version control); it keeps the old README, the old
 `docs/api/*.md` and `docs/perf.md`, the memory and casebook copies, and the
-`INDEX.md` manifest, and remains the source for the items still open in the
-checklist below. The gitignored design records went back to `docs/design/`
+`INDEX.md` manifest, and remains the source for the open items listed under
+Status below. The gitignored design records went back to `docs/design/`
 unchanged.
 
 ## Layout
@@ -19,11 +19,16 @@ README.md                  front page: what fso is, hardware/dtype matrix, insta
 docs/
   README.md                this file — placement rules
   api/
-    gemm.md                frozen op contracts for fish_scales_ops.gemm (no perf numbers)
+    dense.md               fish_scales_ops.dense, the stable dense linear (no perf numbers)
+    moe.md                 fish_scales_ops.moe, the stable MoE layer (no perf numbers)
     attention.md           frozen op contracts for fish_scales_ops.attention (no perf numbers)
+    compat.md              fish_scales_ops.compat: the explicit dense ops and the MoE per-step
+                           pieces, plus the reference sections every GEMM and MoE op shares
+                           (scale layouts, constraints, the generated torch.ops schemas, CUDA
+                           graphs, environment variables) (no perf numbers)
   perf/
     README.md              methodology, shape families (the ONLY definition), M grids, FLOPs
-                           conventions, dtype-per-arch matrix, clock locks, file map, regeneration
+                           conventions, dtype-per-arch matrix, clock policy, file map, regeneration
     gemm/
       sm90.md              H200        — Family A / B / C per-GEMM tables (dense ops, grouped kernels)
       sm120.md             RTX 5090    — Family A / B / C per-GEMM tables (RTX PRO 6000 optional section)
@@ -83,50 +88,37 @@ docs/
 7. **Design records stay gitignored** (`docs/design/`) until a deliberate
    decision changes that. Do not describe a `docs/design/` file as "committed".
 
-## Migration checklist (2026-09-03 → 2026-09-05, GEMM paused)
+## Status
 
-GEMM / layer performance work paused 2026-09-05 with every sm_90 and sm_120
-table backed by an accepted baseline in `tests/baselines/` (H200 runs of
-2026-09-03, RTX 5090 runs of 2026-09-04 / 2026-09-05). Open items at the
-pause: sm_90 grouped kernel-level rows (not measured); `gemm/sm100.md` /
-`layer/sm100.md` B300 decision; the RTX PRO 6000 optional section (keep or
-drop); a slab-free sm_120 grouped entry for M = 8192; pinning the NVRTC build
-the sm_90 JIT binds; attention tables (`attention/sm120.md`) still a skeleton.
+Every GEMM and layer table in `docs/perf/`, and the two hot-shape tables of the
+README, is rendered from `tests/baselines/` by
+`bench/gemm/python/render_perf_docs.py`, whose `--check` exits non-zero when a
+table has drifted from its baseline. Each perf file names the runs its tables
+come from in its provenance section. The attention tables
+(`docs/perf/attention/sm120.md`) are a skeleton with no baseline. Open items:
+the sm_90 grouped GEMM kernel-level rows (not measured), the RTX PRO 6000
+optional section of `gemm/sm120.md` (keep or drop), pinning the NVRTC build the
+sm_90 JIT binds, the attention tables, and the `docs/design/` consolidation in
+the last row of the table below.
 
-The B300 item was closed on 2026-09-15: work resumed on that arch, the
-sm_100/103 grouped MoE path landed, and both sm100 files are now filled from
-ten baselines in `tests/baselines/` — `gemm_sm100_qwen3_4b.jsonl`,
-`gemm_sm100_qwen3_4b_mlp_fwd.jsonl`, `gemm_sm100_qwen3_30a3_dense.jsonl`,
-`gemm_sm100_qwen3_35a3_dense.jsonl`, `perf_moe_qwen3_30a3_b300.jsonl`,
-`perf_moe_qwen3_35a3_b300.jsonl`, `perf_moe_qwen3_35a3_shared_b300.jsonl`,
-`ref_moe_qwen3_30a3_b300.jsonl`, `ref_moe_qwen3_35a3_b300.jsonl` and
-`ref_moe_qwen3_35a3_shared_b300.jsonl` (the last three are the comparator
-files, which on that device are torch's own grouped entry points). The rows are
-unlocked-clock numbers, labelled as such, and the remaining open items are
-unchanged.
+## Migration record
 
-All ten baseline files were replaced on 2026-09-17, after an optimisation round
-on that arch (a wave-tile rule on the dense cascade; in the grouped MoE layer a
-split argument-preparation kernel with programmatic dependent launch, a
-multi-CTA routing builder, and grouped cascade v2). The replacement run was
-taken on a different card of the same pod than the 2026-09-15 one, so the two
-sm100 files were regenerated from it in full rather than cell by cell; the
-2026-09-15 numbers are superseded, not merged.
-
-Content sources were staged in `doc_review/`, now archived at
-`../fso-doc_review-backup-20260915/` (see its `INDEX.md`). Per target file:
+Each document's content was migrated in September 2026 from sources staged in
+`doc_review/`, now archived at `../fso-doc_review-backup-20260915/` (see its
+`INDEX.md`). The status column records the migration; for the numbers, the
+provenance section of each perf file is the current record. Per target file:
 
 | target | source(s) to cherry-pick from | status |
 |---|---|---|
-| `README.md` | `doc_review/repo/README.md` (strip comparisons, strip non-sm90/sm120 perf) | **done 2026-09-13**: hot tables generated from the baselines (2026-09-05); Install / Usage / Status / Layout / Tests / Knobs / License / Acknowledgments migrated and updated to the current op surface (grouped MoE on sm_90 and sm_120, sm_100 block-FP8, UE8M0 defaults, dropped stale claims) |
-| `docs/perf/README.md` | old `perf.md` Methodology + Environment; workspace CLAUDE.md harness invariants; casebook case-01 | protocol, families, M grid, clock locks, dtype matrix, regeneration filled; M grid = bench default (2026-09-05) |
-| `docs/perf/gemm/sm90.md` | old `perf.md` H200 sections + grouped MoE section; `/data/bench-runs/moe_h200_20260903_full/` | filled 2026-09-03: Family A + MLP **re-baselined** on H200 GPU 0 (`tests/baselines/gemm_sm90_qwen3_4b*.jsonl`); Family B MoE layer from committed baseline; **Family B dense + all of Family C measured** (`gemm_sm90_qwen3_30a3_dense.jsonl`, `gemm_sm90_qwen3_35a3_dense.jsonl`, `perf_moe_qwen3_35a3_h200.jsonl`); grouped kernel-level rows **not measured** at the pause |
-| `docs/perf/gemm/sm120.md` | old `perf.md` 5090 + RTX PRO 6000 sections; `moe_m1_sm120_grouped.md` measured tables (only rows with artifacts) | **re-baselined 2026-09-04 on RTX 5090 C1 after the smem fix** (all families, dense + MLP + MoE; six `tests/baselines/*sm120*` / `*_5090.jsonl`, zero error cells). The 2026-09-03 run had found a HEAD regression (dense BSFP8 (64,128,4) could not launch: 102400 B > 101376 B from the grouped-MoE `grouped_layout_smem[512]`; MXFP8 `wo` M=512 +7 %); fixed by the `GroupedLayoutSmem_` builder opt-in, verified against the July commit on the same GPU. 2026-09-05: Family C `moe.down` cascade rule v5 (layer-swept), block-FP8 weight-scale fix (BSFP8 cos 0.967–0.996 → 0.9993, dense tables re-measured, µs unchanged), K % 128. PRO 6000 not migrated |
-| `docs/perf/gemm/sm100.md` | measured fresh on the B300 (`/data/bench-runs/b300_final2_20260917/`); the old `perf.md` B300 rows were not carried over (no clock lock, no preserved jsonl) | **filled 2026-09-15, re-measured in full 2026-09-17**: Families A / B / C dense, both grouped kernel tables, from `gemm_sm100_qwen3_4b.jsonl`, `gemm_sm100_qwen3_30a3_dense.jsonl`, `gemm_sm100_qwen3_35a3_dense.jsonl`, `perf_moe_qwen3_30a3_b300.jsonl` and `perf_moe_qwen3_35a3_b300.jsonl`. Rows are `unlocked` (no lock available on that pod) and carry the ±3 %, M = 8192 scatter, clock-droop and replay-tick caveats of `docs/perf/README.md` §8 |
-| `docs/perf/layer/sm90.md` | Family A MLP-forward and Family B/C MoE-layer baselines (moved out of `gemm/sm90.md`), new Family C routed + shared-expert block run, same-day sglang triton / deep_gemm comparators | filled 2026-09-04 |
-| `docs/perf/layer/sm120.md` | same for RTX 5090 (cuBLAS `scaled_mm` comparators for A from the MLP jsonl, sglang triton comparators for B / C) | filled 2026-09-04 |
-| `docs/perf/layer/sm100.md` | same for the B300 (cuBLAS `scaled_mm` comparators for A from `gemm_sm100_qwen3_4b_mlp_fwd.jsonl`; torch `scaled_grouped_mm` MXFP8 and `_grouped_mm` BF16 for B / C from `ref_moe_qwen3_30a3_b300.jsonl`, `ref_moe_qwen3_35a3_b300.jsonl` and `ref_moe_qwen3_35a3_shared_b300.jsonl`, since neither sglang nor deep_gemm is installed on that pod) | **filled 2026-09-15, re-measured in full 2026-09-17** from `gemm_sm100_qwen3_4b_mlp_fwd.jsonl`, `perf_moe_qwen3_30a3_b300.jsonl`, `perf_moe_qwen3_35a3_b300.jsonl` and `perf_moe_qwen3_35a3_shared_b300.jsonl`; Family C carries four comparator columns (routed and routed + shared) because both were measured, and every comparator row of the 2026-09-17 run was taken on the same card in the same session as the fso rows |
-| `docs/perf/attention/sm120.md` | old `perf.md` attention section | skeleton |
-| `docs/api/gemm.md`, `docs/api/attention.md` | old api docs + grouped MoE ops added 2026-09 | **done 2026-09-13**: rewritten from the bindings and wrappers (all 27 GEMM schemas, both MoE layouts, per-arch scale layouts, constraints, graph contract, every env knob; attention: three kernels, plan/run APIs, current channel-scale contracts) |
+| `README.md` | `doc_review/repo/README.md` (strip comparisons, strip non-sm90/sm120 perf) | **done 2026-09-13**: hot tables rendered from `tests/baselines/`; Install / Usage / Status / Layout / Tests / Knobs / License / Acknowledgments migrated and updated to the current op surface (grouped MoE on sm_90 and sm_120, sm_100 block-FP8, UE8M0 defaults, dropped stale claims) |
+| `docs/perf/README.md` | old `perf.md` Methodology + Environment; workspace CLAUDE.md harness invariants; casebook case-01 | protocol, families, M grid, clock policy, dtype matrix, regeneration filled; M grid = bench default |
+| `docs/perf/gemm/sm90.md` | old `perf.md` H200 sections + grouped MoE section; `/data/bench-runs/moe_h200_20260903_full/` | filled 2026-09-03; every table rendered from `tests/baselines/`, provenance at the top of the file; grouped kernel-level rows **not measured** |
+| `docs/perf/gemm/sm120.md` | old `perf.md` 5090 + RTX PRO 6000 sections; `moe_m1_sm120_grouped.md` measured tables (only rows with artifacts) | filled 2026-09-04; every table rendered from `tests/baselines/`, provenance at the top of the file, which also records the shared-memory regression found and fixed on 2026-09-03/04, grouped cascade rule v5 and the 2026-09-05 block-FP8 weight-scale fix; PRO 6000 not migrated |
+| `docs/perf/gemm/sm100.md` | measured fresh on the B300 (`/data/bench-runs/b300_final2_20260917/`); the old `perf.md` B300 rows were not carried over (no clock lock, no preserved jsonl) | filled 2026-09-15: Families A / B / C dense and both grouped kernel tables, rendered from `gemm_sm100_qwen3_4b.jsonl`, `gemm_sm100_qwen3_30a3_dense.jsonl`, `gemm_sm100_qwen3_35a3_dense.jsonl`, `perf_moe_qwen3_30a3_b300.jsonl` and `perf_moe_qwen3_35a3_b300.jsonl`, provenance at the top of the file; the rows are natural-clock (`unlocked`) numbers and carry the caveats of `docs/perf/README.md` §8 |
+| `docs/perf/layer/sm90.md` | Family A MLP-forward and Family B/C MoE-layer baselines (moved out of `gemm/sm90.md`), new Family C routed + shared-expert block run, same-day sglang triton / deep_gemm comparators | filled 2026-09-04; every table rendered from `tests/baselines/`, provenance at the top of the file |
+| `docs/perf/layer/sm120.md` | same for RTX 5090 (cuBLAS `scaled_mm` comparators for A from the MLP jsonl, sglang triton comparators for B / C) | filled 2026-09-04; every table rendered from `tests/baselines/`, provenance at the top of the file |
+| `docs/perf/layer/sm100.md` | same for the B300 (cuBLAS `scaled_mm` comparators for A from `gemm_sm100_qwen3_4b_mlp_fwd.jsonl`; torch `scaled_grouped_mm` MXFP8 and `_grouped_mm` BF16 for B / C from `ref_moe_qwen3_30a3_b300.jsonl`, `ref_moe_qwen3_35a3_b300.jsonl` and `ref_moe_qwen3_35a3_shared_b300.jsonl`, since neither sglang nor deep_gemm is installed on that pod) | filled 2026-09-15; every table rendered from `gemm_sm100_qwen3_4b_mlp_fwd.jsonl`, `perf_moe_qwen3_30a3_b300.jsonl`, `perf_moe_qwen3_35a3_b300.jsonl` and `perf_moe_qwen3_35a3_shared_b300.jsonl` with their comparator files, provenance at the top of the file; Family C carries four comparator columns (routed and routed + shared) because both were measured |
+| `docs/perf/attention/sm120.md` | old `perf.md` attention section | skeleton: no baseline in `tests/baselines/` and no generator |
+| `docs/api/compat.md` (named `docs/api/gemm.md` until 2026-10-01), `docs/api/attention.md` | old api docs + grouped MoE ops added 2026-09 | **done 2026-09-13**: rewritten from the bindings and wrappers (both MoE layouts, per-arch scale layouts, constraints, graph contract, every env knob; attention: three kernels, plan/run APIs, current channel-scale contracts); the `torch.ops` schema lists of `compat.md` and `attention.md` are generated by `scripts/gen_op_schemas.py` from the `m.def` registrations and the Python `custom_op` registrations, every registered op, between `BEGIN GENERATED` / `END GENERATED` markers, and are regenerated (`--write`, checked with `--check`) rather than edited by hand. On 2026-10-01, for the 0.2.0 interface, `gemm.md` became `compat.md`, took over the MoE per-step section of `moe.md`, and `dense.md` was added for `fso.dense` |
 | harness (kernel-optimization rulebook) | workspace CLAUDE.md harness invariants; global CLAUDE.md GPU benching; casebook SKILL.md; charters' known traps; perf_review Reproduce | **not in the repo** (stone, 2026-09-15): all eight sections were filled on 2026-09-13 as `docs/harness.md`, then moved out of the repo to the maintainer's casebook skill. The measurement caveats the tables cite were folded into `docs/perf/README.md` §8 and the acceptance rule into its §7; no in-repo file points at the harness |
 | `docs/design/` | the seven design docs + memory engineering logs (H200 MoE) | restored to `docs/design/` unchanged on 2026-09-15 (gitignored); consolidation still open: the two MoE charters carry stale status and merge with the memory logs, `moe_m1_sm120_grouped.md` splits into contract vs tuning log with every number traced to an artifact, `attn_v16_rewrite.md` goes to `docs/design/archive/` with a summary, `perf_review_2026-06.md` is archived |

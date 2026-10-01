@@ -75,10 +75,12 @@
 #include "blockscale_gemm/arch/sm100/mxfp8/gemm_types.cuh"
 #include "blockscale_gemm/arch/sm120/common/env_overrides.cuh" // FSO_FORCE_TILE parsing (arch-agnostic)
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
+#include <vector>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -236,13 +238,26 @@ inline int pick_wave_tile(int M, int N) noexcept
     return best_m * 1000 + best_n;
 }
 
-// Thread-local CUTLASS workspace pool. Expected to stay empty (dense
-// BlockScaled + default scheduler needs no workspace); exists so a future
-// scheduler change degrades to a clear runtime contract instead of UB.
+// Thread-local device workspace of the dense cascade. Its main tenant is the
+// two-kernel parallel split-K of the decode band (launch_sm100_mxfp8_gemm_splitk
+// below), which keeps its FP32 partial sums here; the forced Stream-K variants
+// keep their reduction barriers here, and the plain tiles with the default
+// scheduler ask for nothing.
+//
+// A captured CUDA graph keeps the buffer address it saw at capture time, so the
+// pool never frees a buffer. When an eager call needs more than the pool holds,
+// the current buffer is retired -- kept allocated for the life of the process,
+// because a graph captured earlier may still read and write it -- and a new one
+// of at least twice the size is allocated, so retirements stay few. A growth is
+// refused while the launch stream is capturing, where cudaMalloc is not allowed:
+// ensure() then returns cudaErrorStreamCaptureUnsupported, which the op turns
+// into a RuntimeError (sm100_mxfp8_error_hint in mxfp8_sm100_kernel.cu). One
+// eager call of the same shape on the capturing thread sizes the pool for it.
 struct Sm100WorkspacePool
 {
     void* ptr = nullptr;
     std::size_t bytes = 0;
+    std::vector<void*> retired; // never freed: graphs captured earlier may hold them
 
     static Sm100WorkspacePool& instance()
     {
@@ -250,27 +265,48 @@ struct Sm100WorkspacePool
         return p;
     }
 
-    void* ensure(std::size_t needed)
+    // On success *out is a buffer of at least `needed` bytes (nullptr when
+    // `needed` is 0) that stays valid for the life of the process.
+    cudaError_t ensure(std::size_t needed, cudaStream_t stream, void** out)
     {
+        *out = nullptr;
         if (needed == 0)
-            return nullptr;
+            return cudaSuccess;
         if (bytes >= needed)
-            return ptr;
-        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
-        cudaStreamIsCapturing(nullptr, &cap);
-        if (cap == cudaStreamCaptureStatusActive)
         {
-            std::fprintf(stderr,
-                "[blockscale_gemm] Sm100WorkspacePool: needs %zu bytes during stream capture but pool has %zu. "
-                "Warm up linear_mxfp8 on the largest shape before capture.\n",
-                needed, bytes);
-            std::abort();
+            *out = ptr;
+            return cudaSuccess;
+        }
+        // Ask about the stream the launch is on: torch.cuda.graph captures on
+        // a side stream, which a query of the legacy stream does not see.
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &cap) != cudaSuccess)
+        {
+            (void) cudaGetLastError();
+            return cudaErrorStreamCaptureUnsupported;
+        }
+        if (cap != cudaStreamCaptureStatusNone)
+            return cudaErrorStreamCaptureUnsupported;
+        constexpr std::size_t kGranule = std::size_t(1) << 20;
+        std::size_t grow = std::max(needed, 2 * bytes);
+        grow = (grow + kGranule - 1) / kGranule * kGranule;
+        void* fresh = nullptr;
+        if (cudaMalloc(&fresh, grow) != cudaSuccess)
+        {
+            (void) cudaGetLastError();
+            return cudaErrorMemoryAllocation;
         }
         if (ptr)
-            cudaFree(ptr);
-        cudaMalloc(&ptr, needed);
-        bytes = needed;
-        return ptr;
+            retired.push_back(ptr);
+        ptr = fresh;
+        bytes = grow;
+        if (read_print_tile_info())
+            std::fprintf(stderr,
+                "[fso sm100 workspace] grew to %zu bytes for a %zu-byte request; %zu earlier buffer(s) "
+                "retired and kept allocated\n",
+                bytes, needed, retired.size());
+        *out = ptr;
+        return cudaSuccess;
     }
 };
 
@@ -426,7 +462,10 @@ cudaError_t launch_sm100_mxfp8_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, 
             // even on a Params-cache hit. A captured init simply re-runs on
             // every replay — exactly the semantics the barriers need.
             std::size_t const ws_bytes = Gemm::get_workspace_size(args);
-            void* ws = detail::Sm100WorkspacePool::instance().ensure(ws_bytes);
+            void* ws = nullptr;
+            cudaError_t const ws_err = detail::Sm100WorkspacePool::instance().ensure(ws_bytes, stream, &ws);
+            if (ws_err != cudaSuccess)
+                return ws_err;
             if (ws_bytes > 0
                 && GemmKernel::initialize_workspace(args, ws, stream) != cutlass::Status::kSuccess)
                 return cudaErrorUnknown;
@@ -437,7 +476,10 @@ cudaError_t launch_sm100_mxfp8_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, 
         if (Gemm::can_implement(args) != cutlass::Status::kSuccess)
             return cudaErrorInvalidValue;
         std::size_t const ws_bytes = Gemm::get_workspace_size(args);
-        void* ws = detail::Sm100WorkspacePool::instance().ensure(ws_bytes);
+        void* ws = nullptr;
+        cudaError_t const ws_err = detail::Sm100WorkspacePool::instance().ensure(ws_bytes, stream, &ws);
+        if (ws_err != cudaSuccess)
+            return ws_err;
         if (ws_bytes > 0)
         {
             // Stream-ordered workspace init (capture-legal; a captured init
@@ -673,16 +715,20 @@ cudaError_t launch_sm100_mxfp8_gemm_splitk(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* 
     };
     static thread_local std::unordered_map<CacheKey, Params, CacheHash> s_params_cache;
 
-    // The pool ptr is stable unless it grows; growth only happens outside
-    // capture (ensure() aborts otherwise), and the ptr is part of the key.
+    // The pool ptr changes only when the pool grows, which ensure() refuses
+    // inside a capture; the ptr is part of the key, so a grown pool gets fresh
+    // Params, and the retired buffer stays allocated for any graph captured
+    // against it.
     Args args{cutlass::gemm::GemmUniversalMode::kGemm, problem,
         {ptr_A, stride_A, ptr_B, stride_B, ptr_SFA, layout_SFA, ptr_SFB, layout_SFB},
         {{1.0f, 0.0f}, nullptr, stride_D, nullptr /* ptr_D patched below */, stride_D}};
 
     std::size_t const ws_bytes = Gemm::get_workspace_size(args);
-    void* base = detail::Sm100WorkspacePool::instance().ensure(partial_bytes + ws_bytes);
-    if (base == nullptr)
-        return cudaErrorMemoryAllocation;
+    void* base = nullptr;
+    cudaError_t const ws_err
+        = detail::Sm100WorkspacePool::instance().ensure(partial_bytes + ws_bytes, stream, &base);
+    if (ws_err != cudaSuccess)
+        return ws_err;
     float* partials = static_cast<float*>(base);
     void* cutlass_ws = static_cast<char*>(base) + partial_bytes;
     args.epilogue.ptr_D = partials;

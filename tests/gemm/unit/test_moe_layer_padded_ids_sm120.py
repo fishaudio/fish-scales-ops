@@ -58,10 +58,10 @@ def main():
     for fam, (E, TOPK, HIDDEN, INTER, E_GLOBAL) in FAMILIES.items():
         w13 = torch.randn(E, 2 * INTER, HIDDEN, device=dev, dtype=torch.bfloat16) * 0.02
         w2 = torch.randn(E, HIDDEN, INTER, device=dev, dtype=torch.bfloat16) * 0.02
-        w13f, sw13 = fso.gemm.quantize_moe_weights_1x32_fp8(w13)
-        w2f, sw2 = fso.gemm.quantize_moe_weights_1x32_fp8(w2)
+        w13f, sw13 = fso.compat.quantize_moe_weights_1x32_fp8(w13)
+        w2f, sw2 = fso.compat.quantize_moe_weights_1x32_fp8(w2)
         del w13, w2
-        layer = lambda h, ids, w: fso.gemm.moe_layer_mxfp8_sm120(
+        layer = lambda h, ids, w: fso.compat.moe_layer_mxfp8_sm120(
             h, w13f, sw13, w2f, sw2, ids, w)
         for M in (1, 8, 64, 512, 1024):
             g = torch.Generator(device=dev)

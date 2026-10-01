@@ -137,7 +137,7 @@ def test_vs_dequant_reference(G, m_cap, N, K, masked_list):
     a_fp8, a_sf, w_fp8, w_sf = _quant_torch(a, w, G, m_cap, N, K)
 
     sa = a_sf.transpose(1, 2).contiguous()          # [G, K/128, m_cap]
-    y = fso.gemm.linear_fp8_grouped_masked(a_fp8, w_fp8, sa, w_sf.contiguous(), masked_m, expected_m)
+    y = fso.compat.linear_fp8_grouped_masked(a_fp8, w_fp8, sa, w_sf.contiguous(), masked_m, expected_m)
     torch.cuda.synchronize()
 
     worst_deq, worst_bf, checked = 1.0, 1.0, 0
@@ -170,7 +170,7 @@ def test_vs_deepgemm(G, m_cap, N, K, masked_list):
     dg.fp8_m_grouped_gemm_nt_masked((a_fp8, a_sf), (w_fp8, w_sf), d_ref, masked_m, expected_m)
 
     sa = a_sf.transpose(1, 2).contiguous()          # [G, K/128, m_cap]
-    y = fso.gemm.linear_fp8_grouped_masked(a_fp8, w_fp8, sa, w_sf.contiguous(), masked_m, expected_m)
+    y = fso.compat.linear_fp8_grouped_masked(a_fp8, w_fp8, sa, w_sf.contiguous(), masked_m, expected_m)
     torch.cuda.synchronize()
 
     worst_dg, worst_bf, checked = 1.0, 1.0, 0
@@ -196,7 +196,7 @@ def test_graph_replay(G=8, m_cap=128, N=1536, K=2048):
     masked_m = torch.tensor([100, 128, 64, 32, 16, 8, 4, 1], device="cuda", dtype=torch.int32)
     em = 48
 
-    fn = lambda: fso.gemm.linear_fp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, em)
+    fn = lambda: fso.compat.linear_fp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, em)
     s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         for _ in range(3):
@@ -227,12 +227,12 @@ def test_h2_layout_native(m_cap, N, K, label, M=64, G=128, topk=8):
     per_token_cast / tma_align. cos vs per-expert BF16."""
     torch.manual_seed(M * 31 + N + K)
     ids = torch.stack([torch.randperm(G)[:topk] for _ in range(M)]).to("cuda", torch.int32)
-    mm, rm, sof = fso.gemm.moe_build_routing(ids, G, m_cap)
+    mm, rm, sof = fso.compat.moe_build_routing(ids, G, m_cap)
     x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.1
     w = torch.randn(G, N, K, device="cuda", dtype=torch.bfloat16) / (K ** 0.5)
-    a_fp8, sa = fso.gemm.quantize_1x128_grouped_gather_sm90(x, sof, topk, G, m_cap)
-    w_fp8, sw = fso.gemm.quantize_moe_weights_1x128_fp8_sm90(w)
-    y = fso.gemm.linear_fp8_grouped_masked(a_fp8, w_fp8, sa, sw, mm, max(1, M * topk // G))
+    a_fp8, sa = fso.compat.quantize_1x128_grouped_gather_sm90(x, sof, topk, G, m_cap)
+    w_fp8, sw = fso.compat.quantize_moe_weights_1x128_fp8_sm90(w)
+    y = fso.compat.linear_fp8_grouped_masked(a_fp8, w_fp8, sa, sw, mm, max(1, M * topk // G))
     torch.cuda.synchronize()
     rmc = rm.cpu().view(G, m_cap); mmc = mm.cpu(); ys, rs = [], []
     for g in range(G):
@@ -255,7 +255,7 @@ def test_h2_silu(G=128, m_cap=64, INTER=768):
     for g in range(G):
         slots += [g * m_cap + j for j in range(int(mm[g]))]
     sof = torch.tensor(slots, device="cuda", dtype=torch.int32)
-    hq, sh = fso.gemm.silu_chunk_mul_quantize_1x128_grouped_sm90(gu, sof)
+    hq, sh = fso.compat.silu_chunk_mul_quantize_1x128_grouped_sm90(gu, sof)
     torch.cuda.synchronize()
     worst = 1.0
     for g in range(G):
@@ -275,12 +275,12 @@ def moe_layer_sm90(hidden, w13_fp8, sw13, w2_fp8, sw2, topk_ids, topk_w, m_cap, 
     """6 kernels, zero torch-op glue, all fso: routing + gather-quant +
     grouped gate_up + silu-quant + grouped down + combine."""
     topk = topk_ids.shape[1]
-    masked_m, row_map, slot_of_flat = fso.gemm.moe_build_routing(topk_ids, G, m_cap)
-    hq, sh = fso.gemm.quantize_1x128_grouped_gather_sm90(hidden, slot_of_flat, topk, G, m_cap)
-    gu = fso.gemm.linear_fp8_grouped_masked(hq, w13_fp8, sh, sw13, masked_m, em)
-    dq, sd = fso.gemm.silu_chunk_mul_quantize_1x128_grouped_sm90(gu, slot_of_flat)
-    dn = fso.gemm.linear_fp8_grouped_masked(dq, w2_fp8, sd, sw2, masked_m, em)
-    out.copy_(fso.gemm.moe_combine(dn, slot_of_flat, topk_w))
+    masked_m, row_map, slot_of_flat = fso.compat.moe_build_routing(topk_ids, G, m_cap)
+    hq, sh = fso.compat.quantize_1x128_grouped_gather_sm90(hidden, slot_of_flat, topk, G, m_cap)
+    gu = fso.compat.linear_fp8_grouped_masked(hq, w13_fp8, sh, sw13, masked_m, em)
+    dq, sd = fso.compat.silu_chunk_mul_quantize_1x128_grouped_sm90(gu, slot_of_flat)
+    dn = fso.compat.linear_fp8_grouped_masked(dq, w2_fp8, sd, sw2, masked_m, em)
+    out.copy_(fso.compat.moe_combine(dn, slot_of_flat, topk_w))
     return out
 
 
@@ -303,8 +303,8 @@ def test_h3_layer(M, G=128, topk=8, hidden=2048, inter=768):
     x = torch.randn(M, hidden, device="cuda", dtype=torch.bfloat16) * 0.1
     w13 = torch.randn(G, 2 * inter, hidden, device="cuda", dtype=torch.bfloat16) / (hidden ** 0.5)
     w2 = torch.randn(G, hidden, inter, device="cuda", dtype=torch.bfloat16) / (inter ** 0.5)
-    w13_fp8, sw13 = fso.gemm.quantize_moe_weights_1x128_fp8_sm90(w13)
-    w2_fp8, sw2 = fso.gemm.quantize_moe_weights_1x128_fp8_sm90(w2)
+    w13_fp8, sw13 = fso.compat.quantize_moe_weights_1x128_fp8_sm90(w13)
+    w2_fp8, sw2 = fso.compat.quantize_moe_weights_1x128_fp8_sm90(w2)
     g = torch.Generator("cpu").manual_seed(M * 7 + 9)
     topk_ids = torch.stack([torch.randperm(G, generator=g)[:topk] for _ in range(M)]).to("cuda", torch.int32)
     topk_w = torch.softmax(torch.randn(M, topk, generator=g), dim=-1).cuda()

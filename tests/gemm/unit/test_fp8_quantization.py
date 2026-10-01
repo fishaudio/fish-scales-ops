@@ -28,7 +28,7 @@ def test_quantize_128x128_uses_amax_from_every_row() -> None:
     assert torch.cuda.is_available(), "CUDA required"
     weight = _weight()
 
-    weight_fp8, scales = fso.gemm.quantize_128x128_fp8(weight, use_ue8m0=False)
+    weight_fp8, scales = fso.compat.quantize_128x128_fp8(weight, use_ue8m0=False)
     expected_scale = torch.full_like(scales, 16.0 / 448.0)
     torch.testing.assert_close(scales, expected_scale, rtol=1e-6, atol=0)
 
@@ -40,7 +40,7 @@ def test_quantize_128x128_ue8m0_rounds_amax_scale_up() -> None:
     assert torch.cuda.is_available(), "CUDA required"
     weight = _weight()
 
-    weight_fp8, scales = fso.gemm.quantize_128x128_fp8(weight, use_ue8m0=True)
+    weight_fp8, scales = fso.compat.quantize_128x128_fp8(weight, use_ue8m0=True)
     expected = 2.0 ** math.ceil(math.log2(16.0 / 448.0))  # 0.0625: the power of two at or above amax / 448
     torch.testing.assert_close(scales.float(), torch.full_like(scales.float(), expected), rtol=0, atol=0)
 

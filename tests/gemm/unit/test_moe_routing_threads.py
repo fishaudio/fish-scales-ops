@@ -173,9 +173,9 @@ def anchor(draws, m_cap, topk):
     """
     failures = []
     for label, ids, e in draws:
-        ms, rm, sl, se = fso.gemm.moe_build_routing(ids, e, m_cap, with_slots=True)
+        ms, rm, sl, se = fso.compat.moe_build_routing(ids, e, m_cap, with_slots=True)
         bad = check(ids, ms, rm, sl, e, m_cap, topk, se)
-        ms3, rm3, sl3 = fso.gemm.moe_build_routing(ids, e, m_cap)
+        ms3, rm3, sl3 = fso.compat.moe_build_routing(ids, e, m_cap)
         bad += [f"three-output form: {b}"
                 for b in check(ids, ms3, rm3, sl3, e, m_cap, topk)]
         n_active = int((ms > 0).sum())
@@ -215,7 +215,7 @@ def stress(draws, m_cap, topk, rounds, burst):
                 # One eager call first: the scratch pool allocates on the first
                 # call of each host thread and never again.
                 _, ids0, e0 = mine[0]
-                fso.gemm.moe_build_routing(ids0, e0, m_cap, with_slots=True)
+                fso.compat.moe_build_routing(ids0, e0, m_cap, with_slots=True)
                 stream.synchronize()
                 for rnd in range(rounds):
                     if tid == 0:
@@ -233,7 +233,7 @@ def stress(draws, m_cap, topk, rounds, burst):
                         # produced by the same final pass that publishes
                         # masked_m, so a scratch buffer shared between the two
                         # streams corrupts it too and the check catches it.
-                        out.append((label, ids, e) + tuple(fso.gemm.moe_build_routing(
+                        out.append((label, ids, e) + tuple(fso.compat.moe_build_routing(
                             ids, e, m_cap, with_slots=True)))
                     stream.synchronize()
                     for b, (label, ids, e, masked, row_map, slot, sl_exp) in enumerate(out):
@@ -285,7 +285,7 @@ def routing_call(ids, e, m_cap, with_slots):
     kernels it launched."""
     from torch.profiler import ProfilerActivity, profile
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
-        out = fso.gemm.moe_build_routing(ids, e, m_cap, with_slots=with_slots)
+        out = fso.compat.moe_build_routing(ids, e, m_cap, with_slots=with_slots)
         torch.cuda.synchronize()
     names = sorted({ev.key for ev in prof.key_averages() if "moe_build_routing" in ev.key})
     ste = out[3].cpu() if with_slots else None

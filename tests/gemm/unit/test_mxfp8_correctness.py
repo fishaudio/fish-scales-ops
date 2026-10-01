@@ -75,7 +75,7 @@ def _decode_scales(packed: torch.Tensor, M: int, K: int, sm_major: int) -> torch
 def test_quantize_roundtrip(M: int, K: int, sm_major: int) -> None:
     torch.manual_seed(M * 1009 + K)
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
-    xq, sx = fso.gemm.quantize_1x32_fp8(x)
+    xq, sx = fso.compat.quantize_1x32_fp8(x)
     torch.cuda.synchronize()
 
     scales = _decode_scales(sx, M, K, sm_major)  # [M, K/32]
@@ -90,9 +90,9 @@ def test_gemm(M: int, N: int, K: int) -> None:
     torch.manual_seed(M * 1009 + N * 17 + K)
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") * 0.1
     w = (torch.randn(N, K, dtype=torch.bfloat16, device="cuda") / (K ** 0.5))
-    xq, sx = fso.gemm.quantize_1x32_fp8(x)
-    wq, sw = fso.gemm.quantize_1x32_fp8(w)
-    y = fso.gemm.linear_mxfp8(xq, wq, sx, sw)
+    xq, sx = fso.compat.quantize_1x32_fp8(x)
+    wq, sw = fso.compat.quantize_1x32_fp8(w)
+    y = fso.compat.linear_mxfp8(xq, wq, sx, sw)
     y_ref = F.linear(x, w)
     c = _cos(y, y_ref)
     assert c >= COS_GEMM, f"linear_mxfp8 M={M} N={N} K={K}: cos={c:.6f} < {COS_GEMM}"
@@ -105,9 +105,9 @@ def test_silu_fused(M: int, inter: int, K: int) -> None:
     torch.manual_seed(M * 31 + inter)
     gu = torch.randn(M, 2 * inter, dtype=torch.bfloat16, device="cuda") * 0.5
     w = (torch.randn(K, inter, dtype=torch.bfloat16, device="cuda") / (inter ** 0.5))
-    hq, sh = fso.gemm.silu_chunk_mul_quantize_1x32_fp8(gu)
-    wq, sw = fso.gemm.quantize_1x32_fp8(w)
-    y = fso.gemm.linear_mxfp8(hq, wq, sh, sw)
+    hq, sh = fso.compat.silu_chunk_mul_quantize_1x32_fp8(gu)
+    wq, sw = fso.compat.quantize_1x32_fp8(w)
+    y = fso.compat.linear_mxfp8(hq, wq, sh, sw)
     gate, up = gu.split(inter, dim=-1)
     h_ref = F.silu(gate.float()) * up.float()
     y_ref = F.linear(h_ref.bfloat16(), w)

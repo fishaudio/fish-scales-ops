@@ -29,14 +29,14 @@ def run(M: int, N: int, K: int) -> None:
     ref = F.linear(x, w)
 
     # path 1: FP32 UE8M0 scales, packed inside linear_fp8 (per-call repack)
-    xq, sx = fso.gemm.quantize_1x128_fp8(x, use_ue8m0=True)
-    wq, sw = fso.gemm.quantize_128x128_fp8(w)
+    xq, sx = fso.compat.quantize_1x128_fp8(x, use_ue8m0=True)
+    wq, sw = fso.compat.quantize_128x128_fp8(w)
     assert sx.shape == (((M + 3) // 4) * 4, K // 128), sx.shape
-    y1 = fso.gemm.linear_fp8(xq, wq, sx, sw)
+    y1 = fso.compat.linear_fp8(xq, wq, sx, sw)
 
     # path 2: explicit pre-pack ops
-    sx_p = fso.gemm.repack_fp8_act_scales(sx)
-    sw_p = fso.gemm.repack_fp8_wgt_scales(sw)
+    sx_p = fso.compat.repack_fp8_act_scales(sx)
+    sw_p = fso.compat.repack_fp8_wgt_scales(sw)
     sm100 = torch.cuda.get_device_capability(0)[0] == 10
     words = (K // 128 + 3) // 4
     if sm100:
@@ -54,13 +54,13 @@ def run(M: int, N: int, K: int) -> None:
         tail = sx_p.reshape(-1)[(words - 1) * m_pad:words * m_pad].to(torch.int64) & 0xFFFFFFFF
         used = (K // 128) % 4
         assert int((tail >> (8 * used)).max()) == 0, "tail bytes of the last packed word are not zero"
-    y2 = fso.gemm.linear_fp8(xq, wq, sx_p, sw_p)
+    y2 = fso.compat.linear_fp8(xq, wq, sx_p, sw_p)
 
     # path 3: fused quantize + pack (falls back to two-step when K % 512 != 0)
-    xq3, sx3 = fso.gemm.quantize_1x128_fp8_packed(x)
+    xq3, sx3 = fso.compat.quantize_1x128_fp8_packed(x)
     assert torch.equal(xq3, xq), "quantize_1x128_fp8_packed fp8 payload differs from quantize_1x128_fp8"
     assert torch.equal(sx3, sx_p), "quantize_1x128_fp8_packed scales differ from repack_fp8_act_scales"
-    y3 = fso.gemm.linear_fp8(xq3, wq, sx3, sw_p)
+    y3 = fso.compat.linear_fp8(xq3, wq, sx3, sw_p)
 
     assert torch.isfinite(y1).all() and torch.isfinite(y2).all() and torch.isfinite(y3).all(), "NaN/Inf in output"
     assert torch.equal(y1, y2) and torch.equal(y2, y3), "the three scale paths must produce identical outputs"
@@ -85,9 +85,9 @@ def test_fp32_weight_scales_rejected() -> None:
     """Non-power-of-two (plain amax/448) weight scales cannot be represented as UE8M0 exponent bytes;
     the explicit pre-pack op must refuse them instead of truncating silently (the 2026-09-05 bug)."""
     w = torch.randn(256, 512, dtype=torch.bfloat16, device="cuda")
-    _, sw_fp32 = fso.gemm.quantize_128x128_fp8(w, use_ue8m0=False)
+    _, sw_fp32 = fso.compat.quantize_128x128_fp8(w, use_ue8m0=False)
     try:
-        fso.gemm.repack_fp8_wgt_scales(sw_fp32)
+        fso.compat.repack_fp8_wgt_scales(sw_fp32)
     except RuntimeError as e:
         assert "UE8M0" in str(e), str(e)
         print("  repack_fp8_wgt_scales rejects FP32 (non-UE8M0) weight scales  OK")

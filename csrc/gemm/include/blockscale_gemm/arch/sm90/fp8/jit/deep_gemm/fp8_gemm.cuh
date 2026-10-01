@@ -371,6 +371,149 @@ void runGemm(cudaKernel_t kernel, void* mat_a, uint64_t ld_a, uint64_t stride_a,
     DG_HOST_ASSERT(status == cudaSuccess);
 }
 
+// Launch of fp8_gemm_kernel_2wg (non-swap GroupedContiguous FC1, two math warp-groups split along N). The tensor maps
+// are the ones runGemm builds for today's GroupedContiguous FC1 with block_n = 128: the B box is one 128-row half
+// (the kernel issues it twice per stage, gate rows and up rows) and the D box is one warp-group's 64 x 128 bf16 tile.
+// Only the thread count differs: 2 math warp-groups + 1 TMA warp-group = 384 at block_m = 64.
+template <typename LayoutIndexType>
+void runGemm2wg(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, int ld_d,
+    float* scales_a, float* scales_b, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, uint32_t block_m,
+    uint32_t block_n, uint32_t block_k, uint32_t num_groups, LayoutIndexType* grouped_layout, cudaStream_t stream,
+    int num_sms, uint32_t smem_size)
+{
+    constexpr auto gemm_type = GemmType::GroupedContiguous;
+    auto tma_a_desc = make_2d_tma_a_desc(
+        reinterpret_cast<__nv_fp8_e4m3*>(mat_a), shape_m, shape_k, block_m, block_k, num_groups, gemm_type, ld_a);
+    auto tma_b_desc = make_2d_tma_b_desc(
+        reinterpret_cast<__nv_fp8_e4m3*>(mat_b), shape_n, shape_k, block_n, block_k, num_groups, gemm_type, ld_b);
+    auto tma_scales_a_desc
+        = make_2d_tma_scales_a_desc(scales_a, shape_m, shape_k, block_m, block_k, num_groups, gemm_type);
+    auto tma_d_desc = make_2d_tma_d_desc(
+        reinterpret_cast<__nv_bfloat16*>(mat_d), shape_m, shape_n, block_m, block_n, num_groups, gemm_type, ld_d * 2);
+
+    constexpr uint32_t kNumTMAThreads = 128;
+    constexpr uint32_t kNumMathThreadsPerGroup = 128;
+    DG_HOST_ASSERT(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size) == cudaSuccess);
+
+    cudaLaunchConfig_t config;
+    config.gridDim = num_sms;
+    config.blockDim = get_num_threads_per_sm_2wg<kNumTMAThreads, kNumMathThreadsPerGroup>();
+    config.dynamicSmemBytes = smem_size;
+    config.stream = stream;
+
+    // No multicast (per-block weights differ); keep the cluster attribute at 1 like the other grouped launches.
+    cudaLaunchAttribute attr;
+    attr.id = cudaLaunchAttributeClusterDimension;
+    attr.val.clusterDim = {1, 1, 1};
+    config.attrs = &attr;
+    config.numAttrs = 1;
+
+    GroupedContiguousSchedulerInput input;
+    input.shape_m = shape_m;
+    input.grouped_layout = grouped_layout;
+
+    auto status = cudaLaunchKernelEx(&config, kernel, reinterpret_cast<__nv_bfloat16*>(mat_d), scales_b, input,
+        tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc);
+    DG_HOST_ASSERT(status == cudaSuccess);
+}
+
+// Launch of fp8_gemm_kernel_2wg_swiglu (the same FC1 with the SwiGLU + 1x128 FP8 requantize fused into the epilogue,
+// fused-FC1 step 2). A, B and the A scales use runGemm2wg's tensor maps. The output is the SwiGLU kernel's pair:
+// dq [shape_m, shape_n / 2] fp8, stored through its own tensor map with one 64 x 128 byte box per tile and the 128-byte
+// swizzle (the kernel stages the tile in that layout, which keeps its 16-bit shared-memory stores conflict-free), and
+// sd [shape_n / 256, sd_ld] fp32, which the kernel writes directly (one scale per row and 128-column block).
+template <typename LayoutIndexType>
+void runGemm2wgSwiglu(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_dq, float* mat_sd,
+    uint32_t sd_ld, float* scales_a, float* scales_b, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+    uint32_t block_m, uint32_t block_n, uint32_t block_k, uint32_t num_groups, LayoutIndexType* grouped_layout,
+    cudaStream_t stream, int num_sms, uint32_t smem_size)
+{
+    constexpr auto gemm_type = GemmType::GroupedContiguous;
+    auto tma_a_desc = make_2d_tma_a_desc(
+        reinterpret_cast<__nv_fp8_e4m3*>(mat_a), shape_m, shape_k, block_m, block_k, num_groups, gemm_type, ld_a);
+    auto tma_b_desc = make_2d_tma_b_desc(
+        reinterpret_cast<__nv_fp8_e4m3*>(mat_b), shape_n, shape_k, block_n, block_k, num_groups, gemm_type, ld_b);
+    auto tma_scales_a_desc
+        = make_2d_tma_scales_a_desc(scales_a, shape_m, shape_k, block_m, block_k, num_groups, gemm_type);
+    uint32_t const shape_i = shape_n / 2;
+    auto tma_dq_desc = make_2d_tma_desc(reinterpret_cast<__nv_fp8_e4m3*>(mat_dq), Layout::RowMajor, shape_m, shape_i,
+        min(block_m, shape_m), block_n, static_cast<uint64_t>(shape_i), CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B);
+
+    constexpr uint32_t kNumTMAThreads = 128;
+    constexpr uint32_t kNumMathThreadsPerGroup = 128;
+    DG_HOST_ASSERT(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size) == cudaSuccess);
+
+    cudaLaunchConfig_t config;
+    config.gridDim = num_sms;
+    config.blockDim = get_num_threads_per_sm_2wg<kNumTMAThreads, kNumMathThreadsPerGroup>();
+    config.dynamicSmemBytes = smem_size;
+    config.stream = stream;
+
+    // No multicast (per-block weights differ); keep the cluster attribute at 1 like the other grouped launches.
+    cudaLaunchAttribute attr;
+    attr.id = cudaLaunchAttributeClusterDimension;
+    attr.val.clusterDim = {1, 1, 1};
+    config.attrs = &attr;
+    config.numAttrs = 1;
+
+    GroupedContiguousSchedulerInput input;
+    input.shape_m = shape_m;
+    input.grouped_layout = grouped_layout;
+
+    auto status = cudaLaunchKernelEx(&config, kernel, mat_sd, scales_b, input, tma_a_desc, tma_b_desc,
+        tma_scales_a_desc, tma_dq_desc, sd_ld);
+    DG_HOST_ASSERT(status == cudaSuccess);
+}
+
+// Launch of fp8_gemm_kernel_swapAB_swiglu (the swap-AB FC1 in which one CTA owns gate block b and up block b, with the
+// SwiGLU + 1x128 FP8 requantize fused into the epilogue; fused-FC1 P2a). The weight, activation and activation-scale
+// tensor maps are runGemmSwapAB's (one 128-row weight box, issued twice per stage by the kernel). The output is the
+// SwiGLU kernel's pair: dq [shape_n, shape_m / 2] fp8 (shape_n = P_max rows, shape_m = 2I), stored through its own
+// tensor map with one block_n x 128 byte box per tile and the 128-byte swizzle (the kernel stages the tile in that
+// layout), and sd [shape_m / 256, sd_ld] fp32, which the kernel writes directly. 384 threads, as runGemmSwapAB.
+template <typename LayoutIndexType>
+void runGemmSwapABSwiglu(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_dq, float* mat_sd,
+    uint32_t sd_ld, float* scales_a, float* scales_b, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+    uint32_t block_m, uint32_t block_n, uint32_t block_k, uint32_t num_groups, LayoutIndexType* grouped_layout,
+    cudaStream_t stream, int num_sms, uint32_t smem_size)
+{
+    constexpr auto gemm_type = GemmType::GroupedContiguous;
+    auto tma_a_desc = make_2d_tma_a_desc_swapAB(
+        reinterpret_cast<__nv_fp8_e4m3*>(mat_a), shape_m, shape_k, block_m, block_k, num_groups, gemm_type, ld_a);
+    auto tma_b_desc = make_2d_tma_b_desc_swapAB(
+        reinterpret_cast<__nv_fp8_e4m3*>(mat_b), shape_n, shape_k, block_n, block_k, num_groups, gemm_type, ld_b);
+    auto tma_scales_b_desc
+        = make_2d_tma_scales_b_desc_swapAB(scales_b, shape_n, shape_k, block_n, block_k, num_groups, gemm_type);
+    uint32_t const shape_i = shape_m / 2;
+    auto tma_dq_desc = make_2d_tma_desc(reinterpret_cast<__nv_fp8_e4m3*>(mat_dq), Layout::RowMajor, shape_n, shape_i,
+        min(block_n, shape_n), block_m, static_cast<uint64_t>(shape_i), CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B);
+
+    constexpr uint32_t kNumTMAThreads = 128;
+    constexpr uint32_t kNumMathThreadsPerGroup = 128;
+    DG_HOST_ASSERT(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size) == cudaSuccess);
+
+    cudaLaunchConfig_t config;
+    config.gridDim = num_sms;
+    config.blockDim = get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(static_cast<int32_t>(block_m));
+    config.dynamicSmemBytes = smem_size;
+    config.stream = stream;
+
+    // No multicast (per-block weights differ); keep the cluster attribute at 1 like the other grouped launches.
+    cudaLaunchAttribute attr;
+    attr.id = cudaLaunchAttributeClusterDimension;
+    attr.val.clusterDim = {1, 1, 1};
+    config.attrs = &attr;
+    config.numAttrs = 1;
+
+    NormalSchedulerInputSwapAB input;
+    input.shape_n = shape_n;
+    input.grouped_layout = grouped_layout;
+
+    auto status = cudaLaunchKernelEx(&config, kernel, mat_sd, scales_a, input, tma_a_desc, tma_b_desc,
+        tma_scales_b_desc, tma_dq_desc, sd_ld);
+    DG_HOST_ASSERT(status == cudaSuccess);
+}
+
 }; // namespace deep_gemm
 
 #pragma clang diagnostic pop

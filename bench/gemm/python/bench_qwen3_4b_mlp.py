@@ -244,13 +244,13 @@ def bench_one(M, N, K, sm_major, inject_outliers: bool = False):
 
     # BlockScale FP8 (1x128)
     try:
-        xq, sxq = fso.gemm.quantize_1x128_fp8(x, use_ue8m0=(sm_major >= 10))
-        sxqp = fso.gemm.repack_fp8_act_scales(sxq) if sm_major >= 10 else sxq
+        xq, sxq = fso.compat.quantize_1x128_fp8(x, use_ue8m0=(sm_major >= 10))
+        sxqp = fso.compat.repack_fp8_act_scales(sxq) if sm_major >= 10 else sxq
 
         def build_bsfp8(wr):
-            wq, swq = fso.gemm.quantize_128x128_fp8(wr)
-            swqp = fso.gemm.repack_fp8_wgt_scales(swq) if sm_major >= 10 else swq
-            return lambda: fso.gemm.linear_fp8(xq, wq, sxqp, swqp)
+            wq, swq = fso.compat.quantize_128x128_fp8(wr)
+            swqp = fso.compat.repack_fp8_wgt_scales(swq) if sm_major >= 10 else swq
+            return lambda: fso.compat.linear_fp8(xq, wq, sxqp, swqp)
         torch.cuda.synchronize()
         y = build_bsfp8(w)()
         torch.cuda.synchronize()
@@ -263,11 +263,11 @@ def bench_one(M, N, K, sm_major, inject_outliers: bool = False):
     # empty — calling on sm_90 raises)
     if sm_major in (10, 12):
         try:
-            xqm, sxqm = fso.gemm.quantize_1x32_fp8(x)
+            xqm, sxqm = fso.compat.quantize_1x32_fp8(x)
 
             def build_mxfp8(wr):
-                wqm, swqm = fso.gemm.quantize_1x32_fp8(wr)
-                return lambda: fso.gemm.linear_mxfp8(xqm, wqm, sxqm, swqm)
+                wqm, swqm = fso.compat.quantize_1x32_fp8(wr)
+                return lambda: fso.compat.linear_mxfp8(xqm, wqm, sxqm, swqm)
             torch.cuda.synchronize()
             y = build_mxfp8(w)()
             torch.cuda.synchronize()

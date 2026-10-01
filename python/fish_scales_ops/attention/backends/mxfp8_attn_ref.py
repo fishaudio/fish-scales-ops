@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import torch
 
-from mxfp8_ref import quantize_mxfp8, dequantize_mxfp8, DEFAULT_BLOCK
+from .mxfp8_ref import quantize_mxfp8, dequantize_mxfp8, DEFAULT_BLOCK
 
 
 def mxfp8_qk_mixed_pv_fwd(

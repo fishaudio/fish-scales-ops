@@ -6,7 +6,8 @@
  * headers (which `using namespace cute`) are NOT pulled into this TU because
  * they collide with at::Layout.
  *
- * Public ops registered as torch.ops.blockscale_gemm.* in bindings.cpp.
+ * Public ops registered as torch.ops.fish_scales_ops.* in bindings.cpp (the
+ * C++ namespace stays blockscale_gemm).
  */
 
 #include "blockscale_gemm/runner.h"
@@ -56,6 +57,18 @@ cudaError_t launch_sm90_fp8_grouped_contiguous_dispatch(__nv_fp8_e4m3* A, __nv_f
 cudaError_t launch_sm90_fp8_grouped_contiguous_swapab_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D,
     float* SFA, float* SFB, int32_t* sorted_expert_ids, int num_groups, int p_max, int N, int K, int block_n,
     int expected_m, cudaStream_t stream);
+cudaError_t launch_sm90_fp8_grouped_contiguous_swapab_pair_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B,
+    __nv_bfloat16* D, float* SFA, float* SFB, int32_t* sorted_expert_ids, int num_groups, int p_max, int N, int K,
+    int block_n, int expected_m, cudaStream_t stream);
+cudaError_t launch_sm90_fp8_grouped_contiguous_swapab_swiglu_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B,
+    __nv_fp8_e4m3* DQ, float* SD, float* SFA, float* SFB, int32_t* sorted_expert_ids, int num_groups, int p_max, int N,
+    int K, int block_n, int expected_m, cudaStream_t stream);
+cudaError_t launch_sm90_fp8_grouped_contiguous_2wg_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D,
+    float* SFA, float* SFB, int32_t* sorted_expert_ids, int num_groups, int p_max, int N, int K, int block_m,
+    int expected_m, cudaStream_t stream);
+cudaError_t launch_sm90_fp8_grouped_contiguous_swiglu_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_fp8_e4m3* DQ,
+    float* SD, float* SFA, float* SFB, int32_t* sorted_expert_ids, int num_groups, int p_max, int N, int K,
+    int block_m, int expected_m, cudaStream_t stream);
 void fp8bs_quantize_1x128_fp32_sorted_gather(__nv_fp8_e4m3* x_q, float* sfa, __nv_bfloat16 const* x,
     int32_t const* flat_to_sorted, int n_pairs, int topk, int sfa_ld, int K, cudaStream_t stream);
 void fp8bs_silu_chunk_mul_quantize_1x128_fp32_sorted(__nv_fp8_e4m3* x_q, float* sfa, __nv_bfloat16 const* gu,
@@ -104,7 +117,7 @@ static bool is_sm100_family_cached()
 
 std::tuple<at::Tensor, at::Tensor> quantize_1x128_packed(at::Tensor x, bool use_ue8m0);
 std::tuple<at::Tensor, at::Tensor> quantize_128x128(at::Tensor w, bool use_ue8m0);
-at::Tensor repack_fp8_wgt_scales(at::Tensor sw_f32);
+at::Tensor repack_fp8_wgt_scales(at::Tensor sw_f32, bool check);
 at::Tensor linear_fp8(at::Tensor x_fp8, at::Tensor w_fp8, at::Tensor sx, at::Tensor sw);
 
 at::Tensor linear_bf16(at::Tensor x, at::Tensor w)
@@ -122,9 +135,12 @@ at::Tensor linear_bf16(at::Tensor x, at::Tensor w)
     {
         // No runner path on datacenter Blackwell: compose the public ops
         // (UE8M0 quantize of both operands, atom-layout scales, MXFP8 GEMM).
+        // The weight scales come straight from the UE8M0 quantizer, so the
+        // repack skips its power-of-two check: that check copies a flag to
+        // the host, which would synchronize every call and break a capture.
         auto [xq, sx] = quantize_1x128_packed(x.contiguous(), /*use_ue8m0=*/true);
         auto [wq, sw_f32] = quantize_128x128(w.contiguous(), /*use_ue8m0=*/true);
-        return linear_fp8(xq, wq, sx, repack_fp8_wgt_scales(sw_f32));
+        return linear_fp8(xq, wq, sx, repack_fp8_wgt_scales(sw_f32, /*check=*/false));
     }
 
     auto y = at::empty({M, N}, x.options());
@@ -156,6 +172,8 @@ void repack_ue8m0_scales_for_sm120(int32_t* dst, float const* src, int M_pad, in
 // where rows 0..127 share scales from input row 0, etc.
 void repack_ue8m0_scales_sfb_for_sm120(int32_t* dst, float const* src, int N_pad,
     int N_blocks_in, int K_blocks_in_per_row, cudaStream_t stream);
+// In mxfp8_sm100_kernel.cu: guidance for a launch error the caller can act on.
+char const* sm100_mxfp8_error_hint(cudaError_t err);
 }
 
 at::Tensor linear_fp8(at::Tensor x_fp8, at::Tensor w_fp8, at::Tensor sx, at::Tensor sw)
@@ -229,7 +247,8 @@ at::Tensor linear_fp8(at::Tensor x_fp8, at::Tensor w_fp8, at::Tensor sx, at::Ten
             reinterpret_cast<__nv_fp8_e4m3*>(x_fp8.data_ptr()), reinterpret_cast<__nv_fp8_e4m3*>(w_fp8.data_ptr()),
             reinterpret_cast<__nv_bfloat16*>(y.data_ptr()), reinterpret_cast<int32_t*>(sx_use.data_ptr()),
             reinterpret_cast<int32_t*>(sw_use.data_ptr()), M, N, K, stream);
-        TORCH_CHECK(err == cudaSuccess, "sm100 block-FP8 kernel error: ", cudaGetErrorString(err));
+        TORCH_CHECK(err == cudaSuccess, "sm100 block-FP8 kernel error: ", cudaGetErrorString(err),
+            detail::sm100_mxfp8_error_hint(err));
         return y;
     }
     if (sm_major == 12)
@@ -413,12 +432,14 @@ std::tuple<at::Tensor, at::Tensor> quantize_128x128(at::Tensor w, bool use_ue8m0
     return {w_q, scales};
 }
 
-// The sm_120 int32-packed scale format holds UE8M0 exponents only. A scale
+// The Blackwell int32-packed scale formats hold UE8M0 exponents only. A scale
 // that is not an exact power of two cannot be represented and would be
-// truncated silently, so the explicit pre-pack ops reject it (one device
-// -> host sync; these ops run at weight-load time, never inside a captured
-// graph). The per-call auto-repack inside linear_fp8 cannot afford the sync
-// and relies on the quantizers' use_ue8m0 defaults.
+// truncated silently, so the explicit pre-pack ops reject it by default (one
+// device -> host sync; called that way they belong at weight-load time, never
+// inside a captured graph). The per-call packing paths cannot afford the sync
+// and rely on the quantizers' use_ue8m0 defaults: the auto-repack inside
+// linear_fp8, the Python linear_fp8 wrapper on sm_100/103 and linear_bf16 on
+// sm_100/103, the last two by calling these ops with check=false.
 static void check_scales_are_ue8m0(at::Tensor const& s_f32, char const* what)
 {
     auto const mant = at::bitwise_and(s_f32.contiguous().view(at::kInt), 0x7FFFFF);
@@ -439,7 +460,7 @@ static void check_scales_are_ue8m0(at::Tensor const& s_f32, char const* what)
 //   act:  [pad(M, 4), K/512] int32 K-major (4 UE8M0 bytes per word)
 //   wgt:  [pad(N, 4), K/512] int32 K-major (per-N-row, expanded from the
 //         per-128×128-block FP32 input)
-at::Tensor repack_fp8_act_scales(at::Tensor sx_f32)
+at::Tensor repack_fp8_act_scales(at::Tensor sx_f32, bool check)
 {
     TORCH_CHECK(sx_f32.is_cuda() && sx_f32.dtype() == at::kFloat,
         "sx_f32 must be CUDA fp32 (output of quantize_1x128(use_ue8m0=True))");
@@ -447,7 +468,8 @@ at::Tensor repack_fp8_act_scales(at::Tensor sx_f32)
     int const M_pad = sx_f32.size(0);
     int const K_blocks_in = sx_f32.size(1);
     TORCH_CHECK(M_pad % 4 == 0, "sx_f32.size(0) must be a multiple of 4");
-    check_scales_are_ue8m0(sx_f32, "repack_fp8_act_scales: activation scales");
+    if (check)
+        check_scales_are_ue8m0(sx_f32, "repack_fp8_act_scales: activation scales");
     if (is_sm100_family_cached())
     {
         // Sm1xx atom layout [pad(M,128) * K/128] int32, byte replicated x4 (see quant_kernels.cu).
@@ -470,14 +492,15 @@ at::Tensor repack_fp8_act_scales(at::Tensor sx_f32)
 }
 
 
-at::Tensor repack_fp8_wgt_scales(at::Tensor sw_f32)
+at::Tensor repack_fp8_wgt_scales(at::Tensor sw_f32, bool check)
 {
     TORCH_CHECK(sw_f32.is_cuda() && sw_f32.dtype() == at::kFloat,
         "sw_f32 must be CUDA fp32 (output of quantize_128x128)");
     TORCH_CHECK(sw_f32.dim() == 2, "sw_f32 must be 2D [N/128, K/128]");
     int const N_blocks_in = sw_f32.size(0);
     int const K_blocks_in = sw_f32.size(1);
-    check_scales_are_ue8m0(sw_f32, "repack_fp8_wgt_scales: weight scales");
+    if (check)
+        check_scales_are_ue8m0(sw_f32, "repack_fp8_wgt_scales: weight scales");
     if (is_sm100_family_cached())
     {
         int const N = N_blocks_in * 128;   // N_pad128 == N here
@@ -505,9 +528,11 @@ at::Tensor repack_fp8_wgt_scales(at::Tensor sw_f32)
 // FP8 weight + per-128x128 scales. This is the typical inference path: weight
 // is fixed, only the activation needs per-call quantization.
 //
-// `sw` layout (SM90 path): [ceil(N,128), ceil(K,128)] float32, row-major.
-// SM120 layouts differ (UE8M0-packed int32) and are not validated through
-// this op yet.
+// `sw`: [ceil(N,128), ceil(K,128)] float32, row-major, as quantize_128x128_fp8
+// produces it on this device (UE8M0-exact on sm_120, which the runner packs
+// internally). On sm_90 and sm_120 the result is bit-identical to
+// quantize_1x128_fp8 + linear_fp8 (tests/gemm/unit/test_linear_qx.py); sm_100/103
+// refuse the op below.
 at::Tensor linear_qx(at::Tensor x_bf16, at::Tensor w_fp8, at::Tensor sw)
 {
     check_cuda_bf16(x_bf16, "x_bf16");
@@ -690,6 +715,98 @@ at::Tensor linear_fp8_grouped_contiguous(at::Tensor a_fp8, at::Tensor w_fp8, at:
     return y;
 }
 
+// linear_fp8_grouped_contiguous_2wg: the FC1 of the non-swap contiguous path with two math warp-groups split along
+// N (sm_90 fused-FC1 step 1). Same argument contract as linear_fp8_grouped_contiguous, for the stacked [gate; up]
+// weight w_fp8 [G, N = 2I, K]: one CTA computes gate block b and up block b of one 64-row tile, and the result is
+// today's D [P_max, 2I] bf16 with gate in columns [0, I) and up in [I, 2I), bit-identical to
+// linear_fp8_grouped_contiguous on the rows the scheduler computes. Not routed by moe_layer_fp8_sm90 yet.
+at::Tensor linear_fp8_grouped_contiguous_2wg(at::Tensor a_fp8, at::Tensor w_fp8, at::Tensor sa, at::Tensor sw,
+    at::Tensor sorted_expert_ids, int64_t block_m, int64_t expected_m)
+{
+    TORCH_CHECK(a_fp8.is_cuda() && a_fp8.dtype() == at::kFloat8_e4m3fn && a_fp8.dim() == 2,
+        "a_fp8 must be CUDA float8_e4m3fn [P_max, K]");
+    TORCH_CHECK(w_fp8.is_cuda() && w_fp8.dtype() == at::kFloat8_e4m3fn && w_fp8.dim() == 3,
+        "w_fp8 must be CUDA float8_e4m3fn [G, 2I, K] (stacked gate; up)");
+    TORCH_CHECK(sa.is_cuda() && sa.dtype() == at::kFloat, "sa must be CUDA float32");
+    TORCH_CHECK(sw.is_cuda() && sw.dtype() == at::kFloat && sw.is_contiguous(), "sw must be contiguous CUDA float32");
+    TORCH_CHECK(sorted_expert_ids.is_cuda() && sorted_expert_ids.dtype() == at::kInt
+            && sorted_expert_ids.is_contiguous(),
+        "sorted_expert_ids must be contiguous CUDA int32 [P_max]");
+    TORCH_CHECK(a_fp8.is_contiguous() && w_fp8.is_contiguous(), "a_fp8 / w_fp8 must be contiguous");
+    int const P_max = a_fp8.size(0);
+    int const K = a_fp8.size(1);
+    int const G = w_fp8.size(0);
+    int const N = w_fp8.size(1);
+    TORCH_CHECK(w_fp8.size(2) == K, "w_fp8 K must match a_fp8");
+    TORCH_CHECK(sorted_expert_ids.numel() == P_max, "sorted_expert_ids must have P_max entries");
+    TORCH_CHECK(K % 128 == 0, "K must be a multiple of 128");
+    TORCH_CHECK(N % 256 == 0, "N = 2I must be a multiple of 256 (each warp-group half is whole 128-row blocks)");
+    TORCH_CHECK(sw.numel() == static_cast<int64_t>(G) * (N / 128) * (K / 128), "sw must be [G, N/128, K/128]");
+    TORCH_CHECK(block_m == 64, "two-warp-group FC1 supports block_m = 64 only");
+
+    auto y = at::empty({P_max, N}, a_fp8.options().dtype(at::kBFloat16));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto err = detail::launch_sm90_fp8_grouped_contiguous_2wg_dispatch(
+        reinterpret_cast<__nv_fp8_e4m3*>(a_fp8.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3*>(w_fp8.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(y.data_ptr()),
+        reinterpret_cast<float*>(sa.data_ptr()),
+        reinterpret_cast<float*>(sw.data_ptr()),
+        reinterpret_cast<int32_t*>(sorted_expert_ids.data_ptr()),
+        G, P_max, N, K, static_cast<int>(block_m), static_cast<int>(expected_m), stream);
+    TORCH_CHECK(err == cudaSuccess, "sm90 fp8 grouped contiguous 2wg kernel error: ", cudaGetErrorString(err));
+    return y;
+}
+
+// linear_fp8_grouped_contiguous_swiglu: the non-swap contiguous FC1 with the SwiGLU + 1x128 FP8 requantize fused into
+// its epilogue (sm_90 fused-FC1 step 2). Same arguments as linear_fp8_grouped_contiguous for the stacked [gate; up]
+// weight w_fp8 [G, N = 2I, K]; instead of the bf16 [P_max, 2I] FC1 output it returns what
+// silu_chunk_mul_quantize_1x128_sorted_sm90 makes of it, in the same layouts: dq [P_max, I] fp8 and
+// sd [I/128, align4(P_max)] fp32, bit-identical on every routed row. Rows the scheduler visits but no routed pair owns
+// (an expert's padding rows) hold the SwiGLU of the gather's uninitialised padding; rows it skips are not written.
+std::tuple<at::Tensor, at::Tensor> linear_fp8_grouped_contiguous_swiglu(at::Tensor a_fp8, at::Tensor w_fp8,
+    at::Tensor sa, at::Tensor sw, at::Tensor sorted_expert_ids, int64_t block_m, int64_t expected_m)
+{
+    TORCH_CHECK(a_fp8.is_cuda() && a_fp8.dtype() == at::kFloat8_e4m3fn && a_fp8.dim() == 2,
+        "a_fp8 must be CUDA float8_e4m3fn [P_max, K]");
+    TORCH_CHECK(w_fp8.is_cuda() && w_fp8.dtype() == at::kFloat8_e4m3fn && w_fp8.dim() == 3,
+        "w_fp8 must be CUDA float8_e4m3fn [G, 2I, K] (stacked gate; up)");
+    TORCH_CHECK(sa.is_cuda() && sa.dtype() == at::kFloat, "sa must be CUDA float32");
+    TORCH_CHECK(sw.is_cuda() && sw.dtype() == at::kFloat && sw.is_contiguous(), "sw must be contiguous CUDA float32");
+    TORCH_CHECK(sorted_expert_ids.is_cuda() && sorted_expert_ids.dtype() == at::kInt
+            && sorted_expert_ids.is_contiguous(),
+        "sorted_expert_ids must be contiguous CUDA int32 [P_max]");
+    TORCH_CHECK(a_fp8.is_contiguous() && w_fp8.is_contiguous(), "a_fp8 / w_fp8 must be contiguous");
+    int const P_max = a_fp8.size(0);
+    int const K = a_fp8.size(1);
+    int const G = w_fp8.size(0);
+    int const N = w_fp8.size(1);
+    TORCH_CHECK(w_fp8.size(2) == K, "w_fp8 K must match a_fp8");
+    TORCH_CHECK(sorted_expert_ids.numel() == P_max, "sorted_expert_ids must have P_max entries");
+    TORCH_CHECK(K % 128 == 0, "K must be a multiple of 128");
+    TORCH_CHECK(N % 256 == 0, "N = 2I must be a multiple of 256 (each warp-group half is whole 128-row blocks)");
+    TORCH_CHECK(sw.numel() == static_cast<int64_t>(G) * (N / 128) * (K / 128), "sw must be [G, N/128, K/128]");
+    TORCH_CHECK(block_m == 64, "fused SwiGLU FC1 supports block_m = 64 only");
+    int const INTER = N / 2;
+    int const sfa_ld = align_up4(P_max);
+    TORCH_CHECK(sa.numel() >= static_cast<int64_t>(K / 128) * sfa_ld, "sa must be [K/128, align4(P_max)]");
+
+    auto dq = at::empty({P_max, INTER}, a_fp8.options().dtype(at::kFloat8_e4m3fn));
+    auto sd = at::empty({INTER / 128, sfa_ld}, a_fp8.options().dtype(at::kFloat));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto err = detail::launch_sm90_fp8_grouped_contiguous_swiglu_dispatch(
+        reinterpret_cast<__nv_fp8_e4m3*>(a_fp8.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3*>(w_fp8.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3*>(dq.data_ptr()),
+        reinterpret_cast<float*>(sd.data_ptr()),
+        reinterpret_cast<float*>(sa.data_ptr()),
+        reinterpret_cast<float*>(sw.data_ptr()),
+        reinterpret_cast<int32_t*>(sorted_expert_ids.data_ptr()),
+        G, P_max, N, K, static_cast<int>(block_m), static_cast<int>(expected_m), stream);
+    TORCH_CHECK(err == cudaSuccess, "sm90 fp8 grouped contiguous fused SwiGLU kernel error: ", cudaGetErrorString(err));
+    return {dq, sd};
+}
+
 // Swap-AB contiguous grouped GEMM (block_n = 16 activation tiling, for M>=8).
 // Same buffer layouts as linear_fp8_grouped_contiguous; the activation is the
 // swap-AB B matrix and the weight the A matrix. sorted_expert_ids must be built
@@ -729,6 +846,102 @@ at::Tensor linear_fp8_grouped_contiguous_swapab(at::Tensor a_fp8, at::Tensor w_f
         G, P_max, N, K, static_cast<int>(block_n), static_cast<int>(expected_m), stream);
     TORCH_CHECK(err == cudaSuccess, "sm90 fp8 grouped contiguous swapAB kernel error: ", cudaGetErrorString(err));
     return y;
+}
+
+// linear_fp8_grouped_contiguous_swapab_pair: the swap-AB FC1 in which one CTA owns gate block b and up block b
+// (256 weight rows) of one activation tile (sm_90 fused-FC1 P2a, design S2; the mainloop of the fused swap-AB FC1 with
+// a bf16 epilogue). Same arguments as linear_fp8_grouped_contiguous_swapab for the stacked [gate; up] weight
+// w_fp8 [G, N = 2I, K] (N % 256 == 0); the result is today's gu [P_max, 2I] bf16, bit-identical to
+// linear_fp8_grouped_contiguous_swapab on the rows the scheduler computes. Not routed by moe_layer_fp8_sm90.
+at::Tensor linear_fp8_grouped_contiguous_swapab_pair(at::Tensor a_fp8, at::Tensor w_fp8, at::Tensor sa,
+    at::Tensor sw, at::Tensor sorted_expert_ids, int64_t block_n, int64_t expected_m)
+{
+    TORCH_CHECK(a_fp8.is_cuda() && a_fp8.dtype() == at::kFloat8_e4m3fn && a_fp8.dim() == 2,
+        "a_fp8 must be CUDA float8_e4m3fn [P_max, K]");
+    TORCH_CHECK(w_fp8.is_cuda() && w_fp8.dtype() == at::kFloat8_e4m3fn && w_fp8.dim() == 3,
+        "w_fp8 must be CUDA float8_e4m3fn [G, 2I, K] (stacked gate; up)");
+    TORCH_CHECK(sa.is_cuda() && sa.dtype() == at::kFloat, "sa must be CUDA float32");
+    TORCH_CHECK(sw.is_cuda() && sw.dtype() == at::kFloat && sw.is_contiguous(), "sw must be contiguous CUDA float32");
+    TORCH_CHECK(sorted_expert_ids.is_cuda() && sorted_expert_ids.dtype() == at::kInt
+            && sorted_expert_ids.is_contiguous(),
+        "sorted_expert_ids must be contiguous CUDA int32 [P_max]");
+    TORCH_CHECK(a_fp8.is_contiguous() && w_fp8.is_contiguous(), "a_fp8 / w_fp8 must be contiguous");
+    int const P_max = a_fp8.size(0);
+    int const K = a_fp8.size(1);
+    int const G = w_fp8.size(0);
+    int const N = w_fp8.size(1);
+    TORCH_CHECK(w_fp8.size(2) == K, "w_fp8 K must match a_fp8");
+    TORCH_CHECK(sorted_expert_ids.numel() == P_max, "sorted_expert_ids must have P_max entries");
+    TORCH_CHECK(K % 128 == 0, "K must be a multiple of 128");
+    TORCH_CHECK(N % 256 == 0, "N = 2I must be a multiple of 256 (gate and up are whole 128-row blocks)");
+    TORCH_CHECK(sw.numel() == static_cast<int64_t>(G) * (N / 128) * (K / 128), "sw must be [G, N/128, K/128]");
+    TORCH_CHECK(block_n == 16 || block_n == 32 || block_n == 64,
+        "swap-AB gate/up pair FC1: block_n must be 16, 32 or 64 (= the moe_build_sorted padding)");
+
+    auto y = at::empty({P_max, N}, a_fp8.options().dtype(at::kBFloat16));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto err = detail::launch_sm90_fp8_grouped_contiguous_swapab_pair_dispatch(
+        reinterpret_cast<__nv_fp8_e4m3*>(a_fp8.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3*>(w_fp8.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(y.data_ptr()),
+        reinterpret_cast<float*>(sa.data_ptr()),
+        reinterpret_cast<float*>(sw.data_ptr()),
+        reinterpret_cast<int32_t*>(sorted_expert_ids.data_ptr()),
+        G, P_max, N, K, static_cast<int>(block_n), static_cast<int>(expected_m), stream);
+    TORCH_CHECK(err == cudaSuccess, "sm90 fp8 grouped contiguous swapAB pair kernel error: ", cudaGetErrorString(err));
+    return y;
+}
+
+// linear_fp8_grouped_contiguous_swapab_swiglu: the swap-AB contiguous FC1 with the SwiGLU + 1x128 FP8 requantize fused
+// into its epilogue (sm_90 fused-FC1 P2a, design S2). Same arguments as linear_fp8_grouped_contiguous_swapab for the
+// stacked [gate; up] weight w_fp8 [G, N = 2I, K]; instead of the bf16 [P_max, 2I] FC1 output it returns what
+// silu_chunk_mul_quantize_1x128_sorted_sm90 makes of it, in the same layouts: dq [P_max, I] fp8 and
+// sd [I/128, align4(P_max)] fp32, bit-identical on every routed row. Rows the scheduler visits but no routed pair owns
+// (an expert's padding rows) hold the SwiGLU of the gather's uninitialised padding; rows it skips are not written.
+std::tuple<at::Tensor, at::Tensor> linear_fp8_grouped_contiguous_swapab_swiglu(at::Tensor a_fp8, at::Tensor w_fp8,
+    at::Tensor sa, at::Tensor sw, at::Tensor sorted_expert_ids, int64_t block_n, int64_t expected_m)
+{
+    TORCH_CHECK(a_fp8.is_cuda() && a_fp8.dtype() == at::kFloat8_e4m3fn && a_fp8.dim() == 2,
+        "a_fp8 must be CUDA float8_e4m3fn [P_max, K]");
+    TORCH_CHECK(w_fp8.is_cuda() && w_fp8.dtype() == at::kFloat8_e4m3fn && w_fp8.dim() == 3,
+        "w_fp8 must be CUDA float8_e4m3fn [G, 2I, K] (stacked gate; up)");
+    TORCH_CHECK(sa.is_cuda() && sa.dtype() == at::kFloat, "sa must be CUDA float32");
+    TORCH_CHECK(sw.is_cuda() && sw.dtype() == at::kFloat && sw.is_contiguous(), "sw must be contiguous CUDA float32");
+    TORCH_CHECK(sorted_expert_ids.is_cuda() && sorted_expert_ids.dtype() == at::kInt
+            && sorted_expert_ids.is_contiguous(),
+        "sorted_expert_ids must be contiguous CUDA int32 [P_max]");
+    TORCH_CHECK(a_fp8.is_contiguous() && w_fp8.is_contiguous(), "a_fp8 / w_fp8 must be contiguous");
+    int const P_max = a_fp8.size(0);
+    int const K = a_fp8.size(1);
+    int const G = w_fp8.size(0);
+    int const N = w_fp8.size(1);
+    TORCH_CHECK(w_fp8.size(2) == K, "w_fp8 K must match a_fp8");
+    TORCH_CHECK(sorted_expert_ids.numel() == P_max, "sorted_expert_ids must have P_max entries");
+    TORCH_CHECK(K % 128 == 0, "K must be a multiple of 128");
+    TORCH_CHECK(N % 256 == 0, "N = 2I must be a multiple of 256 (gate and up are whole 128-row blocks)");
+    TORCH_CHECK(sw.numel() == static_cast<int64_t>(G) * (N / 128) * (K / 128), "sw must be [G, N/128, K/128]");
+    TORCH_CHECK(block_n == 16 || block_n == 32 || block_n == 64,
+        "fused SwiGLU swap-AB FC1: block_n must be 16, 32 or 64 (= the moe_build_sorted padding)");
+    TORCH_CHECK(P_max % block_n == 0, "P_max must be a multiple of block_n (the moe_build_sorted padding)");
+    int const INTER = N / 2;
+    int const sfa_ld = align_up4(P_max);
+    TORCH_CHECK(sa.numel() >= static_cast<int64_t>(K / 128) * sfa_ld, "sa must be [K/128, align4(P_max)]");
+
+    auto dq = at::empty({P_max, INTER}, a_fp8.options().dtype(at::kFloat8_e4m3fn));
+    auto sd = at::empty({INTER / 128, sfa_ld}, a_fp8.options().dtype(at::kFloat));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto err = detail::launch_sm90_fp8_grouped_contiguous_swapab_swiglu_dispatch(
+        reinterpret_cast<__nv_fp8_e4m3*>(a_fp8.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3*>(w_fp8.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3*>(dq.data_ptr()),
+        reinterpret_cast<float*>(sd.data_ptr()),
+        reinterpret_cast<float*>(sa.data_ptr()),
+        reinterpret_cast<float*>(sw.data_ptr()),
+        reinterpret_cast<int32_t*>(sorted_expert_ids.data_ptr()),
+        G, P_max, N, K, static_cast<int>(block_n), static_cast<int>(expected_m), stream);
+    TORCH_CHECK(err == cudaSuccess, "sm90 fp8 grouped contiguous swapAB fused SwiGLU kernel error: ",
+        cudaGetErrorString(err));
+    return {dq, sd};
 }
 
 // Fused token-gather + 1x128 quantize into the contiguous sorted layout. x

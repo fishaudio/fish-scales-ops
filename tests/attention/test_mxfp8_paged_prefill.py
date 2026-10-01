@@ -137,7 +137,8 @@ def _ref_sdpa_extend(q_bf16_list, k_full_list, v_full_list, softmax_scale, causa
 
 def test_shape_validation_rejects_small_page_size():
     """page_size=1 (sglang default) must raise NotImplementedError —
-    only multiples of 32 (MXFP8 sf_vec_size) are supported."""
+    only multiples of 32 (MXFP8 sf_vec_size) are supported on sm_120/121; any
+    other device is refused before the page size is looked at."""
     if not torch.cuda.is_available():
         pytest.skip("no CUDA")
     B, S, H_q, H_kv, D, page_size = 1, 16, 4, 1, 64, 1
@@ -158,7 +159,7 @@ def test_shape_validation_rejects_small_page_size():
     paged_kv_indptr = torch.tensor([0, num_pages], dtype=torch.int32, device="cuda")
     last_page_len = torch.tensor([page_size], dtype=torch.int32, device="cuda")
 
-    with pytest.raises(NotImplementedError, match="page_size"):
+    with pytest.raises(NotImplementedError, match="page_size" if _is_sm120() else "sm_120"):
         pp_bk.mxfp8_paged_prefill_fwd(
             q_fp8, q_scales, k_pool, k_chan_scale, v_pool, v_chan_scale,
             qo_indptr, paged_kv_indices, paged_kv_indptr, last_page_len,
@@ -168,8 +169,8 @@ def test_shape_validation_rejects_small_page_size():
 @pytest.mark.parametrize("D", [32, 64, 128, 256])
 @pytest.mark.parametrize("page_size", [32, 64])
 def test_dispatch_or_runs(D, page_size):
-    """On sm < 12 the op must raise RuntimeError mentioning the op name.
-    On sm == 12 the kernel runs and produces correctly-shaped output."""
+    """Off sm_120/121 the entry refuses the device before launching anything.
+    On sm_120/121 the kernel runs and produces correctly-shaped output."""
     if not torch.cuda.is_available():
         pytest.skip("no CUDA")
     torch.manual_seed(D * 11 + page_size)
@@ -192,7 +193,7 @@ def test_dispatch_or_runs(D, page_size):
         k_list, v_list, page_size, device=q_full.device)
 
     if not _is_sm120():
-        with pytest.raises(RuntimeError, match="mxfp8_attn_fwd_paged"):
+        with pytest.raises(NotImplementedError, match="sm_120"):
             pp_bk.mxfp8_paged_prefill_fwd(
                 q_fp8, q_sc, k_pool, k_chan_scale, v_pool, v_chan_scale,
                 qo_indptr, paged_kv_indices, paged_kv_indptr, last_page_len,

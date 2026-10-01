@@ -1,23 +1,26 @@
 # fish-scales-ops
 
-Block-scaled FP8 / MXFP8 GEMM and FlashAttention kernels for LLM serving on
-NVIDIA Hopper (H200, sm_90a) and Blackwell (RTX 5090 sm_120a; B300 sm_100 /
-sm_103 for MXFP8 GEMM). PyTorch extension plus a standalone C++ library.
+Block-scaled FP8 / MXFP8 GEMM, MoE layer and FlashAttention kernels for LLM
+serving on NVIDIA Hopper (H200, sm_90a) and Blackwell (RTX 5090 sm_120a;
+B200 / B300 sm_100 / sm_103), as a PyTorch extension. Current version: 0.2.0;
+the changes of each release are in [`CHANGELOG.md`](CHANGELOG.md).
 
-<!-- Status (2026-09-05): the Performance section is generated from
-     tests/baselines/ by bench/gemm/python/render_perf_docs.py (GEMM baselines
-     frozen at the 2026-09-05 pause). All other sections were migrated from
-     the previous README on 2026-09-13 under the placement rules in
-     docs/README.md; the previous README is archived outside the repository
-     (../fso-doc_review-backup-20260915/repo/README.md). -->
+<!-- Status: the tables in the Performance section are rendered from
+     tests/baselines/ by bench/gemm/python/render_perf_docs.py and change only
+     when a baseline does; `render_perf_docs.py --check` reports any drift.
+     Every other section follows the placement rules in docs/README.md. -->
 
 ## Supported hardware and dtypes
 
 | SM | device | GEMM | attention |
 |---|---|---|---|
-| sm_90 | H200 | BF16, block-FP8 1×128 (dense + grouped MoE) | torch SDPA fallback |
-| sm_120 | RTX 5090 | BF16, block-FP8 1×128, MXFP8 1×32 (dense + grouped MoE) | MXFP8 prefill / paged decode / paged prefill |
-| sm_100 / sm_103 | B300 | BF16, MXFP8 1×32 (dense + grouped MoE since 2026-09-15), block-FP8 1×128 (dense; runs on the MXFP8 tcgen05 tiers with replicated scales, added 2026-09-05) | torch SDPA fallback |
+| sm_90 | H200 | block-FP8 1×128 (dense + grouped MoE); `linear_bf16` (bf16 in and out, block-FP8 inside) | torch SDPA fallback |
+| sm_120 | RTX 5090 | block-FP8 1×128, MXFP8 1×32 (dense + grouped MoE); `linear_bf16` (bf16 in and out, block-FP8 inside) | MXFP8 prefill / paged decode / paged prefill |
+| sm_100 / sm_103 | B300 | MXFP8 1×32 (dense + grouped MoE since 2026-09-15), block-FP8 1×128 (dense; runs on the MXFP8 tcgen05 tiers with replicated scales, added 2026-09-05); `linear_bf16` (bf16 in and out, block-FP8 inside) | torch SDPA fallback |
+
+`linear_bf16` takes and returns bf16 but quantizes both operands to block-FP8
+on every call, so its precision is block-FP8's; there is no BF16-precision GEMM
+in this library.
 
 ## Performance
 
@@ -26,36 +29,45 @@ sm_103 for MXFP8 GEMM). PyTorch extension plus a standalone C++ library.
      comparison against any other library. Every row is copied from
      docs/perf/<domain>/<sm>.md at the same commit; docs/perf is the source. -->
 
-Numbers below are CUDA-graph replay medians at locked clocks (H200 GPU 0 runs
-of 2026-09-03; RTX 5090 runs of 2026-09-04 / 2026-09-05); the protocol, shape
-families and full tables are in [`docs/perf/`](docs/perf/README.md). The rows
-are generated from `tests/baselines/` by
-`bench/gemm/python/render_perf_docs.py` and change only when a baseline does.
+Numbers below are CUDA-graph replay medians with cold weights, taken on the
+H200 at its natural clock and on the RTX 5090 under its clock lock
+(`docs/perf/README.md` §5), and they measure the fish-scales-ops 0.2.0 release
+code: the H200 `gate_up` rows and every RTX 5090 row come from the release
+perf run of 2026-10-01 on the release build (commit `633f5ca`), and the H200
+MoE rows from a run of the same code earlier that day, which the release run
+re-measured and matched. The run behind each row is named in the provenance
+section of the `docs/perf/` file it comes from. On the RTX 5090 the Family A
+and Family B rows ran on one card and the Family C MoE rows on another, so
+their absolute prefill numbers are not comparable across families
+(`docs/perf/README.md` §5). The protocol, shape families
+and full tables are in [`docs/perf/`](docs/perf/README.md). The rows are
+generated from `tests/baselines/` by `bench/gemm/python/render_perf_docs.py`
+and change only when a baseline does.
 Attention rows are absent until `docs/perf/attention/sm120.md` has an accepted
 baseline.
 
-### sm_90 — NVIDIA H200 (132 SMs, 1830 MHz locked)
+### sm_90 — NVIDIA H200 (132 SMs, natural clock)
 
 | family            | op                                             | shape                                                        | M / S  | dtype           |     µs | TFLOPS |
 |-------------------|------------------------------------------------|--------------------------------------------------------------|--------|-----------------|-------:|-------:|
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | block-FP8 1×128 |  17.78 |      6 |
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 402.72 |   1013 |
-| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | block-FP8 1×128 |   22.3 |    3.4 |
-| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | block-FP8 1×128 |  421.6 |  366.8 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | block-FP8 1×128 |   34.6 |    1.6 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | block-FP8 1×128 |  424.7 |  273.1 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | block-FP8 1×128 |  18.00 |      6 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 412.16 |    990 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | block-FP8 1×128 |   21.9 |    3.4 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | block-FP8 1×128 |  369.6 |  418.4 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | block-FP8 1×128 |   35.6 |    1.6 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | block-FP8 1×128 |  419.0 |  276.7 |
 
 ### sm_120 — NVIDIA RTX 5090 (170 SMs, 2400 MHz locked)
 
 | family            | op                                             | shape                                                        | M / S  | dtype           |     µs | TFLOPS |
 |-------------------|------------------------------------------------|--------------------------------------------------------------|--------|-----------------|-------:|-------:|
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | MXFP8 1×32      |  35.75 |      3 |
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | MXFP8 1×32      | 719.72 |    567 |
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 702.92 |    580 |
-| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | MXFP8 1×32      |   32.5 |    2.3 |
-| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | MXFP8 1×32      |  577.1 |  267.9 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | MXFP8 1×32      |  35.68 |      3 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | MXFP8 1×32      | 663.12 |    615 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 647.57 |    630 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | MXFP8 1×32      |   32.4 |    2.3 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | MXFP8 1×32      |  564.2 |  274.0 |
 | C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | MXFP8 1×32      |   38.7 |    1.5 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | MXFP8 1×32      |  717.3 |  161.7 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | MXFP8 1×32      |  717.4 |  161.6 |
 
 Row selection rule: per SM, one decode point and one prefill point per shape
 family for GEMM, one prefill and one decode row for attention where a native
@@ -95,65 +107,89 @@ GEMM kernels are NVRTC-compiled in the process at first call and bind the
 `libnvrtc.so.13` already loaded by torch; the NVRTC build affects kernel speed
 (see `docs/perf/README.md` §8).
 
+The built extension keeps reading files from the source tree that built it,
+so install in place (`EDITABLE=1`, or the default `build_ext --inplace`) and
+keep that tree where it is:
+
+- On sm_90 the JIT compiles each kernel from the CUTLASS headers and the
+  vendored deep_gemm headers. Their directories are recorded in the extension
+  at build time. If the tree moves, set `FSO_JIT_INCLUDE_DIRS` to the new
+  colon-separated list.
+- On sm_100/sm_103 the CuTe-DSL tier loads
+  `3rdparty/cutlass/examples/python/CuTeDSL/blackwell/dense_blockscaled_gemm_persistent.py`
+  from the tree. `FSO_DSL_KERNEL_PATH` points it elsewhere.
+
+A wheel installed without the tree does not have these files.
+
 ## Usage
 
 ```python
 import torch
 import fish_scales_ops as fso
 
-sm = torch.cuda.get_device_capability(0)[0]        # 9 = H200, 10 = B200/B300, 12 = RTX 5090
-
-# ----- GEMM, block-FP8 1x128 / 128x128 (every arch) -----------------------------
-wq, sw = fso.gemm.quantize_128x128_fp8(w_bf16)      # UE8M0 scales on Blackwell, FP32 on Hopper
-if sm >= 10:
-    sw = fso.gemm.repack_fp8_wgt_scales(sw)         # pre-pack once at load time
-    xq, sx = fso.gemm.quantize_1x128_fp8_packed(x_bf16)
-else:
-    xq, sx = fso.gemm.quantize_1x128_fp8(x_bf16)
-y = fso.gemm.linear_fp8(xq, wq, sx, sw)             # bf16 [M, N]
-
-# ----- GEMM, MXFP8 1x32 (Blackwell: sm_100/103 and sm_120) ---------------------
-if sm >= 10:
-    wqm, swm = fso.gemm.quantize_1x32_fp8(w_bf16)
-    xqm, sxm = fso.gemm.quantize_1x32_fp8(x_bf16)
-    ym = fso.gemm.linear_mxfp8(xqm, wqm, sxm, swm)
+# ----- Dense linear, every arch: prepare once per weight, then one call per batch ---
+weight = fso.dense.prepare_weight(w_fp8, format="bsfp8", scale=w_scale)  # block-FP8 checkpoint
+# weight = fso.dense.prepare_weight(w_bf16, format="mxfp8")             # bf16 weight -> MXFP8 (Blackwell)
+y = fso.dense.linear(x, weight)     # bf16 [..., K] -> bf16 [..., N]; the arch dispatch is inside the torch op
 
 # ----- MoE layer, every arch: prepare once per layer, then one call per batch ---
 experts = fso.moe.prepare_experts(w13, w2, format="bsfp8", sw13=sw13, sw2=sw2)  # or format="mxfp8" (bf16 experts)
 out = fso.moe.layer(hidden, experts, topk_ids, topk_w)    # the arch dispatch is inside the torch op
-
-# ----- MoE block, sm_120: router + routed experts + shared expert, one call ----
-# router_weight is [E, H] bf16, or [E+1, H] with the shared expert's gate row
-# appended; expert_map / num_token_non_padded carry the expert- and
-# data-parallel contracts (docs/api/gemm.md).
-out = fso.gemm.moe_block_mxfp8_sm120(
-    hidden, router_weight, w13_fp8, sw13, w2_fp8, sw2, topk=8,
-    shared_w13_fp8=s13, shared_sw13=ss13, shared_w2_fp8=s2, shared_sw2=ss2,
-    shared_gate_in_router=True)
+reserve = fso.moe.transient_bytes(experts, max_tokens, topk)   # bytes one call allocates
 
 # ----- Attention -------------------------------------------------------------
 o = fso.attention.flash_attn_fwd(q, k, v, causal=True)      # torch SDPA on every arch
-from fish_scales_ops.attention.backends import sm120_mxfp8   # sm_120 MXFP8 kernels take
-o = sm120_mxfp8.mxfp8_fwd(q_fp8, q_sc, k_fp8, k_sc, v_fp8, v_sc, causal=True)   # pre-quantized inputs
+o = fso.attention.mxfp8_fwd(q_fp8, q_sc, k_fp8, k_sc, v_fp8, v_sc, causal=True)   # sm_120/121 MXFP8, pre-quantized inputs
+
+# ----- Explicit, format-specific GEMM ops (fso.compat) -------------------------
+sm = torch.cuda.get_device_capability(0)[0]          # 9 = H200, 10 = B200/B300, 12 = RTX 5090
+wq, sw = fso.compat.quantize_128x128_fp8(w_bf16)      # UE8M0 scales on Blackwell, FP32 on Hopper
+if sm >= 10:
+    sw = fso.compat.repack_fp8_wgt_scales(sw)         # pre-pack once at load time
+    xq, sx = fso.compat.quantize_1x128_fp8_packed(x_bf16)
+else:
+    xq, sx = fso.compat.quantize_1x128_fp8(x_bf16)
+y = fso.compat.linear_fp8(xq, wq, sx, sw)             # bf16 [M, N]
+if sm >= 10:                                          # MXFP8 1x32 (sm_100/103, sm_120/121)
+    wqm, swm = fso.compat.quantize_1x32_fp8(w_bf16)
+    xqm, sxm = fso.compat.quantize_1x32_fp8(x_bf16)
+    ym = fso.compat.linear_mxfp8(xqm, wqm, sxm, swm)
 ```
 
-`fso.gemm`, `fso.moe` and `fso.attention` are independent namespaces with no
-top-level re-exports. `fso.moe` is the MoE layer surface for every architecture:
-`prepare_experts` converts a layer's local experts for this device at load time,
-and `layer` is one torch custom op whose body runs the architecture's chain — the
-per-arch entries `fso.gemm.moe_layer_fp8_sm90` and `fso.gemm.moe_layer_mxfp8_sm120`
-and the per-step ops they compose, all of which stay public. The contracts, scale
-layouts and constraints of every op are in [`docs/api/gemm.md`](docs/api/gemm.md)
-and [`docs/api/attention.md`](docs/api/attention.md).
+`fso.dense`, `fso.moe` and `fso.attention` are the three stable namespaces,
+independent of each other and without top-level re-exports. `fso.dense` is the
+dense linear interface for every architecture: `prepare_weight` converts a
+weight for this device at load time, and `linear` is one torch custom op whose
+body quantizes the activation and runs the architecture's GEMM. `fso.moe` is the
+MoE layer interface for every architecture, built the same way: `prepare_experts`
+converts a layer's local experts at load time, and `layer` is one torch custom op
+whose body runs the architecture's chain. Both ops ship their own fake
+implementations, so `torch.compile` needs nothing from the caller. `fso.attention`
+holds torch SDPA on every architecture and the sm_120/121 MXFP8 kernels, which
+refuse other architectures.
+
+`fso.compat` keeps the names existing callers use: the explicit, format-specific
+dense ops (`linear_fp8`, `linear_qx`, `linear_mxfp8`, their quantizers and scale
+repacks, `linear_bf16`), which keep their signatures, and the MoE per-step pieces
+(the per-arch layer entries, the sm_120 block, the grouped GEMMs, the routing
+builders, the combines and the router), which are building blocks whose
+arguments follow the kernels. Before 0.2.0 these names were exported from
+`fso.gemm`, where they still resolve with a `DeprecationWarning` until 0.3.0
+removes `fso.gemm`. The contracts, scale layouts and constraints are in
+[`docs/api/dense.md`](docs/api/dense.md), [`docs/api/moe.md`](docs/api/moe.md),
+[`docs/api/attention.md`](docs/api/attention.md) and
+[`docs/api/compat.md`](docs/api/compat.md).
 
 ## Status
 
 | path | Hopper sm_90 | Blackwell sm_120 | Blackwell datacenter sm_100 / sm_103 |
 |---|---|---|---|
 | block-FP8 1×128 GEMM | ✓ deep_gemm WGMMA, NVRTC JIT, FP32 scales | ✓ CUTLASS `Sm120BlockScaledKernel`, UE8M0 scales | ✓ since 2026-09-05, on the MXFP8 tcgen05 path with replicated scales |
-| MXFP8 1×32 GEMM | — | ✓ CUTLASS block-scaled | ✓ three tiers: cuBLAS `scaled_mm`, CuTe DSL, C++ cascade |
-| MoE layer surface `fso.moe` | ✓ block-FP8 experts (`format="bsfp8"`) | ✓ block-FP8 experts, requantized to MXFP8 at load, and bf16 experts (`format="mxfp8"`) | the same code path as sm_120 with the sm_100 routing extras; validation on the B300 pending |
-| grouped MoE layer | ✓ expert-sorted contiguous layout with swap-AB decode path (`moe_layer_fp8_sm90`) | ✓ masked slab layout, MXFP8, composed layer and whole-block entries (`moe_layer_mxfp8_sm120`, `moe_block_mxfp8_sm120`) | ✓ since 2026-09-15 (milestone M3): masked slab layout, MXFP8, CUTLASS pointer-array kernel |
+| `linear_qx` (bf16 activation quantized inside the op, block-FP8 weight) | ✓ bit-identical to `quantize_1x128_fp8` + `linear_fp8` (`tests/gemm/unit/test_linear_qx.py`) | ✓ bit-identical to `quantize_1x128_fp8` + `linear_fp8` (same test) | — refused with a `RuntimeError`; use `quantize_1x128_fp8_packed` + `linear_fp8` |
+| MXFP8 1×32 GEMM | — | ✓ CUTLASS block-scaled | ✓ an M ≤ 64 CuTe-DSL decode row in front of three tiers: cuBLAS `scaled_mm`, CuTe DSL, C++ cascade |
+| dense linear surface `fso.dense` | ✓ `format="bsfp8"` (block-FP8 checkpoints and bf16 weights), run by `linear_qx` | ✓ `format="bsfp8"` (block-FP8 checkpoints, requantized to MXFP8 at load, and bf16 weights) and `format="mxfp8"` (bf16 weights and MXFP8 checkpoints) | ✓ the same formats and the same code path as sm_120, through the MXFP8 router; validated on the B300 by `test_dense.py` |
+| MoE layer surface `fso.moe` | ✓ block-FP8 experts (`format="bsfp8"`) | ✓ block-FP8 experts, requantized to MXFP8 at load, and bf16 experts (`format="mxfp8"`) | ✓ the same formats and the same code path as sm_120, with the sm_100 routing extras; validated on the B300 by the unit tests below (`test_moe_unified.py`, `test_moe_transient_bytes.py`, `test_mxfp8_grouped.py` among them) |
+| grouped MoE layer (the `fso.compat` per-step pieces) | ✓ expert-sorted contiguous layout with swap-AB decode path (`moe_layer_fp8_sm90`) | ✓ masked slab layout, MXFP8, composed layer and whole-block entries (`moe_layer_mxfp8_sm120`, `moe_block_mxfp8_sm120`) | ✓ since 2026-09-15 (milestone M3): masked slab layout, MXFP8, CUTLASS pointer-array kernel |
 | BF16 attention | torch SDPA | torch SDPA | torch SDPA |
 | MXFP8 attention prefill | — | ✓ D ∈ {32, 64, 128, 256}, native GQA | — |
 | MXFP8 paged prefill (extend) | — | ✓ page_size a multiple of 32 | — |
@@ -167,18 +203,30 @@ Constraints worth knowing up front:
   GEMM.
 - `K % 128 == 0` everywhere; `N % 128 == 0` for the Blackwell GEMMs and every
   grouped GEMM.
+- Every op can be captured into a CUDA graph after one eager call of the same
+  shape on the capturing thread, which creates the library's pools and, on
+  sm_90, JIT-compiles the kernels
+  ([`docs/api/compat.md`](docs/api/compat.md#cuda-graph-compatibility)). That
+  includes `linear_fp8` given FP32 scales and `linear_bf16` on sm_100/103,
+  which pack their scales inside the call without a device sync, as on
+  sm_120/121. The explicit pre-pack ops `repack_fp8_act_scales` /
+  `repack_fp8_wgt_scales` check their scales with a device sync and belong at
+  weight-load time, outside any capture.
 - MXFP8 attention is sm_120-only; the paged KV cache needs `page_size ≥ 32`
   (the MXFP8 scale vector), matching sglang's `--page-size 32`; the decode
   kernel caps `H_q / H_kv` at 64.
-- B200 / B300 builds use `ARCH="10.0f"`; the B300 has no clock lock, so its
-  numbers are measured unlocked and are published only in
+- B200 / B300 builds use `ARCH="10.0f"`. B300 numbers are published only in
   [`docs/perf/gemm/sm100.md`](docs/perf/gemm/sm100.md) and
   [`docs/perf/layer/sm100.md`](docs/perf/layer/sm100.md), never in the section
-  above (`docs/perf/README.md` §5 and §8).
+  above, because that section covers sm_90 and sm_120 only
+  (`docs/README.md` rule 2). Like the H200, the B300 is measured at its
+  natural clock (`docs/perf/README.md` §5 and §8).
 - Performance work follows [`docs/perf/README.md`](docs/perf/README.md): same
-  device, locked clock, CUDA-graph replay median, every cell traceable to a
-  baseline jsonl, and a change is accepted only if every affected cell is
-  faster or within ±1 % of the committed baseline.
+  device, the clock policy of its §5 (the RTX 5090 locked, datacenter cards at
+  their natural clock with a clock sampler), CUDA-graph replay median with cold
+  weights, every cell traceable to a baseline jsonl, and a change is accepted
+  only if every affected cell is faster or within ±1 % of the committed
+  baseline.
 
 ## Repository layout
 
@@ -192,13 +240,16 @@ fish-scales-ops/
 │   │   └── ops/                         PyTorch ops (fp8.cu, mxfp8.cu, quant_kernels.cu, moe_glue.cu)
 │   └── attention/                       sm_120 MXFP8 prefill, paged prefill, paged decode
 ├── python/fish_scales_ops/
-│   ├── gemm/                            fp8.py, mxfp8.py, bf16.py, sm_100 tier router
-│   └── attention/                       flash_attn_func.py (SDPA dispatch), backends/sm120_mxfp8*.py
+│   ├── dense/                           fso.dense: prepare_weight, linear (the dense_linear custom op)
+│   ├── moe/                             fso.moe: prepare_experts, layer (the moe_layer custom op)
+│   ├── compat/                          fso.compat: the explicit dense ops and the MoE per-step pieces
+│   ├── gemm/                            implementation: fp8.py, mxfp8.py, bf16.py, sm_100 tier router (fso.gemm: deprecated path of fso.compat)
+│   └── attention/                       fso.attention: SDPA wrapper and the sm_120 MXFP8 entries (backends/)
 ├── tests/{gemm/unit,attention}/         correctness, two-reference FP8 gates, CUDA-graph replay
 ├── tests/baselines/                     accepted perf runs (jsonl), the source of every table
 ├── bench/{gemm/python,attention}/       benches, tile sweeps, render_perf_docs.py
 ├── docs/                                docs/README.md is the map; api/, perf/{gemm,layer,attention}/
-└── scripts/build.sh
+└── scripts/                             build.sh, gen_op_schemas.py (the generated torch.ops blocks of docs/api/)
 ```
 
 ## Tests and benches
@@ -206,20 +257,43 @@ fish-scales-ops/
 ```bash
 export PYTHONPATH=python
 # GEMM correctness (dense BF16/FP8, MXFP8, block-FP8 two-reference gate, grouped MoE, CUDA-graph replay)
+# One script per command: `python a.py b.py` runs a.py only.
+python tests/gemm/unit/test_public_surface.py          # any machine: the exported names, the deprecated fso.gemm path, the arch refusals
+python tests/gemm/unit/test_dense.py                   # every arch: fso.dense against the explicit fso.compat composition, compile, graphs, refusals
 python tests/gemm/unit/test_correctness.py
 python tests/gemm/unit/test_mxfp8_correctness.py
+python tests/gemm/unit/test_fp8_quantization.py
+python tests/gemm/unit/test_linear_qx.py             # sm_90 / sm_120: bf16-in GEMM against quantize + linear_fp8; sm_100 refuses
 python tests/gemm/unit/test_fp8_k128_sm120.py          # sm_100 / sm_120
-python tests/gemm/unit/test_mxfp8_grouped.py           # sm_120
-python tests/gemm/unit/test_moe_routing_threads.py     # sm_100 / sm_103: multi-CTA routing builder under two threads / two streams
+python tests/gemm/unit/test_cuda_graph.py
+python tests/gemm/unit/test_env_knobs.py               # every arch: the boolean FSO_* switches; sm_100/103: the CuTe-DSL tier notices
+python tests/gemm/unit/test_sm100_workspace_growth.py  # sm_100 / sm_103: split-K workspace growth around a captured graph
+python tests/gemm/unit/test_sm120_pack_pool_growth.py  # sm_120 / sm_121: linear_bf16 scale-scratch growth around a captured graph
+python tests/gemm/unit/test_mxfp8_grouped.py           # sm_100 / sm_120
+python tests/gemm/unit/test_mxfp8_decode_sm100.py      # sm_100 / sm_103: the M <= 64 decode row
+python tests/gemm/unit/test_moe_routing_threads.py     # every arch: the single-CTA builder; sm_100/103 and sm_120/121: the multi-CTA builder under two threads / two streams
 python tests/gemm/unit/test_moe_routing_masked_ids.py  # every arch: expert ids outside [0, E) through the builders and the gather
 python tests/gemm/unit/test_moe_router_topk.py         # every arch: fused router top-k vs the torch reference
 python tests/gemm/unit/test_moe_unified.py             # every arch: fso.moe against the per-arch entries, the bsfp8 double quantization, the refusals
+python tests/gemm/unit/test_moe_transient_bytes.py     # every arch: fso.moe.transient_bytes against the measured peak
 python tests/gemm/unit/test_moe_block_sm120.py         # RTX 5090: the composed block and its tp / ep / dp contracts
-python tests/gemm/unit/test_moe_layer_determinism_sm120.py tests/gemm/unit/test_moe_layer_padded_ids_sm120.py   # RTX 5090
-python tests/gemm/unit/test_fp8_grouped_sm90.py tests/gemm/unit/test_moe_layer_dispatch_sm90.py   # H200
-python tests/gemm/unit/test_moe_layer_determinism_sm90.py tests/gemm/unit/test_moe_layer_padded_ids_sm90.py     # H200
-python tests/gemm/unit/test_cuda_graph.py
-# Attention (sm_120)
+python tests/gemm/unit/test_moe_layer_determinism_sm120.py   # RTX 5090
+python tests/gemm/unit/test_moe_layer_padded_ids_sm120.py    # RTX 5090
+python tests/gemm/unit/test_mxfp8_fused_fc1_sm120.py         # RTX 5090
+python tests/gemm/unit/test_mxfp8_fused_combine_sm120.py     # RTX 5090
+python tests/gemm/unit/test_fp8_grouped_sm90.py              # H200
+python tests/gemm/unit/test_fp8_contiguous_sm90.py           # H200
+python tests/gemm/unit/test_fp8_contiguous_swapab_sm90.py    # H200
+python tests/gemm/unit/test_moe_sorted_sm90.py               # H200
+python tests/gemm/unit/test_moe_layer_dispatch_sm90.py       # H200
+python tests/gemm/unit/test_moe_layer_determinism_sm90.py    # H200
+python tests/gemm/unit/test_moe_layer_padded_ids_sm90.py     # H200
+python tests/gemm/unit/test_fp8_contiguous_2wg_sm90.py      # H200: the two-warp-group FC1
+python tests/gemm/unit/test_fp8_fused_fc1_sm90.py           # H200: the fused SwiGLU FC1 against the unfused chain
+python tests/gemm/unit/test_fp8_fused_fc1_swapab_sm90.py    # H200: the fused swap-AB SwiGLU FC1 against the unfused chain
+python tests/gemm/unit/test_jit_cache_sm90.py               # H200: the JIT disk cache (subprocesses, temp dirs)
+# Attention (the MXFP8 kernels run on sm_120; elsewhere the tests check the refusals)
+python tests/attention/test_smoke.py
 python -m pytest tests/attention/
 
 # Benches (write jsonl outside the git tree; one process per cell, graph-replay median)
@@ -229,20 +303,36 @@ python bench/gemm/python/bench_moe_qwen3_30a3.py --run --out <dir>/x.jsonl      
 python bench/gemm/python/bench_moe_qwen3_35a3.py --run --out <dir>/x.jsonl        # Family C (routed + shared expert)
 python bench/attention/bench_qwen3_llama3.py
 python bench/gemm/python/render_perf_docs.py --check   # tables in docs/ and this README match tests/baselines/
+python scripts/gen_op_schemas.py --check               # the generated torch.ops schema blocks of docs/api/ match the source
 ```
 
-The measurement protocol, shape families, clock locks and the acceptance
+The measurement protocol, shape families, clock policy and the acceptance
 rule for a performance change are in
 [`docs/perf/README.md`](docs/perf/README.md).
 
-## Tuning knobs
+## Environment variables
 
-Debugging and A/B environment variables (`FSO_FORCE_TILE`,
-`FSO_FORCE_TILE_K`, `FSO_FORCE_KSPLIT`, `FSO_DISABLE_STREAMK`,
-`FSO_DISABLE_PDL`, `FSO_PRINT_TILE_INFO`, the sm_100 tier switches, the
-deep_gemm JIT diagnostics and the rest) are listed with their scope in
-[`docs/api/gemm.md`](docs/api/gemm.md#env-var-overrides-debugging--a-b-only).
-All are read once per process and none is part of the production contract.
+Every variable the library reads is listed with its scope, default, read time
+and consequence in
+[`docs/api/compat.md`](docs/api/compat.md#environment-variables). They come in two
+kinds:
+
+- **Production switches and capacities**, which a deployment may set on
+  purpose: `FSO_MOE_FUSED_COMBINE=1` (the only way to enable the fused combine
+  of `fso.moe.layer` on sm_120/121), `FSO_FC1_FUSED` (the fused FC1, and with
+  it the weight layout `fso.moe.prepare_experts` writes), `FSO_MOE_BLOCK_OVERLAP`,
+  `FSO_DISABLE_DECODE_DSL`, `FSO_JIT_INCLUDE_DIRS`, and the two pool sizes
+  `FSO_STREAMK_POOL_MB` and `FSO_GROUPED_ARG_POOL_MB`, whose exhaustion aborts
+  the process.
+- **Debugging and A/B knobs** (`FSO_FORCE_TILE`, `FSO_FORCE_KSPLIT`,
+  `FSO_DISABLE_STREAMK`, `FSO_DISABLE_PDL`, `FSO_PRINT_TILE_INFO`, the sm_100
+  tier switches, the deep_gemm JIT diagnostics and the rest), which a correct
+  deployment does not need.
+
+Most are read once per process; `FSO_SWAP_BN`, `FSO_SWAP_STAGES`,
+`FSO_SWAPAB_CTAS_PER_SM`, `FSO_MOE_SCATTER_WARP` and
+`FSO_CHECK_PROBLEM_SHAPES` are read on every call. Set them before the first
+call and keep them unchanged between a CUDA-graph capture and its replays.
 
 ## License
 

@@ -17,19 +17,24 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <random>
 #include <regex>
 #include <sstream>
 #include <string>
+#include <system_error>
+#include <utility>
 #include <vector>
 
 #include "jit_utils.cuh"
@@ -61,53 +66,49 @@ std::string generateUniqueId()
     return std::to_string(value) + "_" + std::to_string(random_value);
 }
 
-std::filesystem::path getDefaultUserDir()
+// Root of the on-disk JIT cache, which only FSO_JIT_DUMP_CUBIN and FSO_JIT_USE_NVCC use (the default NVRTC build
+// lives in memory and never touches the file system). A cubin lives in
+// <root>/cache/<16-hex content key>_<kernel name>/<kKernelName> and is written through <root>/tmp. The root is, in
+// order: FSO_JIT_CACHE_DIR; the deprecated TensorRT-LLM alias TRTLLM_DG_CACHE_DIR; ${XDG_CACHE_HOME:-$HOME/.cache}/
+// fish_scales_ops/jit (%LOCALAPPDATA%\fish_scales_ops\jit on Windows); <temp dir>/fish_scales_ops/jit. Resolved once,
+// on first use; nothing is created here (directories are made when a cubin is written).
+inline std::filesystem::path const& getJitCacheRoot()
 {
-    static std::filesystem::path userDir;
-    if (userDir.empty())
+    static std::filesystem::path const root = []() -> std::filesystem::path
     {
-        char const* cacheDir = getenv("TRTLLM_DG_CACHE_DIR");
-        if (cacheDir)
-        {
-            userDir = cacheDir;
-            std::filesystem::create_directories(userDir);
-        }
-        else
-        {
+        auto isSet = [](char const* value) { return value != nullptr && value[0] != '\0'; };
+        if (char const* dir = getJitEnv("FSO_JIT_CACHE_DIR", "TRTLLM_DG_CACHE_DIR"); isSet(dir))
+            return std::filesystem::path(dir);
+        std::filesystem::path const leaf = std::filesystem::path("fish_scales_ops") / "jit";
 #ifdef _WIN32
-            char const* appData = getenv("APPDATA");
-            if (appData)
-            {
-                userDir = std::filesystem::path(appData) / "tensorrt_llm";
-            }
-            else
-            {
-                userDir = std::filesystem::temp_directory_path() / "tensorrt_llm";
-            }
+        if (char const* localAppData = std::getenv("LOCALAPPDATA"); isSet(localAppData))
+            return std::filesystem::path(localAppData) / leaf;
+        if (char const* appData = std::getenv("APPDATA"); isSet(appData))
+            return std::filesystem::path(appData) / leaf;
 #else
-            char const* homeDir = getenv("HOME");
-            if (homeDir)
-            {
-                userDir = std::filesystem::path(homeDir) / ".tensorrt_llm";
-            }
-            else
-            {
-                userDir = std::filesystem::temp_directory_path() / "tensorrt_llm";
-            }
+        // XDG base-directory rule: an unset, empty or relative XDG_CACHE_HOME means $HOME/.cache.
+        if (char const* xdg = std::getenv("XDG_CACHE_HOME"); isSet(xdg) && std::filesystem::path(xdg).is_absolute())
+            return std::filesystem::path(xdg) / leaf;
+        if (char const* home = std::getenv("HOME"); isSet(home))
+            return std::filesystem::path(home) / ".cache" / leaf;
 #endif
-        }
-    }
-    return userDir;
+        std::error_code ec;
+        std::filesystem::path tmp = std::filesystem::temp_directory_path(ec);
+        if (ec || tmp.empty())
+            tmp = std::filesystem::path(".");
+        return tmp / leaf;
+    }();
+    return root;
 }
 
 inline std::filesystem::path getTmpDir()
 {
-    return getDefaultUserDir() / "tmp";
+    return getJitCacheRoot() / "tmp";
 }
 
 inline std::filesystem::path getCacheDir()
 {
-    return getDefaultUserDir() / "cache";
+    return getJitCacheRoot() / "cache";
 }
 
 std::string getNvccCompiler()
@@ -115,9 +116,9 @@ std::string getNvccCompiler()
     static std::string compiler;
     if (compiler.empty())
     {
-        // Check environment variable
-        char const* envCompiler = getenv("TRTLLM_DG_NVCC_COMPILER");
-        if (envCompiler)
+        // FSO_JIT_NVCC_COMPILER (deprecated alias TRTLLM_DG_NVCC_COMPILER), else $CUDA_HOME/bin/nvcc, else nvcc on PATH
+        char const* envCompiler = getJitEnv("FSO_JIT_NVCC_COMPILER", "TRTLLM_DG_NVCC_COMPILER");
+        if (envCompiler && envCompiler[0] != '\0')
         {
             compiler = envCompiler;
         }
@@ -178,7 +179,29 @@ std::vector<std::filesystem::path> getJitIncludeDirs()
             pushFromColonList(FSO_JIT_INCLUDE_DIRS_DEFAULT);
 #endif
         if (!includeDirs.empty())
+        {
+            // The baked default names directories of the source tree that built the extension
+            // (python/setup.py). An install that moved or deleted that tree leaves NVRTC without
+            // the CUTLASS and deep_gemm headers, and every sm_90 kernel compile then fails with a
+            // bare "cannot open source file". Name the missing directories and the remedy once per
+            // process (this list is resolved once).
+            std::string missing;
+            for (auto const& dir : includeDirs)
+            {
+                std::error_code ec;
+                if (!std::filesystem::is_directory(dir, ec))
+                    missing += "\n  " + dir.string();
+            }
+            if (!missing.empty())
+                std::fprintf(stderr,
+                    "[fish_scales_ops] sm_90 JIT: these include directories do not exist:%s\n"
+                    "  The sm_90 kernels are compiled at run time from the headers of the source tree that built "
+                    "this extension. Keep that tree in place, or set FSO_JIT_INCLUDE_DIRS to a colon-separated "
+                    "list of the CUTLASS include and tools/util/include directories, "
+                    "csrc/gemm/include/blockscale_gemm/arch/sm90/fp8/jit and the CUDA include directory.\n",
+                    missing.c_str());
             return includeDirs;
+        }
 
         // Command to execute
         char const* cmd = "pip show tensorrt_llm 2>/dev/null";
@@ -250,9 +273,20 @@ std::vector<std::filesystem::path> getJitIncludeDirs()
     return includeDirs;
 }
 
+// two_wg: the non-swap GroupedContiguous FC1 with two math warp-groups split along N (fp8_gemm_kernel_2wg). Its
+// scheduler enumerates shape_n / (2 * block_n) N-blocks (one per SwiGLU column block), passed explicitly as
+// SchedulerSelector's kNumNBlocks; every other variant emits exactly the source it emitted before the flag existed.
+// swiglu (requires two_wg): the same FC1 with the SwiGLU + 1x128 FP8 requantize fused into its epilogue
+// (fp8_gemm_kernel_2wg_swiglu, fused-FC1 step 2); same scheduler, only the kernel name differs.
+// swapab_pair (requires swapAB, GroupedContiguous): the swap-AB FC1 in which one CTA owns gate block b and up block b
+// (256 weight rows) of one activation tile (fused-FC1 P2a design S2): fp8_gemm_kernel_swapAB_pair (bf16 gu, the
+// mainloop's test vehicle), or with swiglu fp8_gemm_kernel_swapAB_swiglu (the SwiGLU + 1x128 FP8 requantize fused into
+// the epilogue). Its scheduler enumerates shape_n / (2 * block_m) weight blocks (one per SwiGLU column block), passed
+// explicitly as SchedulerSelectorSwapAB's kNumMBlocks.
 std::string generateKernel(uint32_t const shape_n, uint32_t const shape_k, uint32_t const block_m,
     uint32_t const block_n, uint32_t const block_k, uint32_t const num_groups, uint32_t const num_stages,
-    uint32_t const num_tma_multicast, deep_gemm::GemmType const gemm_type, bool swapAB = false)
+    uint32_t const num_tma_multicast, deep_gemm::GemmType const gemm_type, bool swapAB = false, bool two_wg = false,
+    bool swiglu = false, bool swapab_pair = false)
 {
     constexpr uint32_t kNumTMAThreads = 128;
     constexpr uint32_t kNumMathThreadsPerGroup = 128;
@@ -281,9 +315,22 @@ std::string generateKernel(uint32_t const shape_n, uint32_t const shape_k, uint3
         }
     }
 
+    if (two_wg && (swapAB || gemm_type != deep_gemm::GemmType::GroupedContiguous))
+        throw std::runtime_error("two-warp-group FC1 kernel: non-swap GroupedContiguous only");
+    if (swiglu && !two_wg && !swapab_pair)
+        throw std::runtime_error("fused SwiGLU FC1 kernel: only as the two-warp-group FC1 or the swap-AB gate/up pair FC1");
+    if (swapab_pair && (!swapAB || two_wg || gemm_type != deep_gemm::GemmType::GroupedContiguous))
+        throw std::runtime_error("swap-AB gate/up pair FC1 kernel: swap-AB GroupedContiguous only");
+
     // Modify kernel name based on swapAB to determine which kernel function to use
-    std::string kernel_name = swapAB ? "fp8_gemm_kernel_swapAB" : "fp8_gemm_kernel";
+    std::string kernel_name = swapAB
+        ? (swapab_pair ? (swiglu ? "fp8_gemm_kernel_swapAB_swiglu" : "fp8_gemm_kernel_swapAB_pair")
+                       : "fp8_gemm_kernel_swapAB")
+        : (two_wg ? (swiglu ? "fp8_gemm_kernel_2wg_swiglu" : "fp8_gemm_kernel_2wg") : "fp8_gemm_kernel");
     std::string scheduler_name = swapAB ? "SchedulerSelectorSwapAB" : "SchedulerSelector";
+    std::string const scheduler_n_blocks = two_wg ? ", " + std::to_string(shape_n / (2 * block_n))
+                                                  : (swapab_pair ? ", " + std::to_string(shape_n / (2 * block_m))
+                                                                 : std::string());
 
     // Create the kernel source code using raw string literal
     std::string code = R"(
@@ -313,7 +360,7 @@ typename )"
         + scheduler_name + R"(<GemmType::)" + gemm_type_to_string(gemm_type) + R"(, )" + std::to_string(shape_n)
         + R"(, )" + std::to_string(shape_k) + R"(, )" + std::to_string(block_m) + R"(, )" + std::to_string(block_n)
         + R"(, )" + std::to_string(block_k) + R"(, )" + std::to_string(num_groups) + R"(, )"
-        + std::to_string(num_tma_multicast) + R"(>::type;
+        + std::to_string(num_tma_multicast) + scheduler_n_blocks + R"(>::type;
 
 __global__ void dummy_kernel() {
   void *ptr = (void *)&)"
@@ -326,6 +373,121 @@ __global__ void dummy_kernel() {
 )";
 
     return code;
+}
+
+// FNV-1a, 64-bit. The disk cache's content key must come out the same in every process and every build of the
+// extension, which std::hash does not promise; FNV-1a is fixed by its definition. Integers are fed as 8 little-endian
+// bytes and strings with a length prefix, so two different field sequences never produce the same byte stream.
+class Fnv1a64
+{
+public:
+    void bytes(void const* data, size_t size)
+    {
+        auto const* p = static_cast<unsigned char const*>(data);
+        for (size_t i = 0; i < size; ++i)
+        {
+            state_ ^= p[i];
+            state_ *= 0x100000001b3ull;
+        }
+    }
+
+    void u64(uint64_t value)
+    {
+        unsigned char le[8];
+        for (int i = 0; i < 8; ++i)
+            le[i] = static_cast<unsigned char>(value >> (8 * i));
+        bytes(le, sizeof(le));
+    }
+
+    void field(std::string const& s)
+    {
+        u64(s.size());
+        bytes(s.data(), s.size());
+    }
+
+    [[nodiscard]] uint64_t value() const
+    {
+        return state_;
+    }
+
+    [[nodiscard]] std::string hex() const
+    {
+        char buf[17];
+        std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(state_));
+        return std::string(buf);
+    }
+
+private:
+    uint64_t state_ = 0xcbf29ce484222325ull;
+};
+
+// The deep_gemm header directory a build compiles against and a digest of its contents. The directory is the first
+// include directory holding deep_gemm/fp8_gemm_impl.cuh, which is where NVRTC resolves the generated source's
+// <deep_gemm/...> includes (it searches the -I directories in order); the digest is an FNV-1a 64 over every regular
+// file under it, visited in sorted relative-path order, each file contributing its relative path and its contents.
+// `found` is false when no include directory holds the kernel header or a file cannot be read.
+struct JitHeaderDigest
+{
+    std::filesystem::path dir;
+    uint64_t hash = 0;
+    size_t numFiles = 0;
+    bool found = false;
+};
+
+inline JitHeaderDigest computeJitHeaderDigest(std::vector<std::filesystem::path> const& includeDirs)
+{
+    JitHeaderDigest digest;
+    for (auto const& inc : includeDirs)
+    {
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(inc / "deep_gemm" / "fp8_gemm_impl.cuh", ec))
+        {
+            digest.dir = inc / "deep_gemm";
+            break;
+        }
+    }
+    if (digest.dir.empty())
+        return digest;
+
+    std::vector<std::pair<std::string, std::filesystem::path>> files;
+    std::error_code ec;
+    for (std::filesystem::recursive_directory_iterator it(digest.dir, ec), end; !ec && it != end; it.increment(ec))
+    {
+        std::error_code typeEc;
+        if (it->is_regular_file(typeEc))
+            files.emplace_back(it->path().lexically_relative(digest.dir).generic_string(), it->path());
+    }
+    if (ec)
+        return digest;
+    std::sort(files.begin(), files.end());
+
+    Fnv1a64 h;
+    h.u64(files.size());
+    for (auto const& [rel, file] : files)
+    {
+        std::ifstream in(file, std::ios::binary);
+        if (!in.is_open())
+            return digest;
+        std::string const contents((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        h.field(rel);
+        h.field(contents);
+    }
+    digest.hash = h.value();
+    digest.numFiles = files.size();
+    digest.found = true;
+    return digest;
+}
+
+// The compiler part of the content key: the version of the NVRTC library this process loaded, or the nvcc command
+// (FSO_JIT_USE_NVCC).
+inline std::string jitCompilerIdentity()
+{
+    if (kJitUseNvcc)
+        return "nvcc " + getNvccCompiler();
+    int major = 0;
+    int minor = 0;
+    CHECK_NVRTC(nvrtcVersion(&major, &minor));
+    return "nvrtc " + std::to_string(major) + "." + std::to_string(minor);
 }
 
 /**
@@ -350,7 +512,8 @@ public:
     // Build function
     Runtime* build(uint32_t const shape_n, uint32_t const shape_k, uint32_t const block_m, uint32_t const block_n,
         uint32_t const block_k, uint32_t const num_groups, uint32_t const num_stages, uint32_t const num_tma_multicast,
-        deep_gemm::GemmType const gemm_type, bool swapAB = false, uint32_t const ctas_per_sm = 1)
+        deep_gemm::GemmType const gemm_type, bool swapAB = false, uint32_t const ctas_per_sm = 1, bool two_wg = false,
+        bool swiglu = false, bool swapab_pair = false)
     {
         int sm_version = tensorrt_llm::common::getSMVersion();
         if (sm_version != 90)
@@ -361,18 +524,27 @@ public:
                 sm_version);
         }
 
-        // Build signature - simplified, no MD5 calculation
-        std::string name = std::string(swapAB ? "gemm_swapAB_" : "gemm_") + std::to_string(shape_n) + "_"
+        // Kernel name, from the template arguments alone. It keys the in-memory runtime cache (the per-launch hit path
+        // just below) and is the readable half of a disk-cache directory name; everything else that shapes the cubin
+        // is covered by the disk cache's content key (contentKey). The two-warp-group FC1 variants are marked in the
+        // prefix ("gemm_2wg_", "gemm_2wg_swiglu_"), the swap-AB gate/up pair FC1s as "gemm_swapAB_pair_" and
+        // "gemm_swapAB_swiglu_". The doubled num_groups / num_stages segment is historical and kept
+        // so names stay stable. The name does not have to end in the GEMM type: a disk load takes the type from this
+        // call, not from the path.
+        std::string name
+            = std::string(swapAB ? (swapab_pair ? (swiglu ? "gemm_swapAB_swiglu_" : "gemm_swapAB_pair_") : "gemm_swapAB_")
+                                 : (two_wg ? (swiglu ? "gemm_2wg_swiglu_" : "gemm_2wg_") : "gemm_"))
+            + std::to_string(shape_n) + "_"
             + std::to_string(shape_k) + "_" + std::to_string(block_m) + "_" + std::to_string(block_n) + "_"
             + std::to_string(block_k) + "_" + std::to_string(num_groups) + "_" + std::to_string(num_stages)
             + std::to_string(num_groups) + "_" + std::to_string(num_stages) + "_" + std::to_string(num_tma_multicast)
             + "_" + gemm_type_to_string(gemm_type) + (ctas_per_sm > 1 ? "_c" + std::to_string(ctas_per_sm) : "");
-        std::filesystem::path path = getCacheDir() / name;
 
-        // Check runtime cache or file system hit
+        // Hit path, taken by every sm_90 GEMM launch after the first one of its kernel in this process: the name
+        // above and one in-memory lookup. No hashing, file-system access or environment read happens here; the rest
+        // of this function runs once per kernel per process.
         auto& runtimeCache = getGlobalRuntimeCache();
-        Runtime* cachedRuntime = runtimeCache[path.string()];
-        if (cachedRuntime != nullptr)
+        if (Runtime* cachedRuntime = runtimeCache.find(name))
         {
             if (kJitDebugging)
             {
@@ -388,8 +560,9 @@ public:
                 "-D__FORCE_INCLUDE_CUDA_FP16_HPP_FROM_FP16_H__=1", "-D__FORCE_INCLUDE_CUDA_BF16_HPP_FROM_BF16_H__=1"};
         if (ctas_per_sm > 1)
             flags.push_back("-DFSO_SWAPAB_CTAS_PER_SM=" + std::to_string(ctas_per_sm));
-        // Developer passthrough: FSO_JIT_EXTRA_FLAGS="-DFOO=1 -DBAR=0" appends to every JIT compile. The
-        // cubin cache key does not see these flags, so pair them with a fresh TRTLLM_DG_CACHE_DIR.
+        // Developer passthrough: FSO_JIT_EXTRA_FLAGS="-DFOO=1 -DBAR=0" appends to every JIT compile. Like every other
+        // flag they are part of the disk cache's content key, so a cubin built under different extra flags is never
+        // loaded in their place.
         if (char const* extra = std::getenv("FSO_JIT_EXTRA_FLAGS"))
         {
             std::string tok;
@@ -432,20 +605,46 @@ public:
             flags.push_back("-default-device");
         }
 
-        std::filesystem::path tmpPath = getTmpDir() / (name + "_" + generateUniqueId());
-        std::filesystem::path cubinPath = path / kKernelName;
-        std::filesystem::path tmpCubinPath = tmpPath / kKernelName;
-
-        // Create the target directory if it doesn't exist
-        if (kJitUseNvcc || kJitDumpCubin)
-        {
-            std::filesystem::create_directories(tmpPath);
-            std::filesystem::create_directories(path);
-        }
-
         for (auto const& dir : includeDirs_)
         {
             flags.push_back("-I" + dir.string());
+        }
+
+        std::string code = generateKernel(shape_n, shape_k, block_m, block_n, block_k, num_groups, num_stages,
+            num_tma_multicast, gemm_type, swapAB, two_wg, swiglu, swapab_pair);
+
+        // Disk cache, used only with FSO_JIT_DUMP_CUBIN or FSO_JIT_USE_NVCC (the default NVRTC build stays in memory
+        // and never touches the file system). A cubin lives in <cache>/<content key>_<name>/, the key covering the
+        // generated source, the complete flag list, the compiler and every JIT header file, so a cubin found there
+        // was built from exactly this input and is loaded instead of compiling. Directories without the key
+        // (TensorRT-LLM's DeepGEMM cache layout, dumps of older fish_scales_ops builds) are never looked at.
+        bool const useDiskCache = kJitUseNvcc || kJitDumpCubin;
+        std::filesystem::path path;
+        if (useDiskCache)
+        {
+            // Resolve the cache root first: a deprecated-alias notice must not land inside a log line below.
+            std::filesystem::path const cacheDir = getCacheDir();
+            JitHeaderDigest const& headers = headerDigest();
+            if (!headers.found)
+            {
+                TLLM_THROW(
+                    "deep_gemm JIT: could not read deep_gemm/fp8_gemm_impl.cuh and its directory under the JIT include "
+                    "directories (FSO_JIT_INCLUDE_DIRS or the build-time default), so the disk cache "
+                    "(FSO_JIT_DUMP_CUBIN / FSO_JIT_USE_NVCC) cannot key %s",
+                    name.c_str());
+            }
+            path = cacheDir / (contentKey(code, flags, headers) + "_" + name);
+            if (Runtime::isPathValid(path.string()))
+            {
+                if (kJitDebugging)
+                {
+                    TLLM_LOG_INFO("Loaded JIT runtime %s from the disk cache: %s", name.c_str(), path.string().c_str());
+                }
+                auto runtime = std::make_unique<Runtime>(path.string(), std::vector<char>(), gemm_type);
+                Runtime* result = runtime.get();
+                runtimeCache.set(name, std::move(runtime));
+                return result;
+            }
         }
 
         // Print options if debug enabled
@@ -457,18 +656,23 @@ public:
                 TLLM_LOG_INFO("%s ", flag.c_str());
             }
             TLLM_LOG_INFO("\n");
-        }
-
-        std::string code = generateKernel(
-            shape_n, shape_k, block_m, block_n, block_k, num_groups, num_stages, num_tma_multicast, gemm_type, swapAB);
-
-        if (kJitDebugging)
-        {
             TLLM_LOG_INFO("Generated kernel code:\n%s", code.c_str());
         }
 
+        // A disk-cache write goes through a private temporary directory and one rename, so a concurrent reader never
+        // sees a partial cubin.
+        std::filesystem::path tmpPath;
+        if (useDiskCache)
+        {
+            tmpPath = getTmpDir() / (path.filename().string() + "_" + generateUniqueId());
+        }
+        std::filesystem::path const tmpCubinPath = tmpPath / kKernelName;
+
+        std::vector<char> cubin;
+        bool staged = false; // the cubin sits at tmpCubinPath, ready to be published
         if (kJitUseNvcc)
         {
+            std::filesystem::create_directories(tmpPath);
             std::filesystem::path tmpSrcPath = tmpPath / "kernel.cu";
 
             // Write files
@@ -490,6 +694,7 @@ public:
             // Buffer to store the output
             std::array<char, 128> buffer;
             std::string result;
+            int status = -1;
 
             // Time the compilation
             auto start = std::chrono::high_resolution_clock::now();
@@ -511,9 +716,9 @@ public:
 
 // Close the pipe
 #ifdef _MSC_VER
-                _pclose(pipe);
+                status = _pclose(pipe);
 #else
-                pclose(pipe);
+                status = pclose(pipe);
 #endif
 
                 // Output result if debug enabled
@@ -525,6 +730,22 @@ public:
                     TLLM_LOG_INFO("Compilation log:\n%s", result.c_str());
                 }
             }
+
+            // Only a cubin from a successful nvcc run may reach the disk cache, which later processes trust.
+            std::ifstream cubinFile(tmpCubinPath, std::ios::binary);
+            if (status == 0 && cubinFile.is_open())
+            {
+                cubin.assign(std::istreambuf_iterator<char>(cubinFile), std::istreambuf_iterator<char>());
+            }
+            cubinFile.close();
+            if (cubin.empty())
+            {
+                std::error_code ec;
+                std::filesystem::remove_all(tmpPath, ec);
+                TLLM_THROW("deep_gemm JIT: nvcc failed to compile %s (status %d): %s", name.c_str(), status,
+                    result.c_str());
+            }
+            staged = true;
         }
         else
         {
@@ -562,76 +783,119 @@ public:
                 throw std::runtime_error("NVRTC compilation failed");
             }
 
-            // Save CUBIN to a file
             size_t cubinSize;
             CHECK_NVRTC(nvrtcGetCUBINSize(prog, &cubinSize));
-            std::vector<char> cubin(cubinSize);
+            cubin.resize(cubinSize);
             CHECK_NVRTC(nvrtcGetCUBIN(prog, cubin.data()));
+            CHECK_NVRTC(nvrtcDestroyProgram(&prog));
 
-            // Cache the runtime in memory by default
-            if (!kJitDumpCubin)
+            // FSO_JIT_DUMP_CUBIN: stage the cubin for the disk cache
+            if (kJitDumpCubin)
             {
-                auto runtime = std::make_unique<Runtime>(path.string(), cubin, gemm_type);
-                Runtime* result = runtime.get();
-                runtimeCache.set(path.string(), std::move(runtime));
+                try
+                {
+                    std::filesystem::create_directories(tmpPath);
+                    std::ofstream cubinFile(tmpCubinPath, std::ios::binary);
+                    cubinFile.write(cubin.data(), static_cast<std::streamsize>(cubin.size()));
+                    cubinFile.close();
+                    if (!cubinFile)
+                        throw std::runtime_error("cannot write " + tmpCubinPath.string());
+                    staged = true;
+                }
+                catch (std::exception const& e)
+                {
+                    TLLM_LOG_ERROR("Warning: Failed to stage the cubin for the disk cache: %s", e.what());
+                }
+            }
+        }
+
+        // Publish the staged cubin into its content-keyed directory (rename: atomic) and drop the temporary
+        // directory. A failure costs only the disk copy: the runtime below is built from the cubin in memory.
+        if (staged)
+        {
+            try
+            {
+                std::filesystem::create_directories(path);
+                std::filesystem::rename(tmpCubinPath, path / kKernelName);
                 if (kJitDebugging)
                 {
-                    TLLM_LOG_INFO("Successfully cached JIT runtime %s in memory", name.c_str());
+                    TLLM_LOG_INFO("Wrote JIT runtime %s to the disk cache: %s", name.c_str(), path.string().c_str());
                 }
-                return result;
             }
-
-            std::ofstream cubinFile(tmpCubinPath.string(), std::ios::binary);
-            cubinFile.write(cubin.data(), static_cast<std::streamsize>(cubinSize));
-            cubinFile.close();
-            CHECK_NVRTC(nvrtcDestroyProgram(&prog));
-        }
-
-        // Copy the source and compiled files to the cache directory
-        try
-        {
-            // Rename (atomic operation) to final locations
-            std::filesystem::rename(tmpCubinPath, cubinPath);
-            if (kJitDebugging)
+            catch (std::exception const& e)
             {
-                TLLM_LOG_INFO("Successfully copied kernel files to cache directory: %s", path.string().c_str());
+                TLLM_LOG_ERROR("Warning: Failed to copy kernel files to cache: %s", e.what());
             }
         }
-        catch (std::exception const& e)
+        if (useDiskCache)
         {
-            TLLM_LOG_ERROR("Warning: Failed to copy kernel files to cache: %s", e.what());
-        }
-
-        // Clean up temporary directory after successful compilation
-        try
-        {
-            std::filesystem::remove_all(tmpPath);
-        }
-        catch (std::exception const& e)
-        {
-            TLLM_LOG_ERROR("Warning: Failed to clean up temporary directory: %s", e.what());
+            try
+            {
+                std::filesystem::remove_all(tmpPath);
+            }
+            catch (std::exception const& e)
+            {
+                TLLM_LOG_ERROR("Warning: Failed to clean up temporary directory: %s", e.what());
+            }
         }
 
         // Create runtime and cache it
-        auto runtime = std::make_unique<Runtime>(path.string(), std::vector<char>(), gemm_type);
+        auto runtime = std::make_unique<Runtime>(useDiskCache ? path.string() : name, cubin, gemm_type);
         Runtime* result = runtime.get();
-        runtimeCache.set(path.string(), std::move(runtime));
+        runtimeCache.set(name, std::move(runtime));
+        if (kJitDebugging)
+        {
+            TLLM_LOG_INFO("Successfully cached JIT runtime %s in memory", name.c_str());
+        }
         return result;
     }
 
 private:
     std::vector<std::filesystem::path> includeDirs_;
 
-    // Private constructor for singleton pattern
+    // Private constructor for singleton pattern. Nothing is created on disk here: the disk cache makes its
+    // directories when it writes a cubin.
     Compiler()
         : includeDirs_(getJitIncludeDirs())
     {
-        // Create necessary directories
-        if (kJitUseNvcc || kJitDumpCubin)
+    }
+
+    // The JIT header directory and its digest, computed once per process on the first disk-cache lookup.
+    JitHeaderDigest const& headerDigest() const
+    {
+        static JitHeaderDigest const digest = [this]()
         {
-            std::filesystem::create_directories(getTmpDir());
-            std::filesystem::create_directories(getCacheDir());
+            JitHeaderDigest d = computeJitHeaderDigest(includeDirs_);
+            if (kJitDebugging)
+            {
+                std::string const cacheDir = getCacheDir().string();
+                TLLM_LOG_INFO("JIT disk cache %s; header directory %s: %zu files, digest %016llx", cacheDir.c_str(),
+                    d.dir.string().c_str(), d.numFiles, static_cast<unsigned long long>(d.hash));
+            }
+            return d;
+        }();
+        return digest;
+    }
+
+    // Content key of one build: 16 hex digits of an FNV-1a 64 over the compiler identity (NVRTC version or nvcc
+    // path), the generated source, the complete flag list (FSO_JIT_EXTRA_FLAGS and the -I include directories among
+    // them) and the JIT header digest. Any header edit, flag change or compiler change yields another key, and so
+    // another directory.
+    std::string contentKey(
+        std::string const& code, std::vector<std::string> const& flags, JitHeaderDigest const& headers) const
+    {
+        static std::string const compilerIdentity = jitCompilerIdentity();
+        Fnv1a64 h;
+        h.field("fish_scales_ops deep_gemm JIT cache v1");
+        h.field(compilerIdentity);
+        h.field(code);
+        h.u64(flags.size());
+        for (auto const& flag : flags)
+        {
+            h.field(flag);
         }
+        h.u64(headers.hash);
+        return h.hex();
     }
 
     // Delete copy constructor and assignment operator

@@ -1,8 +1,10 @@
 /*
- * ATen wrapper for the MXFP8 (1×32, true OCP MXFP8) blockwise GEMM.
- * SM120+ only (CUTLASS BlockScaled with kSFVecSize=32). C1 stage:
- * single tile (128,128,2), takes already-packed int32 scales; quantize
- * + repack lands in C3.
+ * ATen ops for the MXFP8 (1×32, true OCP MXFP8) block-scaled GEMMs, dense and
+ * grouped (MoE), on sm_100/sm_103 (CUTLASS tcgen05 BlockScaled) and
+ * sm_120/sm_121 (CUTLASS Sm120 BlockScaled, kSFVecSize=32), with the 1×32
+ * quantizers, the grouped gather / SwiGLU requantize ops and the host-side
+ * route queries. Every op takes the arch-native packed int32 scales the
+ * quantizers of the same architecture produce.
  *
  * Forward-decl of the launcher so cute headers don't leak into this TU
  * and clash with at::Layout.
@@ -29,6 +31,7 @@ cudaError_t launch_sm120_mxfp8_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv
 cudaError_t launch_sm100_mxfp8_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D,
     int32_t* SFA, int32_t* SFB, int M, int N, int K, cudaStream_t stream);
 bool sm100_mxfp8_compiled();
+char const* sm100_mxfp8_error_hint(cudaError_t err);
 // In quant_kernels.cu. sm1xx_sf_layout selects the Sm1xxBlockScaledConfig
 // atom scale layout (sm_100/sm_103) instead of the sm_120 int32 K-major.
 void fp8bs_quantize_1x32(__nv_fp8_e4m3* x_q, float* scales, __nv_bfloat16 const* x, int M, int K, cudaStream_t stream,
@@ -378,7 +381,8 @@ at::Tensor linear_mxfp8_raw(at::Tensor x_fp8, at::Tensor w_fp8, at::Tensor sx_in
             reinterpret_cast<int32_t*>(sx_int32.data_ptr()),
             reinterpret_cast<int32_t*>(sw_int32.data_ptr()),
             M, N, K, stream);
-        TORCH_CHECK(err == cudaSuccess, "sm100 mxfp8 kernel error: ", cudaGetErrorString(err));
+        TORCH_CHECK(err == cudaSuccess, "sm100 mxfp8 kernel error: ", cudaGetErrorString(err),
+            detail::sm100_mxfp8_error_hint(err));
         return y;
     }
     err = detail::launch_sm120_mxfp8_dispatch(
@@ -775,10 +779,13 @@ at::Tensor linear_mxfp8_grouped_masked_combine(at::Tensor a_fp8, at::Tensor w2_f
 //
 // The decision cannot be left to the GEMM, because the two forms need
 // different weights (interleaved vs [gate; up]) and different follow-on
-// kernels, so it has to be made before the layer is composed. It is the
-// negation of the sm_100 slot-route verdict: the fused FC1 lives only on the
-// pointer-array route. Every non-sm_100 device answers false, which is the
-// same answer as "this architecture has no fused FC1".
+// kernels, so it has to be made before the layer is composed. On sm_100/103
+// both grouped routes carry a fused FC1 (the pointer-array cascade and the
+// swap-orientation slot kernel), so with FSO_FC1_FUSED unset the answer is
+// true wherever an instantiation covers the shape, and the slot-route verdict
+// only decides which fused kernel runs. sm_120/121 has one grouped route, so
+// the per-call answer is the load-time one (mxfp8_grouped_swiglu_available).
+// Every other device answers false: it has no fused FC1.
 bool mxfp8_grouped_swiglu_available(int64_t n_w, int64_t k); // defined below
 
 bool mxfp8_grouped_swiglu_fused_route(
@@ -872,9 +879,11 @@ bool mxfp8_grouped_slot_possible(
 // slot route does not. Asking `moe_build_routing` for the triples where no
 // kernel reads them costs the routing kernel a few stores per group for
 // nothing, so a layer asks this per GEMM and requests the shapes exactly
-// where they are consumed. Every architecture but sm_100/103 answers false:
-// sm_120/121 has no pointer-array route and accepts the tensor only so a
-// caller can pass the same arguments on every architecture. `fused_swiglu`
+// where they are consumed. Every architecture but sm_100/103 answers false.
+// sm_120/121 has no pointer-array route: linear_mxfp8_grouped_masked validates
+// such a tensor and ignores it, while linear_mxfp8_grouped_masked_swiglu
+// refuses a non-empty one, so a caller driven by this query never passes one
+// there. `fused_swiglu`
 // names the kernel the call will land on, exactly as for
 // `mxfp8_grouped_slot_possible`: the fused-SwiGLU FC1 leaves the slot route
 // one step earlier than the plain grouped GEMM, so the two queries are

@@ -99,11 +99,11 @@ def gather_bytes_check(hidden, ids, e, m_cap, topk, slot):
     flat quantizer's bytes for that pair's source row."""
     sm = torch.cuda.get_device_capability()[0]
     if sm == 9:
-        hq, _ = fso.gemm.quantize_1x128_grouped_gather_sm90(hidden, slot, topk, e, m_cap)
-        xq, _ = fso.gemm.quantize_1x128_fp8(hidden)
+        hq, _ = fso.compat.quantize_1x128_grouped_gather_sm90(hidden, slot, topk, e, m_cap)
+        xq, _ = fso.compat.quantize_1x128_fp8(hidden)
     else:
-        hq, _ = fso.gemm.quantize_1x32_grouped_gather_fp8(hidden, slot, topk, e, m_cap)
-        xq, _ = fso.gemm.quantize_1x32_fp8(hidden)
+        hq, _ = fso.compat.quantize_1x32_grouped_gather_fp8(hidden, slot, topk, e, m_cap)
+        xq, _ = fso.compat.quantize_1x32_fp8(hidden)
     s = slot.to(torch.int64)
     keep = s >= 0
     if not bool(keep.any()):
@@ -154,7 +154,7 @@ def routing_call(ids, e, m_cap, with_slots):
     kernels it launched."""
     from torch.profiler import ProfilerActivity, profile
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
-        out = fso.gemm.moe_build_routing(ids, e, m_cap, with_slots=with_slots)
+        out = fso.compat.moe_build_routing(ids, e, m_cap, with_slots=with_slots)
         torch.cuda.synchronize()
     names = sorted({ev.key for ev in prof.key_averages() if "moe_build_routing" in ev.key})
     ste = out[3].cpu() if with_slots else None
@@ -230,7 +230,7 @@ def compare_with_single_cta(cases, reference, e, m_cap):
 def run_case(label, ids, e, hidden, with_slots, want_multi):
     m = int(ids.shape[0])
     m_cap = (m + 3) // 4 * 4
-    out = fso.gemm.moe_build_routing(ids, e, m_cap, with_slots=with_slots)
+    out = fso.compat.moe_build_routing(ids, e, m_cap, with_slots=with_slots)
     masked, row_map, slot = out[0], out[1], out[2]
     ste = out[3] if with_slots else None
     torch.cuda.synchronize()

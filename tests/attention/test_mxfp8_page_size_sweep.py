@@ -80,8 +80,8 @@ def _quant_q(q_bf16, n_kv_heads, block=32):
 @pytest.mark.parametrize("D", [32, 64, 128, 256])
 @pytest.mark.parametrize("page_size", [32, 64, 128])
 def test_decode_page_size_dispatch_or_runs(D, page_size):
-    """When sm < 12, expect cudaErrorNotSupported via dispatch raise.
-    When sm >= 12, run the kernel and compare to SDPA reference."""
+    """Off sm_120/121 the entry refuses the device before launching anything.
+    On sm_120/121, run the kernel and compare to the SDPA reference."""
     torch.manual_seed(D * 13 + page_size)
 
     B, H_q, H_kv, S = 2, 8, 2, 256          # gqa=4, small smoke shape
@@ -100,7 +100,7 @@ def test_decode_page_size_dispatch_or_runs(D, page_size):
     softmax_scale = 1.0 / math.sqrt(D)
 
     if not _is_sm120():
-        with pytest.raises(RuntimeError, match="mxfp8_decode_paged"):
+        with pytest.raises(NotImplementedError, match="sm_120"):
             _ = dec_bk.mxfp8_decode_paged_fwd(
                 q_fp8, q_sc, K_pool, k_chan_scale, V_pool, v_chan_scale,
                 block_table, seq_lens, softmax_scale=softmax_scale)
@@ -149,7 +149,8 @@ def test_decode_page_size_cross_equivalence(D):
 
 def test_invalid_page_size_rejected():
     """page_size=1 (sglang default) must be rejected with a clear message
-    pointing at the MXFP8 sf_vec_size=32 lower bound."""
+    pointing at the MXFP8 sf_vec_size=32 lower bound on sm_120/121; any other
+    device is refused before the page size is looked at."""
     torch.manual_seed(0)
     if not torch.cuda.is_available():
         pytest.skip("no CUDA")
@@ -167,7 +168,7 @@ def test_invalid_page_size_rejected():
     block_table = torch.zeros(B, num_pages, dtype=torch.int32, device="cuda")
     seq_lens = torch.full((B,), S, dtype=torch.int32, device="cuda")
 
-    with pytest.raises(NotImplementedError, match="page_size"):
+    with pytest.raises(NotImplementedError, match="page_size" if _is_sm120() else "sm_120"):
         dec_bk.mxfp8_decode_paged_fwd(
             q_fp8, q_sc, K_pool, k_chan_scale, V_pool, v_chan_scale,
             block_table, seq_lens, softmax_scale=0.125)

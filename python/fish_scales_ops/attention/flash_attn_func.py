@@ -1,12 +1,12 @@
-"""Forward-only flash attention dispatch.
+"""Forward-only attention through torch SDPA, on every architecture.
 
-Every dtype routes through ``torch.nn.functional.scaled_dot_product_attention``
-(FP8 inputs are dequantised to BF16 first). For the SM120 MXFP8 fast
-path, call ``backends.sm120_mxfp8.mxfp8_fwd(...)`` or
-``backends.sm120_mxfp8_decode.{mxfp8_decode_paged_fwd, plan_decode_paged}``
-directly — both wrap ``torch.ops.fish_scales_ops.mxfp8_*`` and expect
-pre-quantized Q/K/V plus UE8M0 scales (see the backend module docstrings
-for layout contracts).
+:func:`flash_attn_fwd` is the convenience entry: every dtype on every device
+goes through ``torch.nn.functional.scaled_dot_product_attention`` (FP8 inputs
+are dequantized to bf16 first, GQA heads are expanded). The sm_120/sm_121 MXFP8
+kernels take pre-quantized inputs and are separate entries of
+:mod:`fish_scales_ops.attention`: ``mxfp8_fwd`` (contiguous prefill),
+``mxfp8_paged_prefill_fwd`` / ``plan_paged_prefill`` (paged prefill and extend)
+and ``mxfp8_decode_paged_fwd`` / ``plan_decode_paged`` (paged decode).
 """
 from __future__ import annotations
 
@@ -32,43 +32,13 @@ def _device_caps(device_index: int) -> dict:
     if cached is not None:
         return cached
     major, minor = torch.cuda.get_device_capability(device_index)
-    sm = major * 10 + minor
-    caps = {
-        "sm_major": major, "sm_minor": minor, "sm_version": sm,
-        "has_tma": sm >= 90, "has_fp8": sm >= 89,
-        "has_mxfp8": sm >= 120, "has_cudnn_mxfp8_sdpa": False,
-    }
+    caps = {"sm_version": major * 10 + minor}
     _DEVICE_CAPS_CACHE[device_index] = caps
     return caps
 
 
 def _is_fp8(t: torch.Tensor) -> bool:
     return t.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-
-
-# Pure-Python kernel selection — does not call into the C++ extension to
-# avoid an unnecessary cudaGetDeviceProperties on the hot path.
-def _select_kernel(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                   causal: bool, local_window: bool) -> str:
-    sm = _device_caps(q.device.index or 0)["sm_version"]
-
-    # FP8 + sm_120 routes to the in-tree MXFP8 kernel via torch.ops. The caller
-    # is expected to have pre-quantized Q/K/V plus their UE8M0 scales — this
-    # path only sees FP8 element tensors at the public API surface when the
-    # caller already controls quantization. The pre-quantized path is invoked
-    # directly through `torch.ops.fish_scales_ops.mxfp8_attn_fwd` (see
-    # `backends/sm120_mxfp8.py:mxfp8_fwd`), so `flash_attn_fwd` itself only
-    # accepts BF16/FP16/torch-quantized FP8 tensors and falls back to SDPA on
-    # dequantised inputs.
-
-    # Decode short-circuit: torch SDPA has a dedicated decode path that beats
-    # every prefill-tuned kernel we wrap.
-    if q.size(1) == 1:
-        return "torch_fallback_fwd"
-
-    # Everything else through torch SDPA. FP8-pre-quantized callers should
-    # bypass this function and call the backend op directly.
-    return "torch_fallback_fwd"
 
 
 def _torch_sdpa_fwd(q, k, v, softmax_scale, causal, window_left, window_right):
@@ -122,46 +92,27 @@ def flash_attn_fwd(
     window_left: int = -1,
     window_right: int = -1,
     return_dispatch: bool = False,
-    force_kernel: Optional[str] = None,
 ) -> torch.Tensor | Tuple[torch.Tensor, FlashAttnDispatch]:
-    """Forward-only flash attention — convenience dispatch through torch SDPA.
+    """Forward-only attention through torch SDPA, on every architecture.
 
-    q/k/v: [B, S, H, D] CUDA tensors. Every dtype routes through
-    ``torch.nn.functional.scaled_dot_product_attention``; FP8 inputs are
-    dequantised to BF16 first. For the SM120 MXFP8 fast path call the
-    pre-quantized backend ops directly:
+    q/k/v: [B, S, H, D] CUDA tensors, bf16, fp16 or FP8 (dequantized to bf16
+    first); GQA is expanded with ``repeat_interleave``. ``window_left`` /
+    ``window_right`` >= 0 add a sliding-window mask. With ``return_dispatch`` the
+    call also returns ``FlashAttnDispatch(kernel_id="torch_fallback_fwd",
+    sm_version, backend="torch_sdpa")``.
 
-      * Prefill: ``fso.attention.backends.sm120_mxfp8.mxfp8_fwd(...)``
-      * Decode:  ``fso.attention.backends.sm120_mxfp8_decode.mxfp8_decode_paged_fwd(...)``
-                 or the ``plan_decode_paged`` / ``DecodePagedPlan.run`` pair.
-
-    Both backends wrap ``torch.ops.fish_scales_ops.mxfp8_*`` and expect
-    UE8M0-scaled FP8 inputs that this function does not produce.
-
-    ``force_kernel="torch_fallback_fwd"`` is accepted as a no-op (the
-    only kernel id this function honours).
+    For the sm_120/sm_121 MXFP8 kernels over pre-quantized inputs use
+    :func:`fish_scales_ops.attention.mxfp8_fwd`,
+    :func:`fish_scales_ops.attention.mxfp8_paged_prefill_fwd` or
+    :func:`fish_scales_ops.attention.mxfp8_decode_paged_fwd`.
     """
     assert q.is_cuda and k.is_cuda and v.is_cuda, "inputs must be CUDA"
     assert q.dim() == k.dim() == v.dim() == 4, "q/k/v must be 4D [B,S,H,D]"
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.size(-1))
-
-    local_window = (window_left >= 0) or (window_right >= 0)
-    chosen = force_kernel or _select_kernel(q, k, v, causal, local_window)
-
-    sm_version = _device_caps(q.device.index or 0)["sm_version"]
-
-    # Future expansion: add a BF16→FP8 in-tree quantize + mxfp8_attn_fwd
-    # path here once the scale-derivation kernels land. For now everything
-    # routes through torch SDPA.
-    chosen = "torch_fallback_fwd"
-
-    out = _torch_sdpa_fwd(q, k, v, softmax_scale, causal,
-                           window_left, window_right)
-    backend = "torch_sdpa"
-
+    out = _torch_sdpa_fwd(q, k, v, softmax_scale, causal, window_left, window_right)
     if return_dispatch:
-        return out, FlashAttnDispatch(kernel_id=chosen,
-                                       sm_version=sm_version,
-                                       backend=backend)
+        sm_version = _device_caps(q.device.index or 0)["sm_version"]
+        return out, FlashAttnDispatch(kernel_id="torch_fallback_fwd",
+                                      sm_version=sm_version, backend="torch_sdpa")
     return out

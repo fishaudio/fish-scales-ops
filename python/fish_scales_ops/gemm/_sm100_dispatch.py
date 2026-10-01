@@ -14,24 +14,26 @@ here. The tiers, in order:
    ``nvidia-cutlass-dsl`` is at least 4.5.0; below that it is inert and the
    three tiers below behave exactly as they did before it was added.
 
-1. **cuBLAS ``scaled_mm``** (see :mod:`._sm100_smm`) — the small-M /
-   decode wide-N band. Fair MLP bench 2026-07-07: cuBLAS's
-   ``nvjet_128x128_128x6_4x1_v_bz`` (4-CTA multicast cluster + 6-stage
-   pipeline) beats our CuTe DSL kernel by 15-28% at M ≤ 512 on wide-N
-   shapes. Our fused-quantize output is byte-identical to what
+1. **cuBLAS ``scaled_mm``** (see :mod:`._sm100_smm`) — the band
+   ``_sm100_smm.should_route`` assigns to it, chiefly the wide-N shapes.
+   cuBLAS's ``nvjet_128x128_128x6_4x1_v_bz`` kernel uses a 4-CTA multicast
+   cluster and a 6-stage pipeline there; the band boundaries come from
+   measurements on the B300 (runs cited in ``should_route``), whose numbers
+   are not restated here. Our fused-quantize output is byte-identical to what
    ``scaled_mm`` reads under ``SWIZZLE_32_4_4`` (both use CUTLASS
    ``Sm1xxBlockScaledConfig<32>``), so cuBLAS gets the same payload —
    no extra kernel launches, no re-permute.
 
 2. **CuTe DSL persistent block-scaled kernel** (see :mod:`._sm100_dsl`)
-   — the prefill / mid-band and peak. Wins over cuBLAS on M ≥ 2048
-   through explicit L2 raster swizzle + cluster tuning that the
-   CollectiveBuilder doesn't pick by default.
+   — the cells ``_sm100_dsl.pick_config`` names (the square cubic shapes,
+   and the wide-N rows when tier 1 is unavailable). It applies an explicit L2
+   raster swizzle and a cluster shape per configuration, which the
+   CollectiveBuilder does not pick by default.
 
 3. **C++ cascade** (``dispatch_sm100_mxfp8`` in ``dispatch.cuh``) —
    fall-through catch-all. Owns the ``down``/``wo`` narrow-N band above the
    decode band, which uses a two-kernel parallel split-K scheme that neither
-   cuBLAS nor the DSL kernel can match, plus a NoSmem-epilogue
+   cuBLAS nor the DSL kernel offers, plus a NoSmem-epilogue
    overlapping-accumulator path for square cubic shapes.
 
 Env kills: ``FSO_DISABLE_SMM=1`` skips tier 1, ``FSO_DISABLE_DSL=1``

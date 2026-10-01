@@ -22,7 +22,7 @@ Layered like test_mxfp8_correctness.py:
    path's core graph property: masked_m / row_map are read on device at
    replay time, so one capture serves dynamic routing.
 
-Scale layouts decoded here (both are opaque to callers; see docs/api/gemm.md):
+Scale layouts decoded here (both are opaque to callers; see docs/api/compat.md):
   sm_120/121  per group, int32 words K-major: word (m, kp) at kp * rows + m.
   sm_100/103  per group, one CUTLASS Sm1xxBlockScaledConfig<32> atom slab of
               pad(rows,128) * K/128 words: word (m, kp) at
@@ -139,7 +139,7 @@ def test_gather_quant_roundtrip(M: int, G: int, topk: int, K: int) -> None:
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
     _, _, masked_m, row_map, slot_of_flat = build_routing(M, G, topk, m_cap, seed=M * 7 + 1)
 
-    a_fp8, sa = fso.gemm.quantize_1x32_grouped_gather_fp8(x, slot_of_flat.int(), topk, G, m_cap)
+    a_fp8, sa = fso.compat.quantize_1x32_grouped_gather_fp8(x, slot_of_flat.int(), topk, G, m_cap)
     torch.cuda.synchronize()
 
     scales = _decode_scales_grouped(sa, m_cap, K)           # [G, m_cap, K/32]
@@ -224,7 +224,7 @@ def quant_once_digest(M: int, G: int, topk: int, K: int, draw: str):
     else:
         _, _, masked_m, _, slot_of_flat = build_routing(M, G, topk, m_cap, seed=M * 7 + 1)
 
-    a_fp8, sa = fso.gemm.quantize_1x32_grouped_gather_fp8(x, slot_of_flat.int(), topk, G, m_cap)
+    a_fp8, sa = fso.compat.quantize_1x32_grouped_gather_fp8(x, slot_of_flat.int(), topk, G, m_cap)
     torch.cuda.synchronize()
 
     keep = (torch.arange(m_cap, device="cuda").view(1, -1)
@@ -303,9 +303,9 @@ def test_grouped_gemm(M: int, G: int, topk: int, N: int, K: int) -> None:
     # the larger ones check the pointer-array route.
     max_active_groups = min(M * topk, G)
 
-    a_fp8, sa = fso.gemm.quantize_1x32_grouped_gather_fp8(x, slot_of_flat.int(), topk, G, m_cap)
-    w_fp8, sw = fso.gemm.quantize_moe_weights_1x32_fp8(w)
-    y = fso.gemm.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, expected_m,
+    a_fp8, sa = fso.compat.quantize_1x32_grouped_gather_fp8(x, slot_of_flat.int(), topk, G, m_cap)
+    w_fp8, sw = fso.compat.quantize_moe_weights_1x32_fp8(w)
+    y = fso.compat.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, expected_m,
                                              max_active_groups)
     torch.cuda.synchronize()
 
@@ -363,7 +363,7 @@ def test_silu_grouped(G: int, m_cap: int, inter: int) -> None:
         n = int(masked_m[gi])
         slots += [gi * m_cap + j for j in range(n)]
     slot_of_flat = torch.tensor(slots, device="cuda", dtype=torch.int32)
-    hq, sh = fso.gemm.silu_chunk_mul_quantize_1x32_grouped_fp8(gu, slot_of_flat)
+    hq, sh = fso.compat.silu_chunk_mul_quantize_1x32_grouped_fp8(gu, slot_of_flat)
     torch.cuda.synchronize()
 
     scales = _decode_scales_grouped(sh, m_cap, inter)
@@ -393,15 +393,15 @@ def moe_layer_fso(hidden, w13_fp8, sw13, w2_fp8, sw2, topk_ids, topk_w,
     expert at most one row per token. It is constant for a given (M, topk, G),
     so a graph captured at this M stays valid for every routing draw at that M,
     including the hot-expert draw the slot cases below rewrite in."""
-    masked_m, row_map, slot_of_flat = fso.gemm.moe_build_routing(topk_ids, G, m_cap)
+    masked_m, row_map, slot_of_flat = fso.compat.moe_build_routing(topk_ids, G, m_cap)
     topk = topk_ids.shape[1]
-    hq, sh = fso.gemm.quantize_1x32_grouped_gather_fp8(hidden, slot_of_flat, topk, G, m_cap)
-    gu = fso.gemm.linear_mxfp8_grouped_masked(hq, w13_fp8, sh, sw13, masked_m, expected_m,
+    hq, sh = fso.compat.quantize_1x32_grouped_gather_fp8(hidden, slot_of_flat, topk, G, m_cap)
+    gu = fso.compat.linear_mxfp8_grouped_masked(hq, w13_fp8, sh, sw13, masked_m, expected_m,
                                               max_active_groups)
-    dq, sd = fso.gemm.silu_chunk_mul_quantize_1x32_grouped_fp8(gu, slot_of_flat)
-    dn = fso.gemm.linear_mxfp8_grouped_masked(dq, w2_fp8, sd, sw2, masked_m, expected_m,
+    dq, sd = fso.compat.silu_chunk_mul_quantize_1x32_grouped_fp8(gu, slot_of_flat)
+    dn = fso.compat.linear_mxfp8_grouped_masked(dq, w2_fp8, sd, sw2, masked_m, expected_m,
                                               max_active_groups)
-    out.copy_(fso.gemm.moe_combine(dn, slot_of_flat, topk_w))
+    out.copy_(fso.compat.moe_combine(dn, slot_of_flat, topk_w))
     return out
 
 
@@ -428,8 +428,8 @@ def test_moe_layer(M: int, G: int = 128, topk: int = 8,
     x = torch.randn(M, hidden, dtype=torch.bfloat16, device="cuda") * 0.1
     w13 = torch.randn(G, 2 * inter, hidden, dtype=torch.bfloat16, device="cuda") / (hidden ** 0.5)
     w2 = torch.randn(G, hidden, inter, dtype=torch.bfloat16, device="cuda") / (inter ** 0.5)
-    w13_fp8, sw13 = fso.gemm.quantize_moe_weights_1x32_fp8(w13)
-    w2_fp8, sw2 = fso.gemm.quantize_moe_weights_1x32_fp8(w2)
+    w13_fp8, sw13 = fso.compat.quantize_moe_weights_1x32_fp8(w13)
+    w2_fp8, sw2 = fso.compat.quantize_moe_weights_1x32_fp8(w2)
 
     topk_ids, topk_w, _, _, _ = build_routing(M, G, topk, m_cap, seed=M * 7 + 9)
     out = torch.empty(M, hidden, device="cuda", dtype=torch.bfloat16)
@@ -626,16 +626,16 @@ def fused_cell(fam: str, M: int, draw: str, chain: bool = False) -> None:
     slot_i32 = slot_of_flat.int()
     live = _live_groups(masked_m)
 
-    a_fp8, sa = fso.gemm.quantize_1x32_grouped_gather_fp8(x, slot_i32, topk, G, m_cap)
-    w13_fp8, sw13 = fso.gemm.quantize_moe_weights_1x32_fp8(w13)
-    w13i_fp8, sw13i = fso.gemm.quantize_moe_weights_1x32_fp8(w13, w13_interleave=True)
+    a_fp8, sa = fso.compat.quantize_1x32_grouped_gather_fp8(x, slot_i32, topk, G, m_cap)
+    w13_fp8, sw13 = fso.compat.quantize_moe_weights_1x32_fp8(w13)
+    w13i_fp8, sw13i = fso.compat.quantize_moe_weights_1x32_fp8(w13, w13_interleave=True)
 
     # Control: the pair this replaces.
-    gu = fso.gemm.linear_mxfp8_grouped_masked(a_fp8, w13_fp8, sa, sw13, masked_m,
+    gu = fso.compat.linear_mxfp8_grouped_masked(a_fp8, w13_fp8, sa, sw13, masked_m,
                                               expected_m, mag)
-    h_two, sh_two = fso.gemm.silu_chunk_mul_quantize_1x32_grouped_fp8(gu, slot_i32)
+    h_two, sh_two = fso.compat.silu_chunk_mul_quantize_1x32_grouped_fp8(gu, slot_i32)
     # The fused FC1.
-    h_fus, sh_fus = fso.gemm.linear_mxfp8_grouped_masked_swiglu(
+    h_fus, sh_fus = fso.compat.linear_mxfp8_grouped_masked_swiglu(
         a_fp8, w13i_fp8, sa, sw13i, masked_m, expected_m, mag)
     torch.cuda.synchronize()
 
@@ -657,7 +657,7 @@ def fused_cell(fam: str, M: int, draw: str, chain: bool = False) -> None:
     # Negative control 1: the same op fed the STACKED weights. The layouts are
     # the same bytes in a different row order, so nothing raises; what must
     # happen is that the answer fails the accuracy gate.
-    h_bad, sh_bad = fso.gemm.linear_mxfp8_grouped_masked_swiglu(
+    h_bad, sh_bad = fso.compat.linear_mxfp8_grouped_masked_swiglu(
         a_fp8, w13_fp8, sa, sw13, masked_m, expected_m, mag)
     torch.cuda.synchronize()
     c_bad = _cos_against(h_bad, sh_bad, live, m_cap, inter, ref)
@@ -685,10 +685,10 @@ def fused_cell(fam: str, M: int, draw: str, chain: bool = False) -> None:
         # FC1 -> FC2: hand each FC1 output to the unchanged grouped GEMM and
         # score both chains on the same FP32 reference chain.
         w2 = torch.randn(G, hidden, inter, dtype=torch.bfloat16, device="cuda") / (inter ** 0.5)
-        w2_fp8, sw2 = fso.gemm.quantize_moe_weights_1x32_fp8(w2)
-        dn_fus = fso.gemm.linear_mxfp8_grouped_masked(h_fus, w2_fp8, sh_fus, sw2, masked_m,
+        w2_fp8, sw2 = fso.compat.quantize_moe_weights_1x32_fp8(w2)
+        dn_fus = fso.compat.linear_mxfp8_grouped_masked(h_fus, w2_fp8, sh_fus, sw2, masked_m,
                                                       expected_m, mag)
-        dn_two = fso.gemm.linear_mxfp8_grouped_masked(h_two, w2_fp8, sh_two, sw2, masked_m,
+        dn_two = fso.compat.linear_mxfp8_grouped_masked(h_two, w2_fp8, sh_two, sw2, masked_m,
                                                       expected_m, mag)
         torch.cuda.synchronize()
         sw2_b = _decode_scales_grouped(sw2, hidden, inter)
@@ -725,9 +725,9 @@ def test_fused_interleave_bit_exact(fam: str) -> None:
     # A handful of experts is enough: the property is per row.
     Gs = 4
     w13 = torch.randn(Gs, 2 * inter, hidden, dtype=torch.bfloat16, device="cuda") / (hidden ** 0.5)
-    w_stacked, s_stacked = fso.gemm.quantize_moe_weights_1x32_fp8(w13)
-    w_direct, s_direct = fso.gemm.quantize_moe_weights_1x32_fp8(w13, w13_interleave=True)
-    w_perm, s_perm = fso.gemm.interleave_w13_fp8(w_stacked, s_stacked)
+    w_stacked, s_stacked = fso.compat.quantize_moe_weights_1x32_fp8(w13)
+    w_direct, s_direct = fso.compat.quantize_moe_weights_1x32_fp8(w13, w13_interleave=True)
+    w_perm, s_perm = fso.compat.interleave_w13_fp8(w_stacked, s_stacked)
     torch.cuda.synchronize()
     assert torch.equal(w_direct.view(torch.uint8), w_perm.view(torch.uint8)), \
         f"interleave {fam}: fp8 bytes differ between quantise-then-permute and permute-then-quantise"
@@ -761,12 +761,12 @@ def test_fused_pairwise_kernel(fam: str, M: int = 64) -> None:
     gu_stack[..., :inter] = gu_inter[..., 0::2]
     gu_stack[..., inter:] = gu_inter[..., 1::2]
 
-    h_pair, s_pair = fso.gemm.silu_chunk_mul_quantize_1x32_grouped_fp8(
+    h_pair, s_pair = fso.compat.silu_chunk_mul_quantize_1x32_grouped_fp8(
         gu_inter, slot_i32, pairwise=True)
-    h_old, s_old = fso.gemm.silu_chunk_mul_quantize_1x32_grouped_fp8(gu_stack, slot_i32)
+    h_old, s_old = fso.compat.silu_chunk_mul_quantize_1x32_grouped_fp8(gu_stack, slot_i32)
     # Negative control: the old kernel on the interleaved tensor pairs
     # gate_{2i} with gate_{2i+I}, which is a different function entirely.
-    h_wrong, s_wrong = fso.gemm.silu_chunk_mul_quantize_1x32_grouped_fp8(gu_inter, slot_i32)
+    h_wrong, s_wrong = fso.compat.silu_chunk_mul_quantize_1x32_grouped_fp8(gu_inter, slot_i32)
     torch.cuda.synchronize()
 
     live = _live_groups(masked_m)
@@ -809,9 +809,9 @@ def moe_layer_fso_fused(hidden, w13i_fp8, sw13i, w2_fp8, sw2, topk_ids, topk_w,
     # with `fused_swiglu=True` (run b300_round3_20260922/M-A3: the fused slot
     # kernel stops one epilogue chunk short of the plain kernel's tile).
     want_slots = (
-        fso.gemm.mxfp8_grouped_slot_possible(m_cap, inter2, hidden_dim, G, max_active_groups,
+        fso.compat.mxfp8_grouped_slot_possible(m_cap, inter2, hidden_dim, G, max_active_groups,
                                              fused_swiglu=True)
-        or fso.gemm.mxfp8_grouped_slot_possible(m_cap, hidden_dim, inter, G, max_active_groups))
+        or fso.compat.mxfp8_grouped_slot_possible(m_cap, hidden_dim, inter, G, max_active_groups))
     # The pointer-array route's counterpart (run b300_round3_20260922/M-A4):
     # wherever the cascade serves a GEMM, the routing kernel also emits that
     # GEMM's per-group (rows, N, K) triples and the GEMM launches without its
@@ -819,11 +819,11 @@ def moe_layer_fso_fused(hidden, w13i_fp8, sw13i, w2_fp8, sw2, topk_ids, topk_w,
     # with the same kernel flag, so that per GEMM exactly one of the two is
     # requested.
     want_ps = [
-        fso.gemm.mxfp8_grouped_problem_shapes_consumed(m_cap, inter2, hidden_dim, G, max_active_groups,
+        fso.compat.mxfp8_grouped_problem_shapes_consumed(m_cap, inter2, hidden_dim, G, max_active_groups,
                                                        fused_swiglu=True),
-        fso.gemm.mxfp8_grouped_problem_shapes_consumed(m_cap, hidden_dim, inter, G, max_active_groups)]
+        fso.compat.mxfp8_grouped_problem_shapes_consumed(m_cap, hidden_dim, inter, G, max_active_groups)]
     ps_for = [nk for nk, want in zip([(inter2, hidden_dim), (hidden_dim, inter)], want_ps) if want]
-    routing = fso.gemm.moe_build_routing(topk_ids, G, m_cap, with_slots=want_slots,
+    routing = fso.compat.moe_build_routing(topk_ids, G, m_cap, with_slots=want_slots,
                                          problem_shapes_for=ps_for or None)
     masked_m, _row_map, slot_of_flat = routing[:3]
     slot_to_expert = routing[3] if want_slots else None
@@ -831,12 +831,12 @@ def moe_layer_fso_fused(hidden, w13i_fp8, sw13i, w2_fp8, sw2, topk_ids, topk_w,
     ps1 = ps.pop(0) if want_ps[0] else None
     ps2 = ps.pop(0) if want_ps[1] else None
     topk = topk_ids.shape[1]
-    hq, sh = fso.gemm.quantize_1x32_grouped_gather_fp8(hidden, slot_of_flat, topk, G, m_cap)
-    dq, sd = fso.gemm.linear_mxfp8_grouped_masked_swiglu(
+    hq, sh = fso.compat.quantize_1x32_grouped_gather_fp8(hidden, slot_of_flat, topk, G, m_cap)
+    dq, sd = fso.compat.linear_mxfp8_grouped_masked_swiglu(
         hq, w13i_fp8, sh, sw13i, masked_m, expected_m, max_active_groups, slot_to_expert, ps1)
-    dn = fso.gemm.linear_mxfp8_grouped_masked(dq, w2_fp8, sd, sw2, masked_m, expected_m,
+    dn = fso.compat.linear_mxfp8_grouped_masked(dq, w2_fp8, sd, sw2, masked_m, expected_m,
                                               max_active_groups, slot_to_expert, ps2)
-    out.copy_(fso.gemm.moe_combine(dn, slot_of_flat, topk_w))
+    out.copy_(fso.compat.moe_combine(dn, slot_of_flat, topk_w))
     return out
 
 
@@ -852,8 +852,8 @@ def test_fused_layer_graph(M: int, fam: str = "B") -> None:
     x = torch.randn(M, hidden, dtype=torch.bfloat16, device="cuda") * 0.1
     w13 = torch.randn(G, 2 * inter, hidden, dtype=torch.bfloat16, device="cuda") / (hidden ** 0.5)
     w2 = torch.randn(G, hidden, inter, dtype=torch.bfloat16, device="cuda") / (inter ** 0.5)
-    w13i_fp8, sw13i = fso.gemm.quantize_moe_weights_1x32_fp8(w13, w13_interleave=True)
-    w2_fp8, sw2 = fso.gemm.quantize_moe_weights_1x32_fp8(w2)
+    w13i_fp8, sw13i = fso.compat.quantize_moe_weights_1x32_fp8(w13, w13_interleave=True)
+    w2_fp8, sw2 = fso.compat.quantize_moe_weights_1x32_fp8(w2)
 
     topk_ids, topk_w, _, _, _ = build_routing(M, G, topk, m_cap, seed=M * 7 + 31)
     out = torch.empty(M, hidden, device="cuda", dtype=torch.bfloat16)
@@ -907,9 +907,9 @@ def test_fused_route_helper() -> None:
     knob = os.environ.get("FSO_FC1_FUSED")
     # m_cap = 4 with a real slot bound is inside the slot route's band; m_cap =
     # 1024 is far outside it (the slot kernel's token tile is 64 wide).
-    decode = fso.gemm.mxfp8_grouped_swiglu_fused_route(4, n_w, hidden, G, min(1 * topk, G))
-    prefill = fso.gemm.mxfp8_grouped_swiglu_fused_route(1024, n_w, hidden, G, G)
-    no_bound = fso.gemm.mxfp8_grouped_swiglu_fused_route(4, n_w, hidden, G, 0)
+    decode = fso.compat.mxfp8_grouped_swiglu_fused_route(4, n_w, hidden, G, min(1 * topk, G))
+    prefill = fso.compat.mxfp8_grouped_swiglu_fused_route(1024, n_w, hidden, G, G)
+    no_bound = fso.compat.mxfp8_grouped_swiglu_fused_route(4, n_w, hidden, G, 0)
     if knob == "0":
         assert not decode and not prefill and not no_bound, \
             f"FSO_FC1_FUSED=0 still routed to the fused FC1: {decode} {prefill} {no_bound}"
@@ -936,7 +936,7 @@ def test_fused_route_helper() -> None:
     # Independent of FSO_FC1_FUSED; only meaningful with the slot knob unset.
     if os.environ.get("FSO_GROUPED_SLOT") is None:
         sms = torch.cuda.get_device_properties(0).multi_processor_count
-        q = fso.gemm.mxfp8_grouped_slot_possible
+        q = fso.compat.mxfp8_grouped_slot_possible
         S = G                                   # every expert can hold a row
         fc1_ok = S * ((n_w + 127) // 128) <= 14 * sms
         fc2_ok = S * ((hidden + 127) // 128) <= 14 * sms
@@ -977,17 +977,17 @@ def test_layer_route_consistency() -> None:
     fc1_off = os.environ.get("FSO_FC1_FUSED") == "0"
     for fam, (G, topk, hidden, inter) in FUSED_FAMILIES.items():
         n_w = 2 * inter
-        avail = fso.gemm.mxfp8_grouped_swiglu_available(n_w, hidden)
+        avail = fso.compat.mxfp8_grouped_swiglu_available(n_w, hidden)
         bands = []
         for M in grid:
             m_cap = (M + 3) // 4 * 4
             mag = min(M * topk, G)
-            fc1_fused = avail and fso.gemm.mxfp8_grouped_swiglu_fused_route(m_cap, n_w, hidden, G, mag)
+            fc1_fused = avail and fso.compat.mxfp8_grouped_swiglu_fused_route(m_cap, n_w, hidden, G, mag)
             per_gemm = []
             for name, (N, K, fused) in (("FC1", (n_w, hidden, bool(fc1_fused))),
                                         ("FC2", (hidden, inter, False))):
-                slot = fso.gemm.mxfp8_grouped_slot_possible(m_cap, N, K, G, mag, fused_swiglu=fused)
-                ps = fso.gemm.mxfp8_grouped_problem_shapes_consumed(m_cap, N, K, G, mag,
+                slot = fso.compat.mxfp8_grouped_slot_possible(m_cap, N, K, G, mag, fused_swiglu=fused)
+                ps = fso.compat.mxfp8_grouped_problem_shapes_consumed(m_cap, N, K, G, mag,
                                                                     fused_swiglu=fused)
                 assert slot != ps, (
                     f"fam {fam} M={M} {name} (N={N}, K={K}, fused_swiglu={fused}): slot_possible={slot} "
@@ -1111,7 +1111,7 @@ def test_problem_shapes_contract(M: int, fam: str) -> None:
     topk_ids, _, _, _, _ = build_routing(M, G, topk, m_cap, seed=M * 13 + 7)
     pairs = [(2 * inter, hidden), (hidden, inter)]
 
-    out = fso.gemm.moe_build_routing(topk_ids, G, m_cap, with_slots=True, problem_shapes_for=pairs)
+    out = fso.compat.moe_build_routing(topk_ids, G, m_cap, with_slots=True, problem_shapes_for=pairs)
     assert len(out) == 5, f"problem_shapes_for + with_slots must return 5 items, got {len(out)}"
     masked_m, row_map, slot_of_flat, slot_to_expert, ps = out
     assert isinstance(ps, list) and len(ps) == len(pairs)
@@ -1125,12 +1125,12 @@ def test_problem_shapes_contract(M: int, fam: str) -> None:
 
     # The request changes nothing else: same counts and same slot list as the
     # call without it, and the default call keeps its arity.
-    ref = fso.gemm.moe_build_routing(topk_ids, G, m_cap, with_slots=True)
+    ref = fso.compat.moe_build_routing(topk_ids, G, m_cap, with_slots=True)
     assert len(ref) == 4
     assert torch.equal(ref[0], masked_m) and torch.equal(ref[3], slot_to_expert)
-    only = fso.gemm.moe_build_routing(topk_ids, G, m_cap, problem_shapes_for=pairs[:1])
+    only = fso.compat.moe_build_routing(topk_ids, G, m_cap, problem_shapes_for=pairs[:1])
     assert len(only) == 4 and len(only[3]) == 1 and torch.equal(only[3][0], ps[0])
-    assert len(fso.gemm.moe_build_routing(topk_ids, G, m_cap)) == 3
+    assert len(fso.compat.moe_build_routing(topk_ids, G, m_cap)) == 3
     kernel = "multi-CTA" if (torch.cuda.get_device_capability()[0] == 10 and M * topk >= 4096) else "single-CTA"
     print(f"  ps-contract  M={M:>5} fam={fam}  {kernel} routing kernel  OK")
 
@@ -1141,9 +1141,9 @@ def _ps_inputs(M: int, G: int, topk: int, N: int, K: int, seed: int):
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") * 0.1
     w = torch.randn(G, N, K, dtype=torch.bfloat16, device="cuda") / (K ** 0.5)
     topk_ids, _, _, _, _ = build_routing(M, G, topk, m_cap, seed=seed + 1)
-    masked_m, _rm, slot_of_flat, ps = fso.gemm.moe_build_routing(
+    masked_m, _rm, slot_of_flat, ps = fso.compat.moe_build_routing(
         topk_ids, G, m_cap, problem_shapes_for=[(N, K)])
-    a_fp8, sa = fso.gemm.quantize_1x32_grouped_gather_fp8(x, slot_of_flat, topk, G, m_cap)
+    a_fp8, sa = fso.compat.quantize_1x32_grouped_gather_fp8(x, slot_of_flat, topk, G, m_cap)
     expected_m = max(1, (M * topk + G - 1) // G)
     return m_cap, masked_m, ps[0], a_fp8, sa, w, expected_m, min(M * topk, G)
 
@@ -1173,11 +1173,11 @@ def test_problem_shapes_bit_exact(M: int, G: int, topk: int, N: int, K: int) -> 
     """Plain grouped GEMM: the launch with routing-supplied shapes must equal
     the prep-kernel launch bit for bit on every defined row."""
     m_cap, masked_m, ps, a_fp8, sa, w, expected_m, mag = _ps_inputs(M, G, topk, N, K, seed=M * 101 + N)
-    w_fp8, sw = fso.gemm.quantize_moe_weights_1x32_fp8(w)
-    assert fso.gemm.mxfp8_grouped_problem_shapes_consumed(m_cap, N, K, G, mag), \
+    w_fp8, sw = fso.compat.quantize_moe_weights_1x32_fp8(w)
+    assert fso.compat.mxfp8_grouped_problem_shapes_consumed(m_cap, N, K, G, mag), \
         "this cell must sit on the pointer-array route (m_cap >= the slot tile)"
-    y_prep = fso.gemm.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, expected_m, mag)
-    y_ps = fso.gemm.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, expected_m, mag, None, ps)
+    y_prep = fso.compat.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, expected_m, mag)
+    y_ps = fso.compat.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, expected_m, mag, None, ps)
     torch.cuda.synchronize()
     assert torch.equal(_defined_rows(y_ps, masked_m), _defined_rows(y_prep, masked_m)), \
         f"problem_shapes launch != prep launch at M={M} G={G} N={N} K={K} (m_cap={m_cap})"
@@ -1189,15 +1189,15 @@ def test_problem_shapes_bit_exact_fused(M: int, fam: str) -> None:
     G, topk, hidden, inter = PS_FAMILIES[fam]
     N, K = 2 * inter, hidden
     m_cap, masked_m, ps, a_fp8, sa, w13, expected_m, mag = _ps_inputs(M, G, topk, N, K, seed=M * 103 + 5)
-    w13i_fp8, sw13i = fso.gemm.quantize_moe_weights_1x32_fp8(w13, w13_interleave=True)
+    w13i_fp8, sw13i = fso.compat.quantize_moe_weights_1x32_fp8(w13, w13_interleave=True)
     # Asked with the fused kernel's flag: the fused-SwiGLU slot kernel stops at
     # one 32-column epilogue chunk, so from m_cap = 36 the fused FC1 is on the
     # pointer-array route and reads the shapes (run b300_round3_20260922/M-A3).
-    assert fso.gemm.mxfp8_grouped_problem_shapes_consumed(m_cap, N, K, G, mag, fused_swiglu=True), \
+    assert fso.compat.mxfp8_grouped_problem_shapes_consumed(m_cap, N, K, G, mag, fused_swiglu=True), \
         "this fused FC1 cell must sit on the pointer-array route (m_cap past one epilogue chunk)"
-    h_prep, sh_prep = fso.gemm.linear_mxfp8_grouped_masked_swiglu(
+    h_prep, sh_prep = fso.compat.linear_mxfp8_grouped_masked_swiglu(
         a_fp8, w13i_fp8, sa, sw13i, masked_m, expected_m, mag)
-    h_ps, sh_ps = fso.gemm.linear_mxfp8_grouped_masked_swiglu(
+    h_ps, sh_ps = fso.compat.linear_mxfp8_grouped_masked_swiglu(
         a_fp8, w13i_fp8, sa, sw13i, masked_m, expected_m, mag, None, ps)
     torch.cuda.synchronize()
     assert torch.equal(_defined_rows(h_ps.view(torch.uint8), masked_m),
@@ -1225,8 +1225,8 @@ def test_problem_shapes_pinning(M: int = 64, fam: str = "B") -> None:
     x = torch.randn(M, hidden, dtype=torch.bfloat16, device="cuda") * 0.1
     w13 = torch.randn(G, 2 * inter, hidden, dtype=torch.bfloat16, device="cuda") / (hidden ** 0.5)
     w2 = torch.randn(G, hidden, inter, dtype=torch.bfloat16, device="cuda") / (inter ** 0.5)
-    w13i_fp8, sw13i = fso.gemm.quantize_moe_weights_1x32_fp8(w13, w13_interleave=True)
-    w2_fp8, sw2 = fso.gemm.quantize_moe_weights_1x32_fp8(w2)
+    w13i_fp8, sw13i = fso.compat.quantize_moe_weights_1x32_fp8(w13, w13_interleave=True)
+    w2_fp8, sw2 = fso.compat.quantize_moe_weights_1x32_fp8(w2)
     topk_ids, topk_w, _, _, _ = build_routing(M, G, topk, m_cap, seed=M * 7 + 55)
     out = torch.empty(M, hidden, device="cuda", dtype=torch.bfloat16)
 
@@ -1261,12 +1261,12 @@ def test_problem_shapes_pinning(M: int = 64, fam: str = "B") -> None:
     # another M so its blocks are new keys too, then the first graph again.
     keep = []
     ids_c = build_routing(M, G, topk, m_cap, seed=M * 7 + 57)[0]
-    masked_c, _rm_c, sof_c, ps_c = fso.gemm.moe_build_routing(
+    masked_c, _rm_c, sof_c, ps_c = fso.compat.moe_build_routing(
         ids_c, G, m_cap, problem_shapes_for=[(hidden, inter)])
     for i in range(96):
         xi = torch.randn(M, inter, dtype=torch.bfloat16, device="cuda") * 0.1
-        a_i, sa_i = fso.gemm.quantize_1x32_grouped_gather_fp8(xi, sof_c, topk, G, m_cap)
-        fso.gemm.linear_mxfp8_grouped_masked(a_i, w2_fp8, sa_i, sw2, masked_c, expected_m, mag, None, ps_c[0])
+        a_i, sa_i = fso.compat.quantize_1x32_grouped_gather_fp8(xi, sof_c, topk, G, m_cap)
+        fso.compat.linear_mxfp8_grouped_masked(a_i, w2_fp8, sa_i, sw2, masked_c, expected_m, mag, None, ps_c[0])
         keep.append((a_i, sa_i))
     M2 = 2 * M
     m_cap2 = (M2 + 3) // 4 * 4
@@ -1303,17 +1303,17 @@ def test_problem_shapes_validation() -> None:
     G, topk, hidden, inter = PS_FAMILIES["B"]
     M, N, K = 64, hidden, inter
     m_cap, masked_m, ps, a_fp8, sa, w, expected_m, mag = _ps_inputs(M, G, topk, N, K, seed=4242)
-    w_fp8, sw = fso.gemm.quantize_moe_weights_1x32_fp8(w)
+    w_fp8, sw = fso.compat.quantize_moe_weights_1x32_fp8(w)
     bad = [ps[:, :2].contiguous(), ps.to(torch.int64), ps[:G // 2].contiguous(), ps.t().contiguous()]
     for i, b in enumerate(bad):
         try:
-            fso.gemm.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, expected_m, mag, None, b)
+            fso.compat.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, expected_m, mag, None, b)
         except RuntimeError as e:
             assert "problem_shapes" in str(e), f"bad tensor {i}: unexpected message {e}"
         else:
             raise AssertionError(f"bad problem_shapes tensor {i} (shape {tuple(b.shape)}, {b.dtype}) was accepted")
     try:
-        fso.gemm.moe_build_routing(a_fp8.new_zeros((4, 2), dtype=torch.int32), G, m_cap,
+        fso.compat.moe_build_routing(a_fp8.new_zeros((4, 2), dtype=torch.int32), G, m_cap,
                                    problem_shapes_for=[(1, 1)] * 5)
     except RuntimeError as e:
         assert "at most 4" in str(e), str(e)
@@ -1321,16 +1321,16 @@ def test_problem_shapes_validation() -> None:
         raise AssertionError("five problem-shape pairs were accepted")
     # The content check: a triple built for the OTHER GEMM of the layer.
     other_ids = build_routing(M, G, topk, m_cap, seed=4243)[0]
-    _, _, _, other = fso.gemm.moe_build_routing(other_ids, G, m_cap, problem_shapes_for=[(2 * inter, hidden)])
+    _, _, _, other = fso.compat.moe_build_routing(other_ids, G, m_cap, problem_shapes_for=[(2 * inter, hidden)])
     os.environ["FSO_CHECK_PROBLEM_SHAPES"] = "1"
     try:
         try:
-            fso.gemm.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, expected_m, mag, None, other[0])
+            fso.compat.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, expected_m, mag, None, other[0])
         except RuntimeError as e:
             assert "built for another GEMM" in str(e), str(e)
         else:
             raise AssertionError("FSO_CHECK_PROBLEM_SHAPES=1 accepted the other GEMM's triples")
-        fso.gemm.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, expected_m, mag, None, ps)
+        fso.compat.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, expected_m, mag, None, ps)
     finally:
         del os.environ["FSO_CHECK_PROBLEM_SHAPES"]
     torch.cuda.synchronize()
@@ -1352,16 +1352,16 @@ def test_problem_shapes_arena_full() -> None:
     torch.manual_seed(77)
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") * 0.1
     w = torch.randn(G, N, K, dtype=torch.bfloat16, device="cuda") / (K ** 0.5)
-    w_fp8, sw = fso.gemm.quantize_moe_weights_1x32_fp8(w)
+    w_fp8, sw = fso.compat.quantize_moe_weights_1x32_fp8(w)
     topk_ids, _, _, _, _ = build_routing(M, G, topk, m_cap, seed=78)
     mag = min(M * topk, G)
 
     def call():
-        masked_m, _rm, sof, ps = fso.gemm.moe_build_routing(topk_ids, G, m_cap, problem_shapes_for=[(N, K)])
-        a_fp8, sa = fso.gemm.quantize_1x32_grouped_gather_fp8(x, sof, topk, G, m_cap)
-        return fso.gemm.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, 1, mag, None, ps[0])
+        masked_m, _rm, sof, ps = fso.compat.moe_build_routing(topk_ids, G, m_cap, problem_shapes_for=[(N, K)])
+        a_fp8, sa = fso.compat.quantize_1x32_grouped_gather_fp8(x, sof, topk, G, m_cap)
+        return fso.compat.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, 1, mag, None, ps[0])
 
-    assert fso.gemm.mxfp8_grouped_problem_shapes_consumed(m_cap, N, K, G, mag)
+    assert fso.compat.mxfp8_grouped_problem_shapes_consumed(m_cap, N, K, G, mag)
     call()
     torch.cuda.synchronize()
     s = torch.cuda.Stream()
@@ -1469,7 +1469,7 @@ def slot_weights(G: int, N: int, K: int):
     if key not in _SLOT_W_CACHE:
         torch.manual_seed(N * 17 + K)
         w = torch.randn(G, N, K, dtype=torch.bfloat16, device="cuda") / (K ** 0.5)
-        w_fp8, sw = fso.gemm.quantize_moe_weights_1x32_fp8(w)
+        w_fp8, sw = fso.compat.quantize_moe_weights_1x32_fp8(w)
         sw_f = _decode_scales_grouped(sw, N, K).repeat_interleave(32, dim=2)
         w_deq = (w_fp8.float().cpu().double() * sw_f).float()
         del sw_f
@@ -1506,7 +1506,7 @@ def slot_cell(shape: str, M: int, seed_off: int = 0, hot: bool = False,
     masked_m, row_map, slot_of_flat = routing_index_tensors(topk_ids, G, m_cap)
 
     _, w_fp8, sw, w_deq = slot_weights(G, N, K)
-    a_fp8, sa = fso.gemm.quantize_1x32_grouped_gather_fp8(x, slot_of_flat.int(), topk, G, m_cap)
+    a_fp8, sa = fso.compat.quantize_1x32_grouped_gather_fp8(x, slot_of_flat.int(), topk, G, m_cap)
     expected_m = max(1, (M * topk + G - 1) // G)
     max_active_groups = min(M * topk, G)
     # `use_list` hands the route the packed active-expert list the routing op
@@ -1515,9 +1515,9 @@ def slot_cell(shape: str, M: int, seed_off: int = 0, hot: bool = False,
     # slot_case_list_bit_identity checks.
     slot_to_expert = None
     if use_list:
-        _mm2, _rm2, _sof2, slot_to_expert = fso.gemm.moe_build_routing(
+        _mm2, _rm2, _sof2, slot_to_expert = fso.compat.moe_build_routing(
             topk_ids, G, m_cap, with_slots=True)
-    y = fso.gemm.linear_mxfp8_grouped_masked(
+    y = fso.compat.linear_mxfp8_grouped_masked(
         a_fp8, w_fp8, sa, sw, masked_m, expected_m, max_active_groups, slot_to_expert)
     torch.cuda.synchronize()
 
@@ -1674,9 +1674,9 @@ def slot_case_guard_bound() -> None:
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") * 0.1
     _, _, masked_m, _, slot_of_flat = build_routing(M, G, topk, M, seed=5)
     _, w_fp8, sw, _ = slot_weights(G, N, K)
-    a_fp8, sa = fso.gemm.quantize_1x32_grouped_gather_fp8(x, slot_of_flat.int(), topk, G, M)
+    a_fp8, sa = fso.compat.quantize_1x32_grouped_gather_fp8(x, slot_of_flat.int(), topk, G, M)
     try:
-        fso.gemm.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, 1)
+        fso.compat.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, 1)
     except RuntimeError as e:
         assert "max_active_groups" in str(e), f"wrong refusal message: {e}"
         print("  slot-guard  max_active_groups=0 forced -> refused  OK")
@@ -1703,13 +1703,13 @@ def slot_case_route_pick(mag: int) -> None:
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") * 0.1
     _, _, masked_m, _, slot_of_flat = build_routing(M, G, topk, m_cap, seed=M * 7 + 3)
     _, w_fp8, sw, _ = slot_weights(G, N, K)
-    a_fp8, sa = fso.gemm.quantize_1x32_grouped_gather_fp8(x, slot_of_flat.int(), topk, G, m_cap)
+    a_fp8, sa = fso.compat.quantize_1x32_grouped_gather_fp8(x, slot_of_flat.int(), topk, G, m_cap)
     torch.cuda.synchronize()
     st = torch.cuda.Stream()
     st.wait_stream(torch.cuda.current_stream())
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g, stream=st):
-        fso.gemm.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, 1, mag)
+        fso.compat.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, 1, mag)
     raise AssertionError("a pool allocated during capture instead of refusing")
 
 
@@ -1724,10 +1724,10 @@ def slot_case_route_off(ref_path: str, write_ref: bool) -> None:
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") * 0.1
     _, _, masked_m, _, slot_of_flat = build_routing(M, G, topk, m_cap, seed=M * 7 + 3)
     _, w_fp8, sw, _ = slot_weights(G, N, K)
-    a_fp8, sa = fso.gemm.quantize_1x32_grouped_gather_fp8(x, slot_of_flat.int(), topk, G, m_cap)
+    a_fp8, sa = fso.compat.quantize_1x32_grouped_gather_fp8(x, slot_of_flat.int(), topk, G, m_cap)
 
     y_nobound = slot_valid_rows(
-        fso.gemm.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, 1, 0), masked_m)
+        fso.compat.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, 1, 0), masked_m)
     torch.cuda.synchronize()
     if write_ref:
         torch.save(y_nobound.cpu(), ref_path)
@@ -1772,8 +1772,8 @@ def slot_case_layer_graph_hot() -> None:
                           device="cuda") / (hidden_dim ** 0.5)
         w2 = torch.randn(G, hidden_dim, inter, dtype=torch.bfloat16,
                          device="cuda") / (inter ** 0.5)
-        w13_fp8, sw13 = fso.gemm.quantize_moe_weights_1x32_fp8(w13)
-        w2_fp8, sw2 = fso.gemm.quantize_moe_weights_1x32_fp8(w2)
+        w13_fp8, sw13 = fso.compat.quantize_moe_weights_1x32_fp8(w13)
+        w2_fp8, sw2 = fso.compat.quantize_moe_weights_1x32_fp8(w2)
         topk_ids, topk_w, _, _, _ = build_routing(M, G, topk, m_cap, seed=M * 7 + 9)
         out = torch.empty(M, hidden_dim, device="cuda", dtype=torch.bfloat16)
 
@@ -1803,7 +1803,7 @@ def slot_case_layer_graph_hot() -> None:
         w_hot = torch.softmax(torch.randn(M, topk, device="cuda", dtype=torch.float32), dim=-1)
         topk_ids.copy_(ids_hot)
         topk_w.copy_(w_hot)
-        mm_hot, _, _ = fso.gemm.moe_build_routing(topk_ids, G, m_cap)
+        mm_hot, _, _ = fso.compat.moe_build_routing(topk_ids, G, m_cap)
         torch.cuda.synchronize()
         assert int(mm_hot[0]) == M, \
             f"layer hot draw M={M}: expert 0 holds {int(mm_hot[0])} rows, expected {M}"
@@ -1907,10 +1907,10 @@ def slot_case_big_grid_graph() -> None:
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") * 0.1
     ids = hot_expert_ids(M, G, topk, hot_expert=0, cold_expert=G - 1, seed=99)
     masked_m, _, slot_of_flat = routing_index_tensors(ids, G, m_cap)
-    a_fp8, sa = fso.gemm.quantize_1x32_grouped_gather_fp8(x, slot_of_flat.int(), topk, G, m_cap)
+    a_fp8, sa = fso.compat.quantize_1x32_grouped_gather_fp8(x, slot_of_flat.int(), topk, G, m_cap)
 
     def run():
-        return fso.gemm.linear_mxfp8_grouped_masked(
+        return fso.compat.linear_mxfp8_grouped_masked(
             a_fp8, w_fp8, sa, sw, masked_m, expected_m, mag)
 
     out = run()                                   # eager: pools and workspace
@@ -1928,7 +1928,7 @@ def slot_case_big_grid_graph() -> None:
 
     ids_tail = tail_expert_ids(M, G, topk, SLOT_TAIL_HOT, seed=7)
     mm_tail, _, slot_tail = routing_index_tensors(ids_tail, G, m_cap)
-    a_tail, sa_tail = fso.gemm.quantize_1x32_grouped_gather_fp8(
+    a_tail, sa_tail = fso.compat.quantize_1x32_grouped_gather_fp8(
         x, slot_tail.int(), topk, G, m_cap)
     # In place, so the graph's recorded pointers stay valid.
     masked_m.copy_(mm_tail)
@@ -1992,7 +1992,7 @@ def slot_case_list_contract() -> None:
                     g = torch.Generator(device="cpu").manual_seed(M * 7 + 3 + G)
                     ids = torch.stack([torch.randperm(G, generator=g)[:topk]
                                        for _ in range(M)]).to("cuda", torch.int32)
-                mm, rm, sof, se = fso.gemm.moe_build_routing(ids, G, m_cap, with_slots=True)
+                mm, rm, sof, se = fso.compat.moe_build_routing(ids, G, m_cap, with_slots=True)
                 ref = slot_list_reference(ids, G)
                 assert se.dtype == torch.int32 and se.shape == (G,), \
                     f"slot_to_expert must be int32 [G]; got {se.dtype} {tuple(se.shape)}"
@@ -2006,7 +2006,7 @@ def slot_case_list_contract() -> None:
                 print(f"  slot-list   G={G:>3} M={M:>4} {kernel:<10} draw={draw:<6} "
                       f"active={n_active:>3}  OK")
             # with_slots=False must still return exactly three tensors.
-            out = fso.gemm.moe_build_routing(ids, G, m_cap)
+            out = fso.compat.moe_build_routing(ids, G, m_cap)
             assert len(out) == 3, f"moe_build_routing default arity changed: {len(out)}"
 
 
@@ -2044,10 +2044,10 @@ def slot_case_list_validation() -> None:
     g = torch.Generator(device="cpu").manual_seed(5)
     ids = torch.stack([torch.randperm(G, generator=g)[:topk] for _ in range(M)]
                       ).to("cuda", torch.int32)
-    mm, rm, sof, se = fso.gemm.moe_build_routing(ids, G, m_cap, with_slots=True)
+    mm, rm, sof, se = fso.compat.moe_build_routing(ids, G, m_cap, with_slots=True)
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") * 0.1
     _, w_fp8, sw, _ = slot_weights(G, N, K)
-    a_fp8, sa = fso.gemm.quantize_1x32_grouped_gather_fp8(x, sof.int(), topk, G, m_cap)
+    a_fp8, sa = fso.compat.quantize_1x32_grouped_gather_fp8(x, sof.int(), topk, G, m_cap)
     em, mag = 1, min(M * topk, G)
 
     bad = {
@@ -2058,7 +2058,7 @@ def slot_case_list_validation() -> None:
     }
     for why, t in bad.items():
         try:
-            fso.gemm.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, mm, em, mag, t)
+            fso.compat.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, mm, em, mag, t)
         except (RuntimeError, ValueError) as e:
             assert "slot_to_expert" in str(e), f"{why}: unhelpful message {e}"
             print(f"  slot-list-bad {why:<16} refused  OK")

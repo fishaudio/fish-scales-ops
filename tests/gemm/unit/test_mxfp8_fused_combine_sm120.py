@@ -56,20 +56,20 @@ def main():
         ids = torch.rand(M, G, device=dev, generator=g).topk(topk, dim=1).indices.to(torch.int32)
         wts = torch.softmax(torch.rand(M, topk, device=dev, generator=g), dim=1).float()
         w2 = (torch.randn(G, H, I, device=dev, generator=g) * 0.02).to(torch.bfloat16)
-        w2f, sw2 = fso.gemm.quantize_moe_weights_1x32_fp8(w2)
+        w2f, sw2 = fso.compat.quantize_moe_weights_1x32_fp8(w2)
         del w2
         m_cap = (M + 3) // 4 * 4
         em = max(1, (M * topk + G - 1) // G)
         masked, row_map, slot, _s, _p, wslot = ops.moe_build_routing(ids, G, m_cap, False, [], wts)
         # A stand-in FC2 activation operand in the masked layout.
         gu = (torch.randn(G, m_cap, 2 * I, device=dev, generator=g) * 0.2).to(torch.bfloat16)
-        dq, sd = fso.gemm.silu_chunk_mul_quantize_1x32_grouped_fp8(gu, slot)
+        dq, sd = fso.compat.silu_chunk_mul_quantize_1x32_grouped_fp8(gu, slot)
         del gu
-        dn = fso.gemm.linear_mxfp8_grouped_masked(dq, w2f, sd, sw2, masked, em)
-        ref = fso.gemm.moe_combine(dn, slot, wts)
+        dn = fso.compat.linear_mxfp8_grouped_masked(dq, w2f, sd, sw2, masked, em)
+        ref = fso.compat.moe_combine(dn, slot, wts)
         del dn
         out = torch.zeros(M, H, device=dev, dtype=torch.bfloat16)
-        got = fso.gemm.linear_mxfp8_grouped_masked_combine(
+        got = fso.compat.linear_mxfp8_grouped_masked_combine(
             dq, w2f, sd, sw2, masked, row_map, wslot, out, em)
         torch.cuda.synchronize()
         c = cos(got, ref)
@@ -80,7 +80,7 @@ def main():
         # 2: accumulate into a pre-filled buffer.
         pre = (torch.randn(M, H, device=dev, dtype=torch.bfloat16, generator=g) * 0.1)
         out2 = pre.clone()
-        fso.gemm.linear_mxfp8_grouped_masked_combine(
+        fso.compat.linear_mxfp8_grouped_masked_combine(
             dq, w2f, sd, sw2, masked, row_map, wslot, out2, em)
         torch.cuda.synchronize()
         c2 = cos(out2, (ref.float() + pre.float()).to(torch.bfloat16))
@@ -88,7 +88,7 @@ def main():
             failures.append(f"G={G} M={M}: accumulate contract broken, cos={c2:.6f}")
         # 4: run-to-run spread (atomics: expected non-zero, reported not asserted).
         out3 = torch.zeros_like(out)
-        fso.gemm.linear_mxfp8_grouped_masked_combine(
+        fso.compat.linear_mxfp8_grouped_masked_combine(
             dq, w2f, sd, sw2, masked, row_map, wslot, out3, em)
         torch.cuda.synchronize()
         spread = float((out3.float() - got.float()).abs().max()) / max(scale, 1e-9)
@@ -107,18 +107,18 @@ def main():
     wts = torch.softmax(torch.rand(M, topk, device=dev, generator=g), dim=1).float()
     w13 = (torch.randn(G, 2 * I, H, device=dev, generator=g) * 0.02).to(torch.bfloat16)
     w2 = (torch.randn(G, H, I, device=dev, generator=g) * 0.02).to(torch.bfloat16)
-    w13f, sw13 = fso.gemm.quantize_moe_weights_1x32_fp8(w13)
-    w2f, sw2 = fso.gemm.quantize_moe_weights_1x32_fp8(w2)
+    w13f, sw13 = fso.compat.quantize_moe_weights_1x32_fp8(w13)
+    w2f, sw2 = fso.compat.quantize_moe_weights_1x32_fp8(w2)
     del w13, w2
     m_cap = (M + 3) // 4 * 4
     em = max(1, (M * topk + G - 1) // G)
     masked, row_map, slot, _s, _p, wslot = ops.moe_build_routing(ids, G, m_cap, False, [], wts)
-    hq, sh = fso.gemm.quantize_1x32_grouped_gather_fp8(hidden, slot, topk, G, m_cap)
-    gu = fso.gemm.linear_mxfp8_grouped_masked(hq, w13f, sh, sw13, masked, em)
-    dq, sd = fso.gemm.silu_chunk_mul_quantize_1x32_grouped_fp8(gu, slot)
+    hq, sh = fso.compat.quantize_1x32_grouped_gather_fp8(hidden, slot, topk, G, m_cap)
+    gu = fso.compat.linear_mxfp8_grouped_masked(hq, w13f, sh, sw13, masked, em)
+    dq, sd = fso.compat.silu_chunk_mul_quantize_1x32_grouped_fp8(gu, slot)
     sentinel = torch.full((M, H), 0.25, device=dev, dtype=torch.bfloat16)
     out = sentinel.clone()
-    fso.gemm.linear_mxfp8_grouped_masked_combine(dq, w2f, sd, sw2, masked, row_map, wslot, out, em)
+    fso.compat.linear_mxfp8_grouped_masked_combine(dq, w2f, sd, sw2, masked, row_map, wslot, out, em)
     torch.cuda.synchronize()
     if not torch.equal(out[M // 2:], sentinel[M // 2:]):
         failures.append("rows whose every routed entry was skipped were written")
@@ -127,7 +127,7 @@ def main():
 
     # 5: the layer gate.
     for M_gate, expect in ((512, False), (4096, True)):
-        engages = fso.gemm.moe_layer_fused_combine_engages_sm120(M_gate, 8, 2048)
+        engages = fso.compat.moe_layer_fused_combine_engages_sm120(M_gate, 8, 2048)
         if engages != expect:
             failures.append(f"gate at M={M_gate}: engages={engages}, expected {expect}")
     g = torch.Generator(device=dev).manual_seed(77)
@@ -135,10 +135,10 @@ def main():
         hid = torch.randn(M_l, H, device=dev, dtype=torch.bfloat16, generator=g)
         idl = torch.rand(M_l, G, device=dev, generator=g).topk(topk, dim=1).indices.to(torch.int32)
         wl = torch.softmax(torch.rand(M_l, topk, device=dev, generator=g), dim=1).float()
-        det = fso.gemm.moe_layer_mxfp8_sm120(hid, w13f, sw13, w2f, sw2, idl, wl)
-        fus = fso.gemm.moe_layer_mxfp8_sm120(hid, w13f, sw13, w2f, sw2, idl, wl, fused_combine=True)
+        det = fso.compat.moe_layer_mxfp8_sm120(hid, w13f, sw13, w2f, sw2, idl, wl)
+        fus = fso.compat.moe_layer_mxfp8_sm120(hid, w13f, sw13, w2f, sw2, idl, wl, fused_combine=True)
         torch.cuda.synchronize()
-        engaged = fso.gemm.moe_layer_fused_combine_engages_sm120(M_l, topk, H)
+        engaged = fso.compat.moe_layer_fused_combine_engages_sm120(M_l, topk, H)
         c = cos(det, fus)
         same = torch.equal(det, fus)
         ok = (same if not engaged else (c > 0.9999 and not same))

@@ -6,9 +6,10 @@
 //   mxfp8_attn_fwd_paged  — SM120 MXFP8 paged-KV prefill / extend (S_q > 1),
 //                           flashinfer-style ragged + paged signature.
 //
-// Both host dispatchers return cudaErrorNotSupported on devices below
-// sm_120; the kernel bodies are __CUDA_ARCH__-guarded to compile as
-// empty stubs under sm_90a.
+// All three host dispatchers return cudaErrorNotSupported on devices below
+// sm_120, which the ops below raise as RuntimeError (the Python wrappers refuse
+// other architectures before launching); the kernel bodies are
+// __CUDA_ARCH__-guarded to compile as empty stubs for the other targets.
 //
 // The single PYBIND11_MODULE for the combined extension lives here. The
 // GEMM bindings register their own TORCH_LIBRARY_FRAGMENT in
@@ -121,17 +122,18 @@ at::Tensor mxfp8_attn_fwd(at::Tensor q_fp8, at::Tensor q_scales,
 }
 
 // mxfp8_decode_paged: paged-KV decode forward.
-//   q_fp8        : [B, 1, H_q, D] FP8 — single decode token per batch entry
-//   q_scales     : [B, 1, H_q, D/32] UE8M0
+//   q_fp8        : [B, H_q, D] FP8 — single decode token per batch entry
+//   q_scales     : [B, H_kv, D/32] UE8M0 — shared by the Q heads of a KV-head group
 //   k_pool       : [P, page_size, H_kv, D] FP8           (P = total pages in the pool)
-//   k_pool_scales: [P, page_size, H_kv, D/32] UE8M0
+//   k_chan_scale : [H_kv, D/32] UE8M0 — per KV head and D block, global across
+//                  pages and tokens
 //   v_pool       : [P, D, H_kv, page_size] FP8 (pre-transposed)
 //   v_chan_scale : [H_kv, D] fp32 — per-channel V scale (no per-page layout)
 //   block_table  : [B, max_blocks] int32  per-sequence list of page ids
 //   seq_lens     : [B] int32              actual token counts per sequence
-//   m_partial    : [B, H_q, num_splits] fp32 scratch (re-zeroed per call)
+//   m_partial    : [B, H_q, num_splits] fp32 scratch
 //   l_partial    : [B, H_q, num_splits] fp32 scratch
-//   o_partial    : [B, H_q, num_splits, D] bf16 scratch
+//   o_partial    : [B, H_q, num_splits, D] fp32 scratch
 //   sync_counter : [B, H_q] int32          inter-split sync flags (callers
 //                                          managing kv_split_k must increment
 //                                          target_counter accordingly)
@@ -215,11 +217,12 @@ at::Tensor mxfp8_decode_paged(
 
 // mxfp8_attn_fwd_paged: paged-KV prefill / extend forward.
 //   q_fp8                  : [total_q_tokens, H_q, D] FP8
-//   q_scales               : [total_q_tokens / 16, H_q, D/32] UE8M0
+//   q_scales               : [ceil(total_q_tokens / 16), H_q, D/32] UE8M0
 //   k_pool                 : [num_pages, page_size, H_kv, D] FP8
-//   k_pool_scales          : [num_pages, H_kv, D/32] UE8M0  (max-pooled across S)
+//   k_chan_scale           : [H_kv, D/32] UE8M0 (per KV head and D block, global
+//                            across pages and tokens)
 //   v_pool                 : [num_pages, D, H_kv, page_size] FP8  (pre-transposed)
-//   v_pool_scales          : [num_pages, page_size/32, H_kv] UE8M0
+//   v_chan_scale           : [H_kv, D] fp32 (per-channel V scale)
 //   qo_indptr              : [B+1] int32  cumulative Q-token counts
 //   paged_kv_indices       : [total_pages_used] int32  flat page-id list
 //   paged_kv_indptr        : [B+1] int32  per-req slice into paged_kv_indices

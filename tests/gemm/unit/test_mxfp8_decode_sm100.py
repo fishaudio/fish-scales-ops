@@ -101,8 +101,8 @@ def _inputs(M: int, N: int, K: int):
     torch.manual_seed(M * 1009 + N * 17 + K)
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") * 0.1
     w = torch.randn(N, K, dtype=torch.bfloat16, device="cuda") / (K ** 0.5)
-    xq, sx = fso.gemm.quantize_1x32_fp8(x)
-    wq, sw = fso.gemm.quantize_1x32_fp8(w)
+    xq, sx = fso.compat.quantize_1x32_fp8(x)
+    wq, sw = fso.compat.quantize_1x32_fp8(w)
     torch.cuda.synchronize()
     return x, w, xq, sx, wq, sw
 
@@ -142,7 +142,7 @@ def test_accuracy() -> None:
                 continue
             assert cfg is not None, \
                 f"{tag} M={M}: the decode row declined a cell it should own"
-            y_new = fso.gemm.linear_mxfp8(xq, wq, sx, sw)
+            y_new = fso.compat.linear_mxfp8(xq, wq, sx, sw)
             y_old, tier = _baseline(xq, sx, wq, sw)
             ref = (x.float() @ w.float().t())
             torch.cuda.synchronize()
@@ -305,7 +305,7 @@ def test_capture() -> None:
             xq, sx = xq0.clone(), sx0.clone()
 
             def call():
-                return fso.gemm.linear_mxfp8(xq, wq, sx, sw)
+                return fso.compat.linear_mxfp8(xq, wq, sx, sw)
 
             for _ in range(5):                      # eager warmup: JIT + pools
                 call()
@@ -347,7 +347,7 @@ def test_capture() -> None:
             # decode loop does, then replay.
             torch.manual_seed(987654 + M)
             x2 = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") * 0.1
-            xq2, sx2 = fso.gemm.quantize_1x32_fp8(x2)
+            xq2, sx2 = fso.compat.quantize_1x32_fp8(x2)
             xq.copy_(xq2)
             sx.copy_(sx2)
             captured.fill_(float("nan"))
@@ -388,7 +388,7 @@ def _assert_inert(label: str) -> None:
             x, w, xq, sx, wq, sw = _inputs(M, N, K)
             y_route = _sm100_dispatch.route(xq, wq, sx, sw)
             y_old, tier = _baseline(xq, sx, wq, sw)
-            y_pub = fso.gemm.linear_mxfp8(xq, wq, sx, sw)
+            y_pub = fso.compat.linear_mxfp8(xq, wq, sx, sw)
             torch.cuda.synchronize()
             if tier == "tier1_cublas_scaled_mm":
                 assert y_route is not None and torch.equal(y_route, y_old), (

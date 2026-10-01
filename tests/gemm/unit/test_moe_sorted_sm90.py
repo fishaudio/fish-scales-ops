@@ -66,7 +66,7 @@ def main():
         topk_ids = torch.stack(
             [torch.randperm(E, device="cuda")[:topk] for _ in range(M)]
         ).to(torch.int32)
-        se, fts, npad = fso.gemm.moe_build_sorted(topk_ids, E, block_m)
+        se, fts, npad = fso.compat.moe_build_sorted(topk_ids, E, block_m)
         p_actual = int(npad.item())
         reference_check(topk_ids.cpu(), E, block_m, se.cpu(), fts.cpu(), p_actual)
         R = M * topk
@@ -81,11 +81,11 @@ def main():
     topk_ids = torch.stack(
         [torch.randperm(E, device="cuda")[:topk] for _ in range(M)]).to(torch.int32)
     for _ in range(3):
-        fso.gemm.moe_build_sorted(topk_ids, E, block_m)
+        fso.compat.moe_build_sorted(topk_ids, E, block_m)
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        se, fts, npad = fso.gemm.moe_build_sorted(topk_ids, E, block_m)
+        se, fts, npad = fso.compat.moe_build_sorted(topk_ids, E, block_m)
     new = torch.stack(
         [torch.randperm(E, device="cuda")[:topk] for _ in range(M)]).to(torch.int32)
     topk_ids.copy_(new)

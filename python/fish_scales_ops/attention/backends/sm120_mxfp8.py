@@ -16,7 +16,8 @@ for producing the FP8 element tensors and the UE8M0 block-scale tensors
 in the layouts described below.
 
 Layouts (block size = 32 along the K axis of each MMA, Bc per head_dim
-chosen by the kernel: D=32 → Bc=128, D=64 → Bc=64, D=128 → Bc=64):
+chosen by the kernel: D=32 → Bc=128, D=64 → Bc=64, D=128 → Bc=64,
+D=256 → Bc=32):
 
     Q_fp8     : [B, S_q, H_q, D]              torch.float8_e4m3fn
                 BSHD-contiguous (D innermost).
@@ -39,7 +40,9 @@ chosen by the kernel: D=32 → Bc=128, D=64 → Bc=64, D=128 → Bc=64):
                 along the K=sequence axis).
 
 Constraints (Blackwell sm_120a, CUDA 12.8+):
-    - sm == 12.0 (sm_120a) — host dispatcher returns cudaErrorNotSupported below.
+    - sm_120 / sm_121. The wrapper raises NotImplementedError on any other
+      architecture before launching; the raw op's host dispatcher returns
+      cudaErrorNotSupported there, which the binding raises as RuntimeError.
     - head_dim D ∈ {32, 64, 128, 256}  (D=256 uses a dedicated Bc=32 path)
     - S_q % 64 == 0
     - S_k % Bc == 0  (Bc per the table above)
@@ -58,6 +61,8 @@ import math
 from typing import Optional
 
 import torch
+
+from . import _require_sm120
 
 
 FP8_E4M3_MAX = 448.0
@@ -98,6 +103,7 @@ def mxfp8_fwd(
 
     Returns a BF16 tensor of shape [B, S_q, H_q, D].
     """
+    _require_sm120("mxfp8_fwd")
     assert q_fp8.dtype == torch.float8_e4m3fn, "q_fp8 must be float8_e4m3fn"
     assert k_fp8.dtype == torch.float8_e4m3fn, "k_fp8 must be float8_e4m3fn"
     assert v_fp8.dtype == torch.float8_e4m3fn, "v_fp8 must be float8_e4m3fn"

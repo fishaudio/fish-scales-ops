@@ -13,18 +13,18 @@ x = (torch.randn(M, K, dtype=torch.bfloat16, device="cuda") * 0.1)
 w = (torch.randn(N, K, dtype=torch.bfloat16, device="cuda") / (K ** 0.5))
 
 if op == "mxfp8":
-    xq, sxq = fso.gemm.quantize_1x32_fp8(x)
-    wq, swq = fso.gemm.quantize_1x32_fp8(w)
-    call = lambda: fso.gemm.linear_mxfp8(xq, wq, sxq, swq)
+    xq, sxq = fso.compat.quantize_1x32_fp8(x)
+    wq, swq = fso.compat.quantize_1x32_fp8(w)
+    call = lambda: fso.compat.linear_mxfp8(xq, wq, sxq, swq)
 else:
-    xq, sxq = fso.gemm.quantize_1x128_fp8(x, use_ue8m0=(sm >= 12))
-    wq, swq = fso.gemm.quantize_128x128_fp8(w)
-    if sm >= 12:
-        sxqp = fso.gemm.repack_fp8_act_scales(sxq)
-        swqp = fso.gemm.repack_fp8_wgt_scales(swq)
+    xq, sxq = fso.compat.quantize_1x128_fp8(x)
+    wq, swq = fso.compat.quantize_128x128_fp8(w)
+    if sm >= 10:
+        sxqp = fso.compat.repack_fp8_act_scales(sxq)
+        swqp = fso.compat.repack_fp8_wgt_scales(swq)
     else:
         sxqp, swqp = sxq, swq
-    call = lambda: fso.gemm.linear_fp8(xq, wq, sxqp, swqp)
+    call = lambda: fso.compat.linear_fp8(xq, wq, sxqp, swqp)
 
 for _ in range(10):
     call()

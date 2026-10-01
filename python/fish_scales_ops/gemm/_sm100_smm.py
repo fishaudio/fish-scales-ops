@@ -4,35 +4,26 @@ The fused ``quantize_1x32_fp8`` kernel's raw int32-packed SF buffer is
 byte-identical to the ``Sm1xxBlockScaledConfig<32>`` atom layout that
 ``torch.nn.functional.scaled_mm`` expects under ``SWIZZLE_32_4_4``. So we
 can feed cuBLAS *the exact same* quantized payload — no re-permute, no
-extra kernel launches — and route calls to whichever GEMM is faster per
-shape.
+extra kernel launches — and route each shape to the GEMM the routing rule
+names for it (:func:`should_route`).
 
-Fair MLP bench (sm100-v2-work/fair_gemm_bench.py, 2026-07-07, b300 GPU1):
-
-  M      fso        smm       fair/fso
-    1    30.78      25.40     0.83× ← cuBLAS wins decode
-   16    26.70      24.69     0.93×
-   32    28.71      24.65     0.86×
-  128    36.28      32.82     0.90×
-  512    57.39      51.59     0.90×
- 1024    85.37      82.54     0.97× ~tied
- 2048   147.94     155.55     1.05× ← FSO DSL wins prefill
- 4096   256.43     303.79     1.19×
-
-Root cause: cuBLAS's ``nvjet_128x128_128x6_4x1_v_bz`` uses a 4-CTA
-multicast cluster + 6 smem stages for small M; the CuTe DSL
-``Sm100BlockScaledPersistentDenseGemmKernel`` defaults to c(1,1) at those
-shapes.  Rather than write our own small-M cluster kernel, route the
-band that cuBLAS wins to cuBLAS.
+The mechanism behind the band: cuBLAS's ``nvjet_128x128_128x6_4x1_v_bz`` uses a
+4-CTA multicast cluster and 6 shared-memory stages for small M, while the CuTe
+DSL ``Sm100BlockScaledPersistentDenseGemmKernel`` defaults to cluster (1, 1) at
+those shapes. Rather than write a small-M cluster kernel of our own, the band
+goes to cuBLAS. The measurements behind the boundaries (a fair MLP bench of
+2026-07-07 and the run cited in :func:`should_route`) are kept outside the
+repository; the published fso numbers are in ``docs/perf/gemm/sm100.md``.
 
 ``FSO_DISABLE_SMM=1`` kills the route.
 """
 from __future__ import annotations
 
-import os
 from typing import Optional
 
 import torch
+
+from .._env import env_flag
 
 
 _SM_COUNT: Optional[int] = None
@@ -124,7 +115,7 @@ def _init() -> bool:
     global _AVAILABLE, _ST_BLOCKWISE1X32, _SW_32_4_4, _SCALED_MM
     if _AVAILABLE is not None:
         return _AVAILABLE
-    if os.getenv("FSO_DISABLE_SMM"):
+    if env_flag("FSO_DISABLE_SMM"):
         _AVAILABLE = False
         return False
     try:
@@ -153,9 +144,9 @@ def should_route(m: int, n: int, k: int) -> bool:
     """Decide whether this GEMM should run on cuBLAS ``scaled_mm`` (tier 1).
 
     Small-M bounds are unchanged from the per-GEMM bench of 2026-07-07:
-    * Wide-N (tiles_n ≥ 40) M ≤ 1024: cuBLAS wins.
+    * Wide-N (tiles_n ≥ 40) M ≤ 1024: route to cuBLAS.
     * Narrow-N (tiles_n ≤ 32, i.e. down/wo class) M ≤ 128 with K ≥ 4096:
-      FSO's split-K double-kernel scheme wins → skip.
+      decline, so FSO's split-K double-kernel scheme takes the cell.
     * K % 128 alignment required by scaled_mm.
 
     The large-M rules (M > 1024) come from the per-projection sweep in
@@ -176,20 +167,20 @@ def should_route(m: int, n: int, k: int) -> bool:
     configuration fills the machine but then quantises the tile count into
     74-cluster waves. cuBLAS's nvjet kernel is not persistent: its grid grows
     with the tile count, so on a wide-N shape it runs many waves and its tail
-    is a small fraction of the whole. Measured on gate_up (tiles_n = 152),
-    wqkv (48) and gdn.in_proj (96), cuBLAS is the fastest engine at every M
-    from 1536 to 8192.
+    is a small fraction of the whole. The sweep timed gate_up (tiles_n = 152),
+    wqkv (48) and gdn.in_proj (96) at every M from 1536 to 8192 and put all of
+    those cells on cuBLAS.
 
     **Narrow-N (tiles_n ≤ 32) above M = 1024** splits on K. The C++ cascade's
     kernel for this band amortises its fixed per-CTA cost over K/128 mainloop
     iterations, so it only reaches its asymptotic rate on long-K shapes; and
     it needs enough cluster-waves that its one partially filled tail wave is
     a small fraction of the kernel. Both conditions hold for the Family A
-    ``down`` shape (K = 9728) from M = 4096 upward, where the cascade is the
-    fastest engine; neither the K = 4096 narrow-N shapes (``wo``,
+    ``down`` shape (K = 9728) from M = 4096 upward, which the sweep put on the
+    cascade; neither the K = 4096 narrow-N shapes (``wo``,
     ``gdn.out_proj``) nor the low-wave cells of ``down`` reach that point, and
-    there cuBLAS wins. So: keep cuBLAS unless the shape is long-K **and** the
-    cascade would run at least four cluster-waves.
+    the sweep put those on cuBLAS. So: keep cuBLAS unless the shape is long-K
+    **and** the cascade would run at least four cluster-waves.
 
     Square shapes above the decode band are excluded and left to
     ``_sm100_dsl.pick_config``, whose cubic table is separately measured.
@@ -221,7 +212,7 @@ def should_route(m: int, n: int, k: int) -> bool:
             return False
         if m > 1024:
             # Long-K narrow-N with a deep enough cascade grid: the C++
-            # cascade wins, so decline and let it fall through (pick_config
+            # cascade's cell, so decline and let it fall through (pick_config
             # also returns None for this class).
             return not (k >= 8192 and _cascade_cluster_waves(m, n) >= 4.0)
         return True

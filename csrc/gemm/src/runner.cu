@@ -261,6 +261,48 @@ cudaError_t launch_sm90_fp8_grouped_contiguous_dispatch(__nv_fp8_e4m3* A, __nv_f
 #endif
 }
 
+// C-ABI entry for the sm_90 grouped contiguous FC1 with two math warp-groups split along N (fused-FC1 step 1).
+// Same arguments as launch_sm90_fp8_grouped_contiguous_dispatch; B is the stacked [gate; up] weight [G, N = 2I, K].
+cudaError_t launch_sm90_fp8_grouped_contiguous_2wg_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D,
+    float* SFA, float* SFB, int32_t* sorted_expert_ids, int num_groups, int p_max, int N, int K, int block_m,
+    int expected_m, cudaStream_t stream)
+{
+#ifdef COMPILE_HOPPER_TMA_GEMMS
+    tensorrt_llm::kernels::blockscale_gemm::gemm_dispatch_sm90_grouped_contiguous_2wg(
+        reinterpret_cast<void*>(A), reinterpret_cast<void*>(B), reinterpret_cast<void*>(D), SFA, SFB,
+        sorted_expert_ids, static_cast<uint32_t>(num_groups), static_cast<uint32_t>(p_max),
+        static_cast<uint32_t>(N), static_cast<uint32_t>(K), static_cast<uint32_t>(block_m),
+        static_cast<uint32_t>(expected_m), stream);
+    return cudaGetLastError();
+#else
+    (void) A; (void) B; (void) D; (void) SFA; (void) SFB; (void) sorted_expert_ids;
+    (void) num_groups; (void) p_max; (void) N; (void) K; (void) block_m; (void) expected_m; (void) stream;
+    return cudaErrorNotSupported;
+#endif
+}
+
+// C-ABI entry for the sm_90 grouped contiguous FC1 with the SwiGLU + 1x128 FP8 requantize fused into its epilogue
+// (fused-FC1 step 2). A, SFA, B = the stacked [gate; up] weight [G, N = 2I, K] and SFB as the 2wg entry; the outputs
+// are DQ [p_max, I] fp8 and SD [I/128, align4(p_max)] fp32, the layouts silu_chunk_mul_quantize_1x128_sorted_sm90
+// produces.
+cudaError_t launch_sm90_fp8_grouped_contiguous_swiglu_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_fp8_e4m3* DQ,
+    float* SD, float* SFA, float* SFB, int32_t* sorted_expert_ids, int num_groups, int p_max, int N, int K,
+    int block_m, int expected_m, cudaStream_t stream)
+{
+#ifdef COMPILE_HOPPER_TMA_GEMMS
+    tensorrt_llm::kernels::blockscale_gemm::gemm_dispatch_sm90_grouped_contiguous_swiglu(
+        reinterpret_cast<void*>(A), reinterpret_cast<void*>(B), reinterpret_cast<void*>(DQ), SD, SFA, SFB,
+        sorted_expert_ids, static_cast<uint32_t>(num_groups), static_cast<uint32_t>(p_max),
+        static_cast<uint32_t>(N), static_cast<uint32_t>(K), static_cast<uint32_t>(block_m),
+        static_cast<uint32_t>(expected_m), stream);
+    return cudaGetLastError();
+#else
+    (void) A; (void) B; (void) DQ; (void) SD; (void) SFA; (void) SFB; (void) sorted_expert_ids;
+    (void) num_groups; (void) p_max; (void) N; (void) K; (void) block_m; (void) expected_m; (void) stream;
+    return cudaErrorNotSupported;
+#endif
+}
+
 // C-ABI entry for the sm_90 grouped contiguous swap-AB GEMM (block_n=16
 // activation tiling for M>=8). A = activation [P_max,K], B = weights [G,N,K],
 // SFA = activation K-major scales, SFB = weight scales [G,N/128,K/128].
@@ -278,6 +320,51 @@ cudaError_t launch_sm90_fp8_grouped_contiguous_swapab_dispatch(__nv_fp8_e4m3* A,
     return cudaGetLastError();
 #else
     (void) A; (void) B; (void) D; (void) SFA; (void) SFB; (void) sorted_expert_ids;
+    (void) num_groups; (void) p_max; (void) N; (void) K; (void) block_n; (void) expected_m; (void) stream;
+    return cudaErrorNotSupported;
+#endif
+}
+
+// C-ABI entry for the sm_90 grouped contiguous swap-AB FC1 in which one CTA owns gate block b and up block b
+// (fused-FC1 P2a, design S2). Same arguments as launch_sm90_fp8_grouped_contiguous_swapab_dispatch; B is the stacked
+// [gate; up] weight [G, N = 2I, K] and D today's gu [p_max, 2I] bf16.
+cudaError_t launch_sm90_fp8_grouped_contiguous_swapab_pair_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B,
+    __nv_bfloat16* D, float* SFA, float* SFB, int32_t* sorted_expert_ids, int num_groups, int p_max, int N, int K,
+    int block_n, int expected_m, cudaStream_t stream)
+{
+#ifdef COMPILE_HOPPER_TMA_GEMMS
+    // Weight is the swap-AB A matrix, activation the B matrix.
+    tensorrt_llm::kernels::blockscale_gemm::gemm_dispatch_sm90_grouped_contiguous_swapab_pair(
+        reinterpret_cast<void*>(B), reinterpret_cast<void*>(A), reinterpret_cast<void*>(D), SFB, SFA,
+        sorted_expert_ids, static_cast<uint32_t>(num_groups), static_cast<uint32_t>(p_max),
+        static_cast<uint32_t>(N), static_cast<uint32_t>(K), static_cast<uint32_t>(block_n),
+        static_cast<uint32_t>(expected_m), stream);
+    return cudaGetLastError();
+#else
+    (void) A; (void) B; (void) D; (void) SFA; (void) SFB; (void) sorted_expert_ids;
+    (void) num_groups; (void) p_max; (void) N; (void) K; (void) block_n; (void) expected_m; (void) stream;
+    return cudaErrorNotSupported;
+#endif
+}
+
+// C-ABI entry for the sm_90 grouped contiguous swap-AB FC1 with the SwiGLU + 1x128 FP8 requantize fused into its
+// epilogue (fused-FC1 P2a). A, SFA, B = the stacked [gate; up] weight [G, N = 2I, K] and SFB as the swap-AB pair entry;
+// the outputs are DQ [p_max, I] fp8 and SD [I/128, align4(p_max)] fp32, the layouts
+// silu_chunk_mul_quantize_1x128_sorted_sm90 produces.
+cudaError_t launch_sm90_fp8_grouped_contiguous_swapab_swiglu_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B,
+    __nv_fp8_e4m3* DQ, float* SD, float* SFA, float* SFB, int32_t* sorted_expert_ids, int num_groups, int p_max, int N,
+    int K, int block_n, int expected_m, cudaStream_t stream)
+{
+#ifdef COMPILE_HOPPER_TMA_GEMMS
+    // Weight is the swap-AB A matrix, activation the B matrix.
+    tensorrt_llm::kernels::blockscale_gemm::gemm_dispatch_sm90_grouped_contiguous_swapab_swiglu(
+        reinterpret_cast<void*>(B), reinterpret_cast<void*>(A), reinterpret_cast<void*>(DQ), SD, SFB, SFA,
+        sorted_expert_ids, static_cast<uint32_t>(num_groups), static_cast<uint32_t>(p_max),
+        static_cast<uint32_t>(N), static_cast<uint32_t>(K), static_cast<uint32_t>(block_n),
+        static_cast<uint32_t>(expected_m), stream);
+    return cudaGetLastError();
+#else
+    (void) A; (void) B; (void) DQ; (void) SD; (void) SFA; (void) SFB; (void) sorted_expert_ids;
     (void) num_groups; (void) p_max; (void) N; (void) K; (void) block_n; (void) expected_m; (void) stream;
     return cudaErrorNotSupported;
 #endif

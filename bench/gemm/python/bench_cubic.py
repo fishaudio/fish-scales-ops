@@ -98,13 +98,13 @@ def bench_one(M, N, K, *, sm120, peak_shot=True):
            "bf16_us": bf16_us, "bf16_tf": flops / (bf16_us * 1e6)}
 
     # FP8 1×128.
-    wq, sw = fso.gemm.quantize_128x128_fp8(w)
-    xq, sx = fso.gemm.quantize_1x128_fp8(x, use_ue8m0=sm120)
+    wq, sw = fso.compat.quantize_128x128_fp8(w)
+    xq, sx = fso.compat.quantize_1x128_fp8(x, use_ue8m0=sm120)
     if sm120:
-        sw = fso.gemm.repack_fp8_wgt_scales(sw)
-        sx = fso.gemm.repack_fp8_act_scales(sx)
+        sw = fso.compat.repack_fp8_wgt_scales(sw)
+        sx = fso.compat.repack_fp8_act_scales(sx)
     def fp8():
-        return fso.gemm.linear_fp8(xq, wq, sx, sw)
+        return fso.compat.linear_fp8(xq, wq, sx, sw)
     bsfp8_us = _time_graph(fp8, peak_shot=peak_shot)
     cos_bsfp8 = F.cosine_similarity(fp8().float().flatten(), bf16().float().flatten(),
                                     dim=0).item()
@@ -113,10 +113,10 @@ def bench_one(M, N, K, *, sm120, peak_shot=True):
     out["bsfp8_cos"] = cos_bsfp8
 
     if sm120:
-        xqm, sxm = fso.gemm.quantize_1x32_fp8(x)
-        wqm, swm = fso.gemm.quantize_1x32_fp8(w)
+        xqm, sxm = fso.compat.quantize_1x32_fp8(x)
+        wqm, swm = fso.compat.quantize_1x32_fp8(w)
         def mxfp8():
-            return fso.gemm.linear_mxfp8(xqm, wqm, sxm, swm)
+            return fso.compat.linear_mxfp8(xqm, wqm, sxm, swm)
         mxfp8_us = _time_graph(mxfp8, peak_shot=peak_shot)
         cos_mxfp8 = F.cosine_similarity(mxfp8().float().flatten(), bf16().float().flatten(),
                                         dim=0).item()

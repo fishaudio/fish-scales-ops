@@ -7,10 +7,11 @@ minimal rewiring.
 Calling convention (ragged Q + paged KV):
 
     q_fp8                  : [total_q_tokens, H_q, D]                  fp8_e4m3
-    q_scales               : [total_q_tokens / 16, H_q, D/32]          uint8 (UE8M0)
+    q_scales               : [ceil(total_q_tokens / 16), H_q, D/32]    uint8 (UE8M0)
     k_pool_fp8             : [num_pages, page_size, H_kv, D]           fp8_e4m3
-    k_chan_scale          : [num_pages, H_kv, D/32]                   uint8 (UE8M0)
-                             (max-pooled across the page's S-rows)
+    k_chan_scale           : [H_kv, D/32]                              uint8 (UE8M0)
+                             (one per KV head per D block, global across
+                              pages and tokens; frozen at model load)
     v_pool_fp8             : [num_pages, D, H_kv, page_size]           fp8_e4m3
                              (pre-transposed: D outermost within a page)
     v_chan_scale           : [H_kv, D]                                 fp32
@@ -24,9 +25,10 @@ Calling convention (ragged Q + paged KV):
 Output: bf16 ``[total_q_tokens, H_q, D]``.
 
 Constraints (Blackwell sm_120a):
-    - sm == 12.0 (sm_120a) — the host dispatcher refuses on other arches.
+    - sm_120 / sm_121: the wrappers raise NotImplementedError on any other
+      architecture before launching.
     - head_dim D ∈ {32, 64, 128, 256}  (D=256 uses a dedicated path).
-    - page_size ∈ {32, 64, 128, 256} (must be a multiple of 32 = MXFP8 sf_vec_size).
+    - page_size a positive multiple of 32 (the MXFP8 sf_vec_size).
     - q_seq_len[b] need not be a multiple of 16 IF q-row OOB rows are
       masked at the Q-fragment load (the kernel handles ragged tail).
       The Q-scales array does need exactly ceil(total_q / 16) rows however —
@@ -39,6 +41,8 @@ import math
 from typing import Optional
 
 import torch
+
+from . import _require_sm120
 
 
 FP8_E4M3_MAX = 448.0
@@ -139,6 +143,7 @@ def mxfp8_paged_prefill_fwd(
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """SM120 MXFP8 paged-KV prefill / extend forward (single-call)."""
+    _require_sm120("mxfp8_paged_prefill_fwd")
     _check_inputs(q_fp8, q_scales, k_pool_fp8, k_chan_scale,
                   v_pool_fp8, v_chan_scale, qo_indptr,
                   paged_kv_indices, paged_kv_indptr, paged_kv_last_page_len)
@@ -180,14 +185,18 @@ class PrefillPagedPlan:
     """Reusable plan for a fixed extend schedule.
 
     Pre-computes the (b, h_q, q_tile) work-unit array once so subsequent
-    ``run()`` calls skip the host-side packing. Best for sglang's batched
-    extend pass where the schedule's shape is stable across forward steps.
+    ``run()`` calls skip the host-side packing. The plan is valid only for the
+    ``qo_indptr`` it was built from, i.e. for every request's Q length, not
+    only for the batch size: ``run`` cannot check that without a device-to-host
+    copy, so a plan reused with different Q lengths computes the wrong rows
+    without an error. Build a new plan whenever any request's Q length changes.
     """
 
     def __init__(self, *,
                  qo_indptr_cpu: torch.Tensor,
                  num_q_heads: int,
                  device: str | torch.device = "cuda"):
+        _require_sm120("PrefillPagedPlan")
         if qo_indptr_cpu.device.type != "cpu":
             raise ValueError("qo_indptr_cpu must be a CPU int32 tensor for planning")
         if qo_indptr_cpu.dtype != torch.int32:
@@ -250,7 +259,8 @@ def plan_paged_prefill(*,
                        qo_indptr_cpu: torch.Tensor,
                        num_q_heads: int,
                        device: str | torch.device = "cuda") -> PrefillPagedPlan:
-    """One-time setup for a fixed-shape paged-KV extend workload."""
+    """One-time setup for a paged-KV extend workload with fixed per-request Q
+    lengths (see :class:`PrefillPagedPlan`)."""
     return PrefillPagedPlan(qo_indptr_cpu=qo_indptr_cpu,
                             num_q_heads=num_q_heads, device=device)
 

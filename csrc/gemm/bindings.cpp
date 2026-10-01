@@ -5,9 +5,14 @@
  * the combined extension lives in csrc/attention/csrc/flash_attn_ext.cpp.
  *
  * Surface:
- *   FP8 1×128 / 128×128 block-scaled — sm_90 deep_gemm JIT + sm_120
- *     CUTLASS Sm120BlockScaledKernel + Stream-K.
- *   MXFP8 1×32 (sm_120 only)         — CUTLASS Sm120MxFP8BlockScaledKernel.
+ *   FP8 1×128 / 128×128 block-scaled — sm_90 deep_gemm JIT, sm_120/121
+ *     CUTLASS Sm120BlockScaledKernel + Stream-K, sm_100/103 on the MXFP8
+ *     tcgen05 kernels with replicated scales.
+ *   MXFP8 1×32 (sm_100/103 and sm_120/121) — CUTLASS tcgen05 BlockScaled on
+ *     sm_100/103, Sm120MxFP8BlockScaledKernel on sm_120/121.
+ *   Grouped MoE                      — the sm_90 block-FP8 grouped GEMMs, the
+ *     MXFP8 grouped GEMMs of sm_100/103 and sm_120/121, and the router,
+ *     routing builders and combines that every architecture shares.
  *   BF16 convenience wrappers        — linear_bf16, linear_qx (FP8 path).
  */
 
@@ -34,6 +39,14 @@ at::Tensor linear_fp8_grouped_contiguous(at::Tensor a_fp8, at::Tensor w_fp8, at:
     at::Tensor sw, at::Tensor sorted_expert_ids, int64_t block_m, int64_t expected_m);
 at::Tensor linear_fp8_grouped_contiguous_swapab(at::Tensor a_fp8, at::Tensor w_fp8, at::Tensor sa,
     at::Tensor sw, at::Tensor sorted_expert_ids, int64_t block_n, int64_t expected_m);
+at::Tensor linear_fp8_grouped_contiguous_swapab_pair(at::Tensor a_fp8, at::Tensor w_fp8, at::Tensor sa,
+    at::Tensor sw, at::Tensor sorted_expert_ids, int64_t block_n, int64_t expected_m);
+std::tuple<at::Tensor, at::Tensor> linear_fp8_grouped_contiguous_swapab_swiglu(at::Tensor a_fp8, at::Tensor w_fp8,
+    at::Tensor sa, at::Tensor sw, at::Tensor sorted_expert_ids, int64_t block_n, int64_t expected_m);
+at::Tensor linear_fp8_grouped_contiguous_2wg(at::Tensor a_fp8, at::Tensor w_fp8, at::Tensor sa,
+    at::Tensor sw, at::Tensor sorted_expert_ids, int64_t block_m, int64_t expected_m);
+std::tuple<at::Tensor, at::Tensor> linear_fp8_grouped_contiguous_swiglu(at::Tensor a_fp8, at::Tensor w_fp8,
+    at::Tensor sa, at::Tensor sw, at::Tensor sorted_expert_ids, int64_t block_m, int64_t expected_m);
 std::tuple<at::Tensor, at::Tensor> quantize_1x128_sorted_gather_sm90(
     at::Tensor x, at::Tensor flat_to_sorted, int64_t p_max, int64_t topk);
 std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x128_sorted_sm90(
@@ -42,16 +55,17 @@ at::Tensor linear_qx(at::Tensor x_bf16, at::Tensor w_fp8, at::Tensor sw);
 std::tuple<at::Tensor, at::Tensor> quantize_1x128(at::Tensor x, bool use_ue8m0);
 std::tuple<at::Tensor, at::Tensor> quantize_1x128_packed(at::Tensor x, bool use_ue8m0);
 std::tuple<at::Tensor, at::Tensor> quantize_128x128(at::Tensor w, bool use_ue8m0);
-at::Tensor repack_fp8_act_scales(at::Tensor sx_f32);
-at::Tensor repack_fp8_wgt_scales(at::Tensor sw_f32);
-// MXFP8 1×32 (sm_120 only).
+at::Tensor repack_fp8_act_scales(at::Tensor sx_f32, bool check);
+at::Tensor repack_fp8_wgt_scales(at::Tensor sw_f32, bool check);
+// MXFP8 1×32 (sm_100/103 and sm_120/121).
 std::tuple<at::Tensor, at::Tensor> quantize_1x32(at::Tensor x, bool use_ue8m0);
 std::tuple<at::Tensor, at::Tensor> quantize_1x32_packed(at::Tensor x, bool use_ue8m0);
 std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x32(at::Tensor gu, bool use_ue8m0);
 at::Tensor repack_mxfp8_scales(at::Tensor scales_f32);
 at::Tensor linear_mxfp8_raw(at::Tensor x_fp8, at::Tensor w_fp8,
                             at::Tensor sx_int32, at::Tensor sw_int32);
-// Grouped (MoE, masked layout) MXFP8 — sm_120 only (M1).
+// Grouped (MoE, masked layout) MXFP8 (sm_100/103 and sm_120/121), and the
+// router moe_topk_from_logits, which runs on every architecture.
 at::Tensor linear_mxfp8_grouped_masked(at::Tensor a_fp8, at::Tensor w_fp8, at::Tensor sa_int32,
     at::Tensor sw_int32, at::Tensor masked_m, int64_t expected_m, int64_t max_active_groups,
     std::optional<at::Tensor> slot_to_expert, std::optional<at::Tensor> problem_shapes);
@@ -63,7 +77,7 @@ std::tuple<at::Tensor, at::Tensor> quantize_1x32_grouped_gather(
     int64_t m_cap, bool use_ue8m0);
 std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x32_grouped(
     at::Tensor gu, at::Tensor slot_of_flat, bool use_ue8m0, bool pairwise);
-// Fused-SwiGLU FC1 (sm_100/sm_103 only) and its host-side router.
+// Fused-SwiGLU FC1 (sm_100/sm_103 and sm_120/121) and its host-side router.
 std::tuple<at::Tensor, at::Tensor> linear_mxfp8_grouped_masked_swiglu(at::Tensor a_fp8, at::Tensor w13_fp8,
     at::Tensor sa_int32, at::Tensor sw13_int32, at::Tensor masked_m, int64_t expected_m, int64_t max_active_groups,
     std::optional<at::Tensor> slot_to_expert, std::optional<at::Tensor> problem_shapes);
@@ -110,6 +124,14 @@ TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
                                          "Tensor sorted_expert_ids, int block_m, int expected_m) -> Tensor");
     m.def("linear_fp8_grouped_contiguous_swapab(Tensor a_fp8, Tensor w_fp8, Tensor sa, Tensor sw, "
                                          "Tensor sorted_expert_ids, int block_n, int expected_m) -> Tensor");
+    m.def("linear_fp8_grouped_contiguous_swapab_pair(Tensor a_fp8, Tensor w_fp8, Tensor sa, Tensor sw, "
+                                         "Tensor sorted_expert_ids, int block_n, int expected_m) -> Tensor");
+    m.def("linear_fp8_grouped_contiguous_swapab_swiglu(Tensor a_fp8, Tensor w_fp8, Tensor sa, Tensor sw, "
+          "Tensor sorted_expert_ids, int block_n, int expected_m) -> (Tensor, Tensor)");
+    m.def("linear_fp8_grouped_contiguous_2wg(Tensor a_fp8, Tensor w_fp8, Tensor sa, Tensor sw, "
+                                             "Tensor sorted_expert_ids, int block_m, int expected_m) -> Tensor");
+    m.def("linear_fp8_grouped_contiguous_swiglu(Tensor a_fp8, Tensor w_fp8, Tensor sa, Tensor sw, "
+          "Tensor sorted_expert_ids, int block_m, int expected_m) -> (Tensor, Tensor)");
     m.def("quantize_1x128_sorted_gather_sm90(Tensor x, Tensor flat_to_sorted, int p_max, int topk) "
           "-> (Tensor, Tensor)");
     m.def("silu_chunk_mul_quantize_1x128_sorted_sm90(Tensor gu, Tensor flat_to_sorted) "
@@ -118,8 +140,8 @@ TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
     m.def("quantize_1x128(Tensor x, bool use_ue8m0=False) -> (Tensor, Tensor)");
     m.def("quantize_1x128_packed(Tensor x, bool use_ue8m0=True) -> (Tensor, Tensor)");
     m.def("quantize_128x128(Tensor w, bool use_ue8m0=False) -> (Tensor, Tensor)");
-    m.def("repack_fp8_act_scales(Tensor sx_f32) -> Tensor");
-    m.def("repack_fp8_wgt_scales(Tensor sw_f32) -> Tensor");
+    m.def("repack_fp8_act_scales(Tensor sx_f32, bool check=True) -> Tensor");
+    m.def("repack_fp8_wgt_scales(Tensor sw_f32, bool check=True) -> Tensor");
     m.def("quantize_1x32(Tensor x, bool use_ue8m0=True) -> (Tensor, Tensor)");
     m.def("quantize_1x32_packed(Tensor x, bool use_ue8m0=True) -> (Tensor, Tensor)");
     m.def("silu_chunk_mul_quantize_1x32(Tensor gu, bool use_ue8m0=True) -> (Tensor, Tensor)");
@@ -178,6 +200,10 @@ TORCH_LIBRARY_IMPL(fish_scales_ops, CUDA, m)
     m.impl("silu_chunk_mul_quantize_1x128_grouped_sm90", &blockscale_gemm::silu_chunk_mul_quantize_1x128_grouped_sm90);
     m.impl("linear_fp8_grouped_contiguous", &blockscale_gemm::linear_fp8_grouped_contiguous);
     m.impl("linear_fp8_grouped_contiguous_swapab", &blockscale_gemm::linear_fp8_grouped_contiguous_swapab);
+    m.impl("linear_fp8_grouped_contiguous_swapab_pair", &blockscale_gemm::linear_fp8_grouped_contiguous_swapab_pair);
+    m.impl("linear_fp8_grouped_contiguous_swapab_swiglu", &blockscale_gemm::linear_fp8_grouped_contiguous_swapab_swiglu);
+    m.impl("linear_fp8_grouped_contiguous_2wg", &blockscale_gemm::linear_fp8_grouped_contiguous_2wg);
+    m.impl("linear_fp8_grouped_contiguous_swiglu", &blockscale_gemm::linear_fp8_grouped_contiguous_swiglu);
     m.impl("quantize_1x128_sorted_gather_sm90", &blockscale_gemm::quantize_1x128_sorted_gather_sm90);
     m.impl("silu_chunk_mul_quantize_1x128_sorted_sm90", &blockscale_gemm::silu_chunk_mul_quantize_1x128_sorted_sm90);
     m.impl("linear_qx", &blockscale_gemm::linear_qx);

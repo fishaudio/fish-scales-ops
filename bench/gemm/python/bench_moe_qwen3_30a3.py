@@ -142,9 +142,8 @@ LAYER_IMPLS = ("triton_bf16", "triton_fp8b", "vllm_bf16", "vllm_fp8b",
 # `fso_mxfp8_layer_op` is the opt-in A/B arm of the composed sm_120/121 library
 # entry `moe_layer_mxfp8_sm120` against `fso_mxfp8_layer`, which builds the same
 # six-kernel chain inline in this file. The two must land on the same kernels, so
-# a difference between their cells is glue cost (argument conditioning, the
-# chunking decision, the extra output copy when a call is chunked) and nothing
-# else. It is not part of the published grid: set FSO_BENCH_LAYER_OP=1 to add its
+# a difference between their cells is glue cost (argument conditioning and the
+# host-side plan) and nothing else. It is not part of the published grid: set FSO_BENCH_LAYER_OP=1 to add its
 # cells. Off sm_120/121 the entry raises and the cells record the error.
 # torch-native layer baselines (torch >= 2.11): `torch.nn.functional.
 # scaled_grouped_mm` (MXFP8 1x32, blocked scales) and `torch._grouped_mm`
@@ -197,22 +196,20 @@ FSO_M_CAPPED = sorted(set([m for m in M_GRID if m <= 4096] + [96, 256]))
 
 
 def fso_M():
-    """The masked-slab M grid for this device and model, largest point that fits."""
+    """The masked-slab M grid for this device and model: every point whose one-call
+    transient tensors fit next to the weights."""
     grid = list(FSO_M_CAPPED)
     try:
         import torch
         import fish_scales_ops as fso
-        if not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] != 12:
-            # sm_100/103 keeps the capped grid for now, not because it cannot hold
-            # the slabs (the B300 has 180 GB) but because the per-m_cap cost helper
-            # is the sm_120 one; giving that arch its own fit test is a separate,
-            # deliberate item rather than a silent skip.
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] not in (10, 12):
             return grid
-        per_m_cap = fso.gemm.moe_layer_slab_bytes_per_token_sm120(E, HIDDEN, INTER)
         weights = E * (2 * INTER * HIDDEN + HIDDEN * INTER) * 33 // 32  # fp8 + 1x32 scales
         budget = 0.70 * torch.cuda.get_device_properties(0).total_memory
         for m in (m for m in M_GRID if m > 4096):
-            if ((m + 3) // 4 * 4) * per_m_cap + weights < budget:
+            need = fso.compat.moe_layer_transient_bytes_mxfp8(
+                m, E, TOPK, HIDDEN, INTER, w13_interleaved=True)
+            if need + weights < budget:
                 grid.append(m)
     except Exception:
         return grid
@@ -918,27 +915,27 @@ def run_worker(cell):
                 # actually taken, so the library is asked first: outside the decode
                 # band, and on every architecture that has no slot route, the cell
                 # runs the routing kernel without it.
-                want_slots = fso.gemm.mxfp8_grouped_slot_possible(
+                want_slots = fso.compat.mxfp8_grouped_slot_possible(
                     m_cap, N, K, E, max_active_groups)
                 result["with_slots"] = int(want_slots)
                 # The pointer-array route's counterpart (run
                 # b300_round3_20260922/M-A4): where the cascade serves the call,
                 # the routing kernel also emits the per-group (rows, N, K) triples
                 # and the GEMM launches without its argument-preparation kernel.
-                want_ps = fso.gemm.mxfp8_grouped_problem_shapes_consumed(
+                want_ps = fso.compat.mxfp8_grouped_problem_shapes_consumed(
                     m_cap, N, K, E, max_active_groups)
                 result["with_ps"] = int(want_ps)
                 x_tok = shared("x_tok", lambda: torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.1)
-                routing = shared("routing", lambda: fso.gemm.moe_build_routing(
+                routing = shared("routing", lambda: fso.compat.moe_build_routing(
                     topk_ids, E, m_cap, with_slots=want_slots,
                     problem_shapes_for=[(N, K)] if want_ps else None))
                 masked_dev, row_map, slot_of_flat = routing[:3]
                 slot_to_expert = routing[3] if want_slots else None
                 problem_shapes = routing[-1][0] if want_ps else None
-                a_fp8, sa = shared("a_fp8_sa", lambda: fso.gemm.quantize_1x32_grouped_gather_fp8(
+                a_fp8, sa = shared("a_fp8_sa", lambda: fso.compat.quantize_1x32_grouped_gather_fp8(
                     x_tok, slot_of_flat, TOPK, E, m_cap))
-                w_fp8, sw = fso.gemm.quantize_moe_weights_1x32_fp8(w)
-                fn = lambda: fso.gemm.linear_mxfp8_grouped_masked(
+                w_fp8, sw = fso.compat.quantize_moe_weights_1x32_fp8(w)
+                fn = lambda: fso.compat.linear_mxfp8_grouped_masked(
                     a_fp8, w_fp8, sa, sw, masked_dev, expected_m, max_active_groups,
                     slot_to_expert, problem_shapes)
                 y = fn()
@@ -1086,18 +1083,18 @@ def run_worker(cell):
                     "bf16" if base_impl == "torch_grouped_bf16_layer" else "mxfp8", w13s, w2s)
             import fish_scales_ops as fso
             if base_impl == "fso_mxfp8_layer":
-                w13s_q, s13s = fso.gemm.quantize_1x32_fp8(w13s)
-                w2s_q, s2s = fso.gemm.quantize_1x32_fp8(w2s)
+                w13s_q, s13s = fso.compat.quantize_1x32_fp8(w13s)
+                w2s_q, s2s = fso.compat.quantize_1x32_fp8(w2s)
 
                 def shared_fn(x):
-                    xq, sx = fso.gemm.quantize_1x32_fp8(x)
-                    gu = fso.gemm.linear_mxfp8(xq, w13s_q, sx, s13s)
-                    hq, sh = fso.gemm.silu_chunk_mul_quantize_1x32_fp8(gu)
-                    return fso.gemm.linear_mxfp8(hq, w2s_q, sh, s2s)
+                    xq, sx = fso.compat.quantize_1x32_fp8(x)
+                    gu = fso.compat.linear_mxfp8(xq, w13s_q, sx, s13s)
+                    hq, sh = fso.compat.silu_chunk_mul_quantize_1x32_fp8(gu)
+                    return fso.compat.linear_mxfp8(hq, w2s_q, sh, s2s)
                 return shared_fn
             # sm_90 block-FP8: same closure as bench_qwen3_4b_mlp_forward's BSFP8 path
-            w13s_q, s13s = fso.gemm.quantize_128x128_fp8(w13s)
-            w2s_q, s2s = fso.gemm.quantize_128x128_fp8(w2s)
+            w13s_q, s13s = fso.compat.quantize_128x128_fp8(w13s)
+            w2s_q, s2s = fso.compat.quantize_128x128_fp8(w2s)
 
             @torch.compile(mode="default", dynamic=False)
             def _silu_chunk_mul(gu):
@@ -1105,11 +1102,11 @@ def run_worker(cell):
                 return F.silu(g_) * u_
 
             def shared_fn(x):
-                xq, sx = fso.gemm.quantize_1x128_fp8(x, use_ue8m0=False)
-                gu = fso.gemm.linear_fp8(xq, w13s_q, sx, s13s)
+                xq, sx = fso.compat.quantize_1x128_fp8(x, use_ue8m0=False)
+                gu = fso.compat.linear_fp8(xq, w13s_q, sx, s13s)
                 h = _silu_chunk_mul(gu)
-                hq, sh = fso.gemm.quantize_1x128_fp8(h, use_ue8m0=False)
-                return fso.gemm.linear_fp8(hq, w2s_q, sh, s2s)
+                hq, sh = fso.compat.quantize_1x128_fp8(h, use_ue8m0=False)
+                return fso.compat.linear_fp8(hq, w2s_q, sh, s2s)
             return shared_fn
 
         def construct(w13, w2, w13s, w2s, hidden=hidden, rows=rows):
@@ -1173,7 +1170,7 @@ def run_worker(cell):
                         ws = torch.empty(Ecnt, (N + 127) // 128, (K + 127) // 128,
                                          device=w.device, dtype=torch.float32)
                         for e in range(Ecnt):
-                            q, sc = fso.gemm.quantize_128x128_fp8(w[e], use_ue8m0=False)
+                            q, sc = fso.compat.quantize_128x128_fp8(w[e], use_ue8m0=False)
                             wq[e].copy_(q); ws[e].copy_(sc)
                         return wq, ws
                     w13_fp8, w13_sf = _q(w13)
@@ -1344,14 +1341,14 @@ def run_worker(cell):
                 #     the unfused FC1 on interleaved weights, which is what the
                 #     SwiGLU kernel's `pairwise` flag is for.
                 n_w = 2 * INTER
-                fc1_interleaved = fso.gemm.mxfp8_grouped_swiglu_available(n_w, HIDDEN)
-                fc1_fused = fc1_interleaved and fso.gemm.mxfp8_grouped_swiglu_fused_route(
+                fc1_interleaved = fso.compat.mxfp8_grouped_swiglu_available(n_w, HIDDEN)
+                fc1_fused = fc1_interleaved and fso.compat.mxfp8_grouped_swiglu_fused_route(
                     m_cap, n_w, HIDDEN, E, max_active_groups)
                 result["fc1_interleaved"] = int(fc1_interleaved)
                 result["fc1_fused"] = int(fc1_fused)
-                w13_fp8, sw13 = fso.gemm.quantize_moe_weights_1x32_fp8(
+                w13_fp8, sw13 = fso.compat.quantize_moe_weights_1x32_fp8(
                     w13, w13_interleave=fc1_interleaved)
-                w2_fp8, sw2 = fso.gemm.quantize_moe_weights_1x32_fp8(w2)
+                w2_fp8, sw2 = fso.compat.quantize_moe_weights_1x32_fp8(w2)
 
                 # The routing kernel emits the packed active-expert list in the
                 # same launch (run b300_mxfp8_20260917/M-I1). Where the dispatcher
@@ -1367,9 +1364,9 @@ def run_worker(cell):
                 # has a shorter row-capacity clause than the plain grouped GEMM
                 # (run b300_round3_20260922/M-A3).
                 want_slots = (
-                    fso.gemm.mxfp8_grouped_slot_possible(
+                    fso.compat.mxfp8_grouped_slot_possible(
                         m_cap, n_w, HIDDEN, E, max_active_groups, fused_swiglu=fc1_fused)
-                    or fso.gemm.mxfp8_grouped_slot_possible(
+                    or fso.compat.mxfp8_grouped_slot_possible(
                         m_cap, HIDDEN, INTER, E, max_active_groups))
                 result["with_slots"] = int(want_slots)
                 # The pointer-array route's counterpart of the slot list (run
@@ -1384,15 +1381,15 @@ def run_worker(cell):
                 # are complements only under the same flag: per GEMM exactly one
                 # of the slot list and the problem shapes is then requested.
                 want_ps = [
-                    fso.gemm.mxfp8_grouped_problem_shapes_consumed(
+                    fso.compat.mxfp8_grouped_problem_shapes_consumed(
                         m_cap, n_w, HIDDEN, E, max_active_groups, fused_swiglu=fc1_fused),
-                    fso.gemm.mxfp8_grouped_problem_shapes_consumed(
+                    fso.compat.mxfp8_grouped_problem_shapes_consumed(
                         m_cap, HIDDEN, INTER, E, max_active_groups)]
                 ps_for = [nk for nk, want in zip([(n_w, HIDDEN), (HIDDEN, INTER)], want_ps) if want]
                 result["with_ps"] = int(any(want_ps))
 
                 def build_routing():
-                    r = fso.gemm.moe_build_routing(topk_ids, E, m_cap, with_slots=want_slots,
+                    r = fso.compat.moe_build_routing(topk_ids, E, m_cap, with_slots=want_slots,
                                                    problem_shapes_for=ps_for or None)
                     ps = list(r[-1]) if ps_for else []
                     ps1 = ps.pop(0) if want_ps[0] else None
@@ -1402,29 +1399,29 @@ def run_worker(cell):
                 if fc1_fused:
                     def layer_fn():
                         masked_dev, slot_of_flat, slot_to_expert, ps1, ps2 = build_routing()
-                        hq, sh = fso.gemm.quantize_1x32_grouped_gather_fp8(
+                        hq, sh = fso.compat.quantize_1x32_grouped_gather_fp8(
                             hidden, slot_of_flat, TOPK, E, m_cap)
-                        dq, sd = fso.gemm.linear_mxfp8_grouped_masked_swiglu(
+                        dq, sd = fso.compat.linear_mxfp8_grouped_masked_swiglu(
                             hq, w13_fp8, sh, sw13, masked_dev, expected_m,
                             max_active_groups, slot_to_expert, ps1)
-                        dn = fso.gemm.linear_mxfp8_grouped_masked(
+                        dn = fso.compat.linear_mxfp8_grouped_masked(
                             dq, w2_fp8, sd, sw2, masked_dev, expected_m,
                             max_active_groups, slot_to_expert, ps2)
-                        return fso.gemm.moe_combine(dn, slot_of_flat, topk_w)
+                        return fso.compat.moe_combine(dn, slot_of_flat, topk_w)
                 else:
                     def layer_fn():
                         masked_dev, slot_of_flat, slot_to_expert, ps1, ps2 = build_routing()
-                        hq, sh = fso.gemm.quantize_1x32_grouped_gather_fp8(
+                        hq, sh = fso.compat.quantize_1x32_grouped_gather_fp8(
                             hidden, slot_of_flat, TOPK, E, m_cap)
-                        gu = fso.gemm.linear_mxfp8_grouped_masked(
+                        gu = fso.compat.linear_mxfp8_grouped_masked(
                             hq, w13_fp8, sh, sw13, masked_dev, expected_m,
                             max_active_groups, slot_to_expert, ps1)
-                        dq, sd = fso.gemm.silu_chunk_mul_quantize_1x32_grouped_fp8(
+                        dq, sd = fso.compat.silu_chunk_mul_quantize_1x32_grouped_fp8(
                             gu, slot_of_flat, pairwise=fc1_interleaved)
-                        dn = fso.gemm.linear_mxfp8_grouped_masked(
+                        dn = fso.compat.linear_mxfp8_grouped_masked(
                             dq, w2_fp8, sd, sw2, masked_dev, expected_m,
                             max_active_groups, slot_to_expert, ps2)
-                        return fso.gemm.moe_combine(dn, slot_of_flat, topk_w)
+                        return fso.compat.moe_combine(dn, slot_of_flat, topk_w)
 
                 out_holder = {}
                 if shared_fn is not None:
@@ -1441,19 +1438,16 @@ def run_worker(cell):
                 # The same chain as `fso_mxfp8_layer`, driven through the composed
                 # library entry instead of being built here: one call, the routing
                 # derived on the device inside the timed graph, every host-side
-                # decision (m_cap, expected_m, max_active_groups, the chunk count)
+                # decision (m_cap, expected_m, max_active_groups)
                 # taken by the library from the argument shapes. sm_120/121 only.
                 import fish_scales_ops as fso
-                w13_fp8, sw13 = fso.gemm.quantize_moe_weights_1x32_fp8(w13)
-                w2_fp8, sw2 = fso.gemm.quantize_moe_weights_1x32_fp8(w2)
+                w13_fp8, sw13 = fso.compat.quantize_moe_weights_1x32_fp8(w13)
+                w2_fp8, sw2 = fso.compat.quantize_moe_weights_1x32_fp8(w2)
                 m_cap = (M + 3) // 4 * 4
                 result["m_cap"] = m_cap
-                chunk = fso.gemm.moe_layer_chunk_tokens_sm120(M, E, HIDDEN, INTER)
-                result["chunks"] = (M + chunk - 1) // chunk
-                result["chunk_tokens"] = chunk
 
                 def layer_fn():
-                    return fso.gemm.moe_layer_mxfp8_sm120(
+                    return fso.compat.moe_layer_mxfp8_sm120(
                         hidden, w13_fp8, sw13, w2_fp8, sw2, topk_ids, topk_w)
 
                 out_holder = {}
@@ -1474,12 +1468,12 @@ def run_worker(cell):
                 # block_n 16/32/64 by routed rows per expert, non-swap block_m=64 above 64). Same timed
                 # boundary (routing derived from topk_ids on device in the graph).
                 import fish_scales_ops as fso
-                w13_fp8, sw13 = fso.gemm.quantize_moe_weights_1x128_fp8_sm90(w13)
-                w2_fp8, sw2 = fso.gemm.quantize_moe_weights_1x128_fp8_sm90(w2)
-                result["swap"] = int(fso.gemm.moe_swap_ab_block_n(M, E, TOPK) is not None)
+                w13_fp8, sw13 = fso.compat.quantize_moe_weights_1x128_fp8_sm90(w13)
+                w2_fp8, sw2 = fso.compat.quantize_moe_weights_1x128_fp8_sm90(w2)
+                result["swap"] = int(fso.compat.moe_swap_ab_block_n(M, E, TOPK) is not None)
 
                 def layer_fn():
-                    return fso.gemm.moe_layer_fp8_sm90(
+                    return fso.compat.moe_layer_fp8_sm90(
                         hidden, w13_fp8, sw13, w2_fp8, sw2, topk_ids, topk_w)
 
                 out_holder = {}
@@ -1495,8 +1489,12 @@ def run_worker(cell):
                 result["cos"] = cos_sim(out_holder["out"], ref)
             else:  # dg_fp8_layer: mirror sglang moe_runner/deep_gemm.py masked path
                 from sglang.srt.layers import deep_gemm_wrapper
-                from sglang.srt.layers.moe.ep_moe.kernels import (
-                    moe_ep_deepgemm_preprocess, post_reorder_triton_kernel)
+                try:  # sglang 0.5.20 moved both from sglang.srt.layers.moe.ep_moe.kernels
+                    from sglang.kernels.ops.moe.ep_moe_kernels import (
+                        moe_ep_deepgemm_preprocess, post_reorder_triton_kernel)
+                except ImportError:  # sglang <= 0.5.14
+                    from sglang.srt.layers.moe.ep_moe.kernels import (
+                        moe_ep_deepgemm_preprocess, post_reorder_triton_kernel)
                 from sglang.srt.layers.moe.moe_runner.deep_gemm import (
                     _varlen_deep_gemm_silu_mul_quant)
                 w13_fp8, w13_sf = quant_weights_fp8(w13)

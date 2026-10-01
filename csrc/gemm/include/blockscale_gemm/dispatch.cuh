@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
 namespace kernels::blockscale_gemm
@@ -48,18 +49,25 @@ namespace detail
 {
 
 // Thread-local pool for sm_120's int32-packed SFA/SFB scratch buffers used by
-// the bf16-input fused path. Lazy-allocates on first use, grows on demand.
+// the bf16-input path (`linear_bf16`, `linear_qx`). Lazy-allocates on first
+// use and grows on demand.
 //
-// CUDA-graph compatibility: cudaMalloc/cudaFree are forbidden during stream
-// capture, so callers must warm up the bf16 path on the largest shape they
-// plan to use BEFORE entering capture. If a later capture-mode call needs
-// more, we abort with a clear message (same contract as `StreamKPool`).
+// CUDA-graph compatibility: a graph captured earlier keeps the buffer address
+// it was captured with, so a buffer is never freed once handed out — growth
+// allocates a larger one and retires the old one for the life of the process
+// (so a graph captured before the growth still replays into live memory).
+// Growing during a capture is impossible (cudaMalloc is not capturable), so
+// it raises a RuntimeError that asks for one eager call of the larger shape
+// on the capturing thread before capture. The capture check queries the
+// stream the call runs on: torch.cuda.graph captures on a side stream, which
+// a query of the legacy stream does not see.
 struct Sm120BfPackPool
 {
     int32_t* sfa = nullptr;
     std::size_t sfa_bytes = 0;
     int32_t* sfb = nullptr;
     std::size_t sfb_bytes = 0;
+    std::vector<void*> retired; // never freed: graphs captured earlier may hold them
 
     static Sm120BfPackPool& instance()
     {
@@ -67,46 +75,48 @@ struct Sm120BfPackPool
         return p;
     }
 
-    int32_t* ensure_sfa(std::size_t needed)
+    int32_t* ensure_sfa(std::size_t needed, cudaStream_t stream)
     {
-        if (sfa_bytes >= needed)
-            return sfa;
-        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
-        cudaStreamIsCapturing(nullptr, &cap);
-        if (cap == cudaStreamCaptureStatusActive)
-        {
-            std::fprintf(stderr,
-                "[blockscale_gemm] Sm120BfPackPool: sfa needs %zu bytes during stream capture but pool has %zu. "
-                "Warm up linear_bf16 on the largest shape before capture.\n",
-                needed, sfa_bytes);
-            std::abort();
-        }
-        if (sfa)
-            cudaFree(sfa);
-        cudaMalloc(&sfa, needed);
-        sfa_bytes = needed;
-        return sfa;
+        return grow(sfa, sfa_bytes, needed, stream, "sfa");
     }
 
-    int32_t* ensure_sfb(std::size_t needed)
+    int32_t* ensure_sfb(std::size_t needed, cudaStream_t stream)
     {
-        if (sfb_bytes >= needed)
-            return sfb;
+        return grow(sfb, sfb_bytes, needed, stream, "sfb");
+    }
+
+private:
+    int32_t* grow(int32_t*& buf, std::size_t& bytes, std::size_t needed, cudaStream_t stream, char const* what)
+    {
+        if (bytes >= needed)
+            return buf;
         cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
-        cudaStreamIsCapturing(nullptr, &cap);
-        if (cap == cudaStreamCaptureStatusActive)
+        if (cudaStreamIsCapturing(stream, &cap) != cudaSuccess)
         {
-            std::fprintf(stderr,
-                "[blockscale_gemm] Sm120BfPackPool: sfb needs %zu bytes during stream capture but pool has %zu. "
-                "Warm up linear_bf16 on the largest shape before capture.\n",
-                needed, sfb_bytes);
-            std::abort();
+            (void) cudaGetLastError();
+            cap = cudaStreamCaptureStatusActive;
         }
-        if (sfb)
-            cudaFree(sfb);
-        cudaMalloc(&sfb, needed);
-        sfb_bytes = needed;
-        return sfb;
+        if (cap != cudaStreamCaptureStatusNone)
+            TLLM_THROW(
+                "linear_bf16 / linear_qx on sm_120: the packed %s scale scratch needs %zu bytes but holds %zu, and it cannot "
+                "grow while the stream is capturing. Run the same call once eagerly on the capturing thread "
+                "before capturing it.",
+                what, needed, bytes);
+        constexpr std::size_t kGranule = std::size_t(1) << 20;
+        std::size_t target = needed > 2 * bytes ? needed : 2 * bytes;
+        target = (target + kGranule - 1) / kGranule * kGranule;
+        void* fresh = nullptr;
+        if (cudaMalloc(&fresh, target) != cudaSuccess)
+        {
+            (void) cudaGetLastError();
+            TLLM_THROW("linear_bf16 / linear_qx on sm_120: cudaMalloc of %zu bytes for the packed %s scale scratch failed",
+                target, what);
+        }
+        if (buf)
+            retired.push_back(buf);
+        buf = static_cast<int32_t*>(fresh);
+        bytes = target;
+        return buf;
     }
 };
 
@@ -175,8 +185,8 @@ inline void fp8_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, i
         int const K_words = static_cast<int>(div_up(K_blocks, 4)); // ceil(K/512) packed words per row
         std::size_t const sfa_bytes = static_cast<std::size_t>(M_pad) * K_words * sizeof(int32_t);
         std::size_t const sfb_bytes = static_cast<std::size_t>(N_pad) * K_words * sizeof(int32_t);
-        int32_t* packed_sfa = detail::Sm120BfPackPool::instance().ensure_sfa(sfa_bytes);
-        int32_t* packed_sfb = detail::Sm120BfPackPool::instance().ensure_sfb(sfb_bytes);
+        int32_t* packed_sfa = detail::Sm120BfPackPool::instance().ensure_sfa(sfa_bytes, stream);
+        int32_t* packed_sfb = detail::Sm120BfPackPool::instance().ensure_sfb(sfb_bytes, stream);
         sm120_repack_sfa(packed_sfa, scales_a, M_pad, K_blocks, stream);
         sm120_repack_sfb(packed_sfb, scales_b, N_pad, N_blocks, K_blocks, stream);
         // gemm_dispatch_sm120 takes scales typed as float* but reinterprets to

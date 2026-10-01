@@ -187,7 +187,9 @@ echo "[build] OK  ${so}  ($((size / 1024 / 1024)) MB)"
 
 PYTHONPATH="${REPO}/python" python -c "
 import torch, fish_scales_ops as fso
-print(f'[smoke] gemm ops:      {sorted(n for n in dir(fso.gemm) if not n.startswith(\"_\"))}')
-print(f'[smoke] attention ops: {sorted(n for n in dir(fso.attention) if not n.startswith(\"_\"))}')
+print(f'[smoke] dense:         {fso.dense.__all__}')
+print(f'[smoke] moe:           {fso.moe.__all__}')
+print(f'[smoke] attention:     {fso.attention.__all__}')
+print(f'[smoke] compat:        {len(fso.compat.__all__)} names')
 print(f'[smoke] torch.ops:     {[n for n in dir(torch.ops.fish_scales_ops) if not n.startswith(\"_\")]}')
 "

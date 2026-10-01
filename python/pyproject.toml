@@ -1,13 +1,13 @@
 [build-system]
-requires = ["setuptools>=64", "wheel", "torch>=2.5", "ninja"]
+requires = ["setuptools>=64", "wheel", "torch>=2.11", "ninja"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "fish-scales-ops"
-version = "0.1.0.dev0"
-description = "FP8 block-scaled GEMM + Flash Attention for sm_90 / sm_120."
+version = "0.2.0"
+description = "Block-scaled FP8 / MXFP8 GEMM, MoE layer and attention kernels for sm_90, sm_100/sm_103 and sm_120/sm_121."
 requires-python = ">=3.10"
-dependencies = ["torch>=2.5"]
+dependencies = ["torch>=2.11"]
 license = { text = "Apache-2.0" }
 
 [project.optional-dependencies]
@@ -26,9 +26,12 @@ sm100 = ["nvidia-cutlass-dsl>=4.8.0,<5"]
 package-dir = { "" = "." }
 packages = [
     "fish_scales_ops",
+    "fish_scales_ops.dense",
+    "fish_scales_ops.compat",
     "fish_scales_ops.gemm",
     "fish_scales_ops.gemm._vendor",
     "fish_scales_ops.gemm._vendor.flashinfer_sm100_blockscaled",
+    "fish_scales_ops.moe",
     "fish_scales_ops.attention",
     "fish_scales_ops.attention.backends",
 ]

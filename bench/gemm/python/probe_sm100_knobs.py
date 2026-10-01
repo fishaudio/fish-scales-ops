@@ -14,11 +14,11 @@ M,N,K = {M},{N},{K}
 torch.manual_seed(M*1009+N*17+K)
 x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") * 0.1
 w = torch.randn(N, K, dtype=torch.bfloat16, device="cuda") / (K ** 0.5)
-xq, sx = fso.gemm.quantize_1x32_fp8(x)
-wq, sw = fso.gemm.quantize_1x32_fp8(w)
+xq, sx = fso.compat.quantize_1x32_fp8(x)
+wq, sw = fso.compat.quantize_1x32_fp8(w)
 import torch.nn.functional as F
 y_ref = F.linear(x, w)
-fn = lambda: fso.gemm.linear_mxfp8(xq, wq, sx, sw)
+fn = lambda: fso.compat.linear_mxfp8(xq, wq, sx, sw)
 y = fn(); torch.cuda.synchronize()
 cos = F.cosine_similarity(y.double().flatten(), y_ref.double().flatten(), dim=0).item()
 for _ in range(15): fn()

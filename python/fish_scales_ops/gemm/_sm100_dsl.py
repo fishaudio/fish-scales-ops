@@ -3,18 +3,13 @@
 Wraps CUTLASS's ``Sm100BlockScaledPersistentDenseGemmKernel`` (the CuTe DSL
 persistent blockscaled kernel with *overlapping accumulators*: TMEM
 double-buffering lets the epilogue drain one accumulator while the MMA fills
-the next — the same technique that puts cuBLAS nvjet at ~86% tensor-pipe
-utilisation, vs ~71% for the C++ CollectiveBuilder kernel).
+the next).
 
-Bring-up record (2026-07-06, b300 GPU1, graph best-shot µs vs the C++
-cascade v2.5 at the same protocol): gate M=2048 41.0→38.7, gate M=4096
-→68.5, wqkv M=2048 27.2→25.8, gate_up M=4096 155→144.6, down M=2048
-43.7→41.6 (cluster(2,2) WINS here under this kernel's persistent scheduler —
-the earlier c22 loss was CLC allocation granularity, not multicast itself).
-The C++ path stays for: decode (M ≤ 128 incl. split-K), the narrow-N
-short-K cells where its TileK=256 instantiations win (wo/down small-M), and
-peak cubic (NoSmem C++ 326 vs DSL 342). See
-profile/ncu_sm100_2026-07-06/REPORT.md.
+The C++ path keeps decode (M ≤ 128, including its split-K), the narrow-N
+short-K cells its TileK = 256 instantiations serve (wo / down at small M), and
+the rows ``pick_config`` below does not name. The bring-up measurements of
+2026-07-06 are in profile/ncu_sm100_2026-07-06/REPORT.md, outside the
+repository; the published fso numbers are in ``docs/perf/gemm/sm100.md``.
 
 Contracts:
 
@@ -23,65 +18,112 @@ Contracts:
   validated cos 0.9993 against the BF16 reference, identical to C++).
 * Compile is per (tiler, cluster) — problem shape is a RUNTIME argument, so
   a handful of cached compiles serve every shape. First use of a config
-  JIT-compiles (~10 s); the eager-warmup-before-capture contract from
+  JIT-compiles it; the eager-warmup-before-capture contract from
   test_cuda_graph.py covers it, and kernel launches are capture-safe
   (validated: capture + NaN-clobber + replay → bit-identical cos).
-* ``FSO_DISABLE_DSL=1`` kills the route (falls back to the C++ cascade).
+* ``FSO_DISABLE_DSL=1`` kills the route (falls back to the C++ cascade); like
+  every boolean ``FSO_*`` switch, a value starting with ``0`` means off
+  (:mod:`fish_scales_ops._env`). The kernel source is the CUTLASS example under
+  ``3rdparty/cutlass`` in the source tree, or ``FSO_DSL_KERNEL_PATH``.
+* ``_init`` is silent only when the tier is switched off or the optional
+  ``nvidia-cutlass-dsl`` package (the ``sm100`` extra) is not installed. Any
+  other reason the tier cannot load — the kernel file is missing, as in an
+  installation without the source tree, loading it raises, or part of the DSL
+  stack fails to import — warns once per process with one ``fso:`` line on
+  stderr, and the router falls back to the remaining tiers.
 """
 from __future__ import annotations
 
 import os
+import sys
 from typing import Optional, Tuple
 
 import torch
 
+from .._env import env_flag
+
 _STATE: Optional[dict] = None
 
 
+def _default_kernel_path() -> str:
+    """The CUTLASS example the tier compiles, at its place in the source tree."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(here)))
+    # Base persistent blockscaled kernel — pointer-based compile
+    # via scaled_mm(), shape-generic. The prefetch variant is not
+    # used: under the production torch.cudagraph protocol on the
+    # b300 (2026-07-07 v3.3 bench) it did not hold up the gain its
+    # `cute.testing.benchmark` probes suggested and regressed on huge
+    # cubic shapes. Kept for a future retry, disabled.
+    return os.path.join(
+        repo, "3rdparty", "cutlass", "examples", "python", "CuTeDSL",
+        "blackwell", "dense_blockscaled_gemm_persistent.py")
+
+
+def _warn_unavailable(reason: str) -> None:
+    """Warn that the tier should be there and is not: one line on stderr, in
+    the ``fso:`` format of the decode row's notices (stdout belongs to the
+    benches' JSON protocol). ``_init`` runs once per process, so this prints at
+    most once."""
+    print("fso: sm_100/103 CuTe-DSL mid-band tier unavailable: %s; linear_mxfp8 / "
+          "linear_fp8 fall back to the remaining tiers. Point FSO_DSL_KERNEL_PATH at "
+          "CUTLASS's examples/python/CuTeDSL/blackwell/dense_blockscaled_gemm_persistent.py, "
+          "or set FSO_DISABLE_DSL=1 to skip the tier without this warning"
+          % " ".join(str(reason).split()), file=sys.stderr, flush=True)
+
+
 def _init() -> Optional[dict]:
-    """Lazy one-time init. Returns None when the DSL stack is unavailable."""
+    """Lazy one-time init. Returns None when the DSL stack is unavailable.
+
+    Silent when ``FSO_DISABLE_DSL`` is on or ``nvidia-cutlass-dsl`` is not
+    installed; every other failure warns once (``_warn_unavailable``).
+    """
     global _STATE
     if _STATE is not None:
         return _STATE if _STATE.get("ok") else None
     _STATE = {"ok": False}
-    if os.getenv("FSO_DISABLE_DSL"):
+    if env_flag("FSO_DISABLE_DSL"):
+        return None
+    try:
+        import cutlass
+    except ModuleNotFoundError as exc:
+        if exc.name == "cutlass":
+            return None             # the optional `sm100` extra is not installed
+        _warn_unavailable("importing cutlass failed: %s: %s" % (type(exc).__name__, exc))
+        return None
+    except Exception as exc:
+        _warn_unavailable("importing cutlass failed: %s: %s" % (type(exc).__name__, exc))
         return None
     try:
         import importlib.util
 
         import cuda.bindings.driver as cuda_drv
-        import cutlass
         import cutlass.cute as cute
         import cutlass.torch as cutlass_torch
         import cutlass.utils as dsl_utils
         from cutlass.cute.runtime import from_dlpack, make_ptr
+    except Exception as exc:
+        _warn_unavailable("importing the CuTe-DSL stack failed: %s: %s" % (type(exc).__name__, exc))
+        return None
 
-        kernel_path = os.getenv("FSO_DSL_KERNEL_PATH")
-        if not kernel_path:
-            here = os.path.dirname(os.path.abspath(__file__))
-            repo = os.path.dirname(os.path.dirname(os.path.dirname(here)))
-            # Base persistent blockscaled kernel — pointer-based compile
-            # via scaled_mm(), shape-generic. The prefetch variant looked
-            # 10-22% faster in `cute.testing.benchmark` probes but was
-            # ~neutral (+0.3% geomean) under production torch.cudagraph
-            # best-shot on b300 (2026-07-07 v3.3 bench) with a 8-16%
-            # regression on huge cubic — kept for future retry, disabled.
-            kernel_path = os.path.join(
-                repo, "3rdparty", "cutlass", "examples", "python", "CuTeDSL",
-                "blackwell", "dense_blockscaled_gemm_persistent.py")
-        if not os.path.exists(kernel_path):
-            return None
+    kernel_path = os.getenv("FSO_DSL_KERNEL_PATH") or _default_kernel_path()
+    if not os.path.exists(kernel_path):
+        _warn_unavailable("kernel source %s does not exist" % kernel_path)
+        return None
+    try:
         spec = importlib.util.spec_from_file_location("_fso_sm100_dsl_kernel", kernel_path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-
-        _STATE.update(ok=True, cuda=cuda_drv, cutlass=cutlass, cute=cute,
-                      cutlass_torch=cutlass_torch, utils=dsl_utils,
-                      make_ptr=make_ptr, from_dlpack=from_dlpack,
-                      mod=mod, compiled={})
-        return _STATE
-    except Exception:
+    except Exception as exc:
+        _warn_unavailable("loading kernel source %s raised %s: %s"
+                          % (kernel_path, type(exc).__name__, exc))
         return None
+
+    _STATE.update(ok=True, cuda=cuda_drv, cutlass=cutlass, cute=cute,
+                  cutlass_torch=cutlass_torch, utils=dsl_utils,
+                  make_ptr=make_ptr, from_dlpack=from_dlpack,
+                  mod=mod, compiled={}, kernel_path=kernel_path)
+    return _STATE
 
 
 def _from_torch(st: dict, t: torch.Tensor, dtype, leading_dim: int):
@@ -108,9 +150,9 @@ def _kernel_class(mod, cute_mod, utils_mod, force_stages: Optional[int],
     Stage probe (2026-07-07, sm100-v2-work/stage_probe.log): default
     heuristic near-optimal, only (256,128)c(2,1) cells win under S=8.
 
-    Swizzle probe (2026-07-07, sm100-v2-work/swizzle_probe.log): huge
-    payoff at cubic ≥8192 (swizzle=8 gives −3% at 8192, −8% at 12288,
-    −10% at 16384). Small tile counts REGRESS under swizzle >1.
+    Swizzle probe (2026-07-07, sm100-v2-work/swizzle_probe.log): swizzle = 8
+    pays off on cubic shapes from 8192 up; small tile counts regress under a
+    swizzle above 1.
     """
     base = mod.Sm100BlockScaledPersistentDenseGemmKernel
     if force_stages is None and swizzle_size == 1:
@@ -189,17 +231,18 @@ def pick_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
         # ONLY route cubic sizes we've actually measured. Non-standard
         # sizes (M=2560, 3072, 1536, ...) fall through to C++ — the sweep
         # data only covered {4096, 6144, 8192, 12288, 16384}, and
-        # extrapolating hit +60% regressions on cubic-2560 in v3.6 bench.
+        # extrapolating regressed cubic-2560 badly in the v3.6 bench.
         if m == 4096:
             return (256, 128), (2, 1), 8, 1
         if m == 6144:
             return (256, 256), (2, 1), None, 1
         if m == 8192:
-            return (256, 256), (2, 1), None, 8   # swizzle=8 (-3.5%)
+            return (256, 256), (2, 1), None, 8   # swizzle=8, per the swizzle probe
         if m in (12288, 16384):
-            # Huge cubic: swizzle=8 gives −2.5/−1.2% in bench vs probe's
-            # −8/−10%. Bench-worker inflates huge-M cells (documented
-            # 5-15% noise on b300); still a real win over the C++ path.
+            # Huge cubic: swizzle=8, as for 8192. The bench showed a smaller
+            # gain than the probe on these cells, which the bench worker's
+            # known scatter on huge-M cells of the b300 can hide; the row
+            # stays ahead of the C++ path there.
             return (256, 256), (2, 1), None, 8
         return None
 
@@ -219,20 +262,20 @@ def pick_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
         # other's cost.
         #
         # Measured over six M values on three narrow-N shapes (see the sweep
-        # in the B300 run b300_mlp_tune_20260915): no DSL
-        # configuration was the fastest engine on any narrow-N cell above
-        # M = 1024 — cuBLAS wins the low-wave and short-K cells and the C++
-        # cascade wins the long-K deep-grid cells, and `_sm100_smm.should_route`
-        # now encodes that split. Three rows were removed here:
-        #   * `k >= 4096 and m >= 2048` -> (256,128) c(2,2): loses to cuBLAS
-        #     up to M = 3072 and to the C++ cascade above it.
+        # in the B300 run b300_mlp_tune_20260915): the sweep put no narrow-N
+        # cell above M = 1024 on a DSL configuration — the low-wave and
+        # short-K cells went to cuBLAS and the long-K deep-grid cells to the
+        # C++ cascade, and `_sm100_smm.should_route` now encodes that split.
+        # Three rows were removed here:
+        #   * `k >= 4096 and m >= 2048` -> (256,128) c(2,2): the sweep put
+        #     those cells on cuBLAS up to M = 3072 and on the C++ cascade above.
         #   * `k >= 4096 and m == 4096 and n <= 2560` -> same configuration,
         #     same verdict (it only restated the row above).
         #   * `k >= 8192 and m == 1024` -> (256,256) c(4,1): dead code, since
         #     `should_route` accepts narrow-N at 128 < m <= 1024 and takes the
-        #     cell for cuBLAS first. Timed directly for this decision, it ties
-        #     cuBLAS and the C++ cascade at that cell, so nothing was lost by
-        #     its being unreachable and nothing would be gained by reviving it.
+        #     cell for cuBLAS first. Timed directly for this decision, it gave
+        #     nothing over the routes that serve that cell, so nothing was lost
+        #     by its being unreachable and nothing would be gained by reviving it.
         return None
 
     # ---- Wide-N band (tiles_n > 32): wqkv / gate / gate_up ---------------
@@ -241,13 +284,12 @@ def pick_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
     # reached when tier 1 is unavailable — K not a multiple of 128, or
     # `torch.nn.functional.scaled_mm` missing, or FSO_DISABLE_SMM=1. They are
     # kept as that fall-back, not as the production pick. The sweep behind the
-    # change measured cuBLAS ahead of the best DSL configuration on wide-N
-    # shapes at every M from 1536 to 8192, with the gap narrowing as M grows;
-    # if a future device or CUTLASS release reverses that, re-measure here
-    # rather than restoring the old M <= 1024 cap in should_route.
-    # Widened: gate_up M=256 and M=512 now go DSL (256,128)c(2,1) — sweep
-    # says 15.68 / 23.01 vs C++ 12.33 (M=256 stays C++) / 24.65.
-    # gate_up M=256 stays C++ — DSL loses (15.68 vs C++ 12.33).
+    # change put every wide-N cell from M = 1536 to 8192 on cuBLAS rather than
+    # on the best DSL configuration; if a future device or CUTLASS release
+    # changes that, re-measure here rather than restoring the old M <= 1024 cap
+    # in should_route.
+    # Widened: gate_up M=512 goes DSL (256,128)c(2,1) per the sweep;
+    # gate_up M=256 stays on the C++ path.
     if n >= 16384 and m < 512:
         return None
     if m < 256:
@@ -257,7 +299,7 @@ def pick_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
         return (256, 256), (2, 1), None, 1
     if m >= 2048:
         if n >= 16384:
-            # gate_up M=2048 (256,128)c21: S=8 (-0.7%)
+            # gate_up M=2048 (256,128)c21: S=8, per the stage probe
             return (256, 128), (2, 1), 8, 1
         return (256, 256), (2, 2), None, 1
     if m >= 1024:
@@ -266,7 +308,7 @@ def pick_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
         return (256, 128), (2, 1), None, 1
     # m in [256, 1024).
     # Wave-quant patch (decode_sweep.log 2026-07-07): wqkv-class shapes
-    # (tiles_n ∈ [40, 64]) at M ∈ (256, 384] pay ~10% overhead under
+    # (tiles_n ∈ [40, 64]) at M ∈ (256, 384] under-fill the machine with
     # (256,128) 2SM — 3-4 tiles × ~48 CTAs uses only ~1/3 of 148 SMs.
     # (128,128) 1SM: 3×tiles_n CTAs = 1 perfect wave. Beyond M=384 the
     # K=256 mainloop advantage of (256,128) wins back.

@@ -84,47 +84,47 @@ def _build_mlp_fn(dtype, sm_major):
         return fn
 
     if dtype == "bsfp8":
-        wgu_q, sgu = fso.gemm.quantize_128x128_fp8(w_gate_up_bf)
-        wd_q, sd = fso.gemm.quantize_128x128_fp8(w_down_bf)
+        wgu_q, sgu = fso.compat.quantize_128x128_fp8(w_gate_up_bf)
+        wd_q, sd = fso.compat.quantize_128x128_fp8(w_down_bf)
         if sm_major >= 10:
-            sgu = fso.gemm.repack_fp8_wgt_scales(sgu)
-            sd = fso.gemm.repack_fp8_wgt_scales(sd)
+            sgu = fso.compat.repack_fp8_wgt_scales(sgu)
+            sd = fso.compat.repack_fp8_wgt_scales(sd)
 
         if sm_major >= 10:
             # sm_120 / sm_100: use the fused single-kernel `quantize_1x128_fp8_packed`
             # which emits the int32-packed UE8M0 K-major scale layout directly,
             # skipping the separate `repack_fp8_act_scales` pass.
             def fn(x_bf):
-                xq, sx = fso.gemm.quantize_1x128_fp8_packed(x_bf)
-                gu = fso.gemm.linear_fp8(xq, wgu_q, sx, sgu)
+                xq, sx = fso.compat.quantize_1x128_fp8_packed(x_bf)
+                gu = fso.compat.linear_fp8(xq, wgu_q, sx, sgu)
                 h = _silu_chunk_mul(gu)
-                hq, sh = fso.gemm.quantize_1x128_fp8_packed(h)
-                return fso.gemm.linear_fp8(hq, wd_q, sh, sd)
+                hq, sh = fso.compat.quantize_1x128_fp8_packed(h)
+                return fso.compat.linear_fp8(hq, wd_q, sh, sd)
         else:
             # sm_90: deep_gemm path consumes FP32 scales directly. The
             # underlying `fp8bs_quantize_1x128` already routes to the fast
             # uint64 LDG.64 kernel when K%512==0.
             def fn(x_bf):
-                xq, sx = fso.gemm.quantize_1x128_fp8(x_bf, use_ue8m0=False)
-                gu = fso.gemm.linear_fp8(xq, wgu_q, sx, sgu)
+                xq, sx = fso.compat.quantize_1x128_fp8(x_bf, use_ue8m0=False)
+                gu = fso.compat.linear_fp8(xq, wgu_q, sx, sgu)
                 h = _silu_chunk_mul(gu)
-                hq, sh = fso.gemm.quantize_1x128_fp8(h, use_ue8m0=False)
-                return fso.gemm.linear_fp8(hq, wd_q, sh, sd)
+                hq, sh = fso.compat.quantize_1x128_fp8(h, use_ue8m0=False)
+                return fso.compat.linear_fp8(hq, wd_q, sh, sd)
         return fn
 
     if dtype == "mxfp8":
         if sm_major not in (10, 12):
             return None
-        wgu_q, sgu = fso.gemm.quantize_1x32_fp8(w_gate_up_bf)
-        wd_q, sd = fso.gemm.quantize_1x32_fp8(w_down_bf)
+        wgu_q, sgu = fso.compat.quantize_1x32_fp8(w_gate_up_bf)
+        wd_q, sd = fso.compat.quantize_1x32_fp8(w_down_bf)
 
         def fn(x_bf):
-            xq, sx = fso.gemm.quantize_1x32_fp8(x_bf)
-            gu = fso.gemm.linear_mxfp8(xq, wgu_q, sx, sgu)
+            xq, sx = fso.compat.quantize_1x32_fp8(x_bf)
+            gu = fso.compat.linear_mxfp8(xq, wgu_q, sx, sgu)
             # Fused silu(gate) * up + quantize → fp8 + packed scale,
             # no `h` intermediate.
-            hq, sh = fso.gemm.silu_chunk_mul_quantize_1x32_fp8(gu)
-            return fso.gemm.linear_mxfp8(hq, wd_q, sh, sd)
+            hq, sh = fso.compat.silu_chunk_mul_quantize_1x32_fp8(gu)
+            return fso.compat.linear_mxfp8(hq, wd_q, sh, sd)
         return fn
 
     if dtype in ("smm", "smm_fast"):

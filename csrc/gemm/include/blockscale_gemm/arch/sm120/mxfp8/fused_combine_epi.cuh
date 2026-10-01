@@ -27,8 +27,7 @@
  * sm120_scatterwarp_20260928): the layer is 2-7 % FASTER than the slab pair and the
  * transient footprint still falls about half (Qwen3.5-35B-A3B at M = 8192: 14.0 GiB
  * -> 6.0 GiB; Qwen3-30B-A3B 7.5 -> 3.5), which is the difference between fitting and
- * not fitting beside the weights on a 32 GB card. Chunking the token dimension for
- * the same peak costs +80 to +209 % instead.
+ * not fitting beside the weights on a 32 GB card.
  *
  * ONE warp is not enough: that form costs +6 %, because a single warp cannot keep
  * enough atomic requests in flight to sustain the scatter. Two clears it, and

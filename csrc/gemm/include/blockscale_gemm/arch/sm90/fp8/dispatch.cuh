@@ -17,7 +17,11 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <algorithm>
+#include <cstdio>
 #include <cstdlib>
+#include <string>
+#include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
 namespace kernels::blockscale_gemm
@@ -73,8 +77,7 @@ inline void gemm_dispatch_sm90(void* mat_a, int ld_a, void* mat_b, int ld_b, voi
 // Grouped (MoE, masked) block-scale FP8 on sm_90 — revives the in-tree
 // DeepGEMM GroupedMasked scheduler (jit/deep_gemm/scheduler.cuh). The kernel
 // template, TMA descriptors, grouped runGemm wrapper, and the FP32 K-major
-// scale format all already exist; this entry is the only host-side gap (plus
-// the GroupedMasked case added to runtime.cuh's cubin name->enum map).
+// scale format all already exist; this entry is the only host-side gap.
 //
 // Masked/DeepGEMM layout, identical to the sm_120 masked path:
 //   A   [G, m_cap, K]  fp8   — per-group activation slab (shape_m = m_cap)
@@ -156,6 +159,199 @@ inline void gemm_dispatch_sm90_grouped_contiguous(void* mat_a, void* mat_b, void
         static_cast<int>(shape_n), scales_a, scales_b, p_max, shape_n, shape_k, bm, bn, block_k, num_groups, ntm,
         deep_gemm::GemmType::GroupedContiguous, sorted_expert_ids, stream, num_device_sms,
         static_cast<uint32_t>(smem));
+}
+
+// Contiguous grouped FC1 on sm_90, non-swap, with two math warp-groups split along N (fused-FC1 step 1,
+// 2026-09-30; fp8_gemm_kernel_2wg). Same buffers and contract as gemm_dispatch_sm90_grouped_contiguous, for the FC1
+// only: mat_b is the stacked [gate; up] weight [G, shape_n = 2I, K], and one CTA computes gate block b (warp-group 0)
+// and up block b (warp-group 1) of one 64-row activation tile, storing both bf16 halves to their native columns of
+// D [p_max, 2I]. block_m must be 64 (the moe_build_sorted padding); block_n is fixed at 128 per warp-group.
+//
+// Stages: the largest count whose shared memory fits. A stage carries A (8 KB), both 128-row weight halves (32 KB)
+// and the A scales, and the bf16 staging of the two 64 x 128 output tiles takes 32 KB, so 4 stages fit (197,824 B;
+// 5 would need 239,056 B). Four stages of this kernel hold the same MMA work as today's eight, since every stage
+// feeds both warp-groups.
+//
+// Registers: the kernel is built for 384 threads at one CTA per SM, so ptxas must compile it to exactly 168 registers
+// for setmaxnreg's 40 / 232 split to balance; a lower count would deadlock the math warp-groups' increase. The host
+// therefore refuses any cubin that is not at 168 registers or that uses local memory (checked once per cubin).
+// The two-warp-group FC1 kernels (fp8_gemm_kernel_2wg and fp8_gemm_kernel_2wg_swiglu) are launched with 384 threads at
+// one CTA per SM, so ptxas must compile them to exactly 168 registers for setmaxnreg's 40 / 232 split to balance
+// ((168 - 40) * 128 == (232 - 168) * 256); a lower count would deadlock the math warp-groups' increase, and nothing
+// inside the kernel could recover. Checked once per cubin, together with the absence of local memory (spills).
+inline void sm90_check_2wg_kernel_resources(cudaKernel_t kernel, char const* what)
+{
+    static std::vector<void*> s_checked;
+    if (std::find(s_checked.begin(), s_checked.end(), reinterpret_cast<void*>(kernel)) != s_checked.end())
+        return;
+    int num_regs = 0, local_bytes = -1;
+    auto const ck = reinterpret_cast<CUkernel>(kernel);
+    if (cuKernelGetAttribute(&num_regs, CU_FUNC_ATTRIBUTE_NUM_REGS, ck, 0) != CUDA_SUCCESS || num_regs != 168)
+        TLLM_THROW("%s: the cubin has %d registers per thread, not the 168 its 40 / 232 setmaxnreg split needs; "
+                   "refusing to launch (it would deadlock)",
+            what, num_regs);
+    if (cuKernelGetAttribute(&local_bytes, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, ck, 0) != CUDA_SUCCESS
+        || local_bytes != 0)
+        TLLM_THROW("%s: the cubin uses %d bytes of local memory per thread (spills)", what, local_bytes);
+    s_checked.push_back(reinterpret_cast<void*>(kernel));
+}
+
+inline uint32_t sm90_grouped_contiguous_2wg_smem_size(uint32_t num_stages, uint32_t shape_k)
+{
+    constexpr uint32_t bm = 64u, bn = 128u, bk = 128u;
+    uint32_t const smem_d = 2u * bm * bn * 2u;                     // two bf16 64 x 128 staging tiles
+    uint32_t const per_stage = bm * bk + 2u * bn * bk + bm * 4u;   // A + (gate, up) B halves + A scales
+    uint32_t const smem_scales_b = (2u * ((shape_k + bk - 1u) / bk) * 4u + 7u) / 8u * 8u; // gate and up scale rows
+    uint32_t const smem_barrier = num_stages * 8u * 2u;
+    return smem_d + num_stages * per_stage + smem_scales_b + smem_barrier;
+}
+
+inline void gemm_dispatch_sm90_grouped_contiguous_2wg(void* mat_a, void* mat_b, void* mat_d, float* scales_a,
+    float* scales_b, int* sorted_expert_ids, uint32_t num_groups, uint32_t p_max, uint32_t shape_n, uint32_t shape_k,
+    uint32_t block_m, uint32_t expected_m, cudaStream_t stream, int num_device_sms = kNumDeviceSMs)
+{
+    if (num_device_sms < 0)
+        num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
+
+    constexpr uint32_t block_k = 128;
+    constexpr uint32_t bm = 64u, bn = 128u;
+    (void) expected_m;
+    if (block_m != bm)
+        TLLM_THROW("two-warp-group grouped FC1: block_m must be 64 (= the moe_build_sorted padding), got %u", block_m);
+    if (shape_n % (2u * bn) != 0u || shape_k % block_k != 0u)
+        TLLM_THROW("two-warp-group grouped FC1: N must be a multiple of 256 (2I, I % 128 == 0) and K of 128, "
+                   "got N=%u K=%u",
+            shape_n, shape_k);
+
+    constexpr uint32_t kSm90MaxSmem = 232448u; // the picker's sm90_capacity (227 KB of dynamic shared memory)
+    uint32_t ns = 8u;
+    while (ns > 1u && sm90_grouped_contiguous_2wg_smem_size(ns, shape_k) > kSm90MaxSmem)
+        --ns;
+    uint32_t const smem = sm90_grouped_contiguous_2wg_smem_size(ns, shape_k);
+
+    auto runtime = deep_gemm::jit::getGlobalCompiler().build(shape_n, shape_k, bm, bn, block_k, num_groups, ns, 1u,
+        deep_gemm::GemmType::GroupedContiguous, false, 1u, true);
+    auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
+
+    // Once per cubin: exactly 168 registers (see above) and no local memory.
+    sm90_check_2wg_kernel_resources(kernel, "two-warp-group grouped FC1");
+
+    deep_gemm::runGemm2wg(kernel, mat_a, static_cast<int>(shape_k), mat_b, static_cast<int>(shape_k), mat_d,
+        static_cast<int>(shape_n), scales_a, scales_b, p_max, shape_n, shape_k, bm, bn, block_k, num_groups,
+        sorted_expert_ids, stream, num_device_sms, smem);
+}
+
+// Contiguous grouped FC1 on sm_90, non-swap, with the SwiGLU + 1x128 FP8 requantize fused into the epilogue (fused-FC1
+// step 2, 2026-09-30; fp8_gemm_kernel_2wg_swiglu). Same inputs as gemm_dispatch_sm90_grouped_contiguous_2wg (mat_b is
+// the stacked [gate; up] weight [G, shape_n = 2I, K]); the outputs are what silu_chunk_mul_quantize_1x128_sorted_sm90
+// makes of that FC1's bf16 result: mat_dq [p_max, I] fp8 and mat_sd [I / 128, sd_ld] fp32 (sd_ld = align4(p_max)).
+//
+// Stages: the largest count whose shared memory fits (the layout is sm90_swiglu_smem in fp8_gemm_impl.cuh, which the
+// kernel reads too). A stage is A (8 KB) + both 128-row weight halves (32 KB) + the A scales; the epilogue holds an
+// 8 KB fp8 staging tile, 16 KB of bf16 exchange and 512 B of half-row amaxes. At K = 2048 that is 5 stages
+// (231,376 B of 232,448).
+//
+// Registers: the same 168 / 40 / 232 contract and guard as the step-1 kernel.
+inline uint32_t sm90_grouped_contiguous_swiglu_smem_size(uint32_t num_stages, uint32_t shape_k)
+{
+    return deep_gemm::sm90_swiglu_smem::total_bytes(num_stages, shape_k);
+}
+
+inline uint32_t sm90_grouped_contiguous_swiglu_num_stages(uint32_t shape_k)
+{
+    constexpr uint32_t kSm90MaxSmem = 232448u; // the picker's sm90_capacity (227 KB of dynamic shared memory)
+    uint32_t ns = 8u;
+    while (ns > 1u && sm90_grouped_contiguous_swiglu_smem_size(ns, shape_k) > kSm90MaxSmem)
+        --ns;
+    return ns;
+}
+
+inline void gemm_dispatch_sm90_grouped_contiguous_swiglu(void* mat_a, void* mat_b, void* mat_dq, float* mat_sd,
+    float* scales_a, float* scales_b, int* sorted_expert_ids, uint32_t num_groups, uint32_t p_max, uint32_t shape_n,
+    uint32_t shape_k, uint32_t block_m, uint32_t expected_m, cudaStream_t stream, int num_device_sms = kNumDeviceSMs)
+{
+    if (num_device_sms < 0)
+        num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
+
+    constexpr uint32_t block_k = 128;
+    constexpr uint32_t bm = 64u, bn = 128u;
+    (void) expected_m;
+    if (block_m != bm)
+        TLLM_THROW("fused SwiGLU grouped FC1: block_m must be 64 (= the moe_build_sorted padding), got %u", block_m);
+    if (shape_n % (2u * bn) != 0u || shape_k % block_k != 0u)
+        TLLM_THROW("fused SwiGLU grouped FC1: N must be a multiple of 256 (2I, I % 128 == 0) and K of 128, "
+                   "got N=%u K=%u",
+            shape_n, shape_k);
+
+    uint32_t const ns = sm90_grouped_contiguous_swiglu_num_stages(shape_k);
+    uint32_t const smem = sm90_grouped_contiguous_swiglu_smem_size(ns, shape_k);
+    uint32_t const sd_ld = (p_max + 3u) / 4u * 4u;
+
+    auto runtime = deep_gemm::jit::getGlobalCompiler().build(shape_n, shape_k, bm, bn, block_k, num_groups, ns, 1u,
+        deep_gemm::GemmType::GroupedContiguous, false, 1u, true, true);
+    auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
+    sm90_check_2wg_kernel_resources(kernel, "fused SwiGLU grouped FC1");
+
+    deep_gemm::runGemm2wgSwiglu(kernel, mat_a, static_cast<int>(shape_k), mat_b, static_cast<int>(shape_k), mat_dq,
+        mat_sd, sd_ld, scales_a, scales_b, p_max, shape_n, shape_k, bm, bn, block_k, num_groups, sorted_expert_ids,
+        stream, num_device_sms, smem);
+}
+
+// Two-CTA swap-AB builds (fp8_gemm_kernel_swapAB and the gate/up pair kernel below) rebalance their registers 40 / 96
+// around a compiled count of exactly 80 (fp8_gemm_impl.cuh). ptxas decides that count, so another NVRTC build or
+// another kernel body can land elsewhere, and below 80 the math warp-groups' setmaxnreg increase deadlocks; such a
+// cubin must run at one CTA per SM instead. With check_local, a build that spills to local memory is refused the same
+// way (the pair kernels hold two accumulator sets, so a large tile can spill at the 96-register two-CTA budget).
+// Returns whether the kernel may run at two CTAs per SM. When it may not, it prints one stderr line per kernel name per
+// process, naming the kernel, the count ptxas produced (and the local bytes) and the one-CTA fallback, so a deployment
+// whose NVRTC moves the count does not lose two-CTA residency without a signal.
+inline bool sm90_swapab_two_cta_regs_ok(cudaKernel_t kernel, char const* what, bool check_local = false)
+{
+    int num_regs = 0, local_bytes = 0;
+    auto const ck = reinterpret_cast<CUkernel>(kernel);
+    bool const regs_ok
+        = cuKernelGetAttribute(&num_regs, CU_FUNC_ATTRIBUTE_NUM_REGS, ck, 0) == CUDA_SUCCESS && num_regs == 80;
+    bool const local_ok = !check_local
+        || (cuKernelGetAttribute(&local_bytes, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, ck, 0) == CUDA_SUCCESS
+            && local_bytes == 0);
+    if (regs_ok && local_ok)
+        return true;
+    char const* name = nullptr;
+    if (cuKernelGetName(&name, ck) != CUDA_SUCCESS || name == nullptr)
+        name = "(unnamed)";
+    static std::vector<std::string> s_reported;
+    if (std::find(s_reported.begin(), s_reported.end(), std::string(name)) == s_reported.end())
+    {
+        s_reported.emplace_back(name);
+        if (check_local)
+            std::fprintf(stderr,
+                "[fish_scales_ops] sm_90 %s: the two-CTA build of %s compiled to %d registers per thread and %d bytes "
+                "of local memory, not the 80 registers without spills its 40 / 96 setmaxnreg split needs; falling back "
+                "to one CTA per SM\n",
+                what, name, num_regs, local_bytes);
+        else
+            std::fprintf(stderr,
+                "[fish_scales_ops] sm_90 %s: the two-CTA build of %s compiled to %d registers per thread, not the 80 "
+                "its 40 / 96 setmaxnreg split needs; falling back to one CTA per SM\n",
+                what, name, num_regs);
+    }
+    return false;
+}
+
+// FSO_SWAP_STAGES (1..12) and FSO_SWAPAB_CTAS_PER_SM (1 or 2), the swap-AB tuning knobs, read on every call like the
+// rest of the swap-AB dispatch; 0 when unset or out of range.
+inline uint32_t sm90_env_swap_stages()
+{
+    char const* e = std::getenv("FSO_SWAP_STAGES");
+    int const s = e ? atoi(e) : 0;
+    return (s >= 1 && s <= 12) ? static_cast<uint32_t>(s) : 0u;
+}
+
+inline uint32_t sm90_env_swapab_ctas()
+{
+    char const* e = std::getenv("FSO_SWAPAB_CTAS_PER_SM");
+    int const v = e ? atoi(e) : 0;
+    return (v == 1 || v == 2) ? static_cast<uint32_t>(v) : 0u;
 }
 
 // Contiguous grouped block-scale FP8 on sm_90, swap-AB — H4b. For M >= 8 the
@@ -278,14 +474,14 @@ inline void gemm_dispatch_sm90_grouped_contiguous_swapab(void* mat_a_wgt, void* 
     if (ctas == 2u)
     {
         // The two-CTA kernel rebalances registers 40 / 96 around a compiled count of exactly 80 (see
-        // fp8_gemm_impl.cuh); a cubin ptxas compiled below 80 would deadlock the math warp-groups' increase.
-        int num_regs = 0;
-        if (cuKernelGetAttribute(&num_regs, CU_FUNC_ATTRIBUTE_NUM_REGS, reinterpret_cast<CUkernel>(kernel), 0)
-                != CUDA_SUCCESS
-            || num_regs != 80)
+        // fp8_gemm_impl.cuh); a cubin ptxas compiled below 80 would deadlock the math warp-groups' increase. The
+        // fallback says so on stderr once per kernel and takes the one-CTA stage pick above, FSO_SWAP_STAGES included.
+        if (!sm90_swapab_two_cta_regs_ok(kernel, "swap-AB grouped GEMM"))
         {
             ctas = 1u;
             ns = ns < 6u ? 6u : ns;
+            if (uint32_t const s = sm90_env_swap_stages())
+                ns = s;
             smem = fits(ns);
             while (ns > 1u && smem + kReservedSmemPerCta > kSm90MaxSmem)
             {
@@ -301,6 +497,206 @@ inline void gemm_dispatch_sm90_grouped_contiguous_swapab(void* mat_a_wgt, void* 
         static_cast<int>(shape_n), sfb_wgt, sfa_act, shape_n, p_max, shape_k, bm, bn, block_k, num_groups, ntm,
         deep_gemm::GemmType::GroupedContiguous, sorted_expert_ids, stream, static_cast<int>(num_device_sms * ctas),
         static_cast<uint32_t>(smem));
+}
+
+// Contiguous grouped FC1 on sm_90, swap-AB, with one CTA per (activation tile, 128-column SwiGLU block) (fused-FC1
+// P2a, design S2, 2026-10-01; fp8_gemm_kernel_swapAB_pair). Same buffers and contract as
+// gemm_dispatch_sm90_grouped_contiguous_swapab for the FC1: mat_a_wgt is the stacked [gate; up] weight
+// [G, shape_n = 2I, K] (I a multiple of 128), and one CTA computes gate block b and up block b (256 weight rows) of one
+// block_n-row activation tile. D is today's gu [p_max, 2I] bf16, bit-identical to the swap-AB FC1's on the rows the
+// scheduler computes.
+//
+// Launch plan (sm90_swapab_pair_plan), the swap-AB FC1's rules applied to this tile:
+//   * CTAs per SM: one, for every shape. Measured on the fused kernel (P2a REPORT.md, the D runs): one CTA per SM at
+//     the stage rule below beat two CTAs at 2 stages each at every bn16 cell of both families (by 0.1-19 %), and at
+//     the bn32 cells it won by up to 0.6 % or lost by at most 0.2 %; at block_n = 64 a two-CTA build spills (two
+//     accumulator sets and their promotion copies need 2 * block_n registers per math thread, 128 > the 96 a
+//     two-CTA math warp-group has).
+//     FSO_SWAPAB_CTAS_PER_SM=2 forces two CTAs (an A/B knob; a build that misses 80 registers or spills still falls
+//     back to one CTA).
+//   * Stages, one CTA per SM: the largest stage count that fits the shared-memory budget AND divides K / 128 (4 at
+//     K = 2048: 8 does not fit, 5 and 6 do not divide 16). Measured at M = 1, where every CTA runs a single tile: the
+//     fused FC1 took 9.17 / 8.85 / 8.93 us (Family C) and 10.76 / 10.25 / 10.08 us (Family B) in the layer at
+//     6 / 5 / 4 stages, and only below 6 does the layer meet the 1 % bar at C M=1. The pair kernel (same mainloop, bf16
+//     epilogue) and today's swap-AB kernel do not slow down at 6 stages, so the cost sits in the fused kernel at 6:
+//     a stage count that does not divide K / 128 makes the compiler emit a second, partial copy of the unrolled
+//     pipeline body for the last pass (the NotDivisibleK path), and the fused 6-stage kernel is 42 KiB of code against
+//     30 KiB at 4; with one pass through the code per CTA at tiny M, code size is the likely cost (UNVERIFIED, P2a
+//     GATE1.md). A divisor of K / 128 never has that second copy.
+//   * Stages, two CTAs per SM: FSO_SWAP_STAGES or 6, reduced until both CTAs' shared memory fits, then until it
+//     divides K / 128 (the swap-AB two-CTA determinism rule); one CTA when none of 2.. fits.
+//   * Shared memory: the sm90_swapab_pair_smem layout, rounded to 1 KB so a second CTA's base stays 1024-byte aligned,
+//     plus the 1 KB the driver reserves per CTA. FSO_SWAP_STAGES overrides the stage count of either mode (reduced
+//     until it fits).
+//   * Registers: a two-CTA build must have exactly 80 and no local memory (sm90_swapab_two_cta_regs_ok; otherwise one
+//     CTA, with a stderr line); a one-CTA build exactly 168, the 40 / 232 setmaxnreg split of 384 threads, or it is
+//     refused.
+struct Sm90SwapAbPairPlan
+{
+    uint32_t ctas;   // resident CTAs per SM (the grid is num_sms * ctas)
+    uint32_t stages; // pipeline stages per CTA
+    uint32_t smem;   // dynamic shared memory per CTA in bytes, a multiple of 1 KB
+};
+
+inline uint32_t sm90_swapab_pair_smem_size(uint32_t block_n, bool fused, uint32_t num_stages)
+{
+    return (deep_gemm::sm90_swapab_pair_smem::total_bytes(block_n, fused, num_stages) + 1023u) / 1024u * 1024u;
+}
+
+inline Sm90SwapAbPairPlan sm90_swapab_pair_plan(uint32_t p_max, uint32_t shape_n, uint32_t shape_k, uint32_t block_n,
+    bool fused, uint32_t forced_ctas, int num_device_sms)
+{
+    constexpr uint32_t kSm90MaxSmem = 227u * 1024u; // as gemm_dispatch_sm90_grouped_contiguous_swapab
+    constexpr uint32_t kReservedSmemPerCta = 1024u;
+    (void) p_max;
+    (void) shape_n;
+    (void) num_device_sms;
+    uint32_t ctas = forced_ctas ? forced_ctas : 1u;
+    uint32_t const first = sm90_env_swap_stages() ? sm90_env_swap_stages() : 6u;
+    uint32_t ns = first;
+    if (ctas == 2u)
+    {
+        while (ns > 1u && 2u * (sm90_swapab_pair_smem_size(block_n, fused, ns) + kReservedSmemPerCta) > kSm90MaxSmem)
+            --ns;
+        uint32_t const k_stages = shape_k / 128u;
+        while (ns > 1u && k_stages % ns != 0u)
+            --ns;
+        if (ns < 2u)
+            ctas = 1u;
+    }
+    if (ctas == 1u)
+    {
+        auto const fits_one_cta = [&](uint32_t stages)
+        { return sm90_swapab_pair_smem_size(block_n, fused, stages) + kReservedSmemPerCta <= kSm90MaxSmem; };
+        if (sm90_env_swap_stages())
+        {
+            ns = sm90_env_swap_stages();
+            while (ns > 1u && !fits_one_cta(ns))
+                --ns;
+        }
+        else
+        {
+            uint32_t const k_stages = shape_k / 128u;
+            ns = 1u;
+            for (uint32_t stages = k_stages; stages > 1u; --stages)
+            {
+                if (k_stages % stages == 0u && fits_one_cta(stages))
+                {
+                    ns = stages;
+                    break;
+                }
+            }
+        }
+    }
+    return {ctas, ns, sm90_swapab_pair_smem_size(block_n, fused, ns)};
+}
+
+// One-CTA builds of the pair kernels: 384 threads at one CTA per SM must compile to exactly 168 registers for the
+// 40 / 232 setmaxnreg split to balance ((168 - 40) * 128 == (232 - 168) * 256), as the two-warp-group FC1 kernels;
+// refuse anything else (it could deadlock). Checked once per cubin.
+inline void sm90_check_swapab_pair_one_cta(cudaKernel_t kernel, char const* what)
+{
+    static std::vector<void*> s_checked;
+    if (std::find(s_checked.begin(), s_checked.end(), reinterpret_cast<void*>(kernel)) != s_checked.end())
+        return;
+    int num_regs = 0;
+    if (cuKernelGetAttribute(&num_regs, CU_FUNC_ATTRIBUTE_NUM_REGS, reinterpret_cast<CUkernel>(kernel), 0)
+            != CUDA_SUCCESS
+        || num_regs != 168)
+        TLLM_THROW("%s: the one-CTA cubin has %d registers per thread, not the 168 its 40 / 232 setmaxnreg split "
+                   "needs; refusing to launch (it would deadlock)",
+            what, num_regs);
+    s_checked.push_back(reinterpret_cast<void*>(kernel));
+}
+
+inline void gemm_dispatch_sm90_grouped_contiguous_swapab_pair(void* mat_a_wgt, void* mat_b_act, void* mat_d,
+    float* sfb_wgt, float* sfa_act, int* sorted_expert_ids, uint32_t num_groups, uint32_t p_max, uint32_t shape_n,
+    uint32_t shape_k, uint32_t block_n, uint32_t expected_m, cudaStream_t stream, int num_device_sms = kNumDeviceSMs)
+{
+    if (num_device_sms < 0)
+        num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
+
+    constexpr uint32_t block_k = 128;
+    constexpr uint32_t bm = 128u;
+    (void) expected_m;
+    if (block_n != 16u && block_n != 32u && block_n != 64u)
+        TLLM_THROW("swap-AB gate/up pair FC1: block_n must be 16, 32 or 64 (= the moe_build_sorted padding), got %u",
+            block_n);
+    if (shape_n % (2u * bm) != 0u || shape_k % block_k != 0u)
+        TLLM_THROW("swap-AB gate/up pair FC1: N must be a multiple of 256 (2I, I % 128 == 0) and K of 128, "
+                   "got N=%u K=%u",
+            shape_n, shape_k);
+
+    auto build = [&](Sm90SwapAbPairPlan const& plan)
+    {
+        auto runtime = deep_gemm::jit::getGlobalCompiler().build(shape_n, shape_k, bm, block_n, block_k, num_groups,
+            plan.stages, 1u, deep_gemm::GemmType::GroupedContiguous, true, plan.ctas, false, false, true);
+        return reinterpret_cast<cudaKernel_t>(runtime->getKernel());
+    };
+    Sm90SwapAbPairPlan plan
+        = sm90_swapab_pair_plan(p_max, shape_n, shape_k, block_n, false, sm90_env_swapab_ctas(), num_device_sms);
+    cudaKernel_t kernel = build(plan);
+    if (plan.ctas == 2u && !sm90_swapab_two_cta_regs_ok(kernel, "swap-AB gate/up pair FC1", true))
+    {
+        plan = sm90_swapab_pair_plan(p_max, shape_n, shape_k, block_n, false, 1u, num_device_sms);
+        kernel = build(plan);
+    }
+    if (plan.ctas == 1u)
+        sm90_check_swapab_pair_one_cta(kernel, "swap-AB gate/up pair FC1");
+
+    deep_gemm::runGemmSwapAB(kernel, mat_a_wgt, static_cast<int>(shape_k), mat_b_act, static_cast<int>(shape_k), mat_d,
+        static_cast<int>(shape_n), sfb_wgt, sfa_act, shape_n, p_max, shape_k, bm, block_n, block_k, num_groups, 1u,
+        deep_gemm::GemmType::GroupedContiguous, sorted_expert_ids, stream,
+        static_cast<int>(num_device_sms * plan.ctas), plan.smem);
+}
+
+// Contiguous grouped FC1 on sm_90, swap-AB, with the SwiGLU + 1x128 FP8 requantize fused into the epilogue (fused-FC1
+// P2a, design S2; fp8_gemm_kernel_swapAB_swiglu). Same inputs as gemm_dispatch_sm90_grouped_contiguous_swapab_pair
+// (mat_a_wgt is the stacked [gate; up] weight [G, shape_n = 2I, K]); the outputs are what
+// silu_chunk_mul_quantize_1x128_sorted_sm90 makes of that FC1's bf16 result: mat_dq [p_max, I] fp8 and
+// mat_sd [I / 128, sd_ld] fp32 (sd_ld = align4(p_max)). The launch plan is sm90_swapab_pair_plan on the fused shared-
+// memory layout (an fp8 staging tile and the amax partials instead of the two bf16 tiles), with the same register
+// guards; at block_n = 16 and K = 2048 one CTA runs 4 stages (143,360 B), and two CTAs 2 stages each.
+inline void gemm_dispatch_sm90_grouped_contiguous_swapab_swiglu(void* mat_a_wgt, void* mat_b_act, void* mat_dq,
+    float* mat_sd, float* sfb_wgt, float* sfa_act, int* sorted_expert_ids, uint32_t num_groups, uint32_t p_max,
+    uint32_t shape_n, uint32_t shape_k, uint32_t block_n, uint32_t expected_m, cudaStream_t stream,
+    int num_device_sms = kNumDeviceSMs)
+{
+    if (num_device_sms < 0)
+        num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
+
+    constexpr uint32_t block_k = 128;
+    constexpr uint32_t bm = 128u;
+    (void) expected_m;
+    if (block_n != 16u && block_n != 32u && block_n != 64u)
+        TLLM_THROW("fused SwiGLU swap-AB FC1: block_n must be 16, 32 or 64 (= the moe_build_sorted padding), got %u",
+            block_n);
+    if (shape_n % (2u * bm) != 0u || shape_k % block_k != 0u)
+        TLLM_THROW("fused SwiGLU swap-AB FC1: N must be a multiple of 256 (2I, I % 128 == 0) and K of 128, "
+                   "got N=%u K=%u",
+            shape_n, shape_k);
+
+    auto build = [&](Sm90SwapAbPairPlan const& plan)
+    {
+        auto runtime = deep_gemm::jit::getGlobalCompiler().build(shape_n, shape_k, bm, block_n, block_k, num_groups,
+            plan.stages, 1u, deep_gemm::GemmType::GroupedContiguous, true, plan.ctas, false, true, true);
+        return reinterpret_cast<cudaKernel_t>(runtime->getKernel());
+    };
+    Sm90SwapAbPairPlan plan
+        = sm90_swapab_pair_plan(p_max, shape_n, shape_k, block_n, true, sm90_env_swapab_ctas(), num_device_sms);
+    cudaKernel_t kernel = build(plan);
+    if (plan.ctas == 2u && !sm90_swapab_two_cta_regs_ok(kernel, "fused SwiGLU swap-AB FC1", true))
+    {
+        plan = sm90_swapab_pair_plan(p_max, shape_n, shape_k, block_n, true, 1u, num_device_sms);
+        kernel = build(plan);
+    }
+    if (plan.ctas == 1u)
+        sm90_check_swapab_pair_one_cta(kernel, "fused SwiGLU swap-AB FC1");
+
+    uint32_t const sd_ld = (p_max + 3u) / 4u * 4u;
+    deep_gemm::runGemmSwapABSwiglu(kernel, mat_a_wgt, static_cast<int>(shape_k), mat_b_act, static_cast<int>(shape_k),
+        mat_dq, mat_sd, sd_ld, sfb_wgt, sfa_act, shape_n, p_max, shape_k, bm, block_n, block_k, num_groups,
+        sorted_expert_ids, stream, static_cast<int>(num_device_sms * plan.ctas), plan.smem);
 }
 
 } // namespace kernels::blockscale_gemm

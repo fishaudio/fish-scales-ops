@@ -38,17 +38,17 @@ def main():
     g = torch.Generator(device="cpu").manual_seed(M * 7 + 3)
     topk_ids = torch.stack([torch.randperm(E, generator=g)[:TOPK] for _ in range(M)])
     topk_ids = topk_ids.to("cuda", torch.int32)
-    masked_m, row_map, slot_of_flat = fso.gemm.moe_build_routing(topk_ids, E, m_cap)
+    masked_m, row_map, slot_of_flat = fso.compat.moe_build_routing(topk_ids, E, m_cap)
 
-    a_fp8, sa = fso.gemm.quantize_1x32_grouped_gather_fp8(
+    a_fp8, sa = fso.compat.quantize_1x32_grouped_gather_fp8(
         torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.1,
         slot_of_flat, TOPK, E, m_cap)
     w = torch.randn(E, N, K, device="cuda", dtype=torch.bfloat16) / (K ** 0.5)
-    w_fp8, sw = fso.gemm.quantize_moe_weights_1x32_fp8(w)
+    w_fp8, sw = fso.compat.quantize_moe_weights_1x32_fp8(w)
 
     torch.cuda.synchronize()
     for _ in range(iters):
-        fso.gemm.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m,
+        fso.compat.linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m,
                                              expected_m, max_active_groups)
     torch.cuda.synchronize()
     print(f"done {proj} M={M} iters={iters}")

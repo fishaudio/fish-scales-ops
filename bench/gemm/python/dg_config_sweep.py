@@ -13,9 +13,9 @@ M,N,K={M},{N},{K}
 torch.manual_seed(M*1009+N*17+K)
 x=torch.randn(M,K,dtype=torch.bfloat16,device='cuda')*0.1
 w=torch.randn(N,K,dtype=torch.bfloat16,device='cuda')/(K**0.5)
-xq,sx=fso.gemm.quantize_1x128_fp8(x,use_ue8m0=False); wq,sw=fso.gemm.quantize_128x128_fp8(w)
+xq,sx=fso.compat.quantize_1x128_fp8(x,use_ue8m0=False); wq,sw=fso.compat.quantize_128x128_fp8(w)
 ybf=(x.float()@w.float().t())
-fn=lambda: fso.gemm.linear_fp8(xq,wq,sx,sw)
+fn=lambda: fso.compat.linear_fp8(xq,wq,sx,sw)
 y=fn()
 cos=torch.nn.functional.cosine_similarity(y.float().flatten(),ybf.flatten(),dim=0).item()
 for _ in range(15): fn()

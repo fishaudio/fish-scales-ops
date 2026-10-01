@@ -83,7 +83,7 @@ def main():
         for dtype in (torch.bfloat16, torch.float32):
             logits = (torch.randn(M, E, device=dev, generator=g, dtype=torch.float32) * 3.0).to(dtype)
             for renorm in (True, False):
-                ids, w, gate = fso.gemm.moe_topk_from_logits(logits, topk, renormalize=renorm)
+                ids, w, gate = fso.compat.moe_topk_from_logits(logits, topk, renormalize=renorm)
                 torch.cuda.synchronize()
                 ref_ids, ref_w = reference(logits, topk, renorm)
                 tag = f"M={M} E={E} k={topk} {str(dtype).split('.')[-1]} renorm={int(renorm)}"
@@ -94,7 +94,7 @@ def main():
                     failures.append(f"{tag}: wrong output dtypes")
         # Descending weight order, which is what torch.topk returns.
         logits = (torch.randn(M, E, device=dev, generator=g) * 3.0).to(torch.bfloat16)
-        ids, w, _ = fso.gemm.moe_topk_from_logits(logits, topk)
+        ids, w, _ = fso.compat.moe_topk_from_logits(logits, topk)
         torch.cuda.synchronize()
         if topk > 1 and not bool((w[:, :-1] >= w[:, 1:]).all()):
             failures.append(f"M={M} E={E}: weights are not in descending order")
@@ -102,7 +102,7 @@ def main():
         # Padded rows: sentinel id, zero weight.
         n_real = max(1, M // 2)
         n_valid = torch.tensor([n_real], device=dev, dtype=torch.int32)
-        ids_p, w_p, _ = fso.gemm.moe_topk_from_logits(logits, topk, num_token_non_padded=n_valid)
+        ids_p, w_p, _ = fso.compat.moe_topk_from_logits(logits, topk, num_token_non_padded=n_valid)
         torch.cuda.synchronize()
         if not torch.equal(ids_p[:n_real], ids[:n_real]):
             failures.append(f"M={M} E={E}: the real rows changed when padding was declared")
@@ -115,7 +115,7 @@ def main():
         emap = torch.full((E + 1,), -1, device=dev, dtype=torch.int32)
         emap[:e_local] = torch.arange(e_local, device=dev, dtype=torch.int32)
         emap[E] = e_local
-        ids_m, w_m, _ = fso.gemm.moe_topk_from_logits(
+        ids_m, w_m, _ = fso.compat.moe_topk_from_logits(
             logits, topk, num_token_non_padded=n_valid, expert_map=emap)
         torch.cuda.synchronize()
         if not torch.equal(ids_m[:n_real], emap[ids_p[:n_real].to(torch.int64)]):
@@ -126,7 +126,7 @@ def main():
         # Shared-expert gate as one extra logit column.
         extra = (torch.randn(M, 1, device=dev, generator=g) * 2.0).to(torch.bfloat16)
         wide = torch.cat([logits, extra], dim=1)
-        ids_s, w_s, gate_s = fso.gemm.moe_topk_from_logits(wide, topk, with_shared_gate=True)
+        ids_s, w_s, gate_s = fso.compat.moe_topk_from_logits(wide, topk, with_shared_gate=True)
         torch.cuda.synchronize()
         if not torch.equal(ids_s, ids):
             failures.append(f"M={M} E={E}: the extra gate column changed the selection")
@@ -142,7 +142,7 @@ def main():
     g = torch.Generator(device=dev).manual_seed(7)
     hidden = torch.randn(M, H, device=dev, dtype=torch.bfloat16, generator=g)
     rw = (torch.randn(E + 1, H, device=dev, generator=g) * 0.05).to(torch.bfloat16)
-    ids, w, gate = fso.gemm.moe_router_topk(hidden, rw, topk, with_shared_gate=True)
+    ids, w, gate = fso.compat.moe_router_topk(hidden, rw, topk, with_shared_gate=True)
     logits = torch.nn.functional.linear(hidden, rw)
     ref_ids, ref_w = reference(logits[:, :E], topk, True)
     torch.cuda.synchronize()
@@ -158,12 +158,12 @@ def main():
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         for _ in range(3):
-            fso.gemm.moe_topk_from_logits(logits_buf, 8, num_token_non_padded=n_valid)
+            fso.compat.moe_topk_from_logits(logits_buf, 8, num_token_non_padded=n_valid)
     torch.cuda.current_stream().wait_stream(s)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=s):
-        ids_g, w_g, _ = fso.gemm.moe_topk_from_logits(logits_buf, 8, num_token_non_padded=n_valid)
+        ids_g, w_g, _ = fso.compat.moe_topk_from_logits(logits_buf, 8, num_token_non_padded=n_valid)
     torch.cuda.synchronize()
     logits_buf.copy_((torch.randn(64, 256, device=dev, generator=g) * 3.0).to(torch.bfloat16))
     n_valid.fill_(40)

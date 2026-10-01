@@ -28,15 +28,15 @@ def main():
     for fam, (E, TOPK, HIDDEN, INTER) in FAMILIES.items():
         w13 = torch.randn(E, 2 * INTER, HIDDEN, device=dev, dtype=torch.bfloat16) * 0.02
         w2 = torch.randn(E, HIDDEN, INTER, device=dev, dtype=torch.bfloat16) * 0.02
-        w13f, sw13 = fso.gemm.quantize_moe_weights_1x128_fp8_sm90(w13)
-        w2f, sw2 = fso.gemm.quantize_moe_weights_1x128_fp8_sm90(w2)
+        w13f, sw13 = fso.compat.quantize_moe_weights_1x128_fp8_sm90(w13)
+        w2f, sw2 = fso.compat.quantize_moe_weights_1x128_fp8_sm90(w2)
         for M in (8, 32, 256, 512, 1024, 2048):
             g = torch.Generator(device=dev)
             g.manual_seed(1234 + M)
             hidden = torch.randn(M, HIDDEN, device=dev, dtype=torch.bfloat16, generator=g)
             topk_ids = torch.rand(M, E, device=dev, generator=g).topk(TOPK, dim=1).indices.to(torch.int32)
             topk_w = torch.softmax(torch.rand(M, TOPK, device=dev, generator=g), dim=1).float()
-            fn = lambda: fso.gemm.moe_layer_fp8_sm90(hidden, w13f, sw13, w2f, sw2, topk_ids, topk_w)
+            fn = lambda: fso.compat.moe_layer_fp8_sm90(hidden, w13f, sw13, w2f, sw2, topk_ids, topk_w)
             ref = fn()
             torch.cuda.synchronize()
             bad = 0
@@ -59,7 +59,7 @@ def main():
             graph.replay()
             torch.cuda.synchronize()
             graph_ok = torch.equal(out, ref)
-            bn = fso.gemm.moe_swap_ab_block_n(M, E, TOPK)
+            bn = fso.compat.moe_swap_ab_block_n(M, E, TOPK)
             path = f"swap-AB/{bn}" if bn is not None else "contig"
             status = "OK" if (bad == 0 and graph_ok) else "FAIL"
             print(f"{fam} M={M:5d} {path:10s}: {RUNS} eager runs, {bad} differ; graph replay "

@@ -13,7 +13,7 @@ C). Attention, norms and the router gate GEMM are not part of the block.
 | `sm120.md` | NVIDIA RTX 5090 (sm_120) | Family A / B / C block tables, BSFP8 + MXFP8 |
 | `sm100.md` | NVIDIA B300 (sm_103) | Family A / B / C block tables, BSFP8 + MXFP8; unlocked clocks (see `../gemm/sm100.md`) |
 
-Protocol, clock locks, M grids and the shape families are defined in
+Protocol, clock policy, M grids and the shape families are defined in
 [`../README.md`](../README.md); this file only defines what each family's
 "block" contains and how its numbers are derived.
 
@@ -22,8 +22,8 @@ Protocol, clock locks, M grids and the shape families are defined in
 | family | block | kernels in the timed graph |
 |---|---|---|
 | A — Qwen3-4B | dense SwiGLU MLP: `gate_up` (N=19456, K=2560) → silu·mul → `down` (N=2560, K=9728) | act quantize → gate_up GEMM → silu·mul (+ quantize) → down GEMM. sm_90 BSFP8: `torch.compile`d silu·mul + separate quantize; sm_120 and sm_100/103 MXFP8: fused `silu_chunk_mul_quantize_1x32_fp8`, while their BSFP8 blocks pay the separate 1×128 quantize. Bench: `bench_qwen3_4b_mlp_forward.py`. |
-| B — Qwen3-30B-A3B | routed MoE layer, 128 experts, top-8, moe_inter 768, no shared expert | routing → gather-quant → grouped gate_up → silu-quant → grouped down → combine (six kernels, routing derived on device from `topk_ids`). sm_90: expert-sorted contiguous BSFP8 (`moe_layer_fp8_sm90`); sm_120: masked-slab MXFP8; sm_100/103: the same masked slab with one argument-preparation kernel ahead of each grouped GEMM, so eight kernels are in the graph rather than six. Bench: `bench_moe_qwen3_30a3.py --impls fso_*_layer`. |
-| C — Qwen3.5-35B-A3B | routed MoE layer, 256 experts, top-8, moe_inter 512, **plus the shared expert** (dense SwiGLU MLP, intermediate 512, every token) and the residual add of the two outputs | the six routed kernels above + shared-expert act quantize → gate_up (N=1024, K=2048) → silu·mul (+ quantize) → down (N=2048, K=512) + one bf16 add. Bench: `bench_moe_qwen3_35a3.py --impls fso_*_layer_shared`; the routed-only number (`fso_*_layer`) is published alongside so the shared expert's share is visible. |
+| B — Qwen3-30B-A3B | routed MoE layer, 128 experts, top-8, moe_inter 768, no shared expert | routing → gather-quant → grouped gate_up with the SwiGLU and requantize fused into its epilogue → grouped down → combine: five kernels on every arch, routing derived on device from `topk_ids` (before that fusion a separate silu-quant kernel between the two GEMMs made six). sm_90: expert-sorted contiguous BSFP8 (`moe_layer_fp8_sm90`), whose routing kernel builds the sorted layout; sm_120: masked-slab MXFP8; sm_100/103: the same masked slab, with the routing kernel also supplying the grouped GEMMs' arguments (eight kernels, with one argument-preparation kernel ahead of each grouped GEMM, when the path landed on 2026-09-15). Bench: `bench_moe_qwen3_30a3.py --impls fso_*_layer`. |
+| C — Qwen3.5-35B-A3B | routed MoE layer, 256 experts, top-8, moe_inter 512, **plus the shared expert** (dense SwiGLU MLP, intermediate 512, every token) and the residual add of the two outputs | the routed kernels above + shared-expert act quantize → gate_up (N=1024, K=2048) → silu·mul (+ quantize) → down (N=2048, K=512) + one bf16 add. Bench: `bench_moe_qwen3_35a3.py --impls fso_*_layer_shared`; the routed-only number (`fso_*_layer`) is published alongside so the shared expert's share is visible. |
 
 BF16 columns: Family A has a torch BF16 reference (two `F.linear` + eager
 SwiGLU). Families B and C have no fso BF16 column — fso has no BF16 grouped
@@ -44,20 +44,23 @@ other comparators in `sm100.md`.
 
 ## Reading the tables
 
-- Rows that carry `weight_copies` (the sm_120 MoE tables since 2026-09-28)
-  were measured with cold weights — the graph rotates ≥ 2 × L2 of weight
-  copies, as a serving step evicts every layer's weights (`../README.md` §2);
-  rows without it replayed one warm copy and their small-M values are
-  L2-resident optimism, `model ms` included. See each file's provenance.
+- Every row carries `weight_copies` and was measured with cold weights — the
+  graph rotates ≥ 2 × L2 of weight copies, as a serving step evicts every
+  layer's weights (`../README.md` §1). Rows of the single-copy protocol used
+  before 2026-09-28 replayed one warm copy, and their small-M values were
+  L2-resident optimism, `model ms` included; none of them is published any
+  more. See each file's provenance.
 - Family C rows come in two flavours: routed-only and routed + shared. The
   difference is the price of the shared expert at that M (a K=512 `down` and a
   narrow `gate_up`, both poorly amortised — see the dense rows in `gemm/`).
-- The masked-slab MoE layout's transient slabs scale with `G × m_cap`, so the
-  bench asks `moe_layer_slab_bytes_per_token_sm120` whether a grid point fits
-  instead of capping M: on the RTX 5090 the sm_120 tables run the full grid to
-  M = 8192 (since 2026-09-28, once the fused FC1 dropped the gate/up slab), the
-  sm_100/103 tables still stop at M = 4096, and sm_90's contiguous layout has
-  always run to M = 8192. Comparator columns are published at M = 8192 where they
+- The masked-slab MoE layout's transient tensors scale with `G × m_cap`, and the
+  layer runs every bucket as one call, so the bench asks
+  `moe_layer_transient_bytes_mxfp8` whether a grid point's tensors fit beside the
+  weights instead of capping M: on the RTX 5090 the sm_120 tables run the full
+  grid to M = 8192 (since 2026-09-28, once the fused FC1 dropped the gate/up
+  slab), the sm_100/103 tables run to M = 8192 since the 0.2.0 release, whose
+  bench extends the fit test to that arch (before it they stopped at M = 4096),
+  and sm_90's contiguous layout has always run to M = 8192. Comparator columns are published at M = 8192 where they
   were measured, next to an empty fso cell if that device has none.
 - Comparator columns differ per device and are not comparable across files: the
   sm_90 file carries sglang triton and deep_gemm; the sm_120 file carries the MoE

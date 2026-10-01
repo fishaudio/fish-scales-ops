@@ -42,4 +42,17 @@ cudaError_t launch_sm100_mxfp8_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv
 #endif
 }
 
+// Guidance appended to the op's error message for the one launch error a
+// caller can act on: the dense cascade's split-K workspace would have had to
+// grow inside a CUDA-graph capture (Sm100WorkspacePool::ensure in
+// arch/sm100/mxfp8/dispatch.cuh refuses that). Empty for every other error.
+char const* sm100_mxfp8_error_hint(cudaError_t err)
+{
+    if (err == cudaErrorStreamCaptureUnsupported)
+        return ": the sm_100/103 dense GEMM needed a larger split-K workspace inside a CUDA-graph "
+               "capture, where it cannot allocate. Run the same call once eagerly on this thread "
+               "before capturing it; graphs captured earlier stay valid when the workspace grows.";
+    return "";
+}
+
 } // namespace blockscale_gemm::detail

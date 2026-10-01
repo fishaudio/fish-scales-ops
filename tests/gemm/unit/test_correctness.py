@@ -27,7 +27,7 @@ def test_linear(M: int, N: int, K: int) -> None:
     w = torch.randn(N, K, dtype=torch.bfloat16, device="cuda") / (K**0.5)
 
     ref = F.linear(x, w)  # bf16 @ bf16 -> bf16
-    out = fso.gemm.linear_bf16(x, w)
+    out = fso.compat.linear_bf16(x, w)
 
     assert out.shape == ref.shape and out.dtype == torch.bfloat16
     print(

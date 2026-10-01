@@ -28,10 +28,10 @@ def main():
     for fam, (E, TOPK, HIDDEN, INTER) in FAMILIES.items():
         w13 = torch.randn(E, 2 * INTER, HIDDEN, device=dev, dtype=torch.bfloat16) * 0.02
         w2 = torch.randn(E, HIDDEN, INTER, device=dev, dtype=torch.bfloat16) * 0.02
-        w13f, sw13 = fso.gemm.quantize_moe_weights_1x128_fp8_sm90(w13)
-        w2f, sw2 = fso.gemm.quantize_moe_weights_1x128_fp8_sm90(w2)
-        layer = lambda h, ids, w: fso.gemm.moe_layer_fp8_sm90(h, w13f, sw13, w2f, sw2, ids, w)
-        for M in (8, 64, 512, 1024, 4096):  # swap-AB 16 / 32 / 64 tiles and the non-swap path
+        w13f, sw13 = fso.compat.quantize_moe_weights_1x128_fp8_sm90(w13)
+        w2f, sw2 = fso.compat.quantize_moe_weights_1x128_fp8_sm90(w2)
+        layer = lambda h, ids, w: fso.compat.moe_layer_fp8_sm90(h, w13f, sw13, w2f, sw2, ids, w)
+        for M in (8, 64, 256, 512, 1024, 4096):  # the swap-AB 16 / 32 tiles and the non-swap path, both families
             g = torch.Generator(device=dev)
             g.manual_seed(1234 + M)
             hidden = torch.randn(M, HIDDEN, device=dev, dtype=torch.bfloat16, generator=g)
@@ -39,7 +39,7 @@ def main():
             topk_w = torch.softmax(torch.rand(M, TOPK, device=dev, generator=g), dim=1).float()
             ref = layer(hidden, ids, topk_w)
             torch.cuda.synchronize()
-            bn = fso.gemm.moe_swap_ab_block_n(M, E, TOPK)
+            bn = fso.compat.moe_swap_ab_block_n(M, E, TOPK)
             path = f"swap-AB/{bn}" if bn is not None else "contig"
             for fill in (E, -1):
                 for n_real in (M // 2, 1, M - 1, 0):

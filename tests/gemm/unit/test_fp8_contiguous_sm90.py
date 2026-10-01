@@ -38,15 +38,15 @@ def cos(a, b):
 
 def contiguous_layer(hidden, w13_fp8, sw13, w2_fp8, sw2, topk_ids, topk_w,
                      expected_m):
-    se, fts, npad = fso.gemm.moe_build_sorted(topk_ids, E, BLOCK_M)
+    se, fts, npad = fso.compat.moe_build_sorted(topk_ids, E, BLOCK_M)
     p_max = se.numel()
-    hq, sh = fso.gemm.quantize_1x128_sorted_gather_sm90(hidden, fts, p_max, TOPK)
-    gu = fso.gemm.linear_fp8_grouped_contiguous(
+    hq, sh = fso.compat.quantize_1x128_sorted_gather_sm90(hidden, fts, p_max, TOPK)
+    gu = fso.compat.linear_fp8_grouped_contiguous(
         hq, w13_fp8, sh, sw13, se, BLOCK_M, expected_m)
-    dq, sd = fso.gemm.silu_chunk_mul_quantize_1x128_sorted_sm90(gu, fts)
-    dn = fso.gemm.linear_fp8_grouped_contiguous(
+    dq, sd = fso.compat.silu_chunk_mul_quantize_1x128_sorted_sm90(gu, fts)
+    dn = fso.compat.linear_fp8_grouped_contiguous(
         dq, w2_fp8, sd, sw2, se, BLOCK_M, expected_m)
-    return fso.gemm.moe_combine_sorted(dn, fts, topk_w)
+    return fso.compat.moe_combine_sorted(dn, fts, topk_w)
 
 
 def main():
@@ -63,8 +63,8 @@ def main():
     torch.manual_seed(0)
     w13 = torch.randn(E, 2 * INTER, HIDDEN, device="cuda", dtype=torch.bfloat16) / math.sqrt(HIDDEN)
     w2 = torch.randn(E, HIDDEN, INTER, device="cuda", dtype=torch.bfloat16) / math.sqrt(INTER)
-    w13_fp8, sw13 = fso.gemm.quantize_moe_weights_1x128_fp8_sm90(w13)
-    w2_fp8, sw2 = fso.gemm.quantize_moe_weights_1x128_fp8_sm90(w2)
+    w13_fp8, sw13 = fso.compat.quantize_moe_weights_1x128_fp8_sm90(w13)
+    w2_fp8, sw2 = fso.compat.quantize_moe_weights_1x128_fp8_sm90(w2)
 
     print("=== contiguous layer cos vs per-expert BF16 ===")
     for M in (1, 8, 64, 512):

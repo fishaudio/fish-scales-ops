@@ -13,6 +13,7 @@ caller writes one code path and never names an architecture::
     out = fso.moe.layer(hidden, experts, topk_ids, topk_w)                          # per call
     fso.moe.supported("bsfp8")    # can this device serve the format?
     print(fso.moe.describe())     # the architecture matrix, for logs and errors
+    reserve = fso.moe.transient_bytes(experts, max_tokens_per_forward, topk)       # memory to reserve
 
 ``format`` names what the caller holds. ``"bsfp8"`` is float8_e4m3fn experts with
 fp32 128x128 block scales (the ``bsgemm-moe`` dialect); sm_90 serves them as they
@@ -24,24 +25,33 @@ the checkpoint), quantized to MXFP8 1x32 at load time on sm_100/sm_103 and
 sm_120/sm_121; sm_90 has no MXFP8 hardware and refuses it. Every other format,
 bf16 experts included, raises: there is no fallback of any kind.
 
-The per-arch entries this module calls — ``fso.gemm.moe_layer_fp8_sm90`` and the
-masked-slab MXFP8 chain behind ``fso.gemm.moe_layer_mxfp8_sm120`` — stay public
-and are the implementation behind :func:`layer`.
+Every bucket runs as one layer call. The transient memory a call needs is the
+caller's to reserve, and :func:`transient_bytes` gives the exact figure for the
+largest bucket a forward can carry on this device.
+
+This module is the stable MoE interface. The per-step pieces behind
+:func:`layer` — the per-architecture layer entries, the grouped GEMMs, the
+routing builders, the combines, the router and the route queries — are in
+:mod:`fish_scales_ops.compat`. Their names keep working there, but they are
+building blocks whose arguments follow the kernels and change when a kernel or
+a route changes.
 """
 import dataclasses
-import os
 
 import torch
 
-from ._arch import sm_major
-from .gemm.fp8 import moe_layer_fp8_sm90
-from .gemm.mxfp8 import (
+from .._arch import sm_major
+from .._env import env_flag
+from ..gemm.fp8 import moe_layer_fp8_sm90, moe_layer_transient_bytes_sm90
+from ..gemm.mxfp8 import (
     _moe_layer_mxfp8,
+    moe_layer_transient_bytes_mxfp8,
     mxfp8_grouped_swiglu_available,
     quantize_moe_weights_1x32_fp8,
 )
 
-__all__ = ["FORMATS", "MoeExperts", "prepare_experts", "layer", "supported", "describe"]
+__all__ =["FORMATS", "MoeExperts", "prepare_experts", "layer", "transient_bytes", "supported",
+           "describe"]
 
 # The formats prepare_experts accepts, and the architecture majors that serve each.
 FORMATS = ("bsfp8", "mxfp8")
@@ -142,8 +152,8 @@ def describe() -> str:
         except Exception:  # noqa: BLE001 - the description must never fail
             name = ""
     families = (
-        (9, "sm_90 (H200, H200 MIG)"),
-        (10, "sm_100/sm_103 (B200, B300, B300 MIG)"),
+        (9, "sm_90 (H200)"),
+        (10, "sm_100/sm_103 (B200, B300)"),
         (12, "sm_120/sm_121 (RTX 5090, RTX PRO 6000)"),
     )
     rows = {
@@ -466,7 +476,7 @@ _fused_combine_env: bool | None = None
 def _fused_combine_allowed() -> bool:
     global _fused_combine_env
     if _fused_combine_env is None:
-        _fused_combine_env = os.environ.get("FSO_MOE_FUSED_COMBINE", "").strip() == "1"
+        _fused_combine_env = env_flag("FSO_MOE_FUSED_COMBINE")
     return _fused_combine_env and sm_major() == 12
 
 
@@ -623,3 +633,59 @@ def layer(hidden, experts, topk_ids, topk_w, *, bias=None, bias_scale=None) -> t
     return torch.ops.fish_scales_ops.moe_layer(
         x, experts.w13, experts.sw13, experts.w2, experts.sw2, ids, wts, bias, bias_scale,
         experts.kind, experts.w13_interleaved)
+
+
+def transient_bytes(experts, tokens, topk) -> int:
+    """Device memory, in bytes, that one :func:`layer` call with ``tokens`` rows
+    allocates on this device for these experts: the routing tensors, the gathered
+    and quantized activation, the intermediates of the two grouped GEMMs and the
+    ``[tokens, hidden]`` result, each charged as the caching allocator can charge
+    it (512-byte blocks, and up to 1 MiB more for a tensor above 1 MiB that a cached
+    block serves unsplit). It is an upper bound on what the call occupies, tight to
+    about 1 MiB per large tensor.
+
+    :func:`layer` runs every bucket as one call, so this is the memory a serving
+    stack reserves, once per process, for the largest bucket a forward can carry
+    (the layer's intermediates are freed
+    when the call returns, so the layers of a model reuse one reservation). It is
+    exact for the route the layer takes on this device at that token count,
+    because the layer and this function read the same host-side plan:
+
+    * sm_90, kind ``"bsfp8"``: the expert-sorted layout, sized by the routed rows
+      (``tokens * topk`` plus per-expert padding), see
+      :func:`fish_scales_ops.compat.moe_layer_transient_bytes_sm90`;
+    * sm_100/103 and sm_120/121, kind ``"mxfp8"``: the masked slab, sized by
+      ``num_experts * align(tokens, 4)`` rows, with the fused FC1 when the handle's
+      ``w13_interleaved`` and the route query allow it and, on sm_120/121, the fused
+      combine where ``FSO_MOE_FUSED_COMBINE=1`` allows it and its engagement rule
+      takes it, see :func:`fish_scales_ops.compat.moe_layer_transient_bytes_mxfp8`.
+
+    Inputs, weights, a ``bias`` and the library's persistent pools (routing scratch,
+    the sm_100/103 argument arena) are not counted.
+
+    Args:
+        experts: the :class:`MoeExperts` handle from :func:`prepare_experts`.
+        tokens: rows in the bucket (``M``), ``>= 0``.
+        topk: experts per token.
+    """
+    arch = _device_arch()
+    where = _arch_label(arch)
+    if not isinstance(experts, MoeExperts):
+        raise TypeError(f"fso.moe.transient_bytes ({where}): experts must be the MoeExperts handle from "
+                        f"fso.moe.prepare_experts, got {type(experts).__name__}")
+    if experts.arch // 10 != arch // 10:
+        raise ValueError(
+            f"fso.moe.transient_bytes: the experts were prepared on sm_{experts.arch} and this device is "
+            f"{where}; the layout, and so the memory it needs, is architecture-specific")
+    for name, v in (("tokens", tokens), ("topk", topk)):
+        if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+            raise ValueError(f"fso.moe.transient_bytes ({where}): {name} must be a non-negative int, got {v!r}")
+    if tokens == 0:
+        return 0
+    if topk < 1:
+        raise ValueError(f"fso.moe.transient_bytes ({where}): topk must be >= 1, got {topk}")
+    if experts.kind == "bsfp8":
+        return moe_layer_transient_bytes_sm90(tokens, experts.num_experts, topk, experts.hidden, experts.inter)
+    return moe_layer_transient_bytes_mxfp8(
+        tokens, experts.num_experts, topk, experts.hidden, experts.inter,
+        w13_interleaved=experts.w13_interleaved, fused_combine=_fused_combine_allowed())

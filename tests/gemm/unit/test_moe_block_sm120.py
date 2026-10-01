@@ -43,11 +43,11 @@ def build(dev, e_local=E, inter=INTER, seed=0):
     s13 = (torch.randn(2 * INTER_S, HIDDEN, device=dev, generator=g) * 0.02).to(torch.bfloat16)
     s2 = (torch.randn(HIDDEN, INTER_S, device=dev, generator=g) * 0.02).to(torch.bfloat16)
     rw = (torch.randn(E + 1, HIDDEN, device=dev, generator=g) * 0.05).to(torch.bfloat16)
-    q = fso.gemm.quantize_moe_weights_1x32_fp8
+    q = fso.compat.quantize_moe_weights_1x32_fp8
     w13f, sw13 = q(w13)
     w2f, sw2 = q(w2)
-    s13f, ss13 = fso.gemm.quantize_1x32_fp8(s13)
-    s2f, ss2 = fso.gemm.quantize_1x32_fp8(s2)
+    s13f, ss13 = fso.compat.quantize_1x32_fp8(s13)
+    s2f, ss2 = fso.compat.quantize_1x32_fp8(s2)
     return dict(w13=w13, w2=w2, s13=s13, s2=s2, rw=rw, w13f=w13f, sw13=sw13, w2f=w2f, sw2=sw2,
                 s13f=s13f, ss13=ss13, s2f=s2f, ss2=ss2)
 
@@ -57,16 +57,16 @@ def hand_chain(hidden, p, *, expert_map=None, n_valid=None, shared=True):
     the shared expert the router weight carries no gate row either, which is the
     shape a model with no shared expert (Family B) has."""
     rw = p["rw"] if shared else p["rw"][:E].contiguous()
-    ids, w, gate = fso.gemm.moe_router_topk(
+    ids, w, gate = fso.compat.moe_router_topk(
         hidden, rw, TOPK, with_shared_gate=shared,
         num_token_non_padded=n_valid, expert_map=expert_map)
-    routed = fso.gemm.moe_layer_mxfp8_sm120(hidden, p["w13f"], p["sw13"], p["w2f"], p["sw2"], ids, w)
+    routed = fso.compat.moe_layer_mxfp8_sm120(hidden, p["w13f"], p["sw13"], p["w2f"], p["sw2"], ids, w)
     if not shared:
         return routed
-    xq, sx = fso.gemm.quantize_1x32_fp8(hidden)
-    gu = fso.gemm.linear_mxfp8(xq, p["s13f"], sx, p["ss13"])
-    hq, sh = fso.gemm.silu_chunk_mul_quantize_1x32_fp8(gu)
-    shared_out = fso.gemm.linear_mxfp8(hq, p["s2f"], sh, p["ss2"])
+    xq, sx = fso.compat.quantize_1x32_fp8(hidden)
+    gu = fso.compat.linear_mxfp8(xq, p["s13f"], sx, p["ss13"])
+    hq, sh = fso.compat.silu_chunk_mul_quantize_1x32_fp8(gu)
+    shared_out = fso.compat.linear_mxfp8(hq, p["s2f"], sh, p["ss2"])
     return routed + (gate.unsqueeze(1) * shared_out.float()).to(torch.bfloat16)
 
 
@@ -109,7 +109,7 @@ def main():
     for M in (1, 8, 64, 512):
         g = torch.Generator(device=dev).manual_seed(M)
         hidden = torch.randn(M, HIDDEN, device=dev, dtype=torch.bfloat16, generator=g)
-        blk = fso.gemm.moe_block_mxfp8_sm120(
+        blk = fso.compat.moe_block_mxfp8_sm120(
             hidden, p["rw"], p["w13f"], p["sw13"], p["w2f"], p["sw2"], topk=TOPK,
             shared_w13_fp8=p["s13f"], shared_sw13=p["ss13"],
             shared_w2_fp8=p["s2f"], shared_sw2=p["ss2"], shared_gate_in_router=True)
@@ -138,7 +138,7 @@ def main():
         M = 64
         g = torch.Generator(device=dev).manual_seed(500 + tp)
         hidden = torch.randn(M, HIDDEN, device=dev, dtype=torch.bfloat16, generator=g)
-        blk = fso.gemm.moe_block_mxfp8_sm120(
+        blk = fso.compat.moe_block_mxfp8_sm120(
             hidden, pt["rw"][:E].contiguous(), pt["w13f"], pt["sw13"], pt["w2f"], pt["sw2"], topk=TOPK)
         hand = hand_chain(hidden, pt, shared=False)
         torch.cuda.synchronize()
@@ -157,7 +157,7 @@ def main():
             failures.append(f"the weight quantizer raised the wrong message for INTER=64: {e}")
     try:
         i64 = 64
-        fso.gemm.moe_block_mxfp8_sm120(
+        fso.compat.moe_block_mxfp8_sm120(
             torch.randn(4, HIDDEN, device=dev, dtype=torch.bfloat16),
             p["rw"][:E].contiguous(),
             torch.empty(E, 2 * i64, HIDDEN, device=dev, dtype=torch.float8_e4m3fn),
@@ -182,7 +182,7 @@ def main():
     M = 64
     g = torch.Generator(device=dev).manual_seed(77)
     hidden = torch.randn(M, HIDDEN, device=dev, dtype=torch.bfloat16, generator=g)
-    blk = fso.gemm.moe_block_mxfp8_sm120(
+    blk = fso.compat.moe_block_mxfp8_sm120(
         hidden, pe["rw"][:E].contiguous(), pe["w13f"], pe["sw13"], pe["w2f"], pe["sw2"],
         topk=TOPK, expert_map=emap)
     hand = hand_chain(hidden, pe, expert_map=emap, shared=False)
@@ -190,13 +190,13 @@ def main():
     c = cos(blk, hand)
     if c < 0.99999:
         failures.append(f"ep: cos={c:.6f} vs the hand chain")
-    ids, _, _ = fso.gemm.moe_router_topk(
+    ids, _, _ = fso.compat.moe_router_topk(
         hidden, pe["rw"][:E].contiguous(), TOPK, expert_map=emap)
     n_remote = int((ids < 0).sum())
     print(f"  ep: E_local={e_local}, {n_remote} of {M * TOPK} entries remote, "
           f"block == hand chain (cos={c:.6f})  OK")
     try:
-        fso.gemm.moe_block_mxfp8_sm120(
+        fso.compat.moe_block_mxfp8_sm120(
             hidden, pe["rw"][:E].contiguous(), pe["w13f"], pe["sw13"], pe["w2f"], pe["sw2"], topk=TOPK)
         failures.append("an expert-parallel rank without expert_map was accepted")
     except ValueError as e:
@@ -210,10 +210,10 @@ def main():
     n_valid = torch.tensor([n_real], device=dev, dtype=torch.int32)
     buf = torch.full((M, HIDDEN), float("nan"), device=dev, dtype=torch.bfloat16)
     rw_e = p["rw"][:E].contiguous()
-    ret = fso.gemm.moe_block_mxfp8_sm120(
+    ret = fso.compat.moe_block_mxfp8_sm120(
         hidden, rw_e, p["w13f"], p["sw13"], p["w2f"], p["sw2"], topk=TOPK,
         num_token_non_padded=n_valid, out=buf)
-    full = fso.gemm.moe_block_mxfp8_sm120(
+    full = fso.compat.moe_block_mxfp8_sm120(
         hidden, rw_e, p["w13f"], p["sw13"], p["w2f"], p["sw2"], topk=TOPK)
     torch.cuda.synchronize()
     if ret.data_ptr() != buf.data_ptr():
@@ -230,12 +230,12 @@ def main():
     # for bit, eagerly and through a graph, and the graph has to capture the two
     # branches (the side stream is joined with events, which is what capture
     # follows).
-    seq = fso.gemm.moe_block_mxfp8_sm120(
+    seq = fso.compat.moe_block_mxfp8_sm120(
         hidden, p["rw"], p["w13f"], p["sw13"], p["w2f"], p["sw2"], topk=TOPK,
         shared_w13_fp8=p["s13f"], shared_sw13=p["ss13"],
         shared_w2_fp8=p["s2f"], shared_sw2=p["ss2"], shared_gate_in_router=True,
         overlap_shared=False)
-    ovl = fso.gemm.moe_block_mxfp8_sm120(
+    ovl = fso.compat.moe_block_mxfp8_sm120(
         hidden, p["rw"], p["w13f"], p["sw13"], p["w2f"], p["sw2"], topk=TOPK,
         shared_w13_fp8=p["s13f"], shared_sw13=p["ss13"],
         shared_w2_fp8=p["s2f"], shared_sw2=p["ss2"], shared_gate_in_router=True,
@@ -243,7 +243,7 @@ def main():
     torch.cuda.synchronize()
     if not torch.equal(seq, ovl):
         failures.append("the side-stream overlap changed the result")
-    ovl_fn = lambda: fso.gemm.moe_block_mxfp8_sm120(
+    ovl_fn = lambda: fso.compat.moe_block_mxfp8_sm120(
         hidden, p["rw"], p["w13f"], p["sw13"], p["w2f"], p["sw2"], topk=TOPK,
         shared_w13_fp8=p["s13f"], shared_sw13=p["ss13"],
         shared_w2_fp8=p["s2f"], shared_sw2=p["ss2"], shared_gate_in_router=True,
@@ -269,7 +269,7 @@ def main():
           f"{'==' if ovl_graph_ok else '!='} it  OK")
 
     # 6: determinism, eager and through a graph.
-    call = lambda: fso.gemm.moe_block_mxfp8_sm120(
+    call = lambda: fso.compat.moe_block_mxfp8_sm120(
         hidden, p["rw"], p["w13f"], p["sw13"], p["w2f"], p["sw2"], topk=TOPK,
         shared_w13_fp8=p["s13f"], shared_sw13=p["ss13"],
         shared_w2_fp8=p["s2f"], shared_sw2=p["ss2"], shared_gate_in_router=True,

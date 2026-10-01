@@ -2,7 +2,7 @@
 
 This module is the tier-2 *decode* row of the sm_100/sm_103 MXFP8 router. It
 sits in front of the three tiers described in :mod:`._sm100_dispatch` and takes
-only the band M ≤ 64, where every one of the three shipped tiers loses:
+only the band M ≤ 64, which none of the three shipped tiers fits:
 
 * cuBLAS ``scaled_mm`` (tier 1) picks a 128- or 256-wide N tile and cannot be
   asked for a narrower one, so on a decode shape it leaves most of the machine
@@ -31,8 +31,9 @@ LICENSE). Two classes are used, and which one runs is decided by the shape:
 ``Sm100BlockScaledPersistentDenseGemmKernel``
     The plain persistent block-scaled kernel at the same narrow token tile. On
     a wide-N shape the tile grid already fills the machine, so splitting K only
-    multiplies the work (measured: +100 % at split_k = 2 and +265 % at 4 on
-    ``gate_up``); the single-slice persistent kernel wins instead.
+    multiplies the work (measured on ``gate_up`` in the tactic sweep cited at
+    the end of this docstring); the single-slice persistent kernel is used
+    instead.
 
     Above M = 32 the split-K class refuses the cell (its ``supports_m``), and
     this kernel's own ``can_implement`` refuses a token tile narrower than the
@@ -55,12 +56,16 @@ Contracts and gates:
 * **DSL floor.** The vendored sources use CuTe-DSL surfaces that do not exist
   in 4.4.2 (``cute.nvgpu.OperandMajorMode``, ``Numeric.bitcast``, the newer
   ``make_blockscaled_trivial_tiled_mma`` arity, ``cute.struct`` field handles).
-  4.5.0 is the floor and 4.8.0 is the recommended pin (its JIT is 2–3× faster
-  than 4.4.2's). Below the floor this module is INERT: ``_init`` returns None
+  4.5.0 is the floor and 4.8.0 is the recommended pin (the JIT compile time
+  differs between releases; the version table is run ``M-D2`` below). Below the
+  floor this module is INERT: ``_init`` returns None
   before importing the vendored package, ``pick_config`` returns None, and
-  ``route`` behaves exactly as it did before this module existed. Set
-  ``FSO_LOG=1`` to get the one-line reason, printed once per process on
-  stderr (stdout belongs to the benches' per-cell JSON protocol).
+  ``route`` behaves exactly as it did before this module existed. The row is
+  silent only when it is switched off or ``nvidia-cutlass-dsl`` is not
+  installed at all (``FSO_LOG=1`` then prints that reason once on stderr, since
+  stdout belongs to the benches' per-cell JSON protocol); a DSL below the floor
+  or a failed import of the vendored kernels warns once per process with
+  one ``fso:`` line on stderr, ``FSO_LOG`` or not.
 * **Capture.** ``cute.compile`` runs on the first call for a given tactic and
   is cached per (kernel class, tiler, cluster, split_k, pdl), so the eager
   warm-up every caller already performs before ``torch.cuda.graph`` capture
@@ -72,7 +77,9 @@ Contracts and gates:
 * **Env kills.** ``FSO_DISABLE_DSL=1`` (shared with tier 2) and
   ``FSO_DISABLE_DECODE_DSL=1`` (this module only) both make it inert.
   ``FSO_PRINT_TILE_INFO=1`` prints the picked tactic once per distinct
-  (M, N, K).
+  (M, N, K). All of these switches follow the extension's rule
+  (:mod:`fish_scales_ops._env`): unset, empty or a value starting with ``0``
+  is off.
 
 Provenance of the routing rule: the tactic sweep in the B300 run
 ``b300_mxfp8_20260917/M-D1`` (400 timed rows over four shapes × six M × every
@@ -84,11 +91,12 @@ two passes).
 """
 from __future__ import annotations
 
-import os
 import sys
 from typing import Optional, Tuple
 
 import torch
+
+from .._env import env_flag
 
 # (mma_tiler_mn, cluster_shape_mn, swap_ab, split_k)
 _ConfigT = Tuple[Tuple[int, int], Tuple[int, int], bool, int]
@@ -104,9 +112,8 @@ MAX_DECODE_M = 64
 _WIDE_TOKEN_TILE = 64
 #: Shallowest K the wide-token form takes, in elements: eight mainloop K-tiles
 #: of 128. On a K = 512 shape (Family C `shared_down`) the one-slice mainloop
-#: is four tiles, shorter than the pipeline that fills it, and the form gained
-#: nothing on the per-op slope against the cuBLAS tier while its single-op
-#: replay flipped one ~2 µs tick at M = 48; at K = 2048 it wins clearly. The
+#: is four tiles, shorter than the pipeline that fills it, so the form has
+#: nothing to gain there, while at K = 2048 the sweep put the cells on it. The
 #: floor sits between the two measured points (b300_round3_20260922/M-D5,
 #: tables/SWEEP_BC.txt).
 MIN_WIDE_TOKEN_K = 1024
@@ -119,9 +126,8 @@ _ENABLE_PDL = True
 #: 128. Splitting K costs a wider cluster launch and an in-cluster reduction,
 #: and below four tiles the mainloop is shorter than the pipeline that fills it,
 #: so the split does not pay for itself. Measured on the Family C shared-expert
-#: `down` projection (N = 2048, K = 512), where two slices cost +63 % and four
-#: cost +150 % against one slice at M = 32 (b300_dense_decode_20260922,
-#: tables/SHORTK.txt).
+#: `down` projection (N = 2048, K = 512), where one slice beat two and four at
+#: M = 32 (b300_dense_decode_20260922, tables/SHORTK.txt).
 MIN_SLICE_K = 512
 #: Backstop on the number of operand layouts kept hoisted (see
 #: ``_operand_tensor``); one device buffer is retained per occupied slot.
@@ -144,8 +150,24 @@ def _log_once(msg: str) -> None:
     every decode cell into a parse error wherever the notice fires, i.e. in any
     venv below the DSL floor (run b300_round3_20260922/M-A3).
     """
-    if not os.getenv("FSO_LOG"):
+    if not env_flag("FSO_LOG"):
         return
+    if msg in _LOGGED:
+        return
+    _LOGGED.add(msg)
+    print("fso: " + msg, file=sys.stderr, flush=True)
+
+
+def _warn_unavailable(reason: str) -> None:
+    """Warn, once per process and whatever ``FSO_LOG`` says, that the row
+    should be there and is not: one line on stderr, in the ``_log_once`` format
+    (stdout belongs to the benches' JSON protocol). The row's kernels are
+    vendored in the package, so unlike the mid-band tier there is no kernel
+    path to point elsewhere."""
+    msg = ("sm_100/103 CuTe-DSL decode row (M <= %d) unavailable: %s; linear_mxfp8 / "
+           "linear_fp8 leave that band to the tiers behind it. Install nvidia-cutlass-dsl "
+           ">= 4.8.0 (the recommended pin), or set FSO_DISABLE_DECODE_DSL=1 to skip the "
+           "row without this warning" % (MAX_DECODE_M, " ".join(str(reason).split())))
     if msg in _LOGGED:
         return
     _LOGGED.add(msg)
@@ -181,18 +203,27 @@ def _init() -> Optional[dict]:
     if _STATE is not None:
         return _STATE if _STATE.get("ok") else None
     _STATE = {"ok": False}
-    if os.getenv("FSO_DISABLE_DSL") or os.getenv("FSO_DISABLE_DECODE_DSL"):
+    if env_flag("FSO_DISABLE_DSL") or env_flag("FSO_DISABLE_DECODE_DSL"):
         return None
     try:
         import cutlass
-
+    except ModuleNotFoundError as exc:
+        if exc.name == "cutlass":
+            # The optional `sm100` extra is not installed: documented, silent.
+            _log_once("sm_100 MXFP8 decode rows unavailable: nvidia-cutlass-dsl is not "
+                      "installed; leaving the M <= %d band to the existing tiers" % MAX_DECODE_M)
+            return None
+        _warn_unavailable("importing cutlass failed: %s: %s" % (type(exc).__name__, str(exc)[:160]))
+        return None
+    except Exception as exc:
+        _warn_unavailable("importing cutlass failed: %s: %s" % (type(exc).__name__, str(exc)[:160]))
+        return None
+    try:
         ver = _parse_version(getattr(cutlass, "__version__", ""))
         if ver < MIN_DSL_VERSION:
-            _log_once(
-                "sm_100 MXFP8 decode rows need nvidia-cutlass-dsl >= %d.%d.%d "
-                "(found %s); leaving the M <= %d band to the existing tiers"
-                % (MIN_DSL_VERSION + (getattr(cutlass, "__version__", "?"),
-                                      MAX_DECODE_M)))
+            _warn_unavailable(
+                "it needs nvidia-cutlass-dsl >= %d.%d.%d, found %s"
+                % (MIN_DSL_VERSION + (getattr(cutlass, "__version__", "?"),)))
             return None
 
         import cuda.bindings.driver as cuda_drv
@@ -211,8 +242,8 @@ def _init() -> Optional[dict]:
                       dsl_version=getattr(cutlass, "__version__", "?"))
         return _STATE
     except Exception as exc:                                 # pragma: no cover
-        _log_once("sm_100 MXFP8 decode rows unavailable (%s: %s); routing is "
-                  "unchanged" % (type(exc).__name__, str(exc)[:160]))
+        _warn_unavailable("importing the vendored kernels failed: %s: %s"
+                          % (type(exc).__name__, str(exc)[:160]))
         return None
 
 
@@ -238,7 +269,7 @@ def pick_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
       and the 2-CTA 256-row weight tile in a cluster of two, swap-AB, one K
       slice (``_wide_token_config``); the split-K class refuses the band and the
       narrower token tiles refuse it too. Two shape classes are declined and
-      left to the tiers below, which were measured ahead or level on them:
+      left to the tiers below, where the same sweep kept them:
       the long-K narrow-N class (``k >= 8192`` with ``tiles_n <= 32``), whose
       two-kernel split-K in the C++ cascade keeps the whole machine busy while
       one weight tile per cluster cannot, and the short-K class
@@ -276,7 +307,7 @@ def pick_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
         return hit
     cfg = _compute_config(m, n, k)
     _CFG_CACHE[key] = cfg
-    if cfg is not None and os.getenv("FSO_PRINT_TILE_INFO"):
+    if cfg is not None and env_flag("FSO_PRINT_TILE_INFO"):
         # stderr, like the C++ tile-info prints of the same knob and like
         # `_log_once` above: stdout is the benches' per-cell JSON channel.
         tile, cluster, swap_ab, split_k = cfg
@@ -355,8 +386,8 @@ def _wide_token_config(m: int, n: int, k: int, tiles_n: int,
     lost on every cell measured. FlashInfer's own autotuner picks this tactic
     for the narrow-N shape at M = 64 and M = 128.
 
-    Two shape classes are declined, and the tier that keeps them was measured
-    ahead or level in the same sweep:
+    Two shape classes are declined, and the same sweep kept them on the tier
+    that serves them:
 
     * long-K narrow-N (``k >= 8192`` with ``tiles_n <= 32``), which the C++
       cascade's two-kernel split-K route owns to M = 128. With twenty weight
@@ -364,13 +395,13 @@ def _wide_token_config(m: int, n: int, k: int, tiles_n: int,
       the whole of a 9728-deep mainloop, while the cascade's split spreads the
       same K over the machine and pays only a small reduce launch.
     * short K (``k < MIN_WIDE_TOKEN_K``), where the one-slice mainloop is
-      shorter than the pipeline that fills it and the form is level with the
-      cuBLAS tier at best (see the constant).
+      shorter than the pipeline that fills it and the form has nothing to
+      gain (see the constant).
 
     The very wide shapes are NOT declined: on `gate_up` (152 weight tiles,
     more than the 74 clusters of two the persistent scheduler keeps resident)
-    the form still beat cuBLAS below M = 64 and the cascade's 192-wide wave
-    tile at M = 64, second round of clusters and all.
+    the sweep still put the cells below M = 64 and the cell at M = 64 on this
+    form, second round of clusters and all.
     """
     if k >= 8192 and tiles_n <= 32:
         return None
@@ -395,8 +426,8 @@ def _get_compiled(st: dict, cfg: _ConfigT, sf_m: int, sf_n: int, sf_k: int):
     extents and the three scale-factor extents as ``Int64`` runtime arguments,
     so a single artifact serves every (N, K, M) that picks the same tactic and
     the extents passed here — those of whichever cell compiled first — do not
-    enter the cache key. Compiling costs 0.2–0.4 s and happens on the first
-    eager call, never inside a capture.
+    enter the cache key. Compiling happens on the first eager call, never
+    inside a capture.
     """
     tile, cluster, swap_ab, split_k = cfg
     key = (tile, cluster, swap_ab, split_k, _ENABLE_PDL)
@@ -456,7 +487,8 @@ def _fake_memspace(st: dict):
 
 
 def _make_cute_tensor(st: dict, t: torch.Tensor, dtype, leading_dim: int):
-    """Wrap a torch tensor as a shape-dynamic CuTe tensor. About 4.5 µs."""
+    """Wrap a torch tensor as a shape-dynamic CuTe tensor (host-side work on
+    every call, which is why the operands are hoisted below)."""
     ct = st["from_dlpack"](t, assumed_align=16)
     ct.element_type = dtype
     ct = ct.mark_layout_dynamic(leading_dim=leading_dim)
@@ -480,8 +512,9 @@ def _operand_tensor(st: dict, t: torch.Tensor, dtype, leading_dim: int):
       the call, so a cached entry would keep the previous output alive, the
       allocator would be forced to hand out a different block on the next call,
       and the entry would miss every time — a cache that pins memory and never
-      hits. Rebuilding its descriptor costs 4.5 µs of host time and nothing
-      under CUDA-graph capture, where the whole closure runs once.
+      hits. Its descriptor is rebuilt on every eager call, which costs host
+      time and nothing under CUDA-graph capture, where the whole closure runs
+      once.
     * The weight and the activation of a decode call are caller-owned and keep
       their addresses in any loop worth capturing, so in the steady state this
       is two dict hits and no allocation at all.

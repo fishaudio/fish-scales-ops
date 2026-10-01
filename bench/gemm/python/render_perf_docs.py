@@ -383,7 +383,9 @@ def layer_comparators(sm, shared=False):
         # provenance) and torch's own _grouped_mm, which has no fused sm_120 kernel and
         # runs a host loop over experts -- it cannot be captured, so its cells are eager
         # timings, and the whole-layer torch.compile form is shown beside it as the dense
-        # tables show the compiled quantize.
+        # tables show the compiled quantize. Under torch.compile(mode="max-autotune-no-cudagraphs")
+        # Inductor replaces the host loop with its Triton grouped-GEMM template, so that
+        # form captures and its cells are graph-replay timings like every other column.
         # TensorRT-LLM's CUTLASS fused MoE, JIT-built for sm_120 by the FlashInfer
         # wheel (the `tensorrt_llm` wheel pins torch <= 2.10): BF16 on its Ampere
         # kernels, per-tensor FP8 on its SM89 fallback kernels; tactics autotuned.
@@ -391,7 +393,8 @@ def layer_comparators(sm, shared=False):
                ("trtllm_cutlass_bf16", "TRT-LLM CUTLASS fused MoE BF16 µs"),
                ("trtllm_cutlass_fp8", "TRT-LLM CUTLASS fused MoE FP8 per-tensor µs")] + cmp + [
             ("torch_grouped_bf16_layer", "torch _grouped_mm BF16 µs (eager)"),
-            ("torch_grouped_bf16_layer_compiled", "torch _grouped_mm BF16 + torch.compile µs (eager)")]
+            ("torch_grouped_bf16_layer_compiled", "torch _grouped_mm BF16 + torch.compile µs (eager)"),
+            ("torch_grouped_bf16_layer_maxautotune", "torch _grouped_mm BF16 + torch.compile max-autotune µs")]
     return cmp
 
 

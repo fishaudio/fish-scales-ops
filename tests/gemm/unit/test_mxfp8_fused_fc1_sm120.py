@@ -46,21 +46,21 @@ def main():
         w13 = (torch.randn(G, 2 * I, H, device=dev, generator=g) * 0.02).to(torch.bfloat16)
         # Interleaved rows: the fused epilogue pairs gate_j with up_j inside one
         # thread's accumulator, which only holds when the weight rows alternate.
-        w13i, sw13i = fso.gemm.quantize_moe_weights_1x32_fp8(w13, w13_interleave=True)
-        avail = fso.gemm.mxfp8_grouped_swiglu_available(2 * I, H)
+        w13i, sw13i = fso.compat.quantize_moe_weights_1x32_fp8(w13, w13_interleave=True)
+        avail = fso.compat.mxfp8_grouped_swiglu_available(2 * I, H)
         if not avail:
             failures.append(f"G={G} I={I}: mxfp8_grouped_swiglu_available said no on sm_120")
             continue
         m_cap = (M + 3) // 4 * 4
         rows = M * topk
         em = max(1, (rows + G - 1) // G)
-        masked, _rm, slot, *_ = fso.gemm.moe_build_routing(ids, G, m_cap)
-        a_fp8, sa = fso.gemm.quantize_1x32_grouped_gather_fp8(hidden, slot, topk, G, m_cap)
+        masked, _rm, slot, *_ = fso.compat.moe_build_routing(ids, G, m_cap)
+        a_fp8, sa = fso.compat.quantize_1x32_grouped_gather_fp8(hidden, slot, topk, G, m_cap)
         # The pair it replaces, on the same interleaved weights.
-        gu = fso.gemm.linear_mxfp8_grouped_masked(a_fp8, w13i, sa, sw13i, masked, em)
-        dq_ref, sd_ref = fso.gemm.silu_chunk_mul_quantize_1x32_grouped_fp8(gu, slot, pairwise=True)
+        gu = fso.compat.linear_mxfp8_grouped_masked(a_fp8, w13i, sa, sw13i, masked, em)
+        dq_ref, sd_ref = fso.compat.silu_chunk_mul_quantize_1x32_grouped_fp8(gu, slot, pairwise=True)
         # The fused FC1.
-        dq, sd = fso.gemm.linear_mxfp8_grouped_masked_swiglu(a_fp8, w13i, sa, sw13i, masked, em)
+        dq, sd = fso.compat.linear_mxfp8_grouped_masked_swiglu(a_fp8, w13i, sa, sw13i, masked, em)
         torch.cuda.synchronize()
         if dq.shape != dq_ref.shape or sd.numel() != sd_ref.numel():
             failures.append(f"G={G} M={M} I={I}: shapes differ, {tuple(dq.shape)} vs {tuple(dq_ref.shape)}")
@@ -96,11 +96,11 @@ def main():
     wts = torch.softmax(torch.rand(M, topk, device=dev, generator=g), dim=1).float()
     w13 = (torch.randn(G, 2 * I, H, device=dev, generator=g) * 0.02).to(torch.bfloat16)
     w2 = (torch.randn(G, H, I, device=dev, generator=g) * 0.02).to(torch.bfloat16)
-    w2f, sw2 = fso.gemm.quantize_moe_weights_1x32_fp8(w2)
-    w13p, sw13p = fso.gemm.quantize_moe_weights_1x32_fp8(w13)
-    w13i, sw13i = fso.gemm.quantize_moe_weights_1x32_fp8(w13, w13_interleave=True)
-    plain = fso.gemm.moe_layer_mxfp8_sm120(hidden, w13p, sw13p, w2f, sw2, ids, wts)
-    fused = fso.gemm.moe_layer_mxfp8_sm120(
+    w2f, sw2 = fso.compat.quantize_moe_weights_1x32_fp8(w2)
+    w13p, sw13p = fso.compat.quantize_moe_weights_1x32_fp8(w13)
+    w13i, sw13i = fso.compat.quantize_moe_weights_1x32_fp8(w13, w13_interleave=True)
+    plain = fso.compat.moe_layer_mxfp8_sm120(hidden, w13p, sw13p, w2f, sw2, ids, wts)
+    fused = fso.compat.moe_layer_mxfp8_sm120(
         hidden, w13i, sw13i, w2f, sw2, ids, wts, w13_interleaved=True)
     torch.cuda.synchronize()
     pf = plain.float().flatten()

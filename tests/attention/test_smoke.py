@@ -33,15 +33,27 @@ def _check(B, S, H_q, H_kv, D, causal):
     v = torch.randn(B, S, H_kv, D, dtype=torch.bfloat16, device="cuda")
     scale = D ** -0.5
     out = fso.attention.flash_attn_fwd(
-        q, k, v, softmax_scale=scale, causal=causal,
-        force_kernel="torch_fallback_fwd")
+        q, k, v, softmax_scale=scale, causal=causal)
     ref = _ref_sdpa(q, k, v, scale, causal)
     cos = F.cosine_similarity(out.float().flatten(), ref.float().flatten(), dim=0).item()
     print(f"  BHSD={B}x{H_q}/{H_kv}x{S}x{D}  causal={causal}  cos={cos:.6f}")
     assert cos > 0.99, f"cos={cos:.6f} below 0.99 floor"
 
 
+def test_reference_modules_import():
+    """The plain-PyTorch reference modules ship in the package and must import
+    under their package names (mxfp8_attn_ref once imported `mxfp8_ref` as a
+    top-level module and raised ModuleNotFoundError). Needs no GPU."""
+    import importlib
+
+    for name in ("mxfp8_ref", "mxfp8_attn_ref"):
+        mod = importlib.import_module(f"fish_scales_ops.attention.backends.{name}")
+        print(f"  import fish_scales_ops.attention.backends.{name}  OK")
+    assert callable(mod.mxfp8_qk_mixed_pv_fwd)
+
+
 def main():
+    test_reference_modules_import()
     cap = torch.cuda.get_device_capability(0)
     print(f"Device: {torch.cuda.get_device_name(0)} (sm_{cap[0]}{cap[1]})\n")
 

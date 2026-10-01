@@ -8,13 +8,16 @@ Two APIs:
 
 (B) ``DecodePagedPlan`` / ``plan_decode_paged(...)`` — FlashInfer-style
     plan/run separation. The plan allocates scratch buffers once and
-    tracks the expected-counter value across calls, so the hot-path
-    ``run`` never re-zeroes the counter.
+    tracks the expected-counter value across eager calls, so an eager
+    ``run`` does not re-zero the counter. A ``run`` inside a CUDA-graph
+    capture records the re-zeroing in the graph, and once a plan has been
+    captured every eager ``run`` on it re-zeroes the counter as well.
 
 Both routes call into ``torch.ops.fish_scales_ops.mxfp8_decode_paged``
-(built into ``fish_scales_ops._C``). The kernel is sm_120-only at
-runtime; the C++ dispatcher returns ``cudaErrorNotSupported`` on
-other arches and the binding raises ``RuntimeError``.
+(built into ``fish_scales_ops._C``). The kernel runs on sm_120 / sm_121
+only: both wrappers raise ``NotImplementedError`` on any other
+architecture before launching (the raw op's dispatcher returns
+``cudaErrorNotSupported`` there and the binding raises ``RuntimeError``).
 
 Single-token (S_q = 1) decode against a paged FP8 KV cache.
 
@@ -37,9 +40,10 @@ CALLER CONTRACT — Q/K/V are PRE-QUANTIZED, scales are GROUP-SHARED:
     seq_lens    : [B]                                   torch.int32
 
 Constraints (Blackwell sm_120a):
-    - sm == 12.0 (sm_120a)
+    - sm_120 / sm_121
     - head_dim D ∈ {32, 64, 128, 256}  (D=256 runs at kStages=1 — smem-tight).
-    - page_size ∈ {32, 64, 128, 256} — must be a positive multiple of 32.
+    - page_size a positive multiple of 32 (32, 64, 128 and 256 are the
+      recommended values).
       This comes from K's block-scaled QK mma (sf_vec_size=32 along D),
       NOT V. Channel-V is page-size-agnostic.
     - H_q % H_kv == 0; gqa_group = H_q / H_kv ≤ 64.
@@ -54,6 +58,8 @@ from typing import Optional
 
 import torch
 
+from . import _require_sm120
+
 
 FP8_E4M3_MAX = 448.0
 
@@ -66,14 +72,30 @@ _KERNEL_BC = 32                       # MXFP8 sf_vec_size, matches kernel kBc
 _MIN_PAGE_SIZE = 32                   # caller page_size must be a multiple of kBc
 
 
+_SM_COUNT_CACHE: dict = {}
+
+
+def _sm_count() -> int:
+    """SM count of the current device, resolved once per device and cached, so the
+    first call has to be eager like the first call of every op in this library
+    (170 on the RTX 5090, 188 on the RTX PRO 6000)."""
+    dev = torch.cuda.current_device()
+    n = _SM_COUNT_CACHE.get(dev)
+    if n is None:
+        n = torch.cuda.get_device_properties(dev).multi_processor_count
+        _SM_COUNT_CACHE[dev] = n
+    return n
+
+
 def _auto_kv_split(B: int, H_kv: int) -> int:
-    """Pick kv_split_k targeting ~2× SM saturation on a 170-SM Blackwell GPU.
+    """Pick kv_split_k targeting ~2× SM saturation on this device.
 
     Each (b, h_kv) decode work-unit launches one CTA; kv_split_k > 1 spreads
-    a single seq across multiple SMs (FlashDecoding-style).
+    a single seq across multiple SMs (FlashDecoding-style). On the RTX 5090
+    (170 SMs) this is the split the kernel was tuned with.
     """
     work_units = max(B * H_kv, 1)
-    sm_count = 170
+    sm_count = _sm_count()
     target = max(2 * sm_count // work_units, 1)
     # Round to nearest power-of-two for clean K-tile partitioning.
     s = 1
@@ -136,12 +158,13 @@ def mxfp8_decode_paged_fwd(
     out:          Optional[torch.Tensor] = None,
     kv_split_k:   Optional[int] = None,
 ) -> torch.Tensor:
-    """Single-call paged-KV MXFP8 decode forward (sm_120 only).
+    """Single-call paged-KV MXFP8 decode forward (sm_120 / sm_121).
 
     Allocates partial scratch + sync counter every call. Use
     :class:`DecodePagedPlan` for steady-state decode loops to amortize
     those allocations away.
     """
+    _require_sm120("mxfp8_decode_paged_fwd")
     _check_inputs(q_fp8, q_scales, k_cache_fp8, k_chan_scale, v_cache_fp8, v_chan_scale,
                   block_table, seq_lens)
     B, H_q, D = q_fp8.shape
@@ -186,15 +209,20 @@ class DecodePagedPlan:
     """Reusable plan for a fixed-shape decode workload.
 
     Allocates the partial-output scratch + sync counter once and tracks
-    the running atomic-counter target so subsequent ``run()`` calls don't
-    pay per-call ``cudaMemsetAsync`` (and no scratch allocation either).
-    The counter accumulates eager-mode, and is re-zeroed inside CUDA-graph
-    captures where eager state baking would break replays.
+    the running atomic-counter target so subsequent eager ``run()`` calls
+    don't pay a per-call ``cudaMemsetAsync`` (and no scratch allocation
+    either). The counter accumulates in eager mode and is re-zeroed inside
+    CUDA-graph captures, where a baked eager target would break replays.
+    Once the plan has been captured, every eager ``run`` re-zeroes the
+    counter too, because the replays move the device counter without the
+    host seeing it. One plan must not run on two streams at once: its
+    scratch is shared.
     """
 
     def __init__(self, *, B: int, H_q: int, H_kv: int, D: int, max_blocks: int,
                  kv_split_k: Optional[int] = None,
                  device: str | torch.device = "cuda"):
+        _require_sm120("DecodePagedPlan")
         if D not in _SUPPORTED_D:
             raise NotImplementedError(
                 f"head_dim must be in {_SUPPORTED_D}; got D={D}")
@@ -212,6 +240,7 @@ class DecodePagedPlan:
         self.D = D
         self.max_blocks = max_blocks
         self.kv_split_k = kv_split_k
+        self._captured = False   # set by the first run() inside a graph capture
 
         if kv_split_k > 1:
             self._m_partial = torch.empty(B, H_q, kv_split_k, dtype=torch.float32, device=device)
@@ -241,7 +270,9 @@ class DecodePagedPlan:
             softmax_scale: Optional[float] = None,
             out:          Optional[torch.Tensor] = None,
             ) -> torch.Tensor:
-        """Hot-path decode call. No allocation or memset in eager mode."""
+        """Hot-path decode call. No scratch allocation; no memset in eager mode
+        until the plan has been captured (then every eager call re-zeroes the
+        counter). The output is allocated only when ``out`` is None."""
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(self.D)
         if out is None:
@@ -262,12 +293,21 @@ class DecodePagedPlan:
 
         # Counter target. Eager mode accumulates so we can skip the memset;
         # CUDA-graph capture bakes a fixed target so the counter has to be
-        # re-zeroed each replay (captured as a fast graph node, ~0.1 µs).
+        # re-zeroed each replay (captured as one memset node of the graph).
         if self.kv_split_k > 1:
             if torch.cuda.is_current_stream_capturing():
                 self._sync_counter.zero_()
                 target_counter = self.kv_split_k
                 self._expected_counter = 0
+                self._captured = True
+            elif self._captured:
+                # Once this plan is in a graph, each replay zeroes the counter on
+                # the device while the host sees nothing, so the eager running
+                # total no longer matches the device value and an eager call
+                # would wait for a count that never comes and leave `out`
+                # unwritten. After a capture every eager call re-zeroes instead.
+                self._sync_counter.zero_()
+                target_counter = self.kv_split_k
             else:
                 self._expected_counter += self.kv_split_k
                 target_counter = self._expected_counter
