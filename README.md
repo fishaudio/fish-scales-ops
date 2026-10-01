@@ -3,7 +3,8 @@
 Block-scaled FP8 / MXFP8 GEMM, MoE layer and FlashAttention kernels for LLM
 serving on NVIDIA Hopper (H200, sm_90a) and Blackwell (RTX 5090 sm_120a;
 B200 / B300 sm_100 / sm_103), as a PyTorch extension. Current version: 0.2.0;
-the changes of each release are in [`CHANGELOG.md`](CHANGELOG.md).
+the changes of each release are in [`CHANGELOG.md`](CHANGELOG.md). A serving
+engine starts with the integration guide, [`docs/guide.md`](docs/guide.md).
 
 <!-- Status: the tables in the Performance section are rendered from
      tests/baselines/ by bench/gemm/python/render_perf_docs.py and change only
