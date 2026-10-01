@@ -55,6 +55,13 @@ existing name.
   expert, a 32-row tile up to 24, and above that the non-swap FC1 followed by the swap-AB FC2 on the same
   64-row layout (bit-identical to the non-swap FC2). `FSO_FC2_SWAP=0|1` forces the FC2 for A/B runs.
   `MOE_SWAP_BLOCK_N_CASCADE` and `moe_swap_ab_max_m` in `fso.compat` change accordingly.
+- **Bundled sm_90 compiler.** The sm_90 kernels are compiled by a bundled NVRTC 13.2.78 that the library
+  loads privately. Before, the compiler was whichever NVRTC torch had loaded: 13.0 in the torch 2.13 cu130
+  wheel, which generates slower code for the dense FP8 GEMMs (`docs/perf/README.md`).
+  - `scripts/build.sh` fetches the pinned wheel for an sm_90 build.
+  - `FSO_JIT_NVRTC_LIB` selects another library.
+  - `torch.ops.fish_scales_ops.jit_compiler_sm90()` and `describe()` report the compiler in use.
+  - The extension no longer links `libnvrtc`.
 - **`fish_scales_ops.__version__`.**
 
 ### Fixed
@@ -87,16 +94,13 @@ existing name.
 - **sm_90 Family C prefill.** On Family C prefill, sglang 0.5.20's Triton FP8 MoE layer is ahead of fso
   from M = 1024 to M = 4096. `docs/perf/layer/sm90.md` gives the comparison.
 
-- **sm_90 kernels compiled by an older NVRTC.** The sm_90 kernels are compiled at run time by the NVRTC
-  that torch loads. The torch 2.13 cu130 wheel bundles NVRTC 13.0, which generates slower code than 13.2
-  for the dense FP8 GEMMs; the MoE layer is barely affected. Setting `FSO_JIT_USE_NVCC=1` with a CUDA 13.2
-  nvcc (`FSO_JIT_NVCC_COMPILER`) gives 13.2's code. `docs/perf/README.md` gives the measurement.
-
 ### Install
 
 The extension reads files from the source tree that built it, so build in place (`EDITABLE=1` or the
 default in-place build) and keep the tree where it is:
 - the sm_90 JIT headers; `FSO_JIT_INCLUDE_DIRS` overrides their location;
+- the bundled NVRTC 13.2.78 in `python/fish_scales_ops/_nvrtc/`, which `scripts/build.sh` downloads for an
+  sm_90 build (`FSO_NVRTC_WHEEL` for an offline build);
 - the sm_100/sm_103 CuTe-DSL kernel file; `FSO_DSL_KERNEL_PATH` overrides its location.
 
 The runtime needs torch 2.11 or newer with a CUDA 13 runtime.

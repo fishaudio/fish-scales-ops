@@ -39,6 +39,20 @@
 #                    Sites with multiarch headers (e.g. Debian/Ubuntu python-dev)
 #                    may also need PYTHON_INCLUDE_MULTIARCH for pyconfig.h.
 #
+#   The sm_90 JIT compiles its kernels at run time with the NVRTC 13.2.78 that
+#   the package bundles in python/fish_scales_ops/_nvrtc/ (never with the NVRTC
+#   torch loaded). When ARCH contains 9.0, this script runs
+#   scripts/vendor_nvrtc.py BEFORE it compiles: the script downloads the
+#   nvidia-cuda-nvrtc==13.2.78 wheel with pip, checks its pinned sha256 and
+#   unpacks the library (about 120 MB). A failed step stops the build before
+#   any _C*.so is produced. Two variables control it:
+#
+#   FSO_NVRTC_WHEEL        Path of that wheel, for an offline build (no
+#                          download). Same as `vendor_nvrtc.py --wheel PATH`.
+#   FSO_SKIP_NVRTC_VENDOR  1 → skip the step. The extension then has no bundled
+#                          NVRTC, and every process that runs sm_90 GEMMs must
+#                          set FSO_JIT_NVRTC_LIB to a CUDA 13.2 libnvrtc.so.13.
+#
 # Probes only standard system locations. No hard-coded user paths.
 
 set -euo pipefail
@@ -160,6 +174,18 @@ if [[ "${CLEAN}" == "1" ]]; then
     rm -rf python/build python/fish_scales_ops.egg-info
     rm -f  python/fish_scales_ops/_C.*.so
     echo "[build] cleaned python/build + stale .so"
+fi
+
+# ---- Bundle NVRTC for the sm_90 JIT -------------------------------------------
+# Before the compile, so that a failed download or a refused wheel stops the
+# build without producing a _C*.so (a build that checks "the .so exists" must
+# not pass with an extension that cannot compile its sm_90 kernels).
+if [[ "${ARCH}" == *9.0* ]]; then
+    if [[ "${FSO_SKIP_NVRTC_VENDOR:-0}" == "1" ]]; then
+        echo "[build] FSO_SKIP_NVRTC_VENDOR=1: NVRTC not bundled; set FSO_JIT_NVRTC_LIB at run time"
+    else
+        python "${REPO}/scripts/vendor_nvrtc.py"
+    fi
 fi
 
 # ---- Build --------------------------------------------------------------------

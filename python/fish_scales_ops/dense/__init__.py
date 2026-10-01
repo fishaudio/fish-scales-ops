@@ -43,8 +43,9 @@ import torch
 from .._arch import sm_major
 from ..gemm.fp8 import quantize_128x128_fp8
 from ..gemm.mxfp8 import linear_mxfp8, quantize_1x32_fp8
-# One architecture probe and one parser of the ``arch`` argument, shared with fso.moe.
-from ..moe import _arch_label, _arch_major, _device_arch
+# One architecture probe and one parser of the ``arch`` argument, shared with fso.moe,
+# and the sm_90 JIT compiler line both describe() functions end with.
+from ..moe import _arch_label, _arch_major, _device_arch, _sm90_jit_compiler_line
 
 __all__ = ["FORMATS", "DenseWeight", "prepare_weight", "linear", "supported", "describe"]
 
@@ -90,7 +91,9 @@ def supported(format, arch=None) -> bool:
 def describe() -> str:
     """The architecture matrix of the dense routes as text, with this device's
     rows marked, for logs and for the messages of a caller that refuses a
-    configuration."""
+    configuration. On sm_90 the last line names the compiler of the deep_gemm
+    JIT (the bundled NVRTC and its path), or the error that keeps it from
+    loading; describe() itself never raises."""
     arch = _device_arch()
     major = arch // 10
     name = ""
@@ -147,6 +150,8 @@ def describe() -> str:
         lines.append(f"This device ({_arch_label(arch)}) serves no format.")
     lines.append("linear(): x is bf16 [..., K] and the result bf16 [..., N]; the activation is quantized "
                  "inside the op on every call, and there is no bias argument.")
+    if major == 9:
+        lines.append(_sm90_jit_compiler_line())
     return "\n".join(lines)
 
 

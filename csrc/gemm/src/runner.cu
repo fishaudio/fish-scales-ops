@@ -369,5 +369,14 @@ cudaError_t launch_sm90_fp8_grouped_contiguous_swapab_swiglu_dispatch(__nv_fp8_e
     return cudaErrorNotSupported;
 #endif
 }
+
+// The compiler of the sm_90 deep_gemm JIT in this process (torch.ops.fish_scales_ops.jit_compiler_sm90):
+// "NVRTC 13.2 (<absolute path of the library>)", or "nvcc <path>" under FSO_JIT_USE_NVCC. Lives here for the same
+// reason as the entries above: this is the only translation unit that includes the JIT headers. It loads NVRTC on first
+// use, so where the library cannot be loaded it throws the RuntimeError the first sm_90 GEMM would.
+std::string sm90_jit_compiler_description()
+{
+    return ::deep_gemm::jit::jitCompilerDescription();
+}
 } // namespace blockscale_gemm::detail
 

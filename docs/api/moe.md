@@ -202,7 +202,11 @@ on sm_100/103 and sm_120/121, and nothing else anywhere. `arch` defaults to this
 device. The query never raises for a format it does not know (it answers
 `False`), so a model-level resolver can ask it before it chooses this layer; an
 `arch` that names no compute capability raises `ValueError`. `describe()`
-returns the same matrix as text with this device's rows marked.
+returns the same matrix as text with this device's rows marked. On sm_90 its
+last line names the compiler of the JIT that builds the sm_90 kernels
+(`torch.ops.fish_scales_ops.jit_compiler_sm90()`: the bundled NVRTC 13.2 and its
+path), or the error that keeps that compiler from loading; `describe()` itself
+never raises.
 
 `tests/gemm/unit/test_moe_unified.py` runs on every architecture and skips what
 the device cannot run. It asserts that `fso.moe.layer` is `torch.equal` to the

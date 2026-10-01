@@ -73,6 +73,8 @@ void fp8bs_quantize_1x128_fp32_sorted_gather(__nv_fp8_e4m3* x_q, float* sfa, __n
     int32_t const* flat_to_sorted, int n_pairs, int topk, int sfa_ld, int K, cudaStream_t stream);
 void fp8bs_silu_chunk_mul_quantize_1x128_fp32_sorted(__nv_fp8_e4m3* x_q, float* sfa, __nv_bfloat16 const* gu,
     int32_t const* flat_to_sorted, int n_pairs, int sfa_ld, int K, cudaStream_t stream);
+// The compiler of the sm_90 deep_gemm JIT in this process (runner.cu, the only TU that includes the JIT headers).
+std::string sm90_jit_compiler_description();
 } // namespace detail
 
 namespace
@@ -1004,6 +1006,15 @@ std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x128_sorted_sm90(
         reinterpret_cast<int32_t const*>(flat_to_sorted.data_ptr()),
         R, sfa_ld, INTER, stream);
     return {x_q, sfa};
+}
+
+// jit_compiler_sm90: the compiler the sm_90 deep_gemm JIT uses in this process, for logs and for fso.dense.describe()
+// / fso.moe.describe(): "NVRTC 13.2 (<absolute path of the library>)", or "nvcc <path>" under FSO_JIT_USE_NVCC. A
+// host-side query with no tensor argument. It loads the NVRTC library on first use, so where that library is missing it
+// raises the RuntimeError the first sm_90 GEMM would.
+std::string jit_compiler_sm90()
+{
+    return detail::sm90_jit_compiler_description();
 }
 
 } // namespace blockscale_gemm

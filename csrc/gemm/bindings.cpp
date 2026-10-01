@@ -21,6 +21,7 @@
 #include <torch/torch.h>
 
 #include <optional>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -51,6 +52,8 @@ std::tuple<at::Tensor, at::Tensor> quantize_1x128_sorted_gather_sm90(
     at::Tensor x, at::Tensor flat_to_sorted, int64_t p_max, int64_t topk);
 std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x128_sorted_sm90(
     at::Tensor gu, at::Tensor flat_to_sorted);
+// The compiler of the sm_90 deep_gemm JIT in this process: "NVRTC 13.2 (<path>)", or "nvcc <path>".
+std::string jit_compiler_sm90();
 at::Tensor linear_qx(at::Tensor x_bf16, at::Tensor w_fp8, at::Tensor sw);
 std::tuple<at::Tensor, at::Tensor> quantize_1x128(at::Tensor x, bool use_ue8m0);
 std::tuple<at::Tensor, at::Tensor> quantize_1x128_packed(at::Tensor x, bool use_ue8m0);
@@ -136,6 +139,9 @@ TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
           "-> (Tensor, Tensor)");
     m.def("silu_chunk_mul_quantize_1x128_sorted_sm90(Tensor gu, Tensor flat_to_sorted) "
           "-> (Tensor, Tensor)");
+    // A pure host-side query (no tensor argument), so it carries its own catch-all kernel, like the route queries
+    // below: the compiler of the sm_90 deep_gemm JIT, which it loads on first use.
+    m.def("jit_compiler_sm90() -> str", &blockscale_gemm::jit_compiler_sm90);
     m.def("linear_qx(Tensor x_bf16, Tensor w_fp8, Tensor sw) -> Tensor");
     m.def("quantize_1x128(Tensor x, bool use_ue8m0=False) -> (Tensor, Tensor)");
     m.def("quantize_1x128_packed(Tensor x, bool use_ue8m0=True) -> (Tensor, Tensor)");

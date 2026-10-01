@@ -18,24 +18,32 @@
 #pragma once
 #include <climits>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cuda_runtime.h>
+#include <dlfcn.h>
+#include <filesystem>
 #include <iostream>
 #include <nvrtc.h>
 #include <string>
+#include <system_error>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 
 #include "scheduler.cuh"
+#include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/tllmException.h"
 
-// Helper function to check NVRTC errors
+// Helper function to check NVRTC errors. The call goes through the NVRTC function table (deep_gemm::jit::nvrtc(),
+// below), and a failure throws a RuntimeError instead of ending the process.
 #define CHECK_NVRTC(call)                                                                                              \
     do                                                                                                                 \
     {                                                                                                                  \
         nvrtcResult result = call;                                                                                     \
         if (result != NVRTC_SUCCESS)                                                                                   \
         {                                                                                                              \
-            std::cerr << "NVRTC error: " << nvrtcGetErrorString(result) << std::endl;                                  \
-            exit(1);                                                                                                   \
+            TLLM_THROW("NVRTC error in %s: %s", #call, ::deep_gemm::jit::nvrtc().nvrtcGetErrorString(result));        \
         }                                                                                                              \
     } while (0)
 
@@ -55,6 +63,124 @@
 
 namespace deep_gemm::jit
 {
+
+// The NVRTC library the sm_90 JIT compiles with. The extension does not link libnvrtc: it loads one library itself,
+// privately (dlopen with RTLD_NOW | RTLD_LOCAL), and calls NVRTC only through this table of the nine functions the JIT
+// uses, resolved with dlsym from that library. No call can therefore bind to the libnvrtc.so.13 that torch loads into
+// the process, whose version depends on the torch build. <nvrtc.h> supplies the types and enums only: decltype does not
+// reference the functions it names.
+struct NvrtcApi
+{
+    decltype(&::nvrtcVersion) nvrtcVersion = nullptr;
+    decltype(&::nvrtcCreateProgram) nvrtcCreateProgram = nullptr;
+    decltype(&::nvrtcCompileProgram) nvrtcCompileProgram = nullptr;
+    decltype(&::nvrtcGetProgramLogSize) nvrtcGetProgramLogSize = nullptr;
+    decltype(&::nvrtcGetProgramLog) nvrtcGetProgramLog = nullptr;
+    decltype(&::nvrtcDestroyProgram) nvrtcDestroyProgram = nullptr;
+    decltype(&::nvrtcGetCUBINSize) nvrtcGetCUBINSize = nullptr;
+    decltype(&::nvrtcGetCUBIN) nvrtcGetCUBIN = nullptr;
+    decltype(&::nvrtcGetErrorString) nvrtcGetErrorString = nullptr;
+    std::string path; // the absolute path of the library the table was resolved from
+    int major = 0;    // its nvrtcVersion
+    int minor = 0;
+};
+
+// The table of this process, loaded on first use and kept for the life of the process (defined in compiler.cuh, next
+// to the knobs it reads).
+inline NvrtcApi const& nvrtc();
+
+// What to do when the NVRTC library cannot be loaded; part of every loader error.
+inline constexpr char const* kNvrtcRemedy
+    = "Run `python scripts/vendor_nvrtc.py` in the fish-scales-ops source tree (scripts/build.sh does it for an sm_90 "
+      "build), or set FSO_JIT_NVRTC_LIB to a CUDA 13.2 libnvrtc.so.13.";
+
+// A function with internal linkage, so its address always lies in the shared object this translation unit is linked
+// into (the extension); dladdr on it names that file.
+static void nvrtcLocatorAnchor() {}
+
+// Where the bundled NVRTC lives: <directory of the extension .so>/_nvrtc/libnvrtc.so.13, which scripts/vendor_nvrtc.py
+// fills. The directory is taken from the loaded extension itself rather than from a path baked in at build time, so the
+// library moves with the package.
+inline std::filesystem::path bundledNvrtcPath()
+{
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<void const*>(&nvrtcLocatorAnchor), &info) == 0 || info.dli_fname == nullptr
+        || info.dli_fname[0] == '\0')
+    {
+        TLLM_THROW("sm_90 JIT: cannot locate the fish_scales_ops extension (dladdr failed), so the NVRTC bundled next "
+                   "to it cannot be found. %s",
+            kNvrtcRemedy);
+    }
+    return std::filesystem::path(info.dli_fname).parent_path() / "_nvrtc" / "libnvrtc.so.13";
+}
+
+// Loads the NVRTC library and resolves the table; nvrtc() calls it once per process, with debugLog = FSO_JIT_DEBUG.
+// The library is, in this order: the file FSO_JIT_NVRTC_LIB names, when that is set and non-empty; the copy bundled
+// next to the extension. Nothing else is tried. In particular a failure never falls back to the libnvrtc.so.13 already
+// in the process or to $CUDA_HOME: it throws a RuntimeError with the path, the dlerror() text and the remedy. A version
+// other than 13.2 is the caller's explicit choice (an override, or a replaced bundled file): it is used, with one line
+// on stderr.
+inline NvrtcApi loadNvrtcApi(bool debugLog)
+{
+    char const* envPath = std::getenv("FSO_JIT_NVRTC_LIB");
+    bool const fromEnv = envPath != nullptr && envPath[0] != '\0';
+    char const* const origin = fromEnv ? "set by FSO_JIT_NVRTC_LIB" : "the copy bundled with fish_scales_ops";
+    std::filesystem::path path = fromEnv ? std::filesystem::path(envPath) : bundledNvrtcPath();
+    // An absolute path, so that dlopen opens exactly this file. A bare name such as "libnvrtc.so.13" would make it
+    // search the library path, and it would return the copy torch already loaded under that soname.
+    std::error_code ec;
+    std::filesystem::path const absolute = std::filesystem::absolute(path, ec);
+    if (!ec)
+        path = absolute;
+
+    NvrtcApi api;
+    api.path = path.string();
+    dlerror();
+    void* handle = dlopen(api.path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (handle == nullptr)
+    {
+        char const* err = dlerror();
+        TLLM_THROW("sm_90 JIT: cannot load the NVRTC library %s (%s): %s. %s", api.path.c_str(), origin,
+            err != nullptr ? err : "unknown error", kNvrtcRemedy);
+    }
+    auto resolve = [&](char const* name, auto& fn)
+    {
+        dlerror();
+        void* sym = dlsym(handle, name);
+        if (sym == nullptr)
+        {
+            char const* err = dlerror();
+            std::string const reason = err != nullptr ? err : "the symbol is null";
+            dlclose(handle);
+            TLLM_THROW("sm_90 JIT: the NVRTC library %s (%s) has no %s: %s. %s", api.path.c_str(), origin, name,
+                reason.c_str(), kNvrtcRemedy);
+        }
+        fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(sym);
+    };
+    resolve("nvrtcVersion", api.nvrtcVersion);
+    resolve("nvrtcCreateProgram", api.nvrtcCreateProgram);
+    resolve("nvrtcCompileProgram", api.nvrtcCompileProgram);
+    resolve("nvrtcGetProgramLogSize", api.nvrtcGetProgramLogSize);
+    resolve("nvrtcGetProgramLog", api.nvrtcGetProgramLog);
+    resolve("nvrtcDestroyProgram", api.nvrtcDestroyProgram);
+    resolve("nvrtcGetCUBINSize", api.nvrtcGetCUBINSize);
+    resolve("nvrtcGetCUBIN", api.nvrtcGetCUBIN);
+    resolve("nvrtcGetErrorString", api.nvrtcGetErrorString);
+
+    // Not CHECK_NVRTC: that goes through nvrtc(), whose initialisation is this call.
+    nvrtcResult const versionResult = api.nvrtcVersion(&api.major, &api.minor);
+    if (versionResult != NVRTC_SUCCESS)
+        TLLM_THROW("sm_90 JIT: nvrtcVersion failed in the NVRTC library %s (%s): %s", api.path.c_str(), origin,
+            api.nvrtcGetErrorString(versionResult));
+    if (api.major != 13 || api.minor != 2)
+        std::fprintf(stderr,
+            "[fish_scales_ops] sm_90 JIT: compiling with NVRTC %d.%d from %s (%s); the sm_90 kernels are validated "
+            "and measured with NVRTC 13.2\n",
+            api.major, api.minor, api.path.c_str(), origin);
+    if (debugLog)
+        TLLM_LOG_INFO("sm_90 JIT compiler: NVRTC %d.%d from %s (%s)", api.major, api.minor, api.path.c_str(), origin);
+    return api;
+}
 
 using GemmConfig
     = std::tuple<int, int, int, int, int>; // block_m, block_n, num_stages, num_tma_multicast, best_smem_size

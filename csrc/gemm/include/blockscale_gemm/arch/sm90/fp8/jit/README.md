@@ -40,8 +40,21 @@ on `SHAPE_K % kFullKOfAllStages == 0`). To AOT this, every supported
 production `(N, K)` pair would need an explicit instantiation in the
 .so — feasible, but a separate refactor. It was scoped as a follow-up when
 the library was extracted from blockscale_gemm and has not been started; the
-JIT remains the only sm_90 path, and the NVRTC build the process binds is
+JIT remains the only sm_90 path, and the NVRTC build that compiles it is
 therefore part of the measured kernel (see `docs/perf/README.md` §8).
+
+## Which NVRTC
+
+The extension does not link libnvrtc. On the first NVRTC compile (or the
+first disk-cache key, or the first `jit_compiler_sm90` call) `jit_utils.cuh`
+loads one library with `dlopen(RTLD_NOW | RTLD_LOCAL)` and resolves the nine
+NVRTC functions the JIT calls into a table; every call in `compiler.cuh` goes
+through that table, so none can bind to the `libnvrtc.so.13` torch loaded.
+The library is `FSO_JIT_NVRTC_LIB` when set, else `_nvrtc/libnvrtc.so.13`
+next to the extension (found with `dladdr`), which `scripts/vendor_nvrtc.py`
+unpacks from the pinned `nvidia-cuda-nvrtc==13.2.78` wheel. Nothing else is
+tried: a failed load raises `RuntimeError` with the remedy. A version other
+than 13.2 is used with one stderr line. `FSO_JIT_USE_NVCC` never loads NVRTC.
 
 ## Lint contract
 
@@ -69,9 +82,9 @@ The result should be empty.
 | `deep_gemm/fp8_gemm.cuh` | TMA descriptor builders + run-host wrappers |
 | `deep_gemm/fp8_gemm_impl.cuh` | the kernel `fp8_gemm_kernel<...>` |
 | `deep_gemm/scheduler.cuh` | persistent + grouped + strided-batched schedulers |
-| `deep_gemm/compiler.cuh` | NVRTC driver — generates kernel source, compiles, keys the opt-in disk cache by content |
+| `deep_gemm/compiler.cuh` | NVRTC driver — generates kernel source, compiles through the NVRTC table (loaded once per process), keys the opt-in disk cache by content |
 | `deep_gemm/runtime.cuh` | runtime cubin loader, the in-memory runtime cache and the `FSO_JIT_*` knobs |
-| `deep_gemm/jit_utils.cuh` | `get_best_gemm_config` + `get_smem_size` heuristic |
+| `deep_gemm/jit_utils.cuh` | `get_best_gemm_config` + `get_smem_size` heuristic; the NVRTC function table and its loader |
 | `deep_gemm/{mma,tma}_utils.cuh` | WGMMA + TMA helpers |
 | `deep_gemm/utils.cuh` | misc primitives (`ceil_div`, `lane_id`, etc.) |
 | `deep_gemm/nvrtc_std.cuh` | minimal `<type_traits>` / `<utility>` shim for NVRTC |

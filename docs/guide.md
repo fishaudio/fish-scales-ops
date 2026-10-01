@@ -60,6 +60,18 @@ ARCH="9.0a;10.0f;12.0a" EDITABLE=1 ./scripts/build.sh   # every serving architec
 
   Build in place (`EDITABLE=1` or the default in-place build). A container image that keeps the cloned
   tree, as an image that installs with `pip install -e` does, satisfies this.
+- **The sm_90 compiler is bundled.** The sm_90 kernels are compiled at run time by NVRTC 13.2.78. The
+  library bundles that NVRTC and loads it privately, so the NVRTC that torch ships (13.0 in the torch 2.13
+  cu130 wheel) and the CUDA toolkit of the image play no part.
+  - For an `ARCH` with `9.0a`, `build.sh` downloads the `nvidia-cuda-nvrtc==13.2.78` wheel with pip, checks
+    its pinned sha256 and unpacks it into `python/fish_scales_ops/_nvrtc/` (about 120 MB), before it
+    compiles.
+  - An offline build passes the wheel with `FSO_NVRTC_WHEEL=/path/to/wheel`.
+  - `torch.ops.fish_scales_ops.jit_compiler_sm90()` and both `describe()` texts report the compiler in use.
+  - Driver: the bundled compiler is validated on driver 595 (the CUDA 13.2 driver). CUDA's minor-version
+    compatibility should let a CUDA 13.0 driver (580) load its cubins, but that combination was not
+    tested. On such a host, check one sm_90 GEMM call before rollout; `FSO_JIT_NVRTC_LIB` can point at
+    torch's own `libnvrtc.so.13` as a fallback.
 - **B200/B300 extra.** The CuTe-DSL tiers need `nvidia-cutlass-dsl` (the `sm100` extra in
   `python/pyproject.toml`: `pip install "nvidia-cutlass-dsl>=4.8.0,<5"`). Without it those tiers stay off
   and the other tiers serve every shape. Any other reason a tier cannot load prints one `fso:` line on
@@ -178,7 +190,7 @@ variable.
 |---|---|
 | `FSO_MOE_FUSED_COMBINE=1` | sm_120/121: allows the fused-combine FC2 on the buckets whose down-projection slab would dominate the layer's memory. Those buckets are then not bit-reproducible run to run. `transient_bytes` follows the setting |
 | `FSO_JIT_INCLUDE_DIRS=a:b:c` | sm_90: the source tree that built the extension moved |
-| `FSO_JIT_USE_NVCC=1` with `FSO_JIT_NVCC_COMPILER=/path/to/cuda-13.2/bin/nvcc` | sm_90: compile with CUDA 13.2. The default compiler is the NVRTC that torch loaded, which is 13.0 in the torch 2.13 cu130 wheel, and its code is slower on the dense FP8 GEMMs ([`perf/README.md`](perf/README.md)). The nvcc path keeps its cubins in the disk cache (`FSO_JIT_CACHE_DIR`), which must be writable |
+| `FSO_JIT_NVRTC_LIB=/path/to/libnvrtc.so` | sm_90: compile with another NVRTC library than the bundled 13.2.78. A version other than 13.2 prints one notice. A path that cannot be loaded raises; nothing falls back to torch's NVRTC |
 | `FSO_STREAMK_POOL_MB=<n>` | sm_120/121: the dense GEMM's Stream-K scratch is allocated once. A later shape that needs more aborts the process. Size it for the largest dense shape, or make that shape's call the first |
 | `FSO_GROUPED_ARG_POOL_MB=<n>` | sm_100/103: the per-thread arena that every captured MoE GEMM pins a block of. Raise it if the process captures very many graphs |
 | `FSO_FC1_FUSED=0` | A/B runs only: the unfused FC1 on every architecture. Set it before `prepare_experts`, because it decides the weight layout |

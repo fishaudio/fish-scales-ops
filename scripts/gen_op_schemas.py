@@ -52,7 +52,7 @@ GEMM_GROUPS = (
     ("dense_mxfp8", "Dense MXFP8 (1x32)"),
     ("moe_mxfp8", "MoE: the MXFP8 grouped GEMMs of sm_100/103 and sm_120/121, their route queries, "
                   "and the router, routing builders and combines of both layouts"),
-    ("moe_sm90", "MoE: the sm_90 block-FP8 grouped GEMMs and quantizers"),
+    ("moe_sm90", "MoE: the sm_90 block-FP8 grouped GEMMs and quantizers, and the compiler query of the sm_90 JIT"),
     ("python", "Registered from Python (torch.library.custom_op)"),
 )
 
@@ -80,7 +80,7 @@ GEMM_MEMBERS = {
         "linear_fp8_grouped_contiguous_swapab", "linear_fp8_grouped_contiguous_swapab_pair",
         "linear_fp8_grouped_contiguous_swapab_swiglu", "linear_fp8_grouped_contiguous_2wg",
         "linear_fp8_grouped_contiguous_swiglu", "quantize_1x128_sorted_gather_sm90",
-        "silu_chunk_mul_quantize_1x128_sorted_sm90",
+        "silu_chunk_mul_quantize_1x128_sorted_sm90", "jit_compiler_sm90",
     },
 }
 

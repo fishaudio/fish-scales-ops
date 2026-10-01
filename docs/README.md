@@ -99,9 +99,8 @@ table has drifted from its baseline. Each perf file names the runs its tables
 come from in its provenance section. The attention tables
 (`docs/perf/attention/sm120.md`) are a skeleton with no baseline. Open items:
 the sm_90 grouped GEMM kernel-level rows (not measured), the RTX PRO 6000
-optional section of `gemm/sm120.md` (keep or drop), pinning the NVRTC build the
-sm_90 JIT binds, the attention tables, and the `docs/design/` consolidation in
-the last row of the table below.
+optional section of `gemm/sm120.md` (keep or drop), the attention tables, and
+the `docs/design/` consolidation in the last row of the table below.
 
 ## Migration record
 

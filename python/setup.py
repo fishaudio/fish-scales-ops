@@ -268,12 +268,15 @@ nvcc_flags = (
 cxx_flags = ["-O3", "-std=c++17", "-Wno-psabi", "-Wno-deprecated-declarations"]
 
 
+# No libnvrtc here: the sm_90 JIT loads the NVRTC that scripts/vendor_nvrtc.py bundles in fish_scales_ops/_nvrtc/
+# privately at run time (csrc/gemm/include/blockscale_gemm/arch/sm90/fp8/jit/deep_gemm/jit_utils.cuh). A link-time
+# libnvrtc would bind every NVRTC call to whichever libnvrtc.so.13 the process loaded first, which is torch's.
 ext = CUDAExtension(
     name="fish_scales_ops._C",
     sources=_gemm_sources() + _attention_sources(),
     include_dirs=include_dirs,
     extra_compile_args={"cxx": cxx_flags, "nvcc": nvcc_flags},
-    libraries=["cuda", "nvrtc"],
+    libraries=["cuda"],
 )
 
 

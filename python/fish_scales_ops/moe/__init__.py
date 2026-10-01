@@ -90,6 +90,18 @@ def _arch_label(arch: int) -> str:
     return f"sm_{arch}" if arch > 0 else "no CUDA device"
 
 
+def _sm90_jit_compiler_line() -> str:
+    """The line that :func:`describe` and :func:`fish_scales_ops.dense.describe` add
+    on sm_90: the compiler of the deep_gemm JIT in this process
+    (``torch.ops.fish_scales_ops.jit_compiler_sm90``), which loads the bundled NVRTC
+    on first use, or the error that keeps it from loading. Never raises."""
+    try:
+        compiler = torch.ops.fish_scales_ops.jit_compiler_sm90()
+    except Exception as e:  # noqa: BLE001 - the description must never fail
+        compiler = "unavailable: " + " ".join(str(e).splitlines())
+    return f"sm_90 JIT compiler: {compiler}"
+
+
 def _arch_major(arch) -> int:
     """The compute-capability major of an ``arch`` argument: an int major (9, 10,
     12), an int ``major * 10 + minor`` (90, 100, 103, 120, 121), a ``(major, minor)``
@@ -142,7 +154,10 @@ def supported(format, arch=None) -> bool:
 
 def describe() -> str:
     """The architecture matrix as text, with this device's rows marked, for logs
-    and for the messages of a caller that refuses a configuration."""
+    and for the messages of a caller that refuses a configuration. On sm_90 the
+    last line names the compiler of the deep_gemm JIT (the bundled NVRTC and its
+    path), or the error that keeps it from loading; describe() itself never
+    raises."""
     arch = _device_arch()
     major = arch // 10
     name = ""
@@ -193,6 +208,8 @@ def describe() -> str:
         lines.append(f"This device ({_arch_label(arch)}) serves no format.")
     lines.append("layer(): top-k ids outside [0, E_local) are skipped at no expert cost, and the "
                  "result is this rank's partial sum, which the caller reduces across ranks.")
+    if major == 9:
+        lines.append(_sm90_jit_compiler_line())
     return "\n".join(lines)
 
 

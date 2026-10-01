@@ -38,7 +38,7 @@
 #include <vector>
 
 #include "jit_utils.cuh"
-#include "nvrtc.h"
+#include "nvrtc.h" // types and enums only: the functions are called through the table of jit_utils.cuh
 #include "runtime.cuh"
 #include "scheduler.cuh"
 
@@ -478,16 +478,34 @@ inline JitHeaderDigest computeJitHeaderDigest(std::vector<std::filesystem::path>
     return digest;
 }
 
+// The NVRTC function table of this process (jit_utils.cuh): the library is loaded on the first call, which is the
+// first NVRTC compile or disk-cache key of the process, and kept for the life of the process. FSO_JIT_USE_NVCC never
+// reaches it.
+inline NvrtcApi const& nvrtc()
+{
+    static NvrtcApi const api = loadNvrtcApi(kJitDebugging);
+    return api;
+}
+
 // The compiler part of the content key: the version of the NVRTC library this process loaded, or the nvcc command
 // (FSO_JIT_USE_NVCC).
 inline std::string jitCompilerIdentity()
 {
     if (kJitUseNvcc)
         return "nvcc " + getNvccCompiler();
-    int major = 0;
-    int minor = 0;
-    CHECK_NVRTC(nvrtcVersion(&major, &minor));
-    return "nvrtc " + std::to_string(major) + "." + std::to_string(minor);
+    NvrtcApi const& api = nvrtc();
+    return "nvrtc " + std::to_string(api.major) + "." + std::to_string(api.minor);
+}
+
+// The compiler of the sm_90 JIT in this process, as torch.ops.fish_scales_ops.jit_compiler_sm90 reports it:
+// "NVRTC <major>.<minor> (<absolute path of the library>)", or "nvcc <path>" under FSO_JIT_USE_NVCC. It loads NVRTC on
+// first use, so where the library cannot be loaded it throws the error the first sm_90 GEMM would.
+inline std::string jitCompilerDescription()
+{
+    if (kJitUseNvcc)
+        return "nvcc " + getNvccCompiler();
+    NvrtcApi const& api = nvrtc();
+    return "NVRTC " + std::to_string(api.major) + "." + std::to_string(api.minor) + " (" + api.path + ")";
 }
 
 /**
@@ -749,8 +767,10 @@ public:
         }
         else
         {
+            // Every NVRTC call goes through the table of the privately loaded library (jit_utils.cuh).
+            NvrtcApi const& api = nvrtc();
             nvrtcProgram prog;
-            CHECK_NVRTC(nvrtcCreateProgram(&prog, code.c_str(), "kernel.cu", 0, nullptr, nullptr));
+            CHECK_NVRTC(api.nvrtcCreateProgram(&prog, code.c_str(), "kernel.cu", 0, nullptr, nullptr));
 
             std::vector<char const*> options;
             for (auto const& flag : flags)
@@ -760,7 +780,7 @@ public:
 
             // Time the compilation
             auto start = std::chrono::high_resolution_clock::now();
-            nvrtcResult compileResult = nvrtcCompileProgram(prog, options.size(), options.data());
+            nvrtcResult compileResult = api.nvrtcCompileProgram(prog, options.size(), options.data());
 
             if (kJitDebugging)
             {
@@ -769,9 +789,9 @@ public:
                 TLLM_LOG_INFO("NVRTC compilation took %d ms", duration.count());
 
                 size_t logSize;
-                CHECK_NVRTC(nvrtcGetProgramLogSize(prog, &logSize));
+                CHECK_NVRTC(api.nvrtcGetProgramLogSize(prog, &logSize));
                 std::vector<char> log(logSize);
-                CHECK_NVRTC(nvrtcGetProgramLog(prog, log.data()));
+                CHECK_NVRTC(api.nvrtcGetProgramLog(prog, log.data()));
                 TLLM_LOG_INFO("Compilation log:\n%s", log.data());
             }
 
@@ -779,15 +799,15 @@ public:
             if (compileResult != NVRTC_SUCCESS)
             {
                 TLLM_LOG_ERROR("NVRTC compilation failed");
-                CHECK_NVRTC(nvrtcDestroyProgram(&prog));
+                CHECK_NVRTC(api.nvrtcDestroyProgram(&prog));
                 throw std::runtime_error("NVRTC compilation failed");
             }
 
             size_t cubinSize;
-            CHECK_NVRTC(nvrtcGetCUBINSize(prog, &cubinSize));
+            CHECK_NVRTC(api.nvrtcGetCUBINSize(prog, &cubinSize));
             cubin.resize(cubinSize);
-            CHECK_NVRTC(nvrtcGetCUBIN(prog, cubin.data()));
-            CHECK_NVRTC(nvrtcDestroyProgram(&prog));
+            CHECK_NVRTC(api.nvrtcGetCUBIN(prog, cubin.data()));
+            CHECK_NVRTC(api.nvrtcDestroyProgram(&prog));
 
             // FSO_JIT_DUMP_CUBIN: stage the cubin for the disk cache
             if (kJitDumpCubin)

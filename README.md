@@ -97,16 +97,33 @@ stops early with a clear message when one is missing.
 | `PYTHON_INCLUDE`, `PYTHON_INCLUDE_MULTIARCH` | override for `Python.h` / `pyconfig.h` | `sysconfig` |
 | `MAX_JOBS` | ninja parallelism | `nproc` |
 | `EDITABLE` | `pip install -e` instead of `build_ext --inplace` | `0` |
+| `FSO_NVRTC_WHEEL` | path of the `nvidia-cuda-nvrtc` 13.2.78 wheel, for an offline sm_90 build | unset: `pip download` |
+| `FSO_SKIP_NVRTC_VENDOR` | `1` skips bundling NVRTC; every process then needs `FSO_JIT_NVRTC_LIB` | `0` |
 
 Two things the build depends on: `ninja` must be on `PATH` (without it
 setuptools falls back to distutils, which does not track header dependencies,
 so an edited `.cuh` is not recompiled), and `--no-build-isolation` is
 deliberate so the extension links against the active venv's torch instead of
 a fresh one pulled into a build sandbox (c10 ABI mismatch otherwise). Runtime
-requirement: torch 2.11+cu130 or newer with a CUDA 13 runtime. On sm_90 the
-GEMM kernels are NVRTC-compiled in the process at first call and bind the
-`libnvrtc.so.13` already loaded by torch; the NVRTC build affects kernel speed
-(see `docs/perf/README.md` §8).
+requirement: torch 2.11+cu130 or newer with a CUDA 13 runtime.
+
+On sm_90 the GEMM kernels are compiled in the process at their first call,
+and the NVRTC build that compiles them affects their speed (see
+`docs/perf/README.md` §8). The package therefore bundles NVRTC 13.2.78 in
+`python/fish_scales_ops/_nvrtc/`, next to the extension, and the extension
+loads that library privately instead of linking NVRTC. Neither the
+`libnvrtc.so.13` that torch loads nor the CUDA toolkit that built the
+extension decides the compiler. For a build whose `ARCH` contains 9.0,
+`scripts/build.sh` runs `scripts/vendor_nvrtc.py` before it compiles. The
+script downloads the `nvidia-cuda-nvrtc==13.2.78` wheel with pip, checks its
+pinned sha256, unpacks the library (about 120 MB) and test-compiles a kernel
+with it; a failure stops the build before anything is compiled. Offline,
+download the wheel elsewhere and pass it with
+`FSO_NVRTC_WHEEL=/path/to/nvidia_cuda_nvrtc-13.2.78-…whl` (or
+`python scripts/vendor_nvrtc.py --wheel <path>`). To use another
+`libnvrtc.so`, set `FSO_JIT_NVRTC_LIB` at run time
+([`docs/api/compat.md`](docs/api/compat.md#environment-variables));
+`torch.ops.fish_scales_ops.jit_compiler_sm90()` reports the compiler in use.
 
 The built extension keeps reading files from the source tree that built it,
 so install in place (`EDITABLE=1`, or the default `build_ext --inplace`) and
@@ -250,7 +267,7 @@ fish-scales-ops/
 ├── tests/baselines/                     accepted perf runs (jsonl), the source of every table
 ├── bench/{gemm/python,attention}/       benches, tile sweeps, render_perf_docs.py
 ├── docs/                                docs/README.md is the map; api/, perf/{gemm,layer,attention}/
-└── scripts/                             build.sh, gen_op_schemas.py (the generated torch.ops blocks of docs/api/)
+└── scripts/                             build.sh, vendor_nvrtc.py (the bundled sm_90 NVRTC), gen_op_schemas.py (the generated torch.ops blocks of docs/api/)
 ```
 
 ## Tests and benches
@@ -293,6 +310,7 @@ python tests/gemm/unit/test_fp8_contiguous_2wg_sm90.py      # H200: the two-warp
 python tests/gemm/unit/test_fp8_fused_fc1_sm90.py           # H200: the fused SwiGLU FC1 against the unfused chain
 python tests/gemm/unit/test_fp8_fused_fc1_swapab_sm90.py    # H200: the fused swap-AB SwiGLU FC1 against the unfused chain
 python tests/gemm/unit/test_jit_cache_sm90.py               # H200: the JIT disk cache (subprocesses, temp dirs)
+python tests/gemm/unit/test_jit_nvrtc_pin_sm90.py           # every arch: no link-time NVRTC; H200: the bundled NVRTC 13.2 against torch's (subprocesses)
 # Attention (the MXFP8 kernels run on sm_120; elsewhere the tests check the refusals)
 python tests/attention/test_smoke.py
 python -m pytest tests/attention/
@@ -322,7 +340,7 @@ kinds:
   purpose: `FSO_MOE_FUSED_COMBINE=1` (the only way to enable the fused combine
   of `fso.moe.layer` on sm_120/121), `FSO_FC1_FUSED` (the fused FC1, and with
   it the weight layout `fso.moe.prepare_experts` writes), `FSO_MOE_BLOCK_OVERLAP`,
-  `FSO_DISABLE_DECODE_DSL`, `FSO_JIT_INCLUDE_DIRS`, and the two pool sizes
+  `FSO_DISABLE_DECODE_DSL`, `FSO_JIT_INCLUDE_DIRS`, `FSO_JIT_NVRTC_LIB`, and the two pool sizes
   `FSO_STREAMK_POOL_MB` and `FSO_GROUPED_ARG_POOL_MB`, whose exhaustion aborts
   the process.
 - **Debugging and A/B knobs** (`FSO_FORCE_TILE`, `FSO_FORCE_KSPLIT`,
