@@ -155,6 +155,13 @@ inline void fp8_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, i
             scale_1x128_kernel<__nv_bfloat16, __nv_fp8_e4m3, float, /*USE_UE8M0=*/true>
                 <<<kNumDeviceSMs * 8, 256, 0, stream>>>(fp8_mat_a, scales_a, mat_a, shape_k, shape_m);
         }
+        else if (fp8_1x128_lanes_supported(fp8_mat_a, mat_a, static_cast<int>(shape_k)))
+        {
+            // sm_90: the 8-lanes-per-group quantize, bitwise identical to scale_1x128_kernel (same BF16 amax floor,
+            // padding-row scales unwritten), launched with PDL like the GEMM that follows unless FSO_DISABLE_PDL=1.
+            fp8_1x128_lanes(fp8_mat_a, scales_a, mat_a, static_cast<int>(shape_k), static_cast<int>(shape_m), stream,
+                /*bf16_amax_floor=*/true, /*zero_pad_rows=*/false, fso_pdl_enabled());
+        }
         else
         {
             scale_1x128_kernel<__nv_bfloat16, __nv_fp8_e4m3, float, /*USE_UE8M0=*/false>

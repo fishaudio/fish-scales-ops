@@ -416,4 +416,76 @@ GemmConfig get_best_gemm_config(uint32_t shape_m, uint32_t shape_n, uint32_t sha
 
     return std::make_tuple(best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size);
 }
+
+// Tile choice of the dense GEMM (gemm_dispatch_sm90: GemmType::Normal, one problem). It starts from
+// get_best_gemm_config's pick, which every grouped (MoE) path keeps using unchanged, and applies two rules measured
+// on the H200 (132 SMs) on 2026-10-05 against today's pick, with outputs bitwise identical for every tile (each output
+// element is accumulated by one CTA in the same order whatever the tile):
+//
+// 1. Main path. A 128-row tile 104, 112 or 120 wide straddles the 128-row weight-scale blocks, so every promotion
+//    step selects between two weight scales per accumulator group, and it keeps the store whose completion the CTA
+//    waits for before its next tile; a 128-wide tile has one weight scale per k-block and fp8_gemm_kernel's deferred
+//    swizzled store (block_n a multiple of 64). When the pick is such a 104- to 120-wide tile and a 128-wide tile
+//    needs the same number of waves, the 128-wide tile is taken: it does at most 128 / 104 = 1.23 times the MMA work
+//    of the picked tile per wave, and it took 0.85-0.96 of the 0.2.0 release's time on the nine cells of the dense
+//    family tables and the cubic sweep where the rule applies (M = 256-3072). Narrower picks (block_n <= 96, 1.33
+//    times the work or more) keep their tile; 128 measured 1.01-1.25 there.
+// 2. Swap-AB path (small M). The weight is the swap kernel's A operand, tiled by block_m rows, and at these M every
+//    CTA streams a block_m x K weight slab, so the number of CTAs with work sets the achieved weight bandwidth. When
+//    128-row weight tiles give work to at most a quarter of the SMs (ceil(N / 128) * 4 <= SMs, i.e. N <= 4224 on
+//    132 SMs), 64-row tiles are taken: twice the CTAs, still at most half the SMs per activation tile (0.82-0.91 of
+//    the 0.2.0 release's time on all 30 family cells where the rule applies, N = 1024-2560 at M <= 32). Wider
+//    weights keep 128 rows: 64-row tiles measured mixed at N = 5120-6144 and 3-34 % slower from N = 9216, where they
+//    exceed one wave.
+//
+// The stage count is recomputed for the new tile with get_best_gemm_config's rule (the deepest of 8..4, or 6..4
+// when block_n does not divide 128, that fits the shared memory) and so is the multicast of rule 1 (2 when
+// M >= 1024 and N splits into pairs of 128-wide tiles). `swap_ab` selects the shape convention of the swap-AB call:
+// (shape_m, shape_n) are then (N, M), as gemm_dispatch_sm90 passes them to get_best_gemm_config.
+inline GemmConfig get_dense_gemm_config(
+    uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_device_sms, bool swap_ab)
+{
+    auto [block_m, block_n, num_stages, num_tma_multicast, smem_size]
+        = get_best_gemm_config(shape_m, shape_n, shape_k, 1, num_device_sms, false, swap_ab);
+
+    auto restage = [&]()
+    {
+        constexpr int sm90_capacity = 232448;
+        std::vector<int> const stage_candidates
+            = (128 % block_n != 0) ? std::vector<int>{6, 5, 4} : std::vector<int>{8, 7, 6, 5, 4};
+        for (int stages : stage_candidates)
+        {
+            int const smem = get_smem_size(stages, shape_k, block_m, block_n, 128, swap_ab);
+            if (smem <= sm90_capacity)
+            {
+                num_stages = stages;
+                smem_size = smem;
+                return;
+            }
+        }
+    };
+
+    if (!swap_ab)
+    {
+        auto num_waves = [&](int bm, int bn)
+        { return div_up(div_up(shape_m, bm) * div_up(shape_n, bn), num_device_sms); };
+        if (block_m == 128 && block_n > 96 && block_n < 128 && num_waves(128, 128) == num_waves(128, block_n))
+        {
+            block_n = 128;
+            restage();
+            num_tma_multicast
+                = (shape_m >= 1024 && is_tma_multicast_legal(shape_n, block_n, 2, num_device_sms)) ? 2 : 1;
+        }
+    }
+    else
+    {
+        // shape_m is the weight's N here.
+        if (block_m == 128 && div_up(shape_m, 128) * 4 <= num_device_sms)
+        {
+            block_m = 64;
+            restage();
+        }
+    }
+    return std::make_tuple(block_m, block_n, num_stages, num_tma_multicast, smem_size);
+}
 } // namespace deep_gemm::jit

@@ -12,6 +12,7 @@
 #pragma once
 
 #include "blockscale_gemm/common/kernel_utils.cuh"
+#include "blockscale_gemm/arch/sm120/common/env_overrides.cuh" // fso_pdl_enabled (arch-agnostic)
 #include "blockscale_gemm/arch/sm90/fp8/jit/deep_gemm/fp8_gemm.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
 
@@ -49,29 +50,35 @@ inline void gemm_dispatch_sm90(void* mat_a, int ld_a, void* mat_b, int ld_b, voi
     // keeps the main path (block_m=64 utilisation recovers, swap regresses).
     bool const use_swap_ab = shape_m < 32u || (shape_m == 32u && shape_n < 16384u);
 
+    // Programmatic dependent launch for the dense chain (activation quantize -> GEMM): the GEMM launches while the
+    // quantize runs and waits on it with griddepcontrol.wait after its prologue (fp8_gemm_impl.cuh). On for every
+    // shape, off for every shape with FSO_DISABLE_PDL=1.
+    bool const pdl = fso_pdl_enabled();
+
+    // Tile rules of the dense GEMM on top of the shared picker: deep_gemm::jit::get_dense_gemm_config.
     if (!use_swap_ab)
     {
         auto [bm, bn, ns, ntm, smem]
-            = deep_gemm::jit::get_best_gemm_config(shape_m, shape_n, shape_k, num_problems, num_device_sms);
+            = deep_gemm::jit::get_dense_gemm_config(shape_m, shape_n, shape_k, num_device_sms, false);
         auto runtime = deep_gemm::jit::getGlobalCompiler().build(
             shape_n, shape_k, bm, bn, block_k, num_problems, ns, ntm, deep_gemm::GemmType::Normal);
         auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
         deep_gemm::runGemm(kernel, mat_a, ld_a, mat_b, ld_b, mat_d, ld_d, scales_a, scales_b, shape_m, shape_n, shape_k,
             bm, bn, block_k, num_problems, ntm, deep_gemm::GemmType::Normal, static_cast<int*>(nullptr), stream,
-            num_device_sms, static_cast<uint32_t>(smem));
+            num_device_sms, static_cast<uint32_t>(smem), pdl);
     }
     else
     {
         // Tiny M: swap A/B inside the kernel so the persistent scheduler still
         // has enough tiles along the now-M axis.
         auto [bm, bn, ns, ntm, smem]
-            = deep_gemm::jit::get_best_gemm_config(shape_n, shape_m, shape_k, num_problems, num_device_sms, false, true);
+            = deep_gemm::jit::get_dense_gemm_config(shape_n, shape_m, shape_k, num_device_sms, true);
         auto runtime = deep_gemm::jit::getGlobalCompiler().build(
             shape_n, shape_k, bm, bn, block_k, num_problems, ns, ntm, deep_gemm::GemmType::Normal, true);
         auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
         deep_gemm::runGemmSwapAB(kernel, mat_b, ld_b, mat_a, ld_a, mat_d, ld_d, scales_b, scales_a, shape_n, shape_m,
             shape_k, bm, bn, block_k, num_problems, ntm, deep_gemm::GemmType::Normal, static_cast<int*>(nullptr),
-            stream, num_device_sms, static_cast<uint32_t>(smem));
+            stream, num_device_sms, static_cast<uint32_t>(smem), pdl);
     }
 }
 

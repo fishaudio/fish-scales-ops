@@ -34,6 +34,21 @@
 namespace deep_gemm
 {
 
+// Programmatic dependent launch (PDL) for the dense GEMM: `fso_pdl_wait` blocks until the preceding kernel in the
+// stream has completed and its memory is visible, and is a no-op when the launch carries no programmatic dependency
+// (a plain launch, or FSO_DISABLE_PDL=1 on the host side). The instruction is written out because NVRTC does not
+// declare cudaGridDependencySynchronize.
+//
+// The dense GEMM does not trigger its own dependents early (griddepcontrol.launch_dependents): they launch when it
+// completes, as in DeepGEMM v2's sm90_fp8_gemm_1d2d. On the H200 an early trigger by thread 0 after the wait made the
+// GEMM itself up to 2 % slower (0.5-1 % on most decode cells of wo, wqkv and gate_up) when its successor is not a
+// programmatic dependent (measured with FSO_DISABLE_PDL=1, 2026-10-05), and gained nothing measurable in the MLP
+// block, whose GEMMs are followed by silu*mul; it only helped back-to-back GEMMs.
+__device__ __forceinline__ void fso_pdl_wait()
+{
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+}
+
 enum class Layout
 {
     RowMajor,
@@ -180,6 +195,13 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
 
     // Synchronize all threads to make barrier visible in normal memory model
     (kNumTMAMulticast > 1) ? cute::cluster_sync() : __syncthreads();
+
+    // PDL, dense GEMM only. Everything above reads only kernel parameters and shared memory, so it may overlap the
+    // preceding kernel (the activation quantize, which lets this GEMM launch as soon as its CTAs have started); every
+    // global access below (A and its scales, the B scales, D) comes after the wait. The grouped (MoE) instantiations
+    // compile without it.
+    if constexpr (SchedulerType::gemm_type == GemmType::Normal)
+        fso_pdl_wait();
 
     // For pipeline unrolling
     struct DivisibleK
@@ -411,6 +433,50 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
                     }
                 });
 
+            // Dense GEMM with BLOCK_N a multiple of 64: the D store path of DeepGEMM v2's sm90_fp8_gemm_1d2d. STSM
+            // writes D into shared memory as BLOCK_N / 64 slabs of BLOCK_M x 64 bf16 (128 bytes per row) with the
+            // 128-byte TMA swizzle, so the stores of a warp hit distinct banks (the unswizzled tile below, whose rows
+            // are BLOCK_N * 2 bytes apart, puts the eight rows of an 8x8 matrix in the same banks). Threads
+            // 0 .. BLOCK_N / 64 - 1 each store one slab with its own TMA store, and the wait for the previous tile's
+            // stores moves to just before this tile overwrites the staging buffer, so the store overlaps the next
+            // tile's main loop. The arithmetic and the bytes written are unchanged: only the shared-memory staging
+            // layout and the store issue differ, and the output is bitwise identical to the path below.
+            constexpr bool kSwizzledD = (SchedulerType::gemm_type == GemmType::Normal) && (BLOCK_N % 64 == 0);
+            if constexpr (kSwizzledD)
+            {
+                DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");
+                // smem_d is single-buffered: the previous tile's stores must have read it before it is rewritten.
+                if (threadIdx.x < BLOCK_N / 64)
+                    cute::tma_store_wait<0>();
+                cutlass::arch::NamedBarrier(kNumMathThreads).sync();
+#pragma unroll
+                for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++i)
+                {
+                    // Accumulators 4i .. 4i + 3 are columns 8i .. 8i + 7 of the warp's rows (lane / 4) and
+                    // (lane / 4 + 8). They form two 8x8 matrices that one STSM x2 writes; lanes 0 .. 15 give the
+                    // row addresses (row = lane within the warp's 16 rows). Column chunk i % 8 of slab i / 8 is
+                    // 16 bytes wide and sits at chunk (i % 8) ^ (row % 8) of its 128-byte row (the TMA swizzle).
+                    uint32_t const atom = i / 8, in_atom = i % 8;
+                    uint32_t const row = lane_idx;
+                    uint32_t const col = in_atom ^ (row % 8);
+                    auto smem_ptr = reinterpret_cast<uint8_t*>(smem_d) + warp_idx * (16 * 128) + atom * BLOCK_M * 128
+                        + row * 128 + col * 16;
+                    SM90_U32x2_STSM_N<nv_bfloat162>::copy(
+                        __float22bfloat162_rn({final_accum[i * 4 + 0], final_accum[i * 4 + 1]}),
+                        __float22bfloat162_rn({final_accum[i * 4 + 2], final_accum[i * 4 + 3]}), smem_ptr);
+                }
+                cute::tma_store_fence();
+                cutlass::arch::NamedBarrier(kNumMathThreads).sync();
+                if (threadIdx.x < BLOCK_N / 64)
+                {
+                    cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_d + threadIdx.x * BLOCK_M * 64,
+                        n_block_idx * BLOCK_N + threadIdx.x * 64, scheduler.get_global_m_idx(m_block_idx));
+                    cute::tma_store_arrive();
+                }
+                __syncwarp();
+                continue;
+            }
+
             // Write back to shared memory using STSM
             DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");
 #pragma unroll
@@ -484,6 +550,13 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
             }
 
             __syncwarp();
+        }
+
+        // Swizzled-D path: the last tile's TMA stores must finish reading shared memory before the CTA exits.
+        if constexpr ((SchedulerType::gemm_type == GemmType::Normal) && (BLOCK_N % 64 == 0))
+        {
+            if (threadIdx.x < BLOCK_N / 64)
+                cute::tma_store_wait<0>();
         }
     }
 #else
@@ -603,6 +676,11 @@ __global__ void __launch_bounds__(
 
     // Synchronize all threads to make barrier visible in normal memory model
     (kNumTMAMulticast > 1) ? cute::cluster_sync() : __syncthreads();
+
+    // PDL, dense swap-AB GEMM only: the same wait as fp8_gemm_kernel (see there). The grouped (MoE) instantiations
+    // compile without it.
+    if constexpr (SchedulerType::gemm_type == GemmType::Normal)
+        fso_pdl_wait();
 
     // For pipeline unrolling
     struct DivisibleK

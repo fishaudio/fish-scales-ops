@@ -106,7 +106,7 @@ The result should be empty.
 | `deep_gemm/scheduler.cuh` | persistent + grouped + strided-batched schedulers |
 | `deep_gemm/compiler.cuh` | NVRTC driver — generates kernel source, compiles through the NVRTC table (loaded once per process), keys the opt-in disk cache by content |
 | `deep_gemm/runtime.cuh` | runtime cubin loader, the in-memory runtime cache and the `FSO_JIT_*` knobs |
-| `deep_gemm/jit_utils.cuh` | `get_best_gemm_config` + `get_smem_size` heuristic; the NVRTC function table and its loader |
+| `deep_gemm/jit_utils.cuh` | `get_best_gemm_config` + `get_smem_size` heuristic (every caller), `get_dense_gemm_config` (the dense GEMM's two tile rules on top of it); the NVRTC function table and its loader |
 | `deep_gemm/{mma,tma}_utils.cuh` | WGMMA + TMA helpers |
 | `deep_gemm/utils.cuh` | misc primitives (`ceil_div`, `lane_id`, etc.) |
 | `deep_gemm/nvrtc_std.cuh` | minimal `<type_traits>` / `<utility>` shim for NVRTC |

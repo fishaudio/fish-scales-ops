@@ -160,11 +160,13 @@ CUtensorMap make_2d_tma_desc(T* global_address, Layout layout, uint32_t gmem_row
     }
 }
 
+// `pdl` launches with programmatic stream serialization (the dense GEMM's kernel waits on its predecessor with
+// griddepcontrol.wait; the grouped instantiations carry no wait, so their callers keep the default false).
 template <typename LayoutIndexType>
 void runGemm(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, int ld_d, float* scales_a,
     float* scales_b, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, uint32_t block_m, uint32_t block_n,
     uint32_t block_k, uint32_t num_groups, uint32_t num_tma_multicast, GemmType gemm_type,
-    LayoutIndexType* grouped_layout, cudaStream_t stream, int num_sms, uint32_t smem_size)
+    LayoutIndexType* grouped_layout, cudaStream_t stream, int num_sms, uint32_t smem_size, bool pdl = false)
 {
     auto tma_a_desc = make_2d_tma_a_desc(
         reinterpret_cast<__nv_fp8_e4m3*>(mat_a), shape_m, shape_k, block_m, block_k, num_groups, gemm_type, ld_a);
@@ -172,8 +174,15 @@ void runGemm(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, 
         reinterpret_cast<__nv_fp8_e4m3*>(mat_b), shape_n, shape_k, block_n, block_k, num_groups, gemm_type, ld_b);
     auto tma_scales_a_desc
         = make_2d_tma_scales_a_desc(scales_a, shape_m, shape_k, block_m, block_k, num_groups, gemm_type);
-    auto tma_d_desc = make_2d_tma_d_desc(
-        reinterpret_cast<__nv_bfloat16*>(mat_d), shape_m, shape_n, block_m, block_n, num_groups, gemm_type, ld_d * 2);
+    // The dense kernel with block_n a multiple of 64 stages D as 64-column slabs with the 128-byte swizzle
+    // (fp8_gemm_kernel, kSwizzledD) and stores each slab with one TMA store, so its D box is min(block_m, M) rows by
+    // 64 columns with that swizzle. This condition must match kSwizzledD exactly.
+    bool const swizzled_d = gemm_type == GemmType::Normal && block_n % 64 == 0;
+    auto tma_d_desc = swizzled_d
+        ? make_2d_tma_desc(reinterpret_cast<__nv_bfloat16*>(mat_d), Layout::RowMajor, shape_m, shape_n,
+            min(block_m, shape_m), 64u, static_cast<uint64_t>(ld_d) * 2, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B)
+        : make_2d_tma_d_desc(reinterpret_cast<__nv_bfloat16*>(mat_d), shape_m, shape_n, block_m, block_n, num_groups,
+            gemm_type, ld_d * 2);
 
     constexpr uint32_t kNumTMAThreads = 128;
     constexpr uint32_t kNumMathThreadsPerGroup = 128;
@@ -188,11 +197,13 @@ void runGemm(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, 
 
     // Clusters for TMA multicast
     // NOTES: `>= 4` cluster size will cause performance degradation
-    cudaLaunchAttribute attr;
-    attr.id = cudaLaunchAttributeClusterDimension;
-    attr.val.clusterDim = {num_tma_multicast, 1, 1};
-    config.attrs = &attr;
-    config.numAttrs = 1;
+    cudaLaunchAttribute attrs[2];
+    attrs[0].id = cudaLaunchAttributeClusterDimension;
+    attrs[0].val.clusterDim = {num_tma_multicast, 1, 1};
+    attrs[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[1].val.programmaticStreamSerializationAllowed = 1;
+    config.attrs = attrs;
+    config.numAttrs = pdl ? 2 : 1;
 
     NormalSchedulerInput input;
     input.shape_m = shape_m;
@@ -204,11 +215,12 @@ void runGemm(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, 
     DG_HOST_ASSERT(status == cudaSuccess);
 }
 
+// `pdl`: as runGemm (only the dense swap-AB kernel waits on its predecessor).
 template <typename LayoutIndexType>
 void runGemmSwapAB(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, int ld_d,
     float* scales_a, float* scales_b, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, uint32_t block_m,
     uint32_t block_n, uint32_t block_k, uint32_t num_groups, uint32_t num_tma_multicast, GemmType gemm_type,
-    LayoutIndexType* grouped_layout, cudaStream_t stream, int num_sms, uint32_t smem_size)
+    LayoutIndexType* grouped_layout, cudaStream_t stream, int num_sms, uint32_t smem_size, bool pdl = false)
 {
     auto tma_a_desc = make_2d_tma_a_desc_swapAB(
         reinterpret_cast<__nv_fp8_e4m3*>(mat_a), shape_m, shape_k, block_m, block_k, num_groups, gemm_type, ld_a);
@@ -231,11 +243,13 @@ void runGemmSwapAB(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int 
     config.stream = stream;
 
     // Clusters for TMA multicast
-    cudaLaunchAttribute attr;
-    attr.id = cudaLaunchAttributeClusterDimension;
-    attr.val.clusterDim = {num_tma_multicast, 1, 1};
-    config.attrs = &attr;
-    config.numAttrs = 1;
+    cudaLaunchAttribute attrs[2];
+    attrs[0].id = cudaLaunchAttributeClusterDimension;
+    attrs[0].val.clusterDim = {num_tma_multicast, 1, 1};
+    attrs[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[1].val.programmaticStreamSerializationAllowed = 1;
+    config.attrs = attrs;
+    config.numAttrs = pdl ? 2 : 1;
 
     NormalSchedulerInputSwapAB input;
     input.shape_n = shape_n;

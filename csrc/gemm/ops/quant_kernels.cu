@@ -22,14 +22,26 @@ namespace detail
 void fp8bs_quantize_1x128_fp32_fast(__nv_fp8_e4m3* x_q, float* fp32_scales,
     __nv_bfloat16 const* x, int M, int K, cudaStream_t stream, bool use_ue8m0);
 
+static inline bool fso_pdl_enabled();
+
 void fp8bs_quantize_1x128(__nv_fp8_e4m3* x_q, float* scales, __nv_bfloat16 const* x, int M, int K, cudaStream_t stream,
     bool use_ue8m0)
 {
-    // Fast path: uint64 LDG.64 + e8m0 bit-manip + larger per-warp work. Requires
-    // K % 512 == 0 (4 K-blocks/warp × 128 elem/K-block). Qwen3-4B shapes
-    // (K ∈ {2560, 4096, 9728, 19456}) all satisfy this.
-    // Fallback: the legacy persistent-grid `fp8_1x128_cs` kernel for K only a
-    // multiple of 128.
+    // FP32 dequant scales (the sm_90 GEMM's input): the 8-lanes-per-group kernel, bitwise identical to the two
+    // kernels it replaces (scale_kernels.cuh, scale_1x128_lanes_kernel). It keeps each one's amax floor and padding
+    // rows: for K % 512 == 0 those of fp8bs_quantize_1x128_fp32_fast (floor 1e-10f, padding-row scales zeroed),
+    // otherwise those of fp8_1x128_cs (floor at the BF16 value of 1e-10, padding rows unwritten). Launched with PDL
+    // unless FSO_DISABLE_PDL=1, as the dense GEMM that consumes it.
+    if (!use_ue8m0 && tensorrt_llm::kernels::blockscale_gemm::fp8_1x128_lanes_supported(x_q, x, K))
+    {
+        bool const k512 = K % 512 == 0;
+        tensorrt_llm::kernels::blockscale_gemm::fp8_1x128_lanes(
+            x_q, scales, x, K, M, stream, /*bf16_amax_floor=*/!k512, /*zero_pad_rows=*/k512, fso_pdl_enabled());
+        return;
+    }
+    // UE8M0 scales (and inputs the lanes kernel cannot take). Fast path: uint64 LDG.64 + e8m0 bit-manip + larger
+    // per-warp work. Requires K % 512 == 0 (4 K-blocks/warp × 128 elem/K-block). Fallback: the legacy
+    // persistent-grid `fp8_1x128_cs` kernel for K only a multiple of 128.
     if (K % 512 == 0)
         fp8bs_quantize_1x128_fp32_fast(x_q, scales, x, M, K, stream, use_ue8m0);
     else
