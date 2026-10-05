@@ -5,7 +5,8 @@ Targets (only the first table after each known heading is rewritten; prose is le
   docs/perf/gemm/sm90.md    Family A / B / C dense sections
   docs/perf/gemm/sm120.md   Family A / B / C dense sections, Family B / C grouped kernel tables
   docs/perf/gemm/sm100.md   same structure as sm120.md, from the B300 baselines
-  docs/perf/layer/sm90.md   Family A MLP block, Family B MoE layer, Family C MoE block (+ comparators)
+  docs/perf/layer/sm90.md   Family A MLP block, Family B MoE layer, Family C MoE block (+ comparators; Family A's
+                            serving-library columns come from ref_mlp_qwen3_4b_<dev>.jsonl and appear once it has rows)
   docs/perf/layer/sm120.md  same for the RTX 5090, plus the grouped GEMM kernel-level comparison tables
   docs/perf/layer/sm100.md  same for the B300 (torch scaled_grouped_mm / _grouped_mm comparators)
   README.md                 the two hot-shape tables (sm_90, sm_120) — no comparisons, by policy
@@ -179,14 +180,39 @@ def grouped_kernel_cmp_table(name):
 
 
 # ----------------------------------------------------------------------------- layer tables
-def mlp_table(name, sm):
+# Family A MLP-block comparators (docs/README.md rule 2: layer/ only): the serving libraries' block-FP8 dense linear
+# and cuBLAS's, read from ref_mlp_qwen3_4b_<dev>.jsonl (perf_report.py merges one raw file per library into it) and
+# joined to the fso rows by M. A comparator's columns appear once the file has a timed cell of it, so the table
+# renders unchanged until then; its title names the GEMM backend its cells recorded; ×fso BSFP8 is its µs over fso's
+# BSFP8 µs (the same 1x128 / 128x128 block-FP8 recipe), so above 1 is fso ahead.
+MLP_CMP = [("sgl_fp8b", "sglang block-FP8 linear"), ("vllm_fp8b", "vLLM block-FP8 linear"),
+           ("cublas_fp8b", "cuBLAS scaled_mm block-FP8")]
+
+
+def mlp_cmp_columns(ref_name):
+    """(M -> comparator row, [(dtype, column title)]) of the MLP-block comparator file, or ({}, []) without one."""
+    if not ref_name or not os.path.exists(os.path.join(BASE, ref_name)):
+        return {}, []
+    rows = {r["M"]: r for r in load(ref_name) if "M" in r}
+    cols = []
+    for dt, title in MLP_CMP:
+        timed = [r[dt] for r in rows.values() if isinstance(r.get(dt), dict) and r[dt].get("graph_us") is not None]
+        if timed:
+            cols.append((dt, f"{title} ({'/'.join(sorted({str(c.get('backend')) for c in timed}))}) µs"))
+    return rows, cols
+
+
+def mlp_table(name, sm, ref_name=None):
     rows = {r["M"]: r for r in load(name) if "M" in r}
+    cmp_rows, cmp_cols = mlp_cmp_columns(ref_name)
     if sm != 90:
         hdr = ["| M | BF16 (torch) µs | BSFP8 µs | BSFP8 TFLOPS | BSFP8 cos | model ms | MXFP8 µs | MXFP8 TFLOPS | MXFP8 cos | model ms | "
                "cuBLAS scaled_mm MXFP8 + reference quantize µs | cuBLAS scaled_mm MXFP8 + torch.compile quantize µs |",
                "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     else:
         hdr = ["| M | BF16 (torch) µs | BSFP8 µs | BSFP8 TFLOPS | BSFP8 cos | model ms |", "|---:|---:|---:|---:|---:|---:|"]
+    if cmp_cols:
+        hdr = [hdr[0] + "".join(f" {t} | ×fso BSFP8 |" for _, t in cmp_cols), hdr[1] + "---:|---:|" * len(cmp_cols)]
     body = []
     for M in sorted(rows):
         r = rows[M]
@@ -198,6 +224,9 @@ def mlp_table(name, sm):
             x, c, cf = r["mxfp8"], r["smm"], r["smm_fast"]
             line += (f" {f2(x['graph_us'])} | {f0(fl / x['graph_us'] / 1e6)} | {f4(x['cos'])} | {f2(x['graph_us'] * 36 / 1000)} | "
                      f"{f2(c['graph_us'])} | {f2(cf['graph_us'])} |")
+        for dt, _ in cmp_cols:
+            us, fso_us = ((cmp_rows.get(M) or {}).get(dt) or {}).get("graph_us"), s.get("graph_us")
+            line += f" {f2(us)} | {f2(us / fso_us if us is not None and fso_us else None)} |"
         body.append(line)
     return hdr, body
 
@@ -404,12 +433,12 @@ def layer_comparators(sm, shared=False):
 def render_layer(lines, sm):
     sfx = SFX[sm]
     dt = "bsfp8" if sm == 90 else "mxfp8"
-    check_device(sm, f"gemm_sm{sm}_qwen3_4b_mlp_fwd.jsonl", f"perf_moe_qwen3_30a3_{sfx}.jsonl",
+    check_device(sm, f"gemm_sm{sm}_qwen3_4b_mlp_fwd.jsonl", f"ref_mlp_qwen3_4b_{sfx}.jsonl", f"perf_moe_qwen3_30a3_{sfx}.jsonl",
                  f"ref_moe_qwen3_30a3_{sfx}.jsonl", f"perf_moe_qwen3_35a3_{sfx}.jsonl",
                  f"perf_moe_qwen3_35a3_shared_{sfx}.jsonl", f"ref_moe_qwen3_35a3_{sfx}.jsonl",
                  f"ref_moe_qwen3_35a3_shared_{sfx}.jsonl", f"ref_kern_moe_qwen3_30a3_{sfx}.jsonl",
                  f"ref_kern_moe_qwen3_35a3_{sfx}.jsonl")
-    h, b = mlp_table(f"gemm_sm{sm}_qwen3_4b_mlp_fwd.jsonl", sm)
+    h, b = mlp_table(f"gemm_sm{sm}_qwen3_4b_mlp_fwd.jsonl", sm, f"ref_mlp_qwen3_4b_{sfx}.jsonl")
     pos = replace_table_after(lines, starts("## Family A — Qwen3-4B dense MLP block"), h + b)
     fsoB = moe_rows(f"perf_moe_qwen3_30a3_{sfx}.jsonl")
     set_cmp_rows({**moe_rows(f"perf_moe_qwen3_30a3_{sfx}.jsonl"), **moe_rows(f"ref_moe_qwen3_30a3_{sfx}.jsonl")})

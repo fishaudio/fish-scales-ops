@@ -9,7 +9,7 @@ docs, and prints the comparison reports — so a rerun after any change is
 
   python bench/gemm/python/perf_report.py merge   --run <dir> [--out <dir>]      raw files -> canonical baseline files (n/a cells listed)
   python bench/gemm/python/perf_report.py diff    --a <dir|baselines> --b <dir>   cell-by-cell delta of every shared cell (A/B of an optimisation)
-  python bench/gemm/python/perf_report.py report  [--run <dir>]                  layer-level and kernel-level comparison tables, ×fso and band geomeans
+  python bench/gemm/python/perf_report.py report  [--run <dir>]                  MLP-block, layer-level and kernel-level comparison tables, ×fso and band geomeans
   python bench/gemm/python/perf_report.py install --run <dir> [--accept-drift]   merge + diff against the installed baselines + copy + provenance + render docs
 
 install takes only a run directory written by bench/run_perf.py: it reads <dir>/manifest.json, takes the device and
@@ -30,6 +30,8 @@ Raw-file manifest (device suffix `--device`, families 30a3 / 35a3):
   ref_new_*, ref_fix_*, ref_trt_*, ref_sgl020_*, ref_torchma_*, ref_torchma_smm_*   layer comparators -> ref_moe_qwen3_<fam>_<dev>.jsonl
   ref_kern_c1_vllm_*, ref_kern_c1_sgl_*, ref_kern_c1_fi_*         kernel-level       -> ref_kern_moe_qwen3_<fam>_<dev>.jsonl
   gemm_sm<sm>_qwen3_4b.jsonl, gemm_sm<sm>_qwen3_4b_mlp_fwd.jsonl, gemm_sm<sm>_qwen3_{30a3,35a3}_dense.jsonl   dense tables -> same name
+  ref_mlp_sgl_<dev>.jsonl, ref_mlp_vllm_<dev>.jsonl, ref_mlp_cublas_<dev>.jsonl   Family A MLP-block comparators, one
+                                              row per M with one entry per dtype, merged by M -> ref_mlp_qwen3_4b_<dev>.jsonl
 Bands (stone, 2026-09-28): decode = M 1..128, prefill = M > 128.
 """
 from __future__ import annotations
@@ -72,6 +74,10 @@ FSO_KERN_IMPLS = ["fso_mxfp8_grouped", "fso_bsfp8_grouped"]
 KERN_IMPLS = [("vllm_triton_grouped_fp8b", "vLLM triton FP8-block"), ("sgl_triton_grouped_fp8b", "sglang triton FP8-block"),
               ("fi_cudnn_grouped_mxfp8", "FlashInfer cuDNN MXFP8"), ("vllm_triton_grouped_bf16", "vLLM triton BF16"),
               ("sgl_triton_grouped_bf16", "sglang triton BF16"), ("fi_cudnn_grouped_bf16", "FlashInfer cuDNN BF16")]
+# Family A MLP-block comparators (dtype keys of ref_mlp_qwen3_4b_<dev>.jsonl), set against fso's BSFP8 block: the same
+# 1x128 activation / 128x128 weight block-FP8 recipe
+MLP_IMPLS = [("sgl_fp8b", "sglang block-FP8 linear"), ("vllm_fp8b", "vLLM block-FP8 linear"),
+             ("cublas_fp8b", "cuBLAS scaled_mm block-FP8")]
 
 
 def load(path):
@@ -101,6 +107,40 @@ def merge_files(out_path, sources):
     return len(cells), na
 
 
+def merge_mlp_files(out_path, sources):
+    """The Family A MLP-block comparator files, merged by M: one meta row (the first source's `_device` row, with
+    every source and its dtypes recorded), then one row per M carrying every source's dtype entries. Entries
+    without a graph_us (n/a or failed cells) are kept in the row and returned as (dtype, M, error)."""
+    meta, rows, na = None, {}, []
+    for src in sources:
+        for r in load(src):
+            if "M" not in r:
+                if meta is None:
+                    meta = {k: v for k, v in r.items() if k != "dtypes"}
+                    meta["sources"] = []
+                meta["sources"].append({"file": os.path.basename(src), "dtypes": r.get("dtypes"), "torch": r.get("torch")})
+                continue
+            row = rows.setdefault(r["M"], {k: v for k, v in r.items() if not isinstance(v, dict)})
+            for dt, v in r.items():
+                if isinstance(v, dict):
+                    row[dt] = v
+                    if v.get("graph_us") is None:
+                        na.append((dt, r["M"], v.get("error")))
+    if meta is None:
+        meta = {"sources": [{"file": os.path.basename(s)} for s in sources]}
+    with open(out_path, "w") as f:
+        f.write(json.dumps(meta) + "\n")
+        for M in sorted(rows):
+            f.write(json.dumps(rows[M]) + "\n")
+    cells = sum(1 for r in rows.values() for v in r.values() if isinstance(v, dict) and v.get("graph_us") is not None)
+    return cells, na
+
+
+def merge_baseline(name, out_path, sources):
+    """Merge the raw files of one baseline file, by the file's kind (MLP-block comparators by M, MoE rows by cell)."""
+    return (merge_mlp_files if name.startswith("ref_mlp_") else merge_files)(out_path, sources)
+
+
 def manifest(run, dev, sm):
     """baseline file name -> list of existing raw files in `run` that feed it."""
     m = {}
@@ -116,6 +156,8 @@ def manifest(run, dev, sm):
     for n in (f"gemm_sm{sm}_qwen3_4b.jsonl", f"gemm_sm{sm}_qwen3_4b_mlp_fwd.jsonl",
               f"gemm_sm{sm}_qwen3_30a3_dense.jsonl", f"gemm_sm{sm}_qwen3_35a3_dense.jsonl"):
         m[n] = [n]
+    # the Family A MLP-block comparators (bench_qwen3_4b_mlp_forward.py --dtypes), one raw file per library
+    m[f"ref_mlp_qwen3_4b_{dev}.jsonl"] = [f"ref_mlp_sgl_{dev}.jsonl", f"ref_mlp_vllm_{dev}.jsonl", f"ref_mlp_cublas_{dev}.jsonl"]
     out = {}
     for name, pats in m.items():
         files = []
@@ -157,6 +199,13 @@ def cold_protocol_check(path, dev, mult=2.0):
                     b = r["N"] * r["K"] * (2 if dt == "bf16" else 1)
                     if c["weight_copies"] * b < mult * l2:
                         short.append((r.get("tag"), r.get("M"), dt, c["weight_copies"], b))
+        elif "hidden" in r and "intermediate" in r:       # MLP-block row: both projections' weights per dtype
+            for dt, c in r.items():
+                if isinstance(c, dict) and c.get("weight_copies") and c.get("graph_us"):
+                    n += 1
+                    b = 3 * r["hidden"] * r["intermediate"] * (2 if dt == "bf16" else 1)
+                    if c["weight_copies"] * b < mult * l2:
+                        short.append(("mlp", r.get("M"), dt, c["weight_copies"], b))
     return n, short
 
 
@@ -173,12 +222,17 @@ def cmd_merge(args):
                 print(f"   COLD-PROTOCOL: {len(short)} of {nc} rows rotate fewer than 2 x L2 of weights (not cold): "
                       + ", ".join(str(x) for x in short[:6]) + (" ..." if len(short) > 6 else ""))
             continue
-        n, na = merge_files(os.path.join(out_dir, name), files)
+        n, na = merge_baseline(name, os.path.join(out_dir, name), files)
         print(f"{name}: {n} cells from {len(files)} file(s)")
         nc, short = cold_protocol_check(os.path.join(out_dir, name), args.device)
         if short:
             print(f"   COLD-PROTOCOL: {len(short)} of {nc} rows rotate fewer than 2 x L2 of weights (not cold): "
                   + ", ".join(str(x) for x in short[:6]) + (" ..." if len(short) > 6 else ""))
+        if name.startswith("ref_mlp_"):
+            for dt in sorted({d for d, _, _ in na}):
+                same = [x for x in na if x[0] == dt]
+                print(f"   n/a {dt} ({len(same)} cells, M {','.join(str(M) for _, M, _ in same)}): {(same[0][2] or '')[:110]}")
+            continue
         seen = set()
         for r in na:
             key = (r.get("impl"), r.get("proj"))
@@ -226,7 +280,7 @@ def merged_view(run, dev, sm):
         shutil.copy(f, view)
     for name, files in m.items():
         if not name.startswith("gemm_"):
-            merge_files(os.path.join(view, name), files)
+            merge_baseline(name, os.path.join(view, name), files)
     return view
 
 
@@ -338,9 +392,38 @@ def kernel_report(perf, ref, title):
     return "\n".join(out)
 
 
+def mlp_report(perf, ref, title):
+    """Family A MLP block: each comparator against fso's BSFP8 block (the same block-FP8 recipe), µs, ×fso and cos,
+    with the backend each comparator recorded, and the band geomeans."""
+    fso = {r["M"]: r["bsfp8"] for r in load(perf) if "M" in r and isinstance(r.get("bsfp8"), dict)
+           and r["bsfp8"].get("graph_us") is not None}
+    rows = {r["M"]: r for r in load(ref) if "M" in r}
+    cols = [(i, t) for i, t in MLP_IMPLS if any((r.get(i) or {}).get("graph_us") is not None for r in rows.values())]
+    backend = {i: "/".join(sorted({str(r[i].get("backend")) for r in rows.values()
+                                   if (r.get(i) or {}).get("graph_us") is not None})) for i, _ in cols}
+    out = [f"\n### {title}\n", "|    M | fso BSFP8 µs |    cos |" + "".join(f" {t} ({backend[i]}) µs | ×fso |    cos |" for i, t in cols),
+           "|-----:|------------:|-------:|" + "".join("------:|-----:|-------:|" for _ in cols)]
+    for M in sorted(fso):
+        line = f"| {M:4d} | {fso[M]['graph_us']:11.2f} | {fso[M]['cos']:.4f} |"
+        for i, _ in cols:
+            c = (rows.get(M) or {}).get(i) or {}
+            line += (f" {c['graph_us']:7.2f} | {c['graph_us'] / fso[M]['graph_us']:4.2f} | {c['cos']:.4f} |"
+                     if c.get("graph_us") is not None else "       — |    — |      — |")
+        out.append(line)
+    out += ["", "| geomean ×fso |" + "".join(f" {t} |" for _, t in cols), "|---|" + "---:|" * len(cols)]
+    for name, pred in BANDS:
+        xs = {i: [rows[M][i]["graph_us"] / fso[M]["graph_us"] for M in fso if pred(M) and M in rows
+                  and (rows[M].get(i) or {}).get("graph_us") is not None] for i, _ in cols}
+        out.append(f"| {name} |" + "".join(f" {geo(xs[i]):.2f}× (n={len(xs[i])}) |" if xs[i] else " — |" for i, _ in cols))
+    return "\n".join(out)
+
+
 def cmd_report(args):
     d = merged_view(args.run, args.device, args.sm) if args.run else BASELINES
     dev = args.device
+    perf, ref = os.path.join(d, f"gemm_sm{args.sm}_qwen3_4b_mlp_fwd.jsonl"), os.path.join(d, f"ref_mlp_qwen3_4b_{dev}.jsonl")
+    if os.path.exists(perf) and os.path.exists(ref):
+        print(mlp_report(perf, ref, "Family A — Qwen3-4B dense MLP block, against fso BSFP8 (×fso = comparator µs / fso µs)"))
     for fam, title in FAMILIES.items():
         perf, ref, kern = (os.path.join(d, f"perf_moe_qwen3_{fam}_{dev}.jsonl"), os.path.join(d, f"ref_moe_qwen3_{fam}_{dev}.jsonl"),
                            os.path.join(d, f"ref_kern_moe_qwen3_{fam}_{dev}.jsonl"))

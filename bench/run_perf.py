@@ -269,23 +269,41 @@ def validate_lock(lock):
 
 
 # ----------------------------------------------------------------------------- the suite and what the benches accept
+def _const(node, consts):
+    """The value of a module-level constant expression: a literal, or a sum of literals and earlier constants
+    (DTYPES = FSO_DTYPES + CMP_DTYPES)."""
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _const(node.left, consts) + _const(node.right, consts)
+    if isinstance(node, ast.Name):
+        return consts[node.id]
+    return ast.literal_eval(node)
+
+
 def script_knowledge(path):
     """What a bench script accepts, read from its source and never imported (the benches import torch): its
-    options, its implementation names (KERNEL_IMPLS and LAYER_IMPLS), its dense families and its models. A
-    front-end that runs another bench through runpy (bench_moe_qwen3_35a3.py) knows what the bench it runs knows."""
+    options, its implementation names (KERNEL_IMPLS and LAYER_IMPLS), its dtypes (DTYPES, the MLP-block bench's
+    --dtypes), its dense families and its models. A front-end that runs another bench through runpy
+    (bench_moe_qwen3_35a3.py) knows what the bench it runs knows."""
     with open(path) as f:
         src = f.read()
     m = re.search(r'run_path\(.*?"(bench_[A-Za-z0-9_]+\.py)"', src, re.S)
     if m:
         return script_knowledge(os.path.join(os.path.dirname(path), m.group(1)))
     know = {"options": set(re.findall(r'add_argument\(\s*"(--[A-Za-z0-9_-]+)"', src)), "impls": set(),
-            "families": set(), "models": set()}
+            "dtypes": set(), "families": set(), "models": set()}
+    consts = {}
     for node in ast.parse(src).body:
         if not (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)):
             continue
         name = node.targets[0].id
+        try:
+            consts[name] = _const(node.value, consts)
+        except (ValueError, TypeError, KeyError, SyntaxError):
+            pass
         if name in ("KERNEL_IMPLS", "LAYER_IMPLS"):
             know["impls"].update(ast.literal_eval(node.value))
+        elif name == "DTYPES":
+            know["dtypes"].update(consts.get(name, ()))
         elif name in ("FAMILIES", "MODELS") and isinstance(node.value, ast.Dict):
             keys = {k.value for k in node.value.keys if isinstance(k, ast.Constant) and isinstance(k.value, str)}
             know["families" if name == "FAMILIES" else "models"].update(keys)
@@ -293,9 +311,9 @@ def script_knowledge(path):
 
 
 def validate_suite(machine, lock=None):
-    """The problems of a machine's suite, as sentences: unknown scripts, options, implementations, families or
-    projections, duplicate names or outputs, groups outside GROUPS, environments the lock lacks, and scripts
-    without the --Ms option a smoke run needs."""
+    """The problems of a machine's suite, as sentences: unknown scripts, options, implementations, dtypes,
+    families or projections, duplicate names or outputs, groups outside GROUPS, environments the lock lacks, and
+    scripts without the --Ms option a smoke run needs."""
     problems = []
     steps = perf_suite.SUITES.get(machine)
     if not steps:
@@ -339,6 +357,10 @@ def validate_suite(machine, lock=None):
                 for impl in (val or "").split(","):
                     if impl not in know["impls"]:
                         problems.append(f"{where}: {s['script']} does not know the implementation {impl!r}")
+            elif a == "--dtypes":
+                for dt in (val or "").split(","):
+                    if dt not in know["dtypes"]:
+                        problems.append(f"{where}: {s['script']} does not know the dtype {dt!r}")
             elif a == "--family" and val not in know["families"]:
                 problems.append(f"{where}: {s['script']} does not know the family {val!r}")
             elif a == "--model" and val not in know["models"]:

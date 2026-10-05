@@ -7,6 +7,8 @@ bench/run_perf.py resolves from them, and the raw-file manifest of bench/gemm/py
   - Each suite step names an existing bench script, options and implementation names that script knows, and a
     table group; every script accepts the --Ms option a smoke run adds.
   - Each step's output file is one of the raw files perf_report.manifest() merges into a baseline file.
+  - The Family A MLP-block comparator files (group mlp_ref) merge by M into ref_mlp_qwen3_4b_<dev>.jsonl, and
+    render_perf_docs.py joins them to the Family A table only once that file has timed cells.
   - The plan resolves for every machine (no preflight), a smoke plan adds --Ms 1,64 to every step, and the step
     environment drops every FSO_* knob but the lock's bench environment.
   - The preflight's drift detection lists a package whose version differs from the lock.
@@ -30,6 +32,7 @@ sys.path.insert(0, os.path.join(ROOT, "bench"))
 sys.path.insert(0, os.path.join(ROOT, "bench", "gemm", "python"))
 import perf_report  # noqa: E402
 import perf_suite  # noqa: E402
+import render_perf_docs  # noqa: E402
 import run_perf  # noqa: E402
 
 RUN_PERF = os.path.join(ROOT, "bench", "run_perf.py")
@@ -71,6 +74,15 @@ def test_suite_steps_name_known_scripts_and_impls():
         assert any("no_such_impl" in p or "--impls" in p for p in run_perf.validate_suite("_t")), "an unknown impl passed"
     finally:
         del perf_suite.SUITES["_t"]
+    # the MLP-block bench's --dtypes: its DTYPES tuple (a sum of two tuples) is read from the source and checked
+    know = run_perf.script_knowledge(os.path.join(ROOT, perf_suite.MLP))
+    assert {"bf16", "bsfp8", "sgl_fp8b", "vllm_fp8b", "cublas_fp8b"} <= know["dtypes"] and "--dtypes" in know["options"], know
+    bad = perf_suite.step("bad", "main", perf_suite.MLP, ["--run", "--dtypes", "sgl_fp8b,no_such_dtype"], "x.jsonl", "mlp_ref")
+    perf_suite.SUITES["_t"] = [bad]
+    try:
+        assert any("no_such_dtype" in p for p in run_perf.validate_suite("_t")), "an unknown dtype passed"
+    finally:
+        del perf_suite.SUITES["_t"]
 
 
 def test_suite_outputs_are_covered_by_the_manifest():
@@ -103,7 +115,10 @@ def test_plan_resolution_for_every_machine():
         dense = run_perf.resolve_plan(lock, run_dir, ["dense"], smoke=False)
         assert dense and all(s["group"] == "dense" for s in dense) and len(dense) == 4
         groups = {s["group"] for s in full}
-        assert groups <= set(run_perf.GROUPS) and {"dense", "moe", "moe_ref", "shared"} <= groups, (m, groups)
+        assert groups <= set(run_perf.GROUPS) and {"dense", "moe", "moe_ref", "shared", "mlp_ref"} <= groups, (m, groups)
+        mlp = run_perf.resolve_plan(lock, run_dir, ["mlp_ref"], smoke=False)
+        assert mlp and all(s["group"] == "mlp_ref" and s["script"] == perf_suite.MLP and "--dtypes" in s["argv"]
+                           for s in mlp), (m, mlp)
         # the step environment: FSO_* knobs gone except the lock's bench environment, overlays and fso path set
         base = {"PATH": "/usr/bin", "FSO_SWAP_BN": "1", "FSO_BENCH_WARM_MS": "7", "TRTLLM_DG_CACHE_DIR": "/x",
                 "PYTHONPATH": "/elsewhere", "LD_LIBRARY_PATH": "/old", "HOME": "/home/u"}
@@ -117,6 +132,56 @@ def test_plan_resolution_for_every_machine():
             assert env.get("LD_LIBRARY_PATH") == e["env"].get("LD_LIBRARY_PATH")
             assert env["HOME"] == "/home/u"
     print("  plans: " + ", ".join(f"{m} {len(perf_suite.SUITES[m])} steps" for m in run_perf.MACHINES))
+
+
+def test_mlp_ref_merge_and_render():
+    """Two comparator raw files (one with an n/a cell) merge by M into ref_mlp_qwen3_4b_h200.jsonl; the Family A
+    table of the installed H200 baseline renders unchanged without that file and gains a µs and a ×fso BSFP8 column
+    per comparator with it."""
+    tmp = tempfile.mkdtemp(prefix="perf_plan_mlp_ref_")
+    saved = render_perf_docs.BASE
+    try:
+        meta = {"_device": "NVIDIA H200", "_sm": 90, "torch": "2.13.0+cu130"}
+        row = {"hidden": 2560, "intermediate": 9728}
+        raw = {"ref_mlp_sgl_h200.jsonl": [dict(meta, dtypes=["sgl_fp8b"])] + [
+                   dict(row, M=M, sgl_fp8b={"backend": "DeepGEMM", "cos": 0.998, "weight_copies": 2, "graph_us": 50.0 + M})
+                   for M in (1, 64)],
+               "ref_mlp_cublas_h200.jsonl": [dict(meta, dtypes=["cublas_fp8b"]),
+                   dict(row, M=1, cublas_fp8b={"backend": "cuBLASLt", "cos": 0.998, "weight_copies": 2, "graph_us": 60.0}),
+                   dict(row, M=64, cublas_fp8b={"error": "n/a: test"})]}
+        for name, rows in raw.items():
+            with open(os.path.join(tmp, name), "w") as f:
+                f.writelines(json.dumps(r) + "\n" for r in rows)
+        files = perf_report.manifest(tmp, "h200", "90")["ref_mlp_qwen3_4b_h200.jsonl"]
+        assert [os.path.basename(f) for f in files] == ["ref_mlp_sgl_h200.jsonl", "ref_mlp_cublas_h200.jsonl"], files
+        out = os.path.join(tmp, "ref_mlp_qwen3_4b_h200.jsonl")
+        n, na = perf_report.merge_baseline(os.path.basename(out), out, files)
+        assert n == 3 and na == [("cublas_fp8b", 64, "n/a: test")], (n, na)
+        merged = perf_report.load(out)
+        assert merged[0]["_device"] == "NVIDIA H200" and len(merged[0]["sources"]) == 2
+        assert [r["M"] for r in merged[1:]] == [1, 64] and {"sgl_fp8b", "cublas_fp8b"} <= set(merged[1])
+        assert perf_report.cells_of(out)[("mlp", 64, "sgl_fp8b")] == 114.0
+        base = os.path.join(tmp, "base")
+        os.makedirs(base)
+        fso = "gemm_sm90_qwen3_4b_mlp_fwd.jsonl"
+        shutil.copy(os.path.join(saved, fso), base)
+        render_perf_docs.BASE = base
+        h0, b0 = render_perf_docs.mlp_table(fso, 90, os.path.basename(out))
+        assert (h0, b0) == render_perf_docs.mlp_table(fso, 90), "the table changed without a comparator file"
+        shutil.copy(out, base)
+        h1, b1 = render_perf_docs.mlp_table(fso, 90, os.path.basename(out))
+        assert h1[0].startswith(h0[0]) and h1[0][len(h0[0]):] == (
+            " sglang block-FP8 linear (DeepGEMM) µs | ×fso BSFP8 | cuBLAS scaled_mm block-FP8 (cuBLASLt) µs | ×fso BSFP8 |"), h1[0]
+        bs = {r["M"]: r["bsfp8"]["graph_us"] for r in render_perf_docs.load(fso) if "M" in r}
+        rows0 = {int(l.split("|")[1]): l for l in b0}
+        rows1 = {int(l.split("|")[1]): l for l in b1}
+        assert rows1[1] == rows0[1] + f" 51.00 | {51.0 / bs[1]:.2f} | 60.00 | {60.0 / bs[1]:.2f} |", rows1[1]
+        assert rows1[64] == rows0[64] + f" 114.00 | {114.0 / bs[64]:.2f} | — | — |", rows1[64]
+        assert all(rows1[M] == rows0[M] + " — | — | — | — |" for M in rows0 if M not in (1, 64)), \
+            "an M without comparator rows must read — in every comparator column"
+    finally:
+        render_perf_docs.BASE = saved
+        shutil.rmtree(tmp)
 
 
 def test_drift_is_listed():

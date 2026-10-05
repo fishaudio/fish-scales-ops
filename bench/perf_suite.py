@@ -9,7 +9,8 @@ Each step is one bench invocation in one environment of the machine's lock (benc
   out      the raw file the step writes, named as bench/gemm/python/perf_report.py's manifest expects
   group    the table group: dense (the dense GEMM and MLP-block tables), moe (the fso rows of the MoE layer and
            grouped-kernel tables), moe_ref (layer-level comparators), moe_kern (kernel-level comparators),
-           shared (the routed + shared-expert block of Family C, its fso rows and its comparators)
+           shared (the routed + shared-expert block of Family C, its fso rows and its comparators), mlp_ref (the
+           serving-library comparators of the Family A MLP block)
 
 The steps encode the chains that produced the 2026-10-01 tables, with the same benches, implementations, grids
 (the benches' defaults) and file names; nothing here is a new invocation:
@@ -27,9 +28,14 @@ The steps encode the chains that produced the 2026-10-01 tables, with the same b
   b300  /data/bench-runs/fso_release_perf_20261001/b300/run_stage1.sh (fso MoE rows), run_dense.sh (the dense
         tables, with the expecttest overlay that the lock now gives every step) and stage2/run_stage2.sh (the
         torch-native comparators), one pass. The 2026-10-01 tables of record took pass 1 of two.
+
+The mlp_ref steps at the end of the file are new invocations, added for the 0.2.0 tables (2026-10-05): the
+serving libraries' block-FP8 dense linear (sglang on every machine, vLLM on the RTX 5090) and, on the H200 only,
+cuBLAS's block-FP8 scaled_mm, each driving the same Family A MLP block as the fso BSFP8 cell, in the environment
+where that library lives.
 """
 
-GROUPS = ("dense", "moe", "moe_ref", "moe_kern", "shared")
+GROUPS = ("dense", "moe", "moe_ref", "moe_kern", "shared", "mlp_ref")
 
 B = "bench/gemm/python"
 DENSE = B + "/bench_qwen3_4b_mlp.py"
@@ -132,5 +138,23 @@ B300 = [
     step("ref_35a3_shared", "main", MOE_C, ["--run", "--impls", "torch_grouped_bf16_layer_shared,torch_smm_mxfp8_layer_shared"],
          "ref_new_35a3_shared_b300.jsonl", "shared"),
 ]
+
+# ----------------------------------------------------------------------------- Family A MLP-block comparators
+# bench_qwen3_4b_mlp_forward.py --dtypes: the dense MLP block of the fso BSFP8 cell (gate_up -> silu*mul -> down,
+# both activation quantizations in the graph, block-FP8 weights quantized at load, the same cold-weight rotation)
+# run by sglang's Fp8LinearMethod + SiluAndMul (sgl_fp8b), vLLM's (vllm_fp8b) and torch's cuBLAS block-FP8
+# scaled_mm (cublas_fp8b), each in the lock environment that has the library: sglang 0.5.20 is apex-0520 on the
+# H200, env0520 on the B300 and the separate sglang venv on the RTX 5090; vLLM 0.29 only the RTX 5090's main venv.
+# torch 2.13 takes the cuBLAS block recipe on sm_90 only: elsewhere it refuses with "DeepSeek style (1x128, 128x128)
+# scaling only supported in CUDA for SM90" (the n/a of docs/perf/layer/sm{100,120}.md), so only the H200 has a cuBLAS
+# step. perf_report.py merges the raw files into ref_mlp_qwen3_4b_<dev>.jsonl, which render_perf_docs.py joins to
+# the Family A table by M.
+def mlp_ref(lib, env, dtypes, dev):
+    return step(f"mlp_ref_{lib}", env, MLP, ["--run", "--dtypes", dtypes], f"ref_mlp_{lib}_{dev}.jsonl", "mlp_ref")
+
+
+H200 += [mlp_ref("sgl", "main", "sgl_fp8b", "h200"), mlp_ref("cublas", "main", "cublas_fp8b", "h200")]
+RTX5090 += [mlp_ref("sgl", "sglang", "sgl_fp8b", "5090"), mlp_ref("vllm", "main", "vllm_fp8b", "5090")]
+B300 += [mlp_ref("sgl", "main", "sgl_fp8b", "b300")]
 
 SUITES = {"h200": H200, "5090": RTX5090, "b300": B300}
