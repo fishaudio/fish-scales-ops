@@ -884,6 +884,14 @@ def init_sglang_shim():
     with open(os.path.join(d, "config.json"), "w") as f:
         json.dump(cfg, f)
     set_global_server_args_for_scheduler(ServerArgs(model_path=d))
+    # What every sglang TP worker does at startup once it owns a GPU: in 0.5.20 this turns on DeepGEMM's programmatic
+    # dependent launch (SGLANG_DEEPGEMM_PDL, on by default), which the deep_gemm comparator must run with.
+    try:
+        import torch as _torch
+        from sglang.srt.layers.deep_gemm_wrapper.entrypoint import update_deep_gemm_config
+        update_deep_gemm_config(_torch.cuda.current_device())
+    except Exception:
+        pass
     # 0.5.20's `fused_experts` allocates its output through the TP group's
     # symmetric-memory context and asserts the group exists even at tp=1, so
     # build the world=1 groups the way sglang's own layer unit tests do

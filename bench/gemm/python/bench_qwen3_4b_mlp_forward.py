@@ -323,7 +323,27 @@ def _sglang_init():
     from sglang.srt.layers.quantization.fp8_utils import get_fp8_gemm_runner_backend, initialize_fp8_gemm_config
     initialize_fp8_gemm_config()
     _SGL["fp8_gemm_runner_backend"] = get_fp8_gemm_runner_backend().value
+    # What every sglang TP worker does at startup once it owns a GPU: among other things this turns on DeepGEMM's
+    # programmatic dependent launch when SGLANG_DEEPGEMM_PDL is set, which it is by default in 0.5.20. Without it the
+    # cell would time DeepGEMM with PDL off, which is not how sglang serves.
+    _SGL["deepgemm_pdl"] = _sgl_update_deep_gemm_config()
     return _SGL
+
+
+def _sgl_update_deep_gemm_config():
+    """Call sglang's update_deep_gemm_config(gpu_id) as its scheduler does; return DeepGEMM's PDL state after it
+    (None when this sglang or deep_gemm has no such call)."""
+    try:
+        import torch
+        from sglang.srt.layers.deep_gemm_wrapper.entrypoint import update_deep_gemm_config
+        update_deep_gemm_config(torch.cuda.current_device())
+    except Exception:
+        return None
+    try:
+        import deep_gemm
+        return bool(deep_gemm.get_pdl()) if hasattr(deep_gemm, "get_pdl") else None
+    except Exception:
+        return None
 
 
 def _sgl_backend(linear_name):
@@ -371,6 +391,7 @@ def _build_sgl_fp8b(w_gu, w_d, sm_major):
     sc = l_gu.weight_scale_inv
     fn.info = {"backend": _sgl_backend(name), "linear": f"sglang Fp8LinearMethod -> {name}",
                "fp8_gemm_runner_backend": ctx["fp8_gemm_runner_backend"],
+               "deepgemm_pdl": ctx.get("deepgemm_pdl"),
                "weight_scale": ("UE8M0, requantized at load for DeepGEMM" if getattr(sc, "format_ue8m0", False)
                                 else "fp32") + f" ({_scale_desc(sc)})",
                "act": f"sglang SiluAndMul.{act.dispatch_forward().__name__}",
@@ -475,6 +496,11 @@ def _build_vllm_fp8b(w_gu, w_d, sm_major):
     if "DeepGEMM" in label:             # vLLM imports deep_gemm from site-packages, else its vendored copy
         dg = sys.modules.get("deep_gemm") or sys.modules.get("vllm.third_party.deep_gemm")
         fn.info["deep_gemm"] = f"{getattr(dg, '__name__', '?')} {getattr(dg, '__version__', '')} {getattr(dg, '__file__', '')}"
+        # vLLM turns DeepGEMM's PDL on itself on SM90+ (vllm.utils.deep_gemm._lazy_init); record what ran.
+        try:
+            fn.info["deepgemm_pdl"] = bool(dg.get_pdl()) if hasattr(dg, "get_pdl") else None
+        except Exception:
+            fn.info["deepgemm_pdl"] = None
     if label == "Triton":
         fn.info["config_source"] = _triton_config_source("vllm.model_executor.layers.quantization.utils.fp8_utils")
     return fn
