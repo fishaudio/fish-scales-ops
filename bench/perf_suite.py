@@ -125,6 +125,10 @@ B300 = [
     # stage2/run_stage2.sh: the torch-native comparators of the routed layer and of the routed + shared block
     step("ref_30a3", "main", MOE_B, ["--run", "--impls", "torch_grouped_bf16_layer,torch_smm_mxfp8_layer"], "ref_new_30a3_b300.jsonl", "moe_ref"),
     step("ref_35a3", "main", MOE_C, ["--run", "--impls", "torch_grouped_bf16_layer,torch_smm_mxfp8_layer"], "ref_new_35a3_b300.jsonl", "moe_ref"),
+    # the sglang 0.5.20 Triton fused_experts layers (BF16 and w8a8 block FP8), the backend apex uses on this card with
+    # expert parallelism; the same env0520 venv (sglang 0.5.20), on the same card as the fso rows
+    step("sgl020_30a3", "main", MOE_B, ["--run", "--impls", "triton_bf16,triton_fp8b"], "ref_sgl020_30a3_b300.jsonl", "moe_ref"),
+    step("sgl020_35a3", "main", MOE_C, ["--run", "--impls", "triton_bf16,triton_fp8b"], "ref_sgl020_35a3_b300.jsonl", "moe_ref"),
     step("ref_35a3_shared", "main", MOE_C, ["--run", "--impls", "torch_grouped_bf16_layer_shared,torch_smm_mxfp8_layer_shared"],
          "ref_new_35a3_shared_b300.jsonl", "shared"),
 ]
