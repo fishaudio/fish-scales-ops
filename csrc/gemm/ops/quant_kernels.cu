@@ -10,6 +10,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <cstdint>
 #include <type_traits>
 
 namespace blockscale_gemm
@@ -674,15 +675,19 @@ __global__ void silu_chunk_mul_quantize_1x128_fp32_grouped_kernel(
 // expert-sorted matrix [P_max, K] and the scale is the DENSE K-major layout the
 // contiguous SFA TMA descriptor expects: ColMajor [align(P_max,4), K/128], i.e.
 //   sfa(r, kb) = kb * sfa_ld + r,  sfa_ld = align(P_max, 4).
-// Both iterate the R real routed pairs (i in [0, M*topk)) and place each at its
+// Both cover the R real routed pairs (i in [0, M*topk)) and place each at its
 // sorted row via flat_to_sorted[i] — so the work scales with R, not P_max, and
 // there is no O(P_max) memset. Padding rows of the output are left untouched:
 // the GroupedContiguous GEMM is row-independent, so a padding row only produces
 // a padding output row, which the combine drops (it reads only real rows via
 // flat_to_sorted). Pairs whose flat_to_sorted entry is -1 (expert id outside
-// [0, E): sglang's masked padded rows) are skipped. Each warp owns one
-// (pair i, 128-K-block kb).
-__global__ void fp8bs_quantize_1x128_fp32_sorted_gather_kernel(
+// [0, E): sglang's masked padded rows) are skipped. The gather runs one warp per
+// (token, chunk of K) and writes all of the token's pairs; the SwiGLU kernel
+// runs one warp per (pair i, 128-K-block kb).
+
+// The 0.2.0 kernel, kept for the smallest token counts (see fp8bs_quantize_1x128_fp32_sorted_gather): one warp per
+// (pair, 128-K block), 32 lanes x 4 bf16.
+__global__ void fp8bs_quantize_1x128_fp32_sorted_gather_pair_kernel(
     __nv_fp8_e4m3* __restrict__ out_fp8,  // [P_max, K]
     float* __restrict__ out_sfa,          // [K/128, sfa_ld] = ColMajor[sfa_ld, K/128]
     __nv_bfloat16 const* __restrict__ input,   // [M, K]
@@ -720,6 +725,128 @@ __global__ void fp8bs_quantize_1x128_fp32_sorted_gather_kernel(
     *reinterpret_cast<uint32_t*>(&out_fp8[static_cast<int64_t>(r) * K + k_base + lane_id * 4]) = fp_word;
     if (lane_id == 0)
         out_sfa[static_cast<int64_t>(kb) * sfa_ld + r] = dequant;
+}
+
+// One warp per (token, chunk of K): every routed pair of a token gathers the same input row, so the warp loads and
+// quantizes that row chunk once and stores the identical FP8 bytes and dequant scales to each of the token's (up to
+// topk) sorted rows. The per-pair kernel above runs one warp per (pair, 128-K block), which re-reads and re-quantizes
+// the row topk times and moves 256 bytes per warp; at prefill it is latency-bound (171 us for 65536 pairs at
+// K = 2048), at decode it is the faster of the two by about 0.1 us, so the host keeps it below kSortedGatherMinTokens
+// tokens.
+//
+// A step is 256 elements: lanes 0-15 hold 128-K block 2s and lanes 16-31 block 2s + 1, eight bf16 per lane (one
+// 16-byte load, or two 8-byte loads when the input is only 8-byte aligned), and every lane stores eight FP8 bytes per
+// sorted row, so a warp writes 256 contiguous bytes of each row per step. When K is an odd multiple of 128, the last
+// step has only lanes 0-15. The arithmetic is the per-pair kernel's, element for element: |max| over the 128-element
+// block (fmaxf is exact, so the reduction order does not matter), clamped at 1e-10f, qs = 448/amax and
+// dequant = amax * (1/448), and satfinite E4M3 of x * qs. The bytes and scales of every routed row are therefore
+// bit-identical to the 0.2.0 kernel's. Padding rows are left untouched, as before, and pairs whose flat_to_sorted
+// entry is -1 (expert id outside [0, E)) are skipped.
+//
+// The host picks the launch shape from the token count (the function is the same at every M): at prefill a warp owns
+// a whole row (8 steps at K = 2048) and all of the token's pairs; toward decode the row is split into chunks of fewer
+// steps, and at the smallest token counts the token's pairs are split across warps too (one pair per warp at M = 1,
+// the 0.2.0 kernel's parallelism there), so that enough warps exist to cover the latency. The number of steps a warp
+// loads ahead is a template parameter, so the small-M launches run a short kernel.
+template <bool kVec16, int kInFlight> // kInFlight: steps loaded ahead per warp (1, 2, 4 or 8)
+__global__ void fp8bs_quantize_1x128_fp32_sorted_gather_kernel(
+    __nv_fp8_e4m3* __restrict__ out_fp8,  // [P_max, K]
+    float* __restrict__ out_sfa,          // [K/128, sfa_ld] = ColMajor[sfa_ld, K/128]
+    __nv_bfloat16 const* __restrict__ input,   // [M, K]
+    int32_t const* __restrict__ flat_to_sorted, // [R]: pair -> sorted row
+    int n_pairs, int topk, int sfa_ld, int K, int steps_per_chunk, int log2_chunks, int pairs_per_group,
+    int log2_groups, int n_items)
+{
+    // item = (token, chunk, group), the chunk and group counts powers of two, so the split is shifts: a runtime
+    // division here sat on the path to the first load and cost the M = 1 launch about 0.2 us.
+    int const item = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int const lane = threadIdx.x & 31;
+    if (item >= n_items)
+        return;
+    int const group = item & ((1 << log2_groups) - 1);
+    int const chunk = (item >> log2_groups) & ((1 << log2_chunks) - 1);
+    int const token = item >> (log2_groups + log2_chunks);
+    int const n_steps = (K + 255) / 256;
+    int const step_begin = chunk * steps_per_chunk;
+    int const step_end = min(n_steps, step_begin + steps_per_chunk);
+    int const p_begin = group * pairs_per_group;
+    int const p_end = min(topk, p_begin + pairs_per_group);
+    if (step_begin >= step_end || p_begin >= p_end) // a chunk or group past the end of a power-of-two split
+        return;
+
+    // This warp's pairs of the token: p_begin .. p_end - 1 of its topk. Lane j holds the sorted row of pair
+    // token * topk + p_begin + j (-1: skipped, or past n_pairs).
+    int const pair0 = token * topk;
+    int my_row = -1;
+    if (lane < p_end - p_begin && pair0 + p_begin + lane < n_pairs)
+        my_row = flat_to_sorted[pair0 + p_begin + lane];
+
+    int const half = lane >> 4; // which 128-K block of the step this lane quantizes
+    __nv_bfloat16 const* const xrow = input + static_cast<int64_t>(token) * K;
+
+    for (int s0 = step_begin; s0 < step_end; s0 += kInFlight)
+    {
+        uint4 v[kInFlight];
+#pragma unroll
+        for (int j = 0; j < kInFlight; ++j)
+        {
+            int const k = (s0 + j) * 256 + lane * 8;
+            v[j] = make_uint4(0u, 0u, 0u, 0u);
+            if (s0 + j < step_end && k < K)
+            {
+                if constexpr (kVec16)
+                {
+                    v[j] = *reinterpret_cast<uint4 const*>(xrow + k);
+                }
+                else
+                {
+                    uint2 const lo = *reinterpret_cast<uint2 const*>(xrow + k);
+                    uint2 const hi = *reinterpret_cast<uint2 const*>(xrow + k + 4);
+                    v[j] = make_uint4(lo.x, lo.y, hi.x, hi.y);
+                }
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < kInFlight; ++j)
+        {
+            int const s = s0 + j;
+            if (s >= step_end) // uniform across the warp
+                break;
+            int const k = s * 256 + lane * 8;
+            bool const valid = k < K;
+            __nv_bfloat162 const* const xv = reinterpret_cast<__nv_bfloat162 const*>(&v[j]);
+            float2 const f0 = __bfloat1622float2(xv[0]);
+            float2 const f1 = __bfloat1622float2(xv[1]);
+            float2 const f2 = __bfloat1622float2(xv[2]);
+            float2 const f3 = __bfloat1622float2(xv[3]);
+            float my_ax = fmaxf(fmaxf(fmaxf(fabsf(f0.x), fabsf(f0.y)), fmaxf(fabsf(f1.x), fabsf(f1.y))),
+                fmaxf(fmaxf(fabsf(f2.x), fabsf(f2.y)), fmaxf(fabsf(f3.x), fabsf(f3.y))));
+            // |max| over the sixteen lanes of this half (one 128-K block)
+#pragma unroll
+            for (int off = 8; off > 0; off >>= 1)
+                my_ax = fmaxf(my_ax, __shfl_xor_sync(0xFFFFFFFFu, my_ax, off));
+            my_ax = fmaxf(my_ax, 1e-10f);
+            float const qs = 448.f / my_ax;
+            float const dequant = my_ax * (1.f / 448.f);
+            uint2 const w = make_uint2(fp8x4_from_floats(f0.x * qs, f0.y * qs, f1.x * qs, f1.y * qs),
+                fp8x4_from_floats(f2.x * qs, f2.y * qs, f3.x * qs, f3.y * qs));
+            int const kb = 2 * s + half;
+            for (int p = 0; p < p_end - p_begin; ++p)
+            {
+                // Rows of pairs 32.. of the group (more than 32 pairs) are read here, the same address in every lane.
+                int const r = p < 32 ? __shfl_sync(0xFFFFFFFFu, my_row, p)
+                                     : (pair0 + p_begin + p < n_pairs ? flat_to_sorted[pair0 + p_begin + p] : -1);
+                if (r < 0) // skipped pair (uniform across the warp)
+                    continue;
+                if (valid)
+                {
+                    *reinterpret_cast<uint2*>(&out_fp8[static_cast<int64_t>(r) * K + k]) = w;
+                    if ((lane & 15) == 0)
+                        out_sfa[static_cast<int64_t>(kb) * sfa_ld + r] = dequant;
+                }
+            }
+        }
+    }
 }
 
 __global__ void silu_chunk_mul_quantize_1x128_fp32_sorted_kernel(
@@ -769,12 +896,61 @@ void fp8bs_quantize_1x128_fp32_sorted_gather(__nv_fp8_e4m3* x_q, float* sfa,
     __nv_bfloat16 const* x, int32_t const* flat_to_sorted, int n_pairs, int topk,
     int sfa_ld, int K, cudaStream_t stream)
 {
-    constexpr int kThreads = 256, kWarps = kThreads / 32;
-    int const Kb = K / 128;
-    int64_t const total_warps = static_cast<int64_t>(n_pairs) * Kb;
-    int const grid = static_cast<int>((total_warps + kWarps - 1) / kWarps);
-    fp8bs_quantize_1x128_fp32_sorted_gather_kernel<<<grid, kThreads, 0, stream>>>(
-        x_q, sfa, x, flat_to_sorted, n_pairs, topk, sfa_ld, K);
+    if (n_pairs <= 0 || topk <= 0)
+        return;
+    // Below kSortedGatherMinTokens tokens the 0.2.0 per-pair kernel; both write the same bytes and scales.
+    constexpr int kSortedGatherMinTokens = 32;
+    if ((n_pairs + topk - 1) / topk < kSortedGatherMinTokens)
+    {
+        constexpr int kPairThreads = 256, kPairWarps = kPairThreads / 32;
+        int64_t const total_warps = static_cast<int64_t>(n_pairs) * (K / 128);
+        int const pair_grid = static_cast<int>((total_warps + kPairWarps - 1) / kPairWarps);
+        fp8bs_quantize_1x128_fp32_sorted_gather_pair_kernel<<<pair_grid, kPairThreads, 0, stream>>>(
+            x_q, sfa, x, flat_to_sorted, n_pairs, topk, sfa_ld, K);
+        return;
+    }
+    constexpr int kThreads = 128, kWarps = kThreads / 32;
+    // Launch shape: about kTargetWarps warps. Each token's row is split into chunks of whole 256-element steps (one
+    // chunk per row at prefill, one step per chunk toward decode), then, if there are still too few warps, the
+    // token's pairs are split across warps (one pair per warp at M = 1). Only the shape changes with the token count.
+    constexpr int kTargetWarps = 2048;
+    auto const ceil_div = [](int64_t a, int64_t b) { return static_cast<int>((a + b - 1) / b); };
+    int const n_tokens = ceil_div(n_pairs, topk);
+    int const n_steps = ceil_div(K, 256);
+    // Chunk and group counts are powers of two (the kernel splits its warp index with shifts), at most the step count
+    // and topk rounded up to a power of two; a chunk or group past the end does nothing.
+    int log2_chunks = 0;
+    while ((1 << log2_chunks) < n_steps && static_cast<int64_t>(n_tokens) << log2_chunks < kTargetWarps)
+        ++log2_chunks;
+    int const steps_per_chunk = ceil_div(n_steps, 1 << log2_chunks);
+    int log2_groups = 0;
+    while ((1 << log2_groups) < topk && static_cast<int64_t>(n_tokens) << (log2_chunks + log2_groups) < kTargetWarps)
+        ++log2_groups;
+    int const pairs_per_group = ceil_div(topk, 1 << log2_groups);
+    int64_t const n_items = static_cast<int64_t>(n_tokens) << (log2_chunks + log2_groups);
+    int const grid = static_cast<int>((n_items + kWarps - 1) / kWarps);
+    bool const vec16 = (reinterpret_cast<uintptr_t>(x) & 15u) == 0u; // 16-byte loads, else two 8-byte loads
+    auto launch = [&](auto vec16T, auto inFlightT)
+    {
+        fp8bs_quantize_1x128_fp32_sorted_gather_kernel<decltype(vec16T)::value, decltype(inFlightT)::value>
+            <<<grid, kThreads, 0, stream>>>(x_q, sfa, x, flat_to_sorted, n_pairs, topk, sfa_ld, K, steps_per_chunk,
+                log2_chunks, pairs_per_group, log2_groups, static_cast<int>(n_items));
+    };
+    auto launch_depth = [&](auto vec16T)
+    {
+        if (steps_per_chunk <= 1)
+            launch(vec16T, std::integral_constant<int, 1>{});
+        else if (steps_per_chunk <= 2)
+            launch(vec16T, std::integral_constant<int, 2>{});
+        else if (steps_per_chunk <= 4)
+            launch(vec16T, std::integral_constant<int, 4>{});
+        else
+            launch(vec16T, std::integral_constant<int, 8>{});
+    };
+    if (vec16)
+        launch_depth(std::true_type{});
+    else
+        launch_depth(std::false_type{});
 }
 
 void fp8bs_silu_chunk_mul_quantize_1x128_fp32_sorted(__nv_fp8_e4m3* x_q, float* sfa,

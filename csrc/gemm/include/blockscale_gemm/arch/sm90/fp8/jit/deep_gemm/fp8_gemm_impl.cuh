@@ -2697,4 +2697,574 @@ __global__ void __launch_bounds__(
         DG_DEVICE_ASSERT(false and "This kernel only support sm_90a");
 #endif
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Fused swap-AB FC1 split across a two-CTA cluster (fp8_gemm_kernel_swapAB_swiglu_split; H2 Phase 2a, 2026-10-05).
+//
+// fp8_gemm_kernel_swapAB_swiglu gives one CTA a whole SwiGLU block: for one BLOCK_N-row activation tile, gate block b
+// and up block b of an expert (256 weight rows). At the smallest token counts that is too few CTAs: at M = 1 the eight
+// active experts make 8 * (I / 128) blocks, 48 CTAs on 132 SMs at I = 768 and 32 at I = 512, and each CTA's two math
+// warp-groups work through 16 stages of eight WGMMAs each, one stage after the other. This kernel gives each SwiGLU
+// block to the two CTAs of a cluster, without splitting K: CTA r of the cluster owns gate rows 64r .. 64r+63 and up
+// rows 64r .. 64r+63 of block b, which is the work of math warp-group r of fp8_gemm_kernel_swapAB_swiglu, and it gives
+// the gate rows and the up rows to two math warp-groups of their own (four WGMMAs per stage each). Every accumulator
+// is computed as in that kernel (the same m64nBNk32 WGMMA on the same rows in the same k order, the same per-stage
+// promotion), so the fp32 sums are that kernel's bit for bit.
+//
+// Epilogue. The up warp-group rounds its sums to bf16 as the unsplit kernel does and hands them to the gate warp-group
+// through shared memory (the two warp-groups hold the same (row, token) fragment layout, so the hand-over is one 32-bit
+// word per thread and value pair); the gate warp-group forms the SwiGLU of this CTA's 64 output columns. The 1x128
+// requantize needs each token's |max| over all 128 columns of the block: each CTA reduces its 64 to one value per
+// token, sends it to the peer CTA's shared memory (st.shared::cluster) and signals the peer's exchange barrier
+// (mbarrier.arrive.release.cluster); the peer waits (acquire.cluster) and takes the max of the two values, so both
+// CTAs hold the block's exact amax (max is exact, so the order does not matter), clamp it at 1e-10f and quantize their
+// 64 columns with qs = 448/amax as the unsplit kernel does. Each CTA stores its [BLOCK_N][64] fp8 tile with one TMA
+// store; CTA 0 writes the dequant scales. Output bytes and scales are those of fp8_gemm_kernel_swapAB_swiglu.
+//
+// Threads: two math warp-groups (gate, up) and one TMA warp-group, 384 in all, one CTA per SM, no register
+// reconfiguration. Scheduling: the cluster, not the CTA, is the persistent unit; both CTAs of a cluster walk the same
+// sequence of (activation tile, SwiGLU block) pairs (GroupedContiguousSchedulerSwapAB with the cluster index), so they
+// always work on the same block. The exchange buffers are double-buffered by tile parity: a CTA can only write the
+// peer's buffer for tile t + 2 after the peer has sent its value for tile t + 1, which it does after reading the buffer
+// for tile t.
+namespace sm90_swapab_split_smem
+{
+// Shared-memory layout, in bytes from the dynamic shared-memory base, read by the kernel (NVRTC) and the host's stage
+// pick (dispatch.cuh) alike.
+//   [epilogue, padded to 1 KB: fp8 dq staging tile [BLOCK_N][64] (no swizzle), per-warp amax partials [4][BLOCK_N],
+//    the peer's amax values [2][BLOCK_N], the two exchange barriers, the up warp-group's bf16 pairs [BLOCK_N/4][128]]
+//   [A: gate box 64 rows | up box 64 rows  x stages] [B (activation) x stages] [activation scales x stages, 128 B]
+//   [full barriers x stages] [empty barriers x stages]
+constexpr uint32_t kRowsPerCta = 64; // weight rows of each half per CTA (one WGMMA M)
+constexpr uint32_t kOutCols = 64;    // SwiGLU output columns per CTA
+constexpr uint32_t kBlockK = 128;
+constexpr uint32_t kNumEpilogueWarps = 4; // the gate warp-group
+constexpr uint32_t kNumMathWarps = 8;     // gate and up warp-groups
+constexpr uint32_t kHalfBytesPerStage = kRowsPerCta * kBlockK; // one 64-row weight box: 8 KB
+constexpr uint32_t kABytesPerStage = 2 * kHalfBytesPerStage;   // gate box + up box: 16 KB
+constexpr uint32_t kBarrierBytes = 8;
+
+__device__ __host__ constexpr uint32_t align_up(uint32_t x, uint32_t a)
+{
+    return (x + a - 1) / a * a;
+}
+
+__device__ __host__ constexpr uint32_t dq_tile_bytes(uint32_t block_n)
+{
+    return block_n * kOutCols;
+}
+
+__device__ __host__ constexpr uint32_t amax_offset(uint32_t block_n) // [4 warps][block_n] fp32
+{
+    return align_up(dq_tile_bytes(block_n), 128);
+}
+
+__device__ __host__ constexpr uint32_t peer_offset(uint32_t block_n) // [2 parities][block_n] fp32
+{
+    return amax_offset(block_n) + kNumEpilogueWarps * block_n * 4;
+}
+
+__device__ __host__ constexpr uint32_t xchg_barrier_offset(uint32_t block_n) // [2] mbarriers
+{
+    return align_up(peer_offset(block_n) + 2 * block_n * 4, 8);
+}
+
+__device__ __host__ constexpr uint32_t up_offset(uint32_t block_n) // [2 * block_n / 8][128 threads] bf16x2 words
+{
+    return align_up(xchg_barrier_offset(block_n) + 2 * kBarrierBytes, 16);
+}
+
+__device__ __host__ constexpr uint32_t epilogue_bytes(uint32_t block_n)
+{
+    return align_up(up_offset(block_n) + (2 * block_n / 8) * 128 * 4, 1024);
+}
+
+__device__ __host__ constexpr uint32_t b_bytes_per_stage(uint32_t block_n)
+{
+    return block_n * kBlockK;
+}
+
+__device__ __host__ constexpr uint32_t scales_b_bytes_per_stage(uint32_t block_n) // TMA destination, 128 B aligned
+{
+    return align_up(block_n * 4, 128);
+}
+
+__device__ __host__ constexpr uint32_t a_offset(uint32_t block_n, uint32_t stage)
+{
+    return epilogue_bytes(block_n) + stage * kABytesPerStage;
+}
+
+__device__ __host__ constexpr uint32_t b_offset(uint32_t block_n, uint32_t num_stages, uint32_t stage)
+{
+    return epilogue_bytes(block_n) + num_stages * kABytesPerStage + stage * b_bytes_per_stage(block_n);
+}
+
+__device__ __host__ constexpr uint32_t scales_b_offset(uint32_t block_n, uint32_t num_stages, uint32_t stage)
+{
+    return epilogue_bytes(block_n) + num_stages * (kABytesPerStage + b_bytes_per_stage(block_n))
+        + stage * scales_b_bytes_per_stage(block_n);
+}
+
+__device__ __host__ constexpr uint32_t barriers_offset(uint32_t block_n, uint32_t num_stages)
+{
+    return scales_b_offset(block_n, num_stages, num_stages);
+}
+
+__device__ __host__ constexpr uint32_t total_bytes(uint32_t block_n, uint32_t num_stages)
+{
+    return barriers_offset(block_n, num_stages) + 2 * num_stages * kBarrierBytes;
+}
+} // namespace sm90_swapab_split_smem
+
+namespace sm90_swapab_split
+{
+// Cluster-scope shared-memory operations of the amax exchange.
+__device__ __forceinline__ uint32_t peer_addr(uint32_t local_smem_addr, uint32_t peer_rank)
+{
+    uint32_t r;
+    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(r) : "r"(local_smem_addr), "r"(peer_rank));
+    return r;
+}
+
+__device__ __forceinline__ void st_cluster_v2_f32(uint32_t cluster_addr, float a, float b)
+{
+    asm volatile("st.shared::cluster.v2.f32 [%0], {%1, %2};" ::"r"(cluster_addr), "f"(a), "f"(b) : "memory");
+}
+
+__device__ __forceinline__ void arrive_cluster(uint32_t cluster_barrier_addr)
+{
+    asm volatile("mbarrier.arrive.release.cluster.shared::cluster.b64 _, [%0];" ::"r"(cluster_barrier_addr) : "memory");
+}
+
+__device__ __forceinline__ void wait_cluster(uint32_t barrier_addr, uint32_t parity)
+{
+    uint32_t done = 0;
+    while (!done)
+    {
+        asm volatile(
+            "{\n"
+            ".reg .pred p;\n"
+            "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%1], %2;\n"
+            "selp.u32 %0, 1, 0, p;\n"
+            "}\n"
+            : "=r"(done)
+            : "r"(barrier_addr), "r"(parity)
+            : "memory");
+    }
+}
+
+__device__ __forceinline__ uint32_t cta_rank_in_cluster()
+{
+    uint32_t r;
+    asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(r));
+    return r;
+}
+
+__device__ __forceinline__ void sts_u32(uint32_t addr, uint32_t v)
+{
+    asm volatile("st.shared.u32 [%0], %1;" ::"r"(addr), "r"(v));
+}
+
+__device__ __forceinline__ uint32_t lds_u32(uint32_t addr)
+{
+    uint32_t v;
+    asm volatile("ld.shared.u32 %0, [%1];" : "=r"(v) : "r"(addr));
+    return v;
+}
+} // namespace sm90_swapab_split
+
+template <uint32_t SHAPE_M, uint32_t SHAPE_K, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K, uint32_t kNumGroups,
+    uint32_t kNumStages, uint32_t kNumTMAThreads, uint32_t kNumMathThreadsPerGroup, uint32_t kNumTMAMulticast,
+    typename SchedulerType, typename InputType>
+__global__ void __launch_bounds__(384, 1)
+    fp8_gemm_kernel_swapAB_swiglu_split(float* gmem_sd, float* scales_a, InputType problem_input,
+        const __grid_constant__ CUtensorMap tensor_map_a,        // weight [G * 2I, K], one 64-row box
+        const __grid_constant__ CUtensorMap tensor_map_b,        // activation [P_max, K], one BLOCK_N-row box
+        const __grid_constant__ CUtensorMap tensor_map_scales_b, // activation scales
+        const __grid_constant__ CUtensorMap tensor_map_dq,       // dq [P_max, I] fp8, one BLOCK_N x 64 box, no swizzle
+        uint32_t sd_ld)                                          // sd [I/128, sd_ld] fp32, sd_ld = align4(P_max)
+{
+#if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ == 900))
+    namespace L = sm90_swapab_split_smem;
+    namespace F = sm90_swiglu;
+    namespace G = sm90_swapab_swiglu;
+    namespace X = sm90_swapab_split;
+
+    DG_STATIC_ASSERT(kNumTMAMulticast == 1, "No TMA multicast: the per-block weights differ");
+    DG_STATIC_ASSERT(BLOCK_K == 128 and BLOCK_K == L::kBlockK, "Only support per-128-channel FP8 scaling");
+    DG_STATIC_ASSERT(BLOCK_M == 128, "BLOCK_M is the SwiGLU block (128 output columns, two CTAs of 64)");
+    DG_STATIC_ASSERT(SHAPE_M % (2 * BLOCK_M) == 0, "SHAPE_M must be 2 * I with I a multiple of 128");
+    DG_STATIC_ASSERT(BLOCK_N == 16 or BLOCK_N == 32 or BLOCK_N == 64, "Activation tile of 16, 32 or 64 rows");
+    DG_STATIC_ASSERT(SchedulerType::gemm_type == GemmType::GroupedContiguous, "Grouped-contiguous FC1 only");
+
+    using WGMMA = typename FP8MMASelector<BLOCK_N>::type;
+    using Barrier = cutlass::arch::ClusterTransactionBarrier;
+    DG_STATIC_ASSERT(WGMMA::M == L::kRowsPerCta, "One math warp-group of 64 weight rows per half");
+    DG_STATIC_ASSERT(sizeof(Barrier) == L::kBarrierBytes, "Barrier size");
+
+    constexpr uint32_t SHAPE_M_HALF = SHAPE_M / 2; // I
+    constexpr uint32_t SHAPE_K_SCALES = ceil_div(SHAPE_K, BLOCK_K);
+    constexpr uint32_t kTxBytesPerStage = L::kABytesPerStage + L::b_bytes_per_stage(BLOCK_N) + BLOCK_N * sizeof(float);
+    constexpr uint32_t kFullKOfAllStages = kNumStages * BLOCK_K;
+    constexpr uint32_t kNumMathThreads = L::kNumMathWarps * 32; // 256: the gate and the up warp-group
+    constexpr uint32_t kNumEpilogueThreads = L::kNumEpilogueWarps * 32;
+    DG_STATIC_ASSERT(kNumTMAThreads == 128 and kNumMathThreadsPerGroup == 128, "128-thread warp-groups");
+    DG_STATIC_ASSERT(SHAPE_K % kFullKOfAllStages == 0, "The stage count divides K / 128 (sm90_swapab_split_stages)");
+    constexpr uint32_t kNumIterations = SHAPE_K / kFullKOfAllStages;
+    // Named barriers (user ids; NamedBarrier adds the reserved count): the gate warp-group's own, the up values being
+    // published, and their having been read
+    constexpr uint32_t kBarGate = 0, kBarUpReady = 1, kBarUpFree = 2;
+    uint32_t const warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t const lane_idx = get_lane_id();
+    uint32_t const cta_rank = X::cta_rank_in_cluster();
+    uint32_t const cluster_idx = blockIdx.x / 2;
+    uint32_t const num_clusters = gridDim.x / 2;
+
+    if (threadIdx.x == kNumMathThreads)
+    {
+        cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map_a));
+        cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map_b));
+        cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map_scales_b));
+        cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map_dq));
+    }
+    __syncwarp();
+
+    extern __shared__ __align__(1024) uint8_t smem_buffer[];
+    DG_STATIC_ASSERT(L::epilogue_bytes(BLOCK_N) % 1024 == 0, "The stages must start on a swizzle atom");
+    DG_STATIC_ASSERT(L::kHalfBytesPerStage % 1024 == 0 and L::b_bytes_per_stage(BLOCK_N) % 1024 == 0,
+        "Every A half and every B stage must start on a swizzle atom");
+    if (threadIdx.x == 0 and (static_cast<uint32_t>(__cvta_generic_to_shared(smem_buffer)) & 1023u) != 0u)
+        asm volatile("trap;");
+
+    __nv_fp8_e4m3* smem_a[kNumStages];
+    __nv_fp8_e4m3* smem_b[kNumStages];
+    float* smem_scales_b[kNumStages];
+    Barrier* full_barriers[kNumStages];
+    Barrier* empty_barriers[kNumStages];
+#pragma unroll
+    for (uint32_t i = 0; i < kNumStages; ++i)
+    {
+        smem_a[i] = reinterpret_cast<__nv_fp8_e4m3*>(smem_buffer + L::a_offset(BLOCK_N, i));
+        smem_b[i] = reinterpret_cast<__nv_fp8_e4m3*>(smem_buffer + L::b_offset(BLOCK_N, kNumStages, i));
+        smem_scales_b[i] = reinterpret_cast<float*>(smem_buffer + L::scales_b_offset(BLOCK_N, kNumStages, i));
+    }
+    auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem_buffer + L::barriers_offset(BLOCK_N, kNumStages));
+#pragma unroll
+    for (uint32_t i = 0; i < kNumStages; ++i)
+    {
+        full_barriers[i] = barrier_start_ptr + i;
+        empty_barriers[i] = barrier_start_ptr + kNumStages + i;
+    }
+    auto xchg_barriers = reinterpret_cast<Barrier*>(smem_buffer + L::xchg_barrier_offset(BLOCK_N));
+
+    // Barriers: one arrival per math warp (both warp-groups) frees a stage; the four peer lanes that send the amax
+    // values complete an exchange barrier. Only the initialisation has to be published to the peer before its first
+    // remote arrival (fence_barrier_init), so the cluster arrive can be relaxed, as in CUTLASS's cluster kernels.
+    if (threadIdx.x == kNumMathThreads)
+    {
+#pragma unroll
+        for (uint32_t i = 0; i < kNumStages; ++i)
+        {
+            full_barriers[i]->init(1);
+            empty_barriers[i]->init(L::kNumMathWarps);
+        }
+        xchg_barriers[0].init(4);
+        xchg_barriers[1].init(4);
+        cutlass::arch::fence_view_async_shared();
+        cutlass::arch::fence_barrier_init();
+    }
+    cute::cluster_arrive_relaxed();
+    cute::cluster_wait();
+
+    // m_block_idx is the SwiGLU block b (I / 128 of them); the cluster is the scheduling unit.
+    uint32_t m_block_idx, n_block_idx;
+    auto scheduler = SchedulerType(problem_input);
+
+    if (threadIdx.x >= kNumMathThreads)
+    {
+        if (threadIdx.x == kNumMathThreads)
+        {
+            while (scheduler.get_next_block_unit(m_block_idx, n_block_idx, cluster_idx, num_clusters))
+            {
+                // This CTA's 64 gate rows (expert * 2I + b * 128 + 64 * rank) and the up rows I further
+                uint32_t const gate_row = scheduler.get_global_m_idx(SHAPE_M, BLOCK_M, m_block_idx, n_block_idx)
+                    + cta_rank * L::kRowsPerCta;
+                uint32_t const n_idx = scheduler.get_global_n_idx(n_block_idx);
+                for (uint32_t k_iter = 0; k_iter < kNumIterations; ++k_iter)
+                {
+#pragma unroll
+                    for (uint32_t s = 0; s < kNumStages; ++s)
+                    {
+                        empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
+                        auto& full_barrier = *full_barriers[s];
+                        int const k_idx = static_cast<int>(k_iter * kFullKOfAllStages + s * BLOCK_K);
+                        tma_copy(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier), smem_a[s], k_idx, gate_row);
+                        tma_copy(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
+                            smem_a[s] + L::kHalfBytesPerStage, k_idx, gate_row + SHAPE_M_HALF);
+                        tma_copy(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier), smem_b[s], k_idx, n_idx);
+                        tma_copy(&tensor_map_scales_b, reinterpret_cast<uint64_t*>(&full_barrier), smem_scales_b[s],
+                            n_block_idx * BLOCK_N, scheduler.get_global_scales_b_idx(k_idx / BLOCK_K));
+                        full_barrier.arrive_and_expect_tx(kTxBytesPerStage);
+                    }
+                }
+            }
+        }
+    }
+    else
+    {
+        // Warp-group 0 computes the gate rows and runs the epilogue, warp-group 1 the up rows
+        uint32_t const math_wg = warp_idx / 4;
+        uint32_t const tid_wg = threadIdx.x % 128;
+        uint32_t const scale_offset = (lane_idx % 4) * 2;
+        constexpr uint32_t kChunks = WGMMA::kNumAccum / 4; // n8 token chunks per thread: BLOCK_N / 8
+        uint8_t* const smem_dq = smem_buffer;
+        uint32_t const dq_addr = F::smem_addr(smem_dq);
+        uint32_t const amax_addr = F::smem_addr(smem_buffer + L::amax_offset(BLOCK_N));
+        uint32_t const up_addr = F::smem_addr(smem_buffer + L::up_offset(BLOCK_N)) + tid_wg * 4;
+        uint32_t const peer_buf_local = F::smem_addr(smem_buffer + L::peer_offset(BLOCK_N));
+        uint32_t const xchg_local = F::smem_addr(xchg_barriers);
+        uint32_t const peer_rank = cta_rank ^ 1u;
+        uint32_t const peer_buf_remote = X::peer_addr(peer_buf_local, peer_rank);
+        uint32_t const xchg_remote = X::peer_addr(xchg_local, peer_rank);
+        // The thread's output columns j_0 and j_0 + 8 of this CTA's 64 and its tokens 8 i + tok_lo + {0, 1}
+        uint32_t const j_0 = (warp_idx % 4) * 16 + lane_idx / 4;
+        uint32_t const tok_lo = 2 * (lane_idx % 4);
+        bool const odd_row = ((lane_idx / 4) & 1u) != 0u;
+        uint32_t const a_half = math_wg * L::kHalfBytesPerStage;
+        uint32_t tile = 0;
+
+        while (scheduler.get_next_block_unit(m_block_idx, n_block_idx, cluster_idx, num_clusters))
+        {
+            // Weight scales of gate block b (row b of the expert's 2I/128 scale rows) or up block b (row I/128 + b)
+            auto const num_previous_lines
+                = scheduler.get_global_scales_a_idx(ceil_div(SHAPE_M, BLOCK_K), 0, 0, n_block_idx);
+            float const* const local_scales = scales_a
+                + (num_previous_lines + ((m_block_idx * BLOCK_M) / BLOCK_K) + math_wg * (SHAPE_M_HALF / BLOCK_K))
+                    * SHAPE_K_SCALES;
+
+            // The unsplit kernel's mainloop for one half: per stage four WGMMAs, then the promotion with
+            // scale_a * scale_b (fp8_gemm_kernel_swapAB's expression)
+            float accum[WGMMA::kNumAccum], final_accum[WGMMA::kNumAccum] = {0};
+            for (uint32_t k_iter = 0; k_iter < kNumIterations; ++k_iter)
+            {
+#pragma unroll
+                for (uint32_t s = 0; s < kNumStages; ++s)
+                {
+                    float const scale_a = __ldg(local_scales + k_iter * kNumStages + s);
+                    full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
+
+                    float scale_0[WGMMA::kNumAccum / 4], scale_1[WGMMA::kNumAccum / 4];
+#pragma unroll
+                    for (int i = 0; i < WGMMA::kNumAccum / 4; ++i)
+                    {
+                        float2 scale_b
+                            = ld_shared(reinterpret_cast<const float2*>(smem_scales_b[s] + i * 8 + scale_offset));
+                        scale_0[i] = scale_a * scale_b.x;
+                        scale_1[i] = scale_a * scale_b.y;
+                    }
+
+#pragma unroll
+                    for (int i = 0; i < WGMMA::kNumAccum; ++i)
+                        warpgroup_fence_operand(accum[i]);
+                    warpgroup_arrive();
+#pragma unroll
+                    for (int k = 0; k < BLOCK_K / WGMMA::K; ++k)
+                    {
+                        auto desc_a = make_smem_desc(smem_a[s] + a_half + k * WGMMA::K, 1);
+                        auto desc_b = make_smem_desc(smem_b[s] + k * WGMMA::K, 1);
+                        WGMMA::wgmma(desc_a, desc_b, accum, k);
+                    }
+                    warpgroup_commit_batch();
+#pragma unroll
+                    for (int i = 0; i < WGMMA::kNumAccum; ++i)
+                        warpgroup_fence_operand(accum[i]);
+                    warpgroup_wait<0>();
+                    if (lane_idx == 0)
+                        empty_barriers[s]->arrive();
+
+#pragma unroll
+                    for (int i = 0; i < WGMMA::kNumAccum / 4; ++i)
+                    {
+                        final_accum[i * 4 + 0] += scale_0[i] * accum[i * 4 + 0];
+                        final_accum[i * 4 + 1] += scale_1[i] * accum[i * 4 + 1];
+                        final_accum[i * 4 + 2] += scale_0[i] * accum[i * 4 + 2];
+                        final_accum[i * 4 + 3] += scale_1[i] * accum[i * 4 + 3];
+                    }
+                }
+            }
+
+            if (math_wg == 1)
+            {
+                // The up sums rounded to bf16 pairs, as the unsplit kernel rounds them, to the gate warp-group. The
+                // previous tile's words must have been read first.
+                if (tile > 0)
+                    cutlass::arch::NamedBarrier::sync(kNumMathThreads, kBarUpFree);
+#pragma unroll
+                for (uint32_t i = 0; i < kChunks; ++i)
+                {
+#pragma unroll
+                    for (uint32_t s = 0; s < 2; ++s)
+                        X::sts_u32(up_addr + (2 * i + s) * 128 * 4,
+                            F::bf162_bits(
+                                __float22bfloat162_rn({final_accum[4 * i + 2 * s], final_accum[4 * i + 2 * s + 1]})));
+                }
+                cutlass::arch::NamedBarrier::arrive(kNumMathThreads, kBarUpReady);
+                ++tile;
+                continue;
+            }
+
+            // Gate warp-group: the unsplit kernel's epilogue steps 1-3 on this CTA's 64 columns
+            cutlass::arch::NamedBarrier::sync(kNumMathThreads, kBarUpReady);
+            uint32_t h[kChunks][2];
+            float ax[kChunks][2];
+#pragma unroll
+            for (uint32_t i = 0; i < kChunks; ++i)
+            {
+#pragma unroll
+                for (uint32_t s = 0; s < 2; ++s)
+                {
+                    __nv_bfloat162 const hh = F::silu2_mul(
+                        __float22bfloat162_rn({final_accum[4 * i + 2 * s], final_accum[4 * i + 2 * s + 1]}),
+                        F::bits_bf162(X::lds_u32(up_addr + (2 * i + s) * 128 * 4)));
+                    h[i][s] = F::bf162_bits(hh);
+                    float2 const f = __bfloat1622float2(hh);
+                    if (s == 0)
+                    {
+                        ax[i][0] = fabsf(f.x);
+                        ax[i][1] = fabsf(f.y);
+                    }
+                    else
+                    {
+                        ax[i][0] = fmaxf(ax[i][0], fabsf(f.x));
+                        ax[i][1] = fmaxf(ax[i][1], fabsf(f.y));
+                    }
+                }
+            }
+            cutlass::arch::NamedBarrier::arrive(kNumMathThreads, kBarUpFree);
+#pragma unroll
+            for (uint32_t i = 0; i < kChunks; ++i)
+            {
+#pragma unroll
+                for (uint32_t t = 0; t < 2; ++t)
+                {
+                    ax[i][t] = fmaxf(ax[i][t], __shfl_xor_sync(0xffffffffu, ax[i][t], 4));
+                    ax[i][t] = fmaxf(ax[i][t], __shfl_xor_sync(0xffffffffu, ax[i][t], 8));
+                    ax[i][t] = fmaxf(ax[i][t], __shfl_xor_sync(0xffffffffu, ax[i][t], 16));
+                }
+            }
+            if (lane_idx < 4)
+            {
+#pragma unroll
+                for (uint32_t i = 0; i < kChunks; ++i)
+                    G::sts_v2_f32(amax_addr + (warp_idx * BLOCK_N + 8 * i + tok_lo) * 4, ax[i][0], ax[i][1]);
+            }
+            // The previous tile's dq store must have finished reading the staging tile before it is rewritten
+            if (threadIdx.x == 0)
+                cute::tma_store_wait<0>();
+            cutlass::arch::NamedBarrier::sync(kNumEpilogueThreads, kBarGate); // A: partials published, staging free
+
+            // This CTA's |max| over its 64 columns per token, then the exchange: warp 0's four lanes (one per lane % 4
+            // class, together all BLOCK_N tokens) send theirs to the peer and arrive on the peer's barrier.
+            float local[kChunks][2];
+#pragma unroll
+            for (uint32_t i = 0; i < kChunks; ++i)
+            {
+                float2 m = G::lds_v2_f32(amax_addr + (8 * i + tok_lo) * 4);
+#pragma unroll
+                for (uint32_t w = 1; w < L::kNumEpilogueWarps; ++w)
+                {
+                    float2 const v = G::lds_v2_f32(amax_addr + (w * BLOCK_N + 8 * i + tok_lo) * 4);
+                    m.x = fmaxf(m.x, v.x);
+                    m.y = fmaxf(m.y, v.y);
+                }
+                local[i][0] = m.x;
+                local[i][1] = m.y;
+            }
+            uint32_t const parity_buf = tile & 1u;
+            if (warp_idx == 0 and lane_idx < 4)
+            {
+#pragma unroll
+                for (uint32_t i = 0; i < kChunks; ++i)
+                    X::st_cluster_v2_f32(peer_buf_remote + (parity_buf * BLOCK_N + 8 * i + tok_lo) * 4, local[i][0],
+                        local[i][1]);
+                X::arrive_cluster(xchg_remote + parity_buf * L::kBarrierBytes);
+            }
+            X::wait_cluster(xchg_local + parity_buf * L::kBarrierBytes, (tile >> 1) & 1u);
+
+            // amax over the 128 columns, clamped at 1e-10f; qs = 448 / amax and dequant = amax * (1 / 448), exactly as
+            // fp8_gemm_kernel_swapAB_swiglu and silu_chunk_mul_quantize_1x128_fp32_sorted_kernel write them
+            float qs[kChunks][2], dequant[kChunks][2];
+#pragma unroll
+            for (uint32_t i = 0; i < kChunks; ++i)
+            {
+                float2 const pv = G::lds_v2_f32(peer_buf_local + (parity_buf * BLOCK_N + 8 * i + tok_lo) * 4);
+                float const amax_0 = fmaxf(fmaxf(local[i][0], pv.x), 1e-10f);
+                float const amax_1 = fmaxf(fmaxf(local[i][1], pv.y), 1e-10f);
+                qs[i][0] = 448.f / amax_0;
+                qs[i][1] = 448.f / amax_1;
+                dequant[i][0] = amax_0 * (1.f / 448.f);
+                dequant[i][1] = amax_1 * (1.f / 448.f);
+            }
+
+            // Requantize this CTA's 64 columns into the [BLOCK_N][64] staging tile (row-major, no swizzle), with the
+            // unsplit kernel's paired converts and lane-four byte exchange
+#pragma unroll
+            for (uint32_t i = 0; i < kChunks; ++i)
+            {
+#pragma unroll
+                for (uint32_t s = 0; s < 2; ++s)
+                {
+                    float2 const f = __bfloat1622float2(F::bits_bf162(h[i][s]));
+                    uint32_t const q = static_cast<uint32_t>(__nv_cvt_float2_to_fp8x2(
+                        make_float2(f.x * qs[i][0], f.y * qs[i][1]), __NV_SATFINITE, __NV_E4M3));
+                    uint32_t const send = odd_row ? (q & 0xffu) : (q >> 8);
+                    uint32_t const recv = __shfl_xor_sync(0xffffffffu, send, 4);
+                    uint32_t const pair16 = odd_row ? (recv | (q & 0xff00u)) : ((q & 0xffu) | (recv << 8));
+                    uint32_t const token = 8 * i + tok_lo + (odd_row ? 1u : 0u);
+                    uint32_t const col = j_0 + 8 * s - (odd_row ? 1u : 0u);
+                    F::sts_u16(dq_addr + token * L::kOutCols + col, static_cast<uint16_t>(pair16));
+                }
+            }
+
+            // One dequant scale per token, written by CTA 0 (both CTAs hold the same values)
+            uint32_t const n_global_idx = scheduler.get_global_n_idx(n_block_idx);
+            if (cta_rank == 0 and warp_idx == 0 and lane_idx < 4)
+            {
+                float* const sd_row = gmem_sd + static_cast<uint64_t>(m_block_idx) * sd_ld + n_global_idx + tok_lo;
+#pragma unroll
+                for (uint32_t i = 0; i < kChunks; ++i)
+                    *reinterpret_cast<float2*>(sd_row + 8 * i) = make_float2(dequant[i][0], dequant[i][1]);
+            }
+
+            cute::tma_store_fence();
+            cutlass::arch::NamedBarrier::sync(kNumEpilogueThreads, kBarGate); // B: staging tile complete
+            if (threadIdx.x == 0)
+            {
+                cute::SM90_TMA_STORE_2D::copy(&tensor_map_dq, smem_dq, m_block_idx * BLOCK_M + cta_rank * L::kOutCols,
+                    n_global_idx);
+                cute::tma_store_arrive();
+            }
+            __syncwarp();
+            ++tile;
+        }
+
+        // Balance the last up-free arrival of the gate warp-group; drain the last tile's dq store
+        if (math_wg == 1 and tile > 0)
+            cutlass::arch::NamedBarrier::sync(kNumMathThreads, kBarUpFree);
+        if (threadIdx.x == 0)
+            cute::tma_store_wait<0>();
+    }
+
+    // Neither CTA leaves while its peer might still address its shared memory. The peer's only accesses to this
+    // CTA's shared memory are its amax stores and exchange-barrier arrivals, and this CTA has already waited (with
+    // acquire) for the arrivals of every tile it ran, so no ordering is left for the sync to provide: the arrive is
+    // relaxed, which spares each thread a fence on its outstanding global stores.
+    __syncwarp();
+    cute::cluster_arrive_relaxed();
+    cute::cluster_wait();
+#else
+    if (blockIdx.x == 0 and threadIdx.x == 0)
+        DG_DEVICE_ASSERT(false and "This kernel only support sm_90a");
+#endif
+}
 } // namespace deep_gemm

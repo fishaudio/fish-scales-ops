@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <utility>
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -650,13 +651,89 @@ inline void gemm_dispatch_sm90_grouped_contiguous_swapab_pair(void* mat_a_wgt, v
         static_cast<int>(num_device_sms * plan.ctas), plan.smem);
 }
 
+// FSO_SWAPAB_SPLIT=0|1 forces the cluster-split fused swap-AB FC1 off or on, for A/B runs; unset (or empty) applies
+// the rule of sm90_swapab_split_route. Read on every call, like FSO_SWAPAB_CTAS_PER_SM: set it before the first call
+// and keep it between a capture and its replays.
+inline int sm90_env_swapab_split()
+{
+    char const* e = std::getenv("FSO_SWAPAB_SPLIT");
+    if (e == nullptr || e[0] == '\0')
+        return -1;
+    return e[0] == '0' ? 0 : 1;
+}
+
+// Whether the fused swap-AB FC1 runs as fp8_gemm_kernel_swapAB_swiglu_split (fp8_gemm_impl.cuh), each SwiGLU block
+// shared by the two CTAs of a cluster, instead of one CTA per block (H2 Phase 2a, 2026-10-05). The unsplit kernel gives
+// a whole block (256 gate/up weight rows) to one CTA; when there are few blocks, most SMs stay idle and each busy SM
+// works through all K / 128 stages of its block, eight WGMMAs per warp-group each. The split kernel halves every CTA's
+// rows but pays for it with a longer epilogue (the up values handed between warp-groups, the amax exchanged between the
+// two CTAs through distributed shared memory), about 1 us of serial latency. Measured on H200
+// (/data/bench-runs/sm90_dg2_moe_20261005/phase2a; cold-L2 weights, K = 2048, block_n = 16): at 32 blocks (I = 512,
+// M = 1) the split kernel ran 9.12 us against 10.28 us; at 48 blocks (I = 768, M = 1) 11.06 against 10.90, and at
+// 64 blocks (I = 512, M = 2) 13.57 against 13.45. It only wins while the unsplit kernel occupies at most a quarter of
+// the SMs, hence the rule: 4 * (p_max / block_n activation tiles, an upper bound on the routed tiles) * (I / 128
+// blocks per tile) <= SMs. The output is bit-identical either way; only the launch shape changes. Not with two CTAs
+// per SM forced (FSO_SWAPAB_CTAS_PER_SM=2), and only on an even SM count.
+inline bool sm90_swapab_split_route(uint32_t p_max, uint32_t shape_n, uint32_t block_n, int num_device_sms)
+{
+    int const forced = sm90_env_swapab_split();
+    if (forced >= 0)
+        return forced == 1 && num_device_sms % 2 == 0;
+    if (sm90_env_swapab_ctas() == 2u || num_device_sms % 2 != 0)
+        return false;
+    uint64_t const blocks = static_cast<uint64_t>(p_max / block_n) * (shape_n / 256u);
+    return 4u * blocks <= static_cast<uint64_t>(num_device_sms);
+}
+
+// Stages of the split kernel: the largest count that divides K / 128 (no NotDivisibleK tail copy of the pipeline, as
+// the unsplit kernel's rule) and whose shared memory fits one CTA per SM. 8 at K = 2048 and block_n = 16 (152,704 B).
+inline uint32_t sm90_swapab_split_stages(uint32_t shape_k, uint32_t block_n)
+{
+    constexpr uint32_t kSm90MaxSmem = 227u * 1024u;
+    constexpr uint32_t kReservedSmemPerCta = 1024u;
+    uint32_t const k_stages = shape_k / 128u;
+    for (uint32_t stages = k_stages; stages > 1u; --stages)
+    {
+        if (k_stages % stages == 0u
+            && deep_gemm::sm90_swapab_split_smem::total_bytes(block_n, stages) + kReservedSmemPerCta <= kSm90MaxSmem)
+            return stages;
+    }
+    return 1u;
+}
+
+// The split kernel has no register rebalancing (384 threads, one CTA per SM, no setmaxnreg), so any count ptxas
+// chooses is safe; a build that spills to local memory is refused (the caller then takes the unsplit kernel). Checked
+// once per cubin, like sm90_check_swapab_pair_one_cta.
+inline bool sm90_swapab_split_build_ok(cudaKernel_t kernel)
+{
+    static std::vector<std::pair<void*, bool>> s_checked;
+    for (auto const& entry : s_checked)
+    {
+        if (entry.first == reinterpret_cast<void*>(kernel))
+            return entry.second;
+    }
+    int local_bytes = -1;
+    bool const ok = cuKernelGetAttribute(&local_bytes, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
+                        reinterpret_cast<CUkernel>(kernel), 0)
+            == CUDA_SUCCESS
+        && local_bytes == 0;
+    if (!ok)
+        std::fprintf(stderr,
+            "fish_scales_ops: the cluster-split fused swap-AB FC1 cubin spills (%d bytes of local memory per thread); "
+            "the one-CTA-per-block kernel runs instead\n",
+            local_bytes);
+    s_checked.emplace_back(reinterpret_cast<void*>(kernel), ok);
+    return ok;
+}
+
 // Contiguous grouped FC1 on sm_90, swap-AB, with the SwiGLU + 1x128 FP8 requantize fused into the epilogue (fused-FC1
 // P2a, design S2; fp8_gemm_kernel_swapAB_swiglu). Same inputs as gemm_dispatch_sm90_grouped_contiguous_swapab_pair
 // (mat_a_wgt is the stacked [gate; up] weight [G, shape_n = 2I, K]); the outputs are what
 // silu_chunk_mul_quantize_1x128_sorted_sm90 makes of that FC1's bf16 result: mat_dq [p_max, I] fp8 and
 // mat_sd [I / 128, sd_ld] fp32 (sd_ld = align4(p_max)). The launch plan is sm90_swapab_pair_plan on the fused shared-
 // memory layout (an fp8 staging tile and the amax partials instead of the two bf16 tiles), with the same register
-// guards; at block_n = 16 and K = 2048 one CTA runs 4 stages (143,360 B), and two CTAs 2 stages each.
+// guards; at block_n = 16 and K = 2048 one CTA runs 4 stages (143,360 B), and two CTAs 2 stages each. Where the
+// SwiGLU blocks are few enough (sm90_swapab_split_route), the cluster-split kernel runs instead.
 inline void gemm_dispatch_sm90_grouped_contiguous_swapab_swiglu(void* mat_a_wgt, void* mat_b_act, void* mat_dq,
     float* mat_sd, float* sfb_wgt, float* sfa_act, int* sorted_expert_ids, uint32_t num_groups, uint32_t p_max,
     uint32_t shape_n, uint32_t shape_k, uint32_t block_n, uint32_t expected_m, cudaStream_t stream,
@@ -675,6 +752,23 @@ inline void gemm_dispatch_sm90_grouped_contiguous_swapab_swiglu(void* mat_a_wgt,
         TLLM_THROW("fused SwiGLU swap-AB FC1: N must be a multiple of 256 (2I, I % 128 == 0) and K of 128, "
                    "got N=%u K=%u",
             shape_n, shape_k);
+
+    uint32_t const sd_ld_split = (p_max + 3u) / 4u * 4u;
+    if (sm90_swapab_split_route(p_max, shape_n, block_n, num_device_sms))
+    {
+        uint32_t const stages = sm90_swapab_split_stages(shape_k, block_n);
+        auto runtime = deep_gemm::jit::getGlobalCompiler().build(shape_n, shape_k, bm, block_n, block_k, num_groups,
+            stages, 1u, deep_gemm::GemmType::GroupedContiguous, true, 1u, false, true, true, true);
+        auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
+        if (sm90_swapab_split_build_ok(kernel))
+        {
+            deep_gemm::runGemmSwapABSwigluSplit(kernel, mat_a_wgt, static_cast<int>(shape_k), mat_b_act,
+                static_cast<int>(shape_k), mat_dq, mat_sd, sd_ld_split, sfb_wgt, sfa_act, shape_n, p_max, shape_k,
+                block_n, block_k, num_groups, sorted_expert_ids, stream, num_device_sms,
+                deep_gemm::sm90_swapab_split_smem::total_bytes(block_n, stages));
+            return;
+        }
+    }
 
     auto build = [&](Sm90SwapAbPairPlan const& plan)
     {

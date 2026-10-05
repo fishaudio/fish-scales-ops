@@ -310,10 +310,12 @@ std::vector<std::filesystem::path> getJitIncludeDirs()
 // mainloop's test vehicle), or with swiglu fp8_gemm_kernel_swapAB_swiglu (the SwiGLU + 1x128 FP8 requantize fused into
 // the epilogue). Its scheduler enumerates shape_n / (2 * block_m) weight blocks (one per SwiGLU column block), passed
 // explicitly as SchedulerSelectorSwapAB's kNumMBlocks.
+// swapab_split (requires swapab_pair and swiglu): fp8_gemm_kernel_swapAB_swiglu_split, the same fused FC1 with each
+// SwiGLU block shared by the two CTAs of a cluster (H2 Phase 2a); same scheduler, only the kernel name differs.
 std::string generateKernel(uint32_t const shape_n, uint32_t const shape_k, uint32_t const block_m,
     uint32_t const block_n, uint32_t const block_k, uint32_t const num_groups, uint32_t const num_stages,
     uint32_t const num_tma_multicast, deep_gemm::GemmType const gemm_type, bool swapAB = false, bool two_wg = false,
-    bool swiglu = false, bool swapab_pair = false)
+    bool swiglu = false, bool swapab_pair = false, bool swapab_split = false)
 {
     constexpr uint32_t kNumTMAThreads = 128;
     constexpr uint32_t kNumMathThreadsPerGroup = 128;
@@ -348,11 +350,15 @@ std::string generateKernel(uint32_t const shape_n, uint32_t const shape_k, uint3
         throw std::runtime_error("fused SwiGLU FC1 kernel: only as the two-warp-group FC1 or the swap-AB gate/up pair FC1");
     if (swapab_pair && (!swapAB || two_wg || gemm_type != deep_gemm::GemmType::GroupedContiguous))
         throw std::runtime_error("swap-AB gate/up pair FC1 kernel: swap-AB GroupedContiguous only");
+    if (swapab_split && !(swapab_pair && swiglu))
+        throw std::runtime_error("cluster-split swap-AB FC1 kernel: only as the fused swap-AB gate/up FC1");
 
     // Modify kernel name based on swapAB to determine which kernel function to use
+    std::string const swiglu_pair_kernel
+        = swapab_split ? "fp8_gemm_kernel_swapAB_swiglu_split" : "fp8_gemm_kernel_swapAB_swiglu";
     std::string kernel_name = swapAB
-        ? (swapab_pair ? (swiglu ? "fp8_gemm_kernel_swapAB_swiglu" : "fp8_gemm_kernel_swapAB_pair")
-                       : "fp8_gemm_kernel_swapAB")
+        ? (swapab_pair ? (swiglu ? swiglu_pair_kernel : std::string("fp8_gemm_kernel_swapAB_pair"))
+                       : std::string("fp8_gemm_kernel_swapAB"))
         : (two_wg ? (swiglu ? "fp8_gemm_kernel_2wg_swiglu" : "fp8_gemm_kernel_2wg") : "fp8_gemm_kernel");
     std::string scheduler_name = swapAB ? "SchedulerSelectorSwapAB" : "SchedulerSelector";
     std::string const scheduler_n_blocks = two_wg ? ", " + std::to_string(shape_n / (2 * block_n))
@@ -558,7 +564,7 @@ public:
     Runtime* build(uint32_t const shape_n, uint32_t const shape_k, uint32_t const block_m, uint32_t const block_n,
         uint32_t const block_k, uint32_t const num_groups, uint32_t const num_stages, uint32_t const num_tma_multicast,
         deep_gemm::GemmType const gemm_type, bool swapAB = false, uint32_t const ctas_per_sm = 1, bool two_wg = false,
-        bool swiglu = false, bool swapab_pair = false)
+        bool swiglu = false, bool swapab_pair = false, bool swapab_split = false)
     {
         int sm_version = tensorrt_llm::common::getSMVersion();
         if (sm_version != 90)
@@ -572,12 +578,13 @@ public:
         // Kernel name, from the template arguments alone. It keys the in-memory runtime cache (the per-launch hit path
         // just below) and is the readable half of a disk-cache directory name; everything else that shapes the cubin
         // is covered by the disk cache's content key (contentKey). The two-warp-group FC1 variants are marked in the
-        // prefix ("gemm_2wg_", "gemm_2wg_swiglu_"), the swap-AB gate/up pair FC1s as "gemm_swapAB_pair_" and
-        // "gemm_swapAB_swiglu_". The doubled num_groups / num_stages segment is historical and kept
-        // so names stay stable. The name does not have to end in the GEMM type: a disk load takes the type from this
+        // prefix ("gemm_2wg_", "gemm_2wg_swiglu_"), the swap-AB gate/up pair FC1s as "gemm_swapAB_pair_",
+        // "gemm_swapAB_swiglu_" and (the cluster-split one) "gemm_swapAB_swiglu_split_". The doubled num_groups /
+        // num_stages segment is historical and kept so names stay stable. The name does not have to end in the GEMM type: a disk load takes the type from this
         // call, not from the path.
+        char const* const swiglu_pair_prefix = swapab_split ? "gemm_swapAB_swiglu_split_" : "gemm_swapAB_swiglu_";
         std::string name
-            = std::string(swapAB ? (swapab_pair ? (swiglu ? "gemm_swapAB_swiglu_" : "gemm_swapAB_pair_") : "gemm_swapAB_")
+            = std::string(swapAB ? (swapab_pair ? (swiglu ? swiglu_pair_prefix : "gemm_swapAB_pair_") : "gemm_swapAB_")
                                  : (two_wg ? (swiglu ? "gemm_2wg_swiglu_" : "gemm_2wg_") : "gemm_"))
             + std::to_string(shape_n) + "_"
             + std::to_string(shape_k) + "_" + std::to_string(block_m) + "_" + std::to_string(block_n) + "_"
@@ -656,7 +663,7 @@ public:
         }
 
         std::string code = generateKernel(shape_n, shape_k, block_m, block_n, block_k, num_groups, num_stages,
-            num_tma_multicast, gemm_type, swapAB, two_wg, swiglu, swapab_pair);
+            num_tma_multicast, gemm_type, swapAB, two_wg, swiglu, swapab_pair, swapab_split);
 
         // Disk cache, used only with FSO_JIT_DUMP_CUBIN or FSO_JIT_USE_NVCC (the default NVRTC build stays in memory
         // and never touches the file system). A cubin lives in <cache>/<content key>_<name>/, the key covering the

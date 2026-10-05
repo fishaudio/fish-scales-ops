@@ -11,19 +11,22 @@ bf16 epilogue into gu. For Family B (Qwen3-30B-A3B routed experts: E=128, top-8,
 (Qwen3.5-35B-A3B: E=256, top-8, H=2048, I=512), with about one routed entry in ten masked to -1 or E, this test checks:
 
   1. Op level, for block_n 16, 32 and 64, M in {1, 8, 64, 256, 1024, 2048}, and the CTA mode the dispatch picks as
-     well as one and two CTAs per SM forced through FSO_SWAPAB_CTAS_PER_SM: the fused op's dq bytes and sd floats
-     (compared as int32 bit patterns) equal the unfused pair's on every routed row, i.e. every sorted row
-     flat_to_sorted assigns, and the pair op's gu equals the swap-AB FC1's gu on every routed row. The unfused SwiGLU
-     kernel writes only routed rows; the fused kernel also writes the padding rows of every tile it visits, whose
-     inputs the gather leaves uninitialised, so padding rows are not compared (FC2 is row-independent and the combine
-     reads routed rows only).
+     well as one and two CTAs per SM forced through FSO_SWAPAB_CTAS_PER_SM, and the cluster-split kernel
+     (fp8_gemm_kernel_swapAB_swiglu_split, two CTAs per SwiGLU block) forced off and on through FSO_SWAPAB_SPLIT:
+     the fused op's dq bytes and sd floats (compared as int32 bit patterns) equal the unfused pair's on every routed
+     row, i.e. every sorted row flat_to_sorted assigns, and the pair op's gu equals the swap-AB FC1's gu on every
+     routed row. The unfused SwiGLU kernel writes only routed rows; the fused kernel also writes the padding rows of
+     every tile it visits, whose inputs the gather leaves uninitialised, so padding rows are not compared with the
+     unfused pair (FC2 is row-independent and the combine reads routed rows only). The split kernel, however, must
+     equal the one-CTA-per-block kernel on every row of every tile they visit, padding rows included: the same
+     inputs give the same bytes.
   2. Layer level, under FSO_SWAP_BN=16, 32 and 64 and under the default dispatch, M in {1, 8, 64, 256, 1024, 2048}.
      In this process (FSO_FC1_FUSED unset) the layer output must equal the explicit unfused chain built from the
      public ops. A child process with FSO_FC1_FUSED=0 (the knob is read once per process) checks that the unfused
      layer equals the same chain and reports a sha256 of every cell's output; the fused layer's hashes must match.
   3. Determinism. For block_n 16, 32 and 64 (forced), twenty eager calls of the fused layer are bitwise identical and
      a CUDA-graph replay equals the eager result; one graph is also replayed after its routing, hidden states and
-     masked entries change.
+     masked entries change. M = 1 is among the cells, where the default route takes the cluster-split kernel.
 
 Script style: run as `python tests/gemm/unit/test_fp8_fused_fc1_swapab_sm90.py` on an H200. `--quick` restricts every
 part to M in {1, 8} and block_n 16 (the decode cells).
@@ -52,7 +55,8 @@ FAMILIES = {
 QUICK = "--quick" in sys.argv
 MS = (1, 8) if QUICK else (1, 8, 64, 256, 1024, 2048)
 BNS = (16,) if QUICK else (16, 32, 64)
-CTA_MODES = (None, "1", "2")  # None: the dispatch's own plan
+# (FSO_SWAPAB_CTAS_PER_SM, FSO_SWAPAB_SPLIT); None: the dispatch's own plan
+CTA_MODES = ((None, None), ("1", None), ("2", None), (None, "0"), (None, "1"))
 LAYER_MODES = ("bn16",) if QUICK else ("bn16", "bn32", "bn64", "default")
 DET_RUNS = 20
 
@@ -146,32 +150,50 @@ def op_level():
                 # The compared rows must hold real data, so equality is not vacuous.
                 sane = (real.numel() > 0 and bool(torch.isfinite(sd_ref[:, real]).all())
                         and bool((sd_ref[:, real] > 0).all()) and bool((ref_b != 0).any()))
-                for mode in CTA_MODES:
+                # Every row of every tile the kernels visit (block-start label >= 0), padding rows included
+                labels = se[torch.arange(0, p_max, bn, device="cuda")]
+                tiles = torch.nonzero(labels >= 0).flatten()
+                tile_rows = (tiles[:, None] * bn + torch.arange(bn, device="cuda")[None, :]).flatten()
+                unsplit = None
+                for mode, split in CTA_MODES:
                     set_env("FSO_SWAPAB_CTAS_PER_SM", mode)
+                    set_env("FSO_SWAPAB_SPLIT", split)
                     dq, sd = linear_fp8_grouped_contiguous_swapab_swiglu(hq, w13q, sh, sw13, se, bn, expected_m)
                     gu2 = linear_fp8_grouped_contiguous_swapab_pair(hq, w13q, sh, sw13, se, bn, expected_m)
                     torch.cuda.synchronize()
                     set_env("FSO_SWAPAB_CTAS_PER_SM", None)
+                    set_env("FSO_SWAPAB_SPLIT", None)
+                    tile_rows_ok = True
+                    if split == "0":
+                        unsplit = (dq[tile_rows].view(torch.uint8).clone(), sd[:, tile_rows].view(torch.int32).clone())
+                    elif split == "1":
+                        tile_rows_ok = unsplit is not None and torch.equal(
+                            dq[tile_rows].view(torch.uint8), unsplit[0]) and torch.equal(
+                            sd[:, tile_rows].view(torch.int32), unsplit[1])
                     shapes = (tuple(dq.shape) == tuple(dq_ref.shape) == (p_max, I)
                               and tuple(sd.shape) == tuple(sd_ref.shape) == (I // 128, (p_max + 3) // 4 * 4))
                     ok_fused = shapes and torch.equal(dq[real].view(torch.uint8), ref_b) \
                         and torch.equal(sd[:, real].view(torch.int32), ref_s)
                     ok_pair = torch.equal(gu2[real].view(torch.int16), gu[real].view(torch.int16))
-                    ok = sane and ok_fused and ok_pair
+                    ok = sane and ok_fused and ok_pair and tile_rows_ok
                     if shapes and not ok_fused:
                         bad_rows = int((dq[real].view(torch.uint8) != ref_b).any(dim=1).sum())
                         bad_sd = int((sd[:, real].view(torch.int32) != ref_s).sum())
                         print(f"    mismatch: {bad_rows} dq rows, {bad_sd} sd entries differ")
                     total += 1
                     passed += int(ok)
-                    print(f"{fam} M={M:5d} bn={bn:2d} ctas={mode or 'plan'}: P_max={p_max:6d} "
+                    what = f"split={split}" if split is not None else f"ctas={mode or 'plan'}"
+                    extra = "" if split != "1" else (f", split {'==' if tile_rows_ok else '!='} unsplit on "
+                                                     f"{tile_rows.numel()} tile rows")
+                    print(f"{fam} M={M:5d} bn={bn:2d} {what:9s}: P_max={p_max:6d} "
                           f"padded={int(npad.item()):6d} routed rows={real.numel():6d}  fused "
-                          f"{'==' if ok_fused else '!='} ref, pair {'==' if ok_pair else '!='} FC1  "
+                          f"{'==' if ok_fused else '!='} ref, pair {'==' if ok_pair else '!='} FC1{extra}  "
                           f"{'OK' if ok else 'FAIL'}")
                 del gu
         del w13q, sw13
         torch.cuda.empty_cache()
     set_env("FSO_SWAPAB_CTAS_PER_SM", None)
+    set_env("FSO_SWAPAB_SPLIT", None)
     return passed, total
 
 
@@ -213,7 +235,7 @@ def determinism():
         w13q, sw13, w2q, sw2 = family_weights(fam)
         for bn in BNS:
             set_mode(f"bn{bn}")
-            for M in ((1, 8) if QUICK else (8, 256)):
+            for M in ((1, 8) if QUICK else (1, 8, 256)):
                 hidden, topk_ids, topk_w = cell_inputs(fam, M, salt=1)
                 _, use_swap, _, _, fused = _sm90_layer_plan(M, E, TOPK, H, I)
                 fn = lambda: fso.compat.moe_layer_fp8_sm90(hidden, w13q, sw13, w2q, sw2, topk_ids, topk_w)
@@ -285,7 +307,8 @@ def main():
     if os.environ.get("FSO_FC1_FUSED", "")[:1] == "0":
         print("SKIP: run with FSO_FC1_FUSED unset (the test starts its own FSO_FC1_FUSED=0 child)")
         return 0
-    saved = {k: os.environ.get(k) for k in ("FSO_SWAP_BN", "FSO_SWAPAB_CTAS_PER_SM")}
+    saved = {k: os.environ.get(k) for k in ("FSO_SWAP_BN", "FSO_SWAPAB_CTAS_PER_SM", "FSO_SWAPAB_SPLIT")}
+    set_env("FSO_SWAPAB_SPLIT", None)
 
     passed, total = op_level()
 
@@ -299,6 +322,7 @@ def main():
     env["FSO_FC1_FUSED"] = "0"
     env.pop("FSO_SWAP_BN", None)
     env.pop("FSO_SWAPAB_CTAS_PER_SM", None)
+    env.pop("FSO_SWAPAB_SPLIT", None)
     child = subprocess.run([sys.executable, os.path.abspath(__file__), "--unfused-worker"]
                            + (["--quick"] if QUICK else []), env=env, capture_output=True, text=True)
     sys.stdout.write("".join("  | " + l + "\n" for l in child.stdout.splitlines() if not l.startswith("HASHES ")))

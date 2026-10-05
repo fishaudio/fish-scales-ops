@@ -650,16 +650,16 @@ __global__ void moe_build_routing_multi_ps_kernel(
 // (the DeepGEMM GroupedMasked scheduler scans all E groups per block fetch).
 // The contiguous layout instead sorts the M*topk routed pairs by expert into
 // one compact list, padding each active expert's run up to BLOCK_M, so the
-// GroupedContiguous scheduler enumerates only active padded blocks. This
-// single CTA emits, capture-safe (fixed P_max buffers, device length scalar):
-//   sorted_expert_ids [P_max] : owning expert id per sorted row across an
-//     active expert's whole padded run; -1 for the trailing slack past the
-//     actual padded length (never enumerated, thanks to the scheduler's
-//     device length gate). = the scheduler's grouped_layout.
-//   sorted_src [P_max] : source flat pair index (t*topk+s) for real rows; -1
-//     for both intra-expert pad rows and trailing slack (gather/combine skip).
+// GroupedContiguous scheduler enumerates only active padded blocks. One CTA
+// emits, capture-safe (fixed P_max buffers, device length scalar):
+//   sorted_expert_ids [P_max] : the owning expert id at every block-START row
+//     (the scheduler reads grouped_layout at m_block*BLOCK_M), -1 at the block
+//     starts of the trailing slack past the actual padded length (the
+//     scheduler's device length gate). Rows that do not start a block are not
+//     written.
+//   flat_to_sorted [M*topk] : routed pair (t*topk+s) -> its sorted row.
 //   num_padded_dev [1] : the actual padded length P_actual (triton's
-//     num_tokens_post_padded); the GEMM's device length gate reads it.
+//     num_tokens_post_padded).
 // Expert ids outside [0, num_groups) are skipped: sglang masks the rows past
 // num_token_non_padded of a CUDA-graph / piecewise-graph bucket to -1 or to
 // num_experts (its moe_align overflow slot), and those pairs must cost no
@@ -669,7 +669,44 @@ __global__ void moe_build_routing_multi_ps_kernel(
 // The first row of every block is always real (nb=ceil(cnt/BLOCK_M) implies
 // (nb-1)*BLOCK_M < cnt), so grouped_layout read at a block's first row is
 // always a valid expert even before the pad rows are labelled.
-__global__ void moe_build_sorted_kernel(
+//
+// Two launch shapes of the same function (2026-10-05, H2 Phase 2a), chosen by
+// the pair count (moe_build_sorted below):
+//   * moe_build_sorted_shared_kernel, the 0.2.0 kernel unchanged, up to
+//     kSortedSharedMaxPairs pairs: 512 threads, one shared-memory histogram,
+//     shared-memory atomics in both passes. Its cost there is the launch, not
+//     the pairs (about 2.3 us at decode).
+//   * moe_build_sorted_private_kernel above that. In the shared kernel every
+//     warp contends for the same few hundred counters, which made it 50 us for
+//     65536 pairs at E = 128. Here W "pair warps" (the host picks W from the
+//     pair count and E) each own a contiguous chunk of the pairs and a private
+//     histogram row in shared memory, so no two warps ever touch the same
+//     counter:
+//       1. each pair warp counts its chunk into its own row;
+//       2. per expert, an exclusive prefix over the rows' counts (in place) and
+//          the per-expert totals;
+//       3. warp 0: the exclusive prefix of the padded totals over the experts
+//          (the shared kernel's shuffle scan), num_padded;
+//       4. block-start labels (the shared kernel's binary search) and the
+//          scatter: an atomic increment of the warp's own counter gives the
+//          pair's rank, so a pair's row is off[e] + (pairs of e in earlier
+//          chunks) + (pairs of e placed earlier in this warp's chunk).
+//     The CTA has at least eight warps, so the per-expert and per-block loops
+//     stay parallel when W is small, and a pair warp keeps its first eight
+//     32-pair steps of expert ids in registers between the two passes.
+// Both produce the same expert segments, block labels and padded length. Inside
+// a segment the shared kernel orders pairs by the arrival of their atomics; the
+// private kernel puts earlier chunks first and keeps a chunk's step order, the
+// pairs of one 32-pair step that share an expert taking the order of their
+// atomics. No consumer depends on that order (the GEMMs and the SwiGLU-quant are
+// row-independent and the combine reads rows through flat_to_sorted).
+constexpr int kSortedSharedMaxPairs = 2048;  // up to here the shared kernel (M <= 256 at top-8)
+constexpr int kSortedMaxPairWarps = 32;
+constexpr int kSortedMinWarps = 8;
+constexpr int kSortedSmemBudget = 46 * 1024; // under the 48 KB launch limit: no cudaFuncSetAttribute, no capture hazard
+constexpr int kSortedBatch = 8;              // 32-pair steps loaded ahead per pair warp
+
+__global__ void moe_build_sorted_shared_kernel(
     int32_t const* __restrict__ topk_ids, // [M * topk]
     int32_t* __restrict__ sorted_expert_ids, // [P_max] (block-start labels)
     int32_t* __restrict__ flat_to_sorted,     // [M * topk]: pair -> sorted row
@@ -780,6 +817,180 @@ __global__ void moe_build_sorted_kernel(
         int const r = atomicAdd(&fill[es], 1);
         // -1 for a masked padded-row entry (id outside [0, num_groups)): gather / combine skip it.
         flat_to_sorted[i] = (ue < static_cast<unsigned>(num_groups)) ? off[es] + r : -1;
+    }
+}
+
+__host__ __device__ constexpr int sorted_row_len(int num_groups)
+{
+    return num_groups + 1; // + the masked-id slot (num_groups)
+}
+
+__host__ __device__ constexpr int sorted_smem_bytes(int num_pair_warps, int num_groups)
+{
+    // per pair warp: counts [row_len]; then off [num_groups]
+    return (num_pair_warps * sorted_row_len(num_groups) + num_groups) * static_cast<int>(sizeof(int32_t));
+}
+
+// The slots of kSortedBatch steps of 32 pairs from `base`: the expert id, or the masked-id slot (num_groups) for an id
+// outside [0, num_groups). Lanes past `end` get -1 and take no part.
+__device__ __forceinline__ void load_expert_batch(
+    int32_t const* __restrict__ topk_ids, int base, int end, int lane, int num_groups, int (&ev)[kSortedBatch])
+{
+#pragma unroll
+    for (int g = 0; g < kSortedBatch; ++g)
+    {
+        int const i = base + 32 * g + lane;
+        ev[g] = -1;
+        if (i < end)
+        {
+            unsigned const ue = static_cast<unsigned>(topk_ids[i]);
+            ev[g] = ue < static_cast<unsigned>(num_groups) ? static_cast<int>(ue) : num_groups;
+        }
+    }
+}
+
+__global__ void moe_build_sorted_private_kernel(
+    int32_t const* __restrict__ topk_ids, // [M * topk]
+    int32_t* __restrict__ sorted_expert_ids, // [P_max] (block-start labels)
+    int32_t* __restrict__ flat_to_sorted,     // [M * topk]: pair -> sorted row
+    int32_t* __restrict__ num_padded_dev,     // [1]
+    int num_pairs, int topk, int num_groups, int block_m, int p_max, int num_pair_warps, bool pdl)
+{
+    if (pdl)
+    {
+        cudaGridDependencySynchronize();
+        if (threadIdx.x == 0)
+            cudaTriggerProgrammaticLaunchCompletion();
+    }
+    extern __shared__ int32_t sorted_smem[];
+    int const warp = static_cast<int>(threadIdx.x) / 32;
+    int const lane = static_cast<int>(threadIdx.x) & 31;
+    int const row_len = sorted_row_len(num_groups);
+    int32_t* const hist = sorted_smem;                           // [num_pair_warps][row_len]
+    int32_t* const off = sorted_smem + num_pair_warps * row_len; // [num_groups]: totals, then their exclusive prefix
+    __shared__ int32_t s_p_actual;
+
+    // A pair warp's chunk of the pairs (a multiple of 32, so only the last chunk has a partial step); the other warps
+    // get an empty range and only take part in the per-expert and per-block loops.
+    int const chunk = ((num_pairs + num_pair_warps - 1) / num_pair_warps + 31) & ~31;
+    int const i_begin = warp * chunk;
+    int const i_end = warp < num_pair_warps ? min(num_pairs, i_begin + chunk) : i_begin;
+    int32_t* const h = hist + warp * row_len;
+
+    // Phase 1: per-warp histogram.
+    for (int idx = static_cast<int>(threadIdx.x); idx < num_pair_warps * row_len; idx += static_cast<int>(blockDim.x))
+        hist[idx] = 0;
+    __syncthreads();
+    int ev0[kSortedBatch]; // the first batch, kept for phase 4b
+    load_expert_batch(topk_ids, i_begin, i_end, lane, num_groups, ev0);
+#pragma unroll
+    for (int g = 0; g < kSortedBatch; ++g)
+    {
+        if (ev0[g] >= 0)
+            atomicAdd(&h[ev0[g]], 1); // counts only: the order of the increments does not matter
+    }
+    for (int base = i_begin + 32 * kSortedBatch; base < i_end; base += 32 * kSortedBatch)
+    {
+        int ev[kSortedBatch];
+        load_expert_batch(topk_ids, base, i_end, lane, num_groups, ev);
+#pragma unroll
+        for (int g = 0; g < kSortedBatch; ++g)
+        {
+            if (ev[g] >= 0)
+                atomicAdd(&h[ev[g]], 1);
+        }
+    }
+    __syncthreads();
+
+    // Phase 2: per expert, the exclusive prefix over the pair warps' rows (in place) and the total.
+    for (int e = static_cast<int>(threadIdx.x); e < num_groups; e += static_cast<int>(blockDim.x))
+    {
+        int running = 0;
+        for (int w = 0; w < num_pair_warps; ++w)
+        {
+            int const c = hist[w * row_len + e];
+            hist[w * row_len + e] = running;
+            running += c;
+        }
+        off[e] = running;
+    }
+    __syncthreads();
+
+    // Phase 3: exclusive prefix of padded_e = ceil(cnt/BM)*BM over the experts, as a single warp-0 shuffle scan over
+    // chunks of 32 experts. block_m is a power of 2, so the ceil is a bitwise AND.
+    int const bm_mask = block_m - 1;
+    if (warp == 0)
+    {
+        int base = 0;
+        for (int chunk0 = 0; chunk0 < num_groups; chunk0 += 32)
+        {
+            int const e = chunk0 + lane;
+            int const c = (e < num_groups) ? off[e] : 0;
+            int const padded = c > 0 ? ((c + bm_mask) & ~bm_mask) : 0;
+            int incl = padded;
+#pragma unroll
+            for (int d = 1; d < 32; d <<= 1)
+            {
+                int const v = __shfl_up_sync(0xFFFFFFFFu, incl, d);
+                if (lane >= d)
+                    incl += v;
+            }
+            if (e < num_groups)
+                off[e] = incl - padded + base; // exclusive prefix
+            base += __shfl_sync(0xFFFFFFFFu, incl, 31); // chunk total
+        }
+        if (lane == 0)
+        {
+            s_p_actual = base;
+            num_padded_dev[0] = base;
+        }
+    }
+    __syncthreads();
+    int const p_actual = s_p_actual;
+
+    // Phase 4a: label block-START rows only via an O(log E) search over off[]; slack block starts past p_actual get
+    // -1 for the scheduler length gate.
+    int const num_blocks = p_max / block_m;
+    for (int b = static_cast<int>(threadIdx.x); b < num_blocks; b += static_cast<int>(blockDim.x))
+    {
+        int const r0 = b * block_m;
+        int eid = -1;
+        if (r0 < p_actual)
+        {
+            int lo = 0, hi = num_groups - 1;
+            while (lo < hi)
+            {
+                int mid = (lo + hi + 1) >> 1;
+                if (off[mid] <= r0)
+                    lo = mid;
+                else
+                    hi = mid - 1;
+            }
+            eid = lo;
+        }
+        sorted_expert_ids[r0] = eid;
+    }
+
+    // Phase 4b: scatter, in the chunk order of phase 1. h[e] holds this warp's first rank inside expert e; an atomic
+    // increment of the warp's own counter hands out the next.
+#pragma unroll
+    for (int g = 0; g < kSortedBatch; ++g)
+    {
+        int const e = ev0[g];
+        if (e >= 0)
+            flat_to_sorted[i_begin + 32 * g + lane] = e < num_groups ? off[e] + atomicAdd(&h[e], 1) : -1;
+    }
+    for (int base = i_begin + 32 * kSortedBatch; base < i_end; base += 32 * kSortedBatch)
+    {
+        int ev[kSortedBatch];
+        load_expert_batch(topk_ids, base, i_end, lane, num_groups, ev);
+#pragma unroll
+        for (int g = 0; g < kSortedBatch; ++g)
+        {
+            int const e = ev[g];
+            if (e >= 0)
+                flat_to_sorted[base + 32 * g + lane] = e < num_groups ? off[e] + atomicAdd(&h[e], 1) : -1;
+        }
     }
 }
 
@@ -1381,8 +1592,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
 
 
 // moe_build_sorted: topk_ids [M, topk] int32 -> (sorted_expert_ids [P_max],
-// sorted_src [P_max], num_padded_dev [1]), one launch. P_max = M*topk +
-// num_groups*(block_m-1) is the worst-case padded length (fixed for capture).
+// flat_to_sorted [M*topk], num_padded_dev [1]), one launch. P_max = M*topk +
+// min(M*topk, num_groups)*(block_m-1), rounded up to block_m, is the
+// worst-case padded length (fixed for capture).
 std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_build_sorted(
     at::Tensor topk_ids, int64_t num_groups, int64_t block_m)
 {
@@ -1411,12 +1623,41 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_build_sorted(
     auto num_padded_dev = at::empty({1}, opts);
 
     auto stream = at::cuda::getCurrentCUDAStream();
-    fso_pdl_launch(moe_build_sorted_kernel, dim3(1), dim3(kRoutingThreads), stream, fso_pdl_enabled(),
+    int const E = static_cast<int>(num_groups);
+    bool const pdl = fso_pdl_enabled();
+    if (R <= kSortedSharedMaxPairs)
+    {
+        fso_pdl_launch(moe_build_sorted_shared_kernel, dim3(1), dim3(kRoutingThreads), stream, pdl,
+            reinterpret_cast<int32_t const*>(topk_ids.data_ptr()),
+            reinterpret_cast<int32_t*>(sorted_expert_ids.data_ptr()),
+            reinterpret_cast<int32_t*>(flat_to_sorted.data_ptr()),
+            reinterpret_cast<int32_t*>(num_padded_dev.data_ptr()),
+            R, topk, E, static_cast<int>(block_m), p_max);
+        return {sorted_expert_ids, flat_to_sorted, num_padded_dev};
+    }
+    // The private kernel's pair-warp count: about 256 pairs per pair warp, at most kSortedMaxPairWarps, and no more
+    // than their histogram rows fit in the static shared-memory budget; the CTA has at least kSortedMinWarps warps.
+    int num_pair_warps = (R + 255) / 256;
+    num_pair_warps = num_pair_warps > kSortedMaxPairWarps ? kSortedMaxPairWarps : num_pair_warps;
+    while (num_pair_warps > 1 && sorted_smem_bytes(num_pair_warps, E) > kSortedSmemBudget)
+        --num_pair_warps;
+    int const num_warps = num_pair_warps > kSortedMinWarps ? num_pair_warps : kSortedMinWarps;
+    cudaLaunchConfig_t cfg{};
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = pdl ? 1 : 0;
+    cfg.gridDim = dim3(1);
+    cfg.blockDim = dim3(32 * num_warps);
+    cfg.dynamicSmemBytes = static_cast<size_t>(sorted_smem_bytes(num_pair_warps, E));
+    cfg.stream = stream;
+    cfg.attrs = attrs;
+    cfg.numAttrs = 1;
+    cudaLaunchKernelEx(&cfg, moe_build_sorted_private_kernel,
         reinterpret_cast<int32_t const*>(topk_ids.data_ptr()),
         reinterpret_cast<int32_t*>(sorted_expert_ids.data_ptr()),
         reinterpret_cast<int32_t*>(flat_to_sorted.data_ptr()),
         reinterpret_cast<int32_t*>(num_padded_dev.data_ptr()),
-        R, topk, static_cast<int>(num_groups), static_cast<int>(block_m), p_max);
+        R, topk, E, static_cast<int>(block_m), p_max, num_pair_warps, pdl);
     return {sorted_expert_ids, flat_to_sorted, num_padded_dev};
 }
 

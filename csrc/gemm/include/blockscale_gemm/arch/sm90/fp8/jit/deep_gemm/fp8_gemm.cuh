@@ -514,6 +514,53 @@ void runGemmSwapABSwiglu(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b
     DG_HOST_ASSERT(status == cudaSuccess);
 }
 
+// Launch of fp8_gemm_kernel_swapAB_swiglu_split (fp8_gemm_impl.cuh): the fused swap-AB FC1 with each SwiGLU block
+// shared by the two CTAs of a cluster. Same inputs and outputs as runGemmSwapABSwiglu; the weight box is 64 rows (one
+// CTA's half of each 128-row block), the dq box is BLOCK_N x 64 without swizzle (one CTA's columns), and the launch has
+// 384 threads per CTA (gate, up and TMA warp-groups) in clusters of two. num_sms must be even.
+template <typename LayoutIndexType>
+void runGemmSwapABSwigluSplit(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_dq,
+    float* mat_sd, uint32_t sd_ld, float* scales_a, float* scales_b, uint32_t shape_m, uint32_t shape_n,
+    uint32_t shape_k, uint32_t block_n, uint32_t block_k, uint32_t num_groups, LayoutIndexType* grouped_layout,
+    cudaStream_t stream, int num_sms, uint32_t smem_size)
+{
+    constexpr auto gemm_type = GemmType::GroupedContiguous;
+    constexpr uint32_t kRowsPerCta = 64;
+    DG_HOST_ASSERT(num_sms % 2 == 0);
+    auto tma_a_desc = make_2d_tma_a_desc_swapAB(
+        reinterpret_cast<__nv_fp8_e4m3*>(mat_a), shape_m, shape_k, kRowsPerCta, block_k, num_groups, gemm_type, ld_a);
+    auto tma_b_desc = make_2d_tma_b_desc_swapAB(
+        reinterpret_cast<__nv_fp8_e4m3*>(mat_b), shape_n, shape_k, block_n, block_k, num_groups, gemm_type, ld_b);
+    auto tma_scales_b_desc
+        = make_2d_tma_scales_b_desc_swapAB(scales_b, shape_n, shape_k, block_n, block_k, num_groups, gemm_type);
+    uint32_t const shape_i = shape_m / 2;
+    auto tma_dq_desc = make_2d_tma_desc(reinterpret_cast<__nv_fp8_e4m3*>(mat_dq), Layout::RowMajor, shape_n, shape_i,
+        min(block_n, shape_n), kRowsPerCta, static_cast<uint64_t>(shape_i),
+        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
+
+    DG_HOST_ASSERT(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size) == cudaSuccess);
+
+    cudaLaunchConfig_t config;
+    config.gridDim = num_sms;
+    config.blockDim = 384;
+    config.dynamicSmemBytes = smem_size;
+    config.stream = stream;
+
+    cudaLaunchAttribute attr;
+    attr.id = cudaLaunchAttributeClusterDimension;
+    attr.val.clusterDim = {2, 1, 1};
+    config.attrs = &attr;
+    config.numAttrs = 1;
+
+    NormalSchedulerInputSwapAB input;
+    input.shape_n = shape_n;
+    input.grouped_layout = grouped_layout;
+
+    auto status = cudaLaunchKernelEx(&config, kernel, mat_sd, scales_a, input, tma_a_desc, tma_b_desc,
+        tma_scales_b_desc, tma_dq_desc, sd_ld);
+    DG_HOST_ASSERT(status == cudaSuccess);
+}
+
 }; // namespace deep_gemm
 
 #pragma clang diagnostic pop

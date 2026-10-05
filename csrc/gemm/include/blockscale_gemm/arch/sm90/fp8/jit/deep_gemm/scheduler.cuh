@@ -637,13 +637,22 @@ struct GroupedContiguousSchedulerSwapAB
 
     __device__ __forceinline__ bool get_next_block(uint32_t& m_block_idx, uint32_t& n_block_idx)
     {
+        return get_next_block_unit(m_block_idx, n_block_idx, blockIdx.x, gridDim.x);
+    }
+
+    // The persistent walk with an explicit scheduling unit: `unit` of `num_units` (the CTA and the grid size above;
+    // the cluster and the cluster count for a kernel whose cluster shares each block,
+    // fp8_gemm_kernel_swapAB_swiglu_split).
+    __device__ __forceinline__ bool get_next_block_unit(
+        uint32_t& m_block_idx, uint32_t& n_block_idx, uint32_t unit, uint32_t num_units)
+    {
         // Capture-safe length gate: skip activation-row blocks past the actual
         // padded length (grouped_layout first row -1), so work tracks active
         // padded blocks while shape_n stays a fixed host P_max.
         while (true)
         {
             ++current_iter;
-            auto const next_block_idx = current_iter * gridDim.x + blockIdx.x;
+            auto const next_block_idx = current_iter * num_units + unit;
             if (next_block_idx >= num_blocks)
             {
                 return false;
