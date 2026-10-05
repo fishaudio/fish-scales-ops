@@ -49,7 +49,8 @@
       },
       "env": {
         "CUDA_HOME": "/home/fish-dev/workspace/cuda-13.0",
-        "LD_LIBRARY_PATH": "/home/fish-dev/workspace/cuda-13.0/lib64"
+        "LD_LIBRARY_PATH": "/home/fish-dev/workspace/cuda-13.0/lib64",
+        "SGLANG_MOE_CONFIG_DIR": "/home/fish-dev/bench-runs/fso-harness/apex-moe-configs/cfed1d25"
       },
       "path_prepend": [
         "/home/fish-dev/workspace/cuda-13.0/bin"
@@ -66,7 +67,8 @@
     "Compute mode: DEFAULT for the run and the mode found before the run restored after it, as /data/bench-runs/fso_release_perf_20261001/b300/run_stage1.sh did (it found Exclusive_Process); when the card is already in Default mode the restore is a no-op.",
     "The PYTHONPATH overlay holds only expecttest 0.3.0 (pip install --no-deps --target): env0520 lacks it, and torch.testing._internal imports it for the reference MXFP8 quantize of the dense bench's cuBLAS columns and of the torch scaled_grouped_mm comparators. The overlay lives in the 2026-10-01 run directory; the preflight checks that expecttest resolves to 0.3.0 through it, so a moved or deleted overlay is a refusal, not a silent loss of those columns.",
     "Package keys are distribution names: deep_gemm is the sgl-deep-gemm distribution. Every package of the harness's list that the environment has installed is pinned (sglang, deep_gemm and FlashInfer are installed but no B300 table uses them), plus nvidia-cublas, nvidia-cuda-nvrtc and the expecttest overlay.",
-    "The sm tag is 100: the B300 is sm_103, built for the 10.0f family target, and its dense baselines are named gemm_sm100_*."
+    "The sm tag is 100: the B300 is sm_103, built for the 10.0f family target, and its dense baselines are named gemm_sm100_*.",
+    "2026-10-05: The sglang Triton comparators read their MoE tile configs from SGLANG_MOE_CONFIG_DIR, a pinned copy of apex's own config tree (apex-fish-inference cfed1d25, sglang_fish/sglang_fish/layers/moe/moe_runner/triton_utils/configs; 370 files, MANIFEST.md5 sha256 prefix 366a34a36d026df0), so the comparator column runs the configs apex serves with when it does not use fso. Each comparator row records the file sglang resolved for the gate_up and the down GEMM (moe_config)."
   ],
   "suite": {
     "pythonpath_overlays": [],

@@ -43,7 +43,8 @@
         "nvidia-cuda-nvrtc": "13.0.88"
       },
       "env": {
-        "CUDA_HOME": "/usr/local/cuda-13.2"
+        "CUDA_HOME": "/usr/local/cuda-13.2",
+        "SGLANG_MOE_CONFIG_DIR": "/data/bench-runs/fso-harness/apex-moe-configs/cfed1d25"
       },
       "path_prepend": [],
       "pythonpath_overlays": [],
@@ -55,7 +56,8 @@
     "Package keys are distribution names: deep_gemm is the sgl-deep-gemm distribution. Every package of the harness's list that the environment has installed is pinned, plus nvidia-cublas and nvidia-cuda-nvrtc (the cuBLAS and NVRTC builds torch loads); any change to one of them is drift.",
     "The environment, the CUDA_HOME and the unset knobs are those of the chains that produced the 2026-10-01 tables: /data/bench-runs/fso_release_perf_20261001/h200/scripts/run_stage1.sh and /data/bench-runs/h200_moe_tables_20261001/scripts/run_chain.sh.",
     "The sm_90 kernels are compiled by the NVRTC 13.2.78 bundled with fish_scales_ops since 9cf0a46, never by the NVRTC 13.0.88 of the torch wheel, so jit_compiler_sm90() must name NVRTC 13.2.",
-    "2026-10-05: the card is GPU 0 (PCI 8F:00.0, GPU-e87af6ea), granted for the 0.2.0 tables measured from the release wheel. The card of the 2026-10-01 runs, GPU 6 (PCI CB:00.0, GPU-f7556d6e), has run another tenant's service since 2026-10-01, and the harness refuses a card with a compute process."
+    "2026-10-05: the card is GPU 0 (PCI 8F:00.0, GPU-e87af6ea), granted for the 0.2.0 tables measured from the release wheel. The card of the 2026-10-01 runs, GPU 6 (PCI CB:00.0, GPU-f7556d6e), has run another tenant's service since 2026-10-01, and the harness refuses a card with a compute process.",
+    "2026-10-05: The sglang Triton comparators read their MoE tile configs from SGLANG_MOE_CONFIG_DIR, a pinned copy of apex's own config tree (apex-fish-inference cfed1d25, sglang_fish/sglang_fish/layers/moe/moe_runner/triton_utils/configs; 370 files, MANIFEST.md5 sha256 prefix 366a34a36d026df0), so the comparator column runs the configs apex serves with when it does not use fso. Each comparator row records the file sglang resolved for the gate_up and the down GEMM (moe_config)."
   ],
   "suite": {
     "pythonpath_overlays": [],

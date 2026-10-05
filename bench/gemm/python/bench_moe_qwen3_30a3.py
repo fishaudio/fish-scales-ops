@@ -667,6 +667,53 @@ def cos_sim(a, b):
         a.float().flatten(), b.float().flatten(), dim=0).item()
 
 
+_SGLANG_MOE_CONFIG_LOGGER = "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config"
+
+
+def _capture_sglang_moe_config_log():
+    """Start collecting the messages sglang's MoE config lookup logs (it logs the file it uses at INFO, a fallback to
+    another Triton version's file or the default config at WARNING). Returns the list the messages go into."""
+    import logging
+    msgs = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            msgs.append(record.getMessage())
+
+    log = logging.getLogger(_SGLANG_MOE_CONFIG_LOGGER)
+    log.addHandler(_Collect(level=logging.INFO))
+    if log.getEffectiveLevel() > logging.INFO:
+        log.setLevel(logging.INFO)
+    return msgs
+
+
+def _sglang_moe_config_result(msgs):
+    """The config each GEMM of an sglang Triton cell ran with, from the lookup messages:
+    moe_config = {"up": src, "down": src}, src one of "exact <triton_x_y_z>/<file>" (the running Triton's tuned file),
+    "fallback <triton_x_y_z>/<file>" (another Triton version's tuned file), "reuse-up" (no down file; the up config is
+    reused) or "default" (sglang's heuristic tiles); moe_config_dir = where sglang looked (SGLANG_MOE_CONFIG_DIR or its
+    package); tuned_cfg = whether the gate_up GEMM ran a tuned file."""
+    import re as _re
+    src = {}
+    for m in msgs:
+        hit = _re.search(r"Using MoE kernel config from (.+?\.json)", m) or \
+            _re.search(r"use MoE kernel config from (.+?\.json)", m)
+        if hit:
+            path = hit.group(1)
+            key = "down" if path.endswith("_down.json") else "up"
+            kind = "fallback" if "Fallback to triton version" in m else "exact"
+            src.setdefault(key, f"{kind} {os.path.basename(os.path.dirname(path))}/{os.path.basename(path)}")
+        elif "Down MoE config file not found" in m:
+            src.setdefault("down", "reuse-up")
+        elif "Using default MoE kernel config" in m:
+            path = (_re.search(r"Config file not found at (.+?\.json)", m) or [None, ""])[1]
+            src.setdefault("down" if path.endswith("_down.json") else "up", "default")
+    out = {"moe_config": {"up": src.get("up", "unknown"), "down": src.get("down", "unknown")},
+           "moe_config_dir": os.environ.get("SGLANG_MOE_CONFIG_DIR") or "sglang package"}
+    out["tuned_cfg"] = out["moe_config"]["up"].split(" ")[0] in ("exact", "fallback")
+    return out
+
+
 def init_sglang_shim():
     """Global server args so sglang's MoE wrappers are callable outside an engine.
 
@@ -1141,8 +1188,13 @@ def run_worker(cell):
                 fn0 = fn
                 def fn():
                     out_holder["out"] = fn0()
+                # Which tile config the two GEMMs run with is part of what this column measures: record the config file
+                # sglang resolved for the gate_up and the down GEMM (sglang_moe_config_sources), from the first call.
+                capture = None if "moe_config" in result else _capture_sglang_moe_config_log()
                 fn()
                 torch.cuda.synchronize()
+                if capture is not None:
+                    result.update(_sglang_moe_config_result(capture))
                 result["cos"] = cos_sim(out_holder["out"], ref)
             elif impl.startswith("vllm"):
                 # vLLM 0.29 triton fused_experts, the same layer boundary as the
@@ -1609,8 +1661,8 @@ def run_all(args):
                   f"M={cell['M']:<5d} FAILED: {row['error'][:120]}")
         else:
             row = derive(json.loads(line[5:]))
-            if "Config file not found" in (p.stderr or ""):
-                row["tuned_cfg"] = False
+            if "tuned_cfg" not in row and "Config file not found" in (p.stderr or ""):
+                row["tuned_cfg"] = False   # impls that do not report their config themselves
             extra = f" moe_tok/s={row['moe_tok_s']:8.1f}" if "moe_tok_s" in row else ""
             print(f"[{i+1}/{len(cells)}] {cell['impl']:14s} {cell['proj']:8s} "
                   f"M={cell['M']:<5d} {row['us']:9.2f} us  "
