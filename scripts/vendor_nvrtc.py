@@ -165,6 +165,14 @@ def mapped_files(fragment: str) -> list[str] | None:
 def self_check(stage: Path) -> str:
     """Load the staged NVRTC privately, check its version and compile a trivial kernel for sm_90a; returns a summary."""
     lib_path = stage / LIBRARY
+    # NVIDIA's libnvrtc.so.13 13.0.88 has no RUNPATH: it opens its builtins library by soname, so a copy found on the
+    # library path (the build image's own CUDA 13.0 toolkit, for one) would stand in for the staged file. An object
+    # with that soname already in the process satisfies the lookup first, so load the staged builtins by absolute
+    # path before the library, as the sm_90 JIT loader does at run time.
+    try:
+        ctypes.CDLL(str(stage / BUILTINS), mode=os.RTLD_NOW | os.RTLD_LOCAL)
+    except OSError as e:
+        raise VendorError(f"cannot load {stage / BUILTINS}: {e}") from e
     try:
         lib = ctypes.CDLL(str(lib_path), mode=os.RTLD_NOW | os.RTLD_LOCAL)
     except OSError as e:

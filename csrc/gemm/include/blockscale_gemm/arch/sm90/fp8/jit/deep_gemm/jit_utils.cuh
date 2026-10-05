@@ -94,6 +94,9 @@ inline constexpr char const* kNvrtcRemedy
     = "Run `python scripts/vendor_nvrtc.py` in the fish-scales-ops source tree (scripts/build.sh does it for an sm_90 "
       "build), or set FSO_JIT_NVRTC_LIB to a CUDA 13.0 libnvrtc.so.13.";
 
+// The builtins library that ships next to the bundled libnvrtc.so.13 (scripts/vendor_nvrtc.py unpacks both).
+inline constexpr char const* kBundledNvrtcBuiltins = "libnvrtc-builtins.so.13.0";
+
 // A function with internal linkage, so its address always lies in the shared object this translation unit is linked
 // into (the extension); dladdr on it names that file.
 static void extensionLocatorAnchor() {}
@@ -155,6 +158,22 @@ inline NvrtcApi loadNvrtcApi(bool debugLog)
 
     NvrtcApi api;
     api.path = path.string();
+    if (!fromEnv)
+    {
+        // NVIDIA's libnvrtc.so.13 13.0.88 has no RUNPATH: it opens its builtins library by soname, and an object with
+        // that soname already in the process satisfies the lookup before any directory is searched. Loading the
+        // bundled builtins by absolute path first makes that lookup find a 13.0.88 copy: torch 2.13's own when torch
+        // has already loaded it (torch preloads its NVRTC at import; same version), else this one. A builtins library
+        // of another toolkit on the library path is never used.
+        std::filesystem::path const builtins = path.parent_path() / kBundledNvrtcBuiltins;
+        dlerror();
+        if (dlopen(builtins.string().c_str(), RTLD_NOW | RTLD_LOCAL) == nullptr)
+        {
+            char const* err = dlerror();
+            TLLM_THROW("sm_90 JIT: cannot load the bundled NVRTC builtins library %s: %s. %s", builtins.string().c_str(),
+                err != nullptr ? err : "unknown error", kNvrtcRemedy);
+        }
+    }
     dlerror();
     void* handle = dlopen(api.path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (handle == nullptr)
