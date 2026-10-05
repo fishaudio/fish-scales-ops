@@ -55,6 +55,23 @@ existing name.
   expert, a 32-row tile up to 24, and above that the non-swap FC1 followed by the swap-AB FC2 on the same
   64-row layout (bit-identical to the non-swap FC2). `FSO_FC2_SWAP=0|1` forces the FC2 for A/B runs.
   `MOE_SWAP_BLOCK_N_CASCADE` and `moe_swap_ab_max_m` in `fso.compat` change accordingly.
+- **Faster sm_90 dense GEMMs.** The sm_90 dense FP8 GEMM stores its output through shared memory, one
+  TMA store per 64-column slab with the 128-byte swizzle, which is the output path of DeepGEMM's
+  `sm90_fp8_gemm_1d2d`. Its tile picker widens a 128-row tile to 128 columns where that adds no wave, and
+  at M = 65–128 it uses a 64-row tile twice as wide when the picked 128-row tile is 32 columns or
+  narrower. On the swap-AB path, which serves the smallest batches, the weight tile drops to 64 rows when
+  128-row tiles would give work to at most a quarter of the SMs. The 1x128 activation quantize gives each
+  128-element group to eight lanes. The quantize and
+  the GEMM are chained with programmatic dependent launch (PDL) on every shape, and `FSO_DISABLE_PDL=1`
+  turns it off for A/B runs. Outputs are bitwise identical to the previous kernels.
+  `docs/perf/gemm/sm90.md` and `docs/perf/layer/sm90.md` give the tables.
+- **Faster sm_90 MoE prefill glue.** Above 2048 routed pairs the routing sort gives each warp private
+  counters. From 32 tokens on, the sorted gather-quantize reads and quantizes each token row once instead
+  of once per routed pair. The layer outputs are bitwise identical; the order of the routed pairs inside
+  an expert stays unspecified, as before.
+- **Split fused FC1 for the smallest sm_90 decode.** When the swap-AB fused FC1 launches few enough blocks
+  (four times the block count fits on the SMs), two CTAs of a cluster share each 128-column SwiGLU block.
+  The result is bitwise identical, and `FSO_SWAPAB_SPLIT=0|1` forces the choice for A/B runs.
 - **Bundled sm_90 compiler.** The sm_90 kernels are compiled by a bundled NVRTC 13.2.78 that the library
   loads privately. Before, the compiler was whichever NVRTC torch had loaded: 13.0 in the torch 2.13 cu130
   wheel, which generates slower code for the dense FP8 GEMMs (`docs/perf/README.md`).
@@ -101,27 +118,31 @@ existing name.
 
 ### Known issues
 
-- **sm_90 routed + shared-expert block at M = 1.** On sm_90 the Family C block of routed experts plus the
-  shared expert is slightly slower at M = 1 than it was before the fused FC1, and faster from M = 2 up.
-  The cause is the fused FC1's first memory access in that context. `docs/perf/layer/sm90.md` gives the
-  measurement.
-- **sm_90 Family C against sglang's Triton FP8 MoE layer.** Run with apex's tuned Triton configs, sglang
-  0.5.20's Triton FP8 MoE layer is 2–4 % faster than fso on Family C at M = 1 and from M = 16 to M = 128, and
-  3–5 % faster from M = 1024 to M = 4096; at the other batch sizes fso is level with it or ahead.
+- **sm_90 MoE layer against sglang's Triton FP8 MoE layer at some decode batch sizes.** Run with apex's
+  tuned Triton configs, sglang 0.5.20's Triton FP8 MoE layer is 1.4–4.1 % faster than fso on Family C from
+  M = 16 to M = 128, and 2.3 % faster on Family B at M = 4. fso is level with it or ahead at every other
+  batch size of both families. `docs/perf/layer/sm90.md` gives the comparison.
+- **sm_90 dense block-FP8 MLP block at some batch sizes.** sglang 0.5.20's block-FP8 linear layer, which
+  runs DeepGEMM's `sm90_fp8_gemm_1d2d` kernel (sgl-deep-gemm 0.2.0) with the programmatic dependent launch
+  sglang serves it with, is faster than fso on the Family A MLP block at M = 64 to 256, by 1.6–5.6 %, and
+  at M = 1024, 2048 and 8192, by 6.0–10.5 %. fso is ahead at M = 1 to 32, at M = 512 and at M = 4096.
   `docs/perf/layer/sm90.md` gives the comparison.
-- **sm_90 dense block-FP8 GEMMs.** sglang 0.5.20's block-FP8 linear layer, which runs DeepGEMM's newer
-  `sm90_fp8_gemm_1d2d` kernel (sgl-deep-gemm 0.2.0) with the programmatic dependent launch sglang serves it
-  with, is faster than fso on the Family A MLP block at every batch size. Most of the gap is fso's GEMM
-  output-store path at prefill and its 1×128 activation quantize at decode; the next sm_90 round addresses
-  both. `docs/perf/layer/sm90.md` gives the comparison.
 - **sm_100/sm_103 MoE at middle batch sizes.** TensorRT-LLM's trtllm-gen block-FP8 routed MoE (through
-  FlashInfer 0.6.18) is up to 6 % faster than fso on Family B from M = 16 to M = 128 and up to 9 % faster on
-  Family C from M = 16 to M = 512. fso is ahead at M ≤ 8 and from M = 1024 up. `docs/perf/layer/sm100.md`
+  FlashInfer 0.6.18) is up to 6 % faster than fso on Family B from M = 32 to M = 128, and up to 8 % faster on
+  Family C from M = 16 to M = 512. On Family C, sglang 0.5.20's Triton FP8 layer with apex's tuned configs is
+  also 1.5–1.8 % faster at M = 64 and 128. fso is level with trtllm-gen at Family B's M = 16 and ahead of it
+  at M ≤ 8, from M = 256 up on Family B and from M = 1024 up on Family C. `docs/perf/layer/sm100.md` gives
+  the comparison.
+- **sm_120 Family C MoE layer at M = 1024.** On the RTX 5090, sglang 0.5.20's and vLLM 0.29.0's Triton FP8
+  MoE layers are 3.6–4.3 % faster than fso's Family C routed layer at M = 1024, and TensorRT-LLM's CUTLASS
+  FP8 per-tensor MoE is 1.1 % faster there; vLLM's layer is also 1.6 % faster at M = 64. fso is level or
+  ahead at the other Family C batch sizes and at every Family B batch size. `docs/perf/layer/sm120.md`
   gives the comparison.
-- **Blackwell dense MLP block at some batch sizes.** On the B300, sglang's block-FP8 linear (DeepGEMM) is up
-  to 12 % faster than fso's MXFP8 block from M = 32 to M = 512; on the RTX 5090, vLLM's (DeepGEMM, run as eager
-  ops) is up to 4 % faster at M = 512 and M = 1024. fso is ahead or level at the other batch sizes.
-  `docs/perf/layer/sm100.md` and `docs/perf/layer/sm120.md` give the comparisons.
+- **Blackwell dense MLP block at some batch sizes.** On the B300, sglang's block-FP8 linear (DeepGEMM) is
+  faster than fso's MXFP8 block from M = 32 to M = 2048, by up to 12.5 % at M = 128; fso is ahead at M ≤ 16
+  and from M = 4096 up. On the RTX 5090, vLLM's (DeepGEMM, run as eager ops) is 4 % faster at M = 512 and
+  level with fso at M = 1024; fso is ahead at the other batch sizes. `docs/perf/layer/sm100.md` and
+  `docs/perf/layer/sm120.md` give the comparisons.
 - **sm_100/sm_103 build toolchain.** The wheel compiles the sm_100f kernels with the CUDA 13.2.1 toolkit.
   The same kernel sources built with CUDA 13.0 are up to 3 % faster on most grouped MoE GEMM cells at
   prefill on the B300; the MoE layer moves by under 2 %. How the toolchain is pinned is under review.

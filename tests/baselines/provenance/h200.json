@@ -4,10 +4,10 @@
   "gemm_sm90_qwen3_30a3_dense.jsonl": {
    "bench_env": {},
    "bench_tree": {
-    "bench_dirty": false,
-    "commit": "5f0fb8ac3674e52e4f11f5951276a975d8a0dbe8",
-    "fingerprint": "b965c43a9dc9bc21a34c3a2ead004c5318ef8b18914dec291938062baf4a3380",
-    "source": "git"
+    "bench_dirty": null,
+    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
+    "fingerprint": "e76a0e65b6535e0a82bbb7dcc20362463497b465b741ec310b3abe8a7b8d7f9e",
+    "source": "kit"
    },
    "card": {
     "clocks_max_sm_mhz": 1980,
@@ -52,8 +52,8 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T04:22:09Z",
-     "commit": "37e316bc3febff51427dd956305e076f467b402a",
+     "built_at": "2026-10-05T17:21:52Z",
+     "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
      "cuda_toolkit": "13.2.1",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
@@ -74,66 +74,66 @@
      "torch": "2.13.0+cu130",
      "version": "0.2.0"
     },
-    "commit": "37e316bc3febff51427dd956305e076f467b402a",
-    "extension_sha256": "801f51e6cf79de8444196b7a448995bb3685e202b7038d2f0bc54e315663ecf4",
+    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
+    "extension_sha256": "cd9e552802ef10a3b50b9dd8d48adaa9bb03319e5d199035ec45585c0bfb907b",
     "source_build": false,
     "version": "0.2.0"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-05T06:04:40Z",
-   "jit_compiler_sm90": "NVRTC 13.2 (/data/bench-runs/fso_release_0.2.0_20261005/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "4a19c904c27a439b59c42c403104e279bd5f62ebb8bc30fe47bec34f0576b02f",
+   "installed_utc": "2026-10-05T18:19:07Z",
+   "jit_compiler_sm90": "NVRTC 13.2 (/data/bench-runs/fso_release_0.2.0_20261005/final/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
+   "lock_sha256": "4f4f7d998694057ba132ed40df623fa82161b5ddf8bc24045f10b2867dc67923",
    "machine": "h200",
-   "manifest_sha256": "358168616169e129d8d67d20b8b1757dac25eb46e30a8696fc27883dac185788",
+   "manifest_sha256": "cec4b2ea08e8a5d8018dc17a818a0d60638750df5c3b6ccbbded73b0eea6c84a",
    "observed_clocks": {
     "dense_B": {
-     "busy_samples": 86,
+     "busy_samples": 77,
      "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 24,
-     "power_capped_share_of_busy": 0.2791,
-     "power_w_max": 527.69,
-     "samples": 412,
+     "power_capped_busy_samples": 23,
+     "power_capped_share_of_busy": 0.2987,
+     "power_w_max": 508.33,
+     "samples": 332,
      "sm_mhz_max_busy": 1980,
-     "sm_mhz_median_busy": 1980.0,
-     "sm_mhz_min_busy": 1515,
-     "temperature_c_max": 56,
+     "sm_mhz_median_busy": 1980,
+     "sm_mhz_min_busy": 1470,
+     "temperature_c_max": 53,
      "thermal_busy_samples": 0
     }
    },
-   "run": "release-0.2.0-wheel-h200",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/release-0.2.0-wheel-h200",
+   "run": "final-0.2.0-h200",
+   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/final-0.2.0-h200",
    "steps": [
     {
      "command": [
       "/home/stone/venvs/apex-0520/bin/python",
-      "/home/stone/workspace/standalone/fso-sm90-fused-fc1/bench/gemm/python/bench_qwen3_4b_mlp.py",
+      "/data/bench-runs/fso_release_0.2.0_20261005/final/h200/suite/kit/fish_scales_ops-0.2.0-testkit-5253cd4/bench/gemm/python/bench_qwen3_4b_mlp.py",
       "--run",
       "--family",
       "qwen3-30a3",
       "--out",
-      "/data/bench-runs/fso_release_0.2.0_20261005/h200/perf/gemm_sm90_qwen3_30a3_dense.jsonl"
+      "/data/bench-runs/fso_release_0.2.0_20261005/final/h200/perf/gemm_sm90_qwen3_30a3_dense.jsonl"
      ],
-     "end_utc": "2026-10-05T05:26:44.441Z",
+     "end_utc": "2026-10-05T18:11:29.962Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "dense_B",
      "rows": 28,
-     "start_utc": "2026-10-05T05:25:21.999Z"
+     "start_utc": "2026-10-05T18:10:23.493Z"
     }
    ],
    "window_utc": [
-    "2026-10-05T05:25:21.999Z",
-    "2026-10-05T05:26:44.441Z"
+    "2026-10-05T18:10:23.493Z",
+    "2026-10-05T18:11:29.962Z"
    ]
   },
   "gemm_sm90_qwen3_35a3_dense.jsonl": {
    "bench_env": {},
    "bench_tree": {
-    "bench_dirty": false,
-    "commit": "5f0fb8ac3674e52e4f11f5951276a975d8a0dbe8",
-    "fingerprint": "b965c43a9dc9bc21a34c3a2ead004c5318ef8b18914dec291938062baf4a3380",
-    "source": "git"
+    "bench_dirty": null,
+    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
+    "fingerprint": "e76a0e65b6535e0a82bbb7dcc20362463497b465b741ec310b3abe8a7b8d7f9e",
+    "source": "kit"
    },
    "card": {
     "clocks_max_sm_mhz": 1980,
@@ -178,8 +178,8 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T04:22:09Z",
-     "commit": "37e316bc3febff51427dd956305e076f467b402a",
+     "built_at": "2026-10-05T17:21:52Z",
+     "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
      "cuda_toolkit": "13.2.1",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
@@ -200,66 +200,66 @@
      "torch": "2.13.0+cu130",
      "version": "0.2.0"
     },
-    "commit": "37e316bc3febff51427dd956305e076f467b402a",
-    "extension_sha256": "801f51e6cf79de8444196b7a448995bb3685e202b7038d2f0bc54e315663ecf4",
+    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
+    "extension_sha256": "cd9e552802ef10a3b50b9dd8d48adaa9bb03319e5d199035ec45585c0bfb907b",
     "source_build": false,
     "version": "0.2.0"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-05T06:04:40Z",
-   "jit_compiler_sm90": "NVRTC 13.2 (/data/bench-runs/fso_release_0.2.0_20261005/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "4a19c904c27a439b59c42c403104e279bd5f62ebb8bc30fe47bec34f0576b02f",
+   "installed_utc": "2026-10-05T18:19:07Z",
+   "jit_compiler_sm90": "NVRTC 13.2 (/data/bench-runs/fso_release_0.2.0_20261005/final/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
+   "lock_sha256": "4f4f7d998694057ba132ed40df623fa82161b5ddf8bc24045f10b2867dc67923",
    "machine": "h200",
-   "manifest_sha256": "358168616169e129d8d67d20b8b1757dac25eb46e30a8696fc27883dac185788",
+   "manifest_sha256": "cec4b2ea08e8a5d8018dc17a818a0d60638750df5c3b6ccbbded73b0eea6c84a",
    "observed_clocks": {
     "dense_C": {
-     "busy_samples": 270,
+     "busy_samples": 245,
      "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 61,
-     "power_capped_share_of_busy": 0.2259,
-     "power_w_max": 555.87,
-     "samples": 1233,
+     "power_capped_busy_samples": 68,
+     "power_capped_share_of_busy": 0.2776,
+     "power_w_max": 589.77,
+     "samples": 982,
      "sm_mhz_max_busy": 1980,
-     "sm_mhz_median_busy": 1980.0,
-     "sm_mhz_min_busy": 1500,
-     "temperature_c_max": 55,
+     "sm_mhz_median_busy": 1980,
+     "sm_mhz_min_busy": 1470,
+     "temperature_c_max": 53,
      "thermal_busy_samples": 0
     }
    },
-   "run": "release-0.2.0-wheel-h200",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/release-0.2.0-wheel-h200",
+   "run": "final-0.2.0-h200",
+   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/final-0.2.0-h200",
    "steps": [
     {
      "command": [
       "/home/stone/venvs/apex-0520/bin/python",
-      "/home/stone/workspace/standalone/fso-sm90-fused-fc1/bench/gemm/python/bench_qwen3_4b_mlp.py",
+      "/data/bench-runs/fso_release_0.2.0_20261005/final/h200/suite/kit/fish_scales_ops-0.2.0-testkit-5253cd4/bench/gemm/python/bench_qwen3_4b_mlp.py",
       "--run",
       "--family",
       "qwen3.5-35a3",
       "--out",
-      "/data/bench-runs/fso_release_0.2.0_20261005/h200/perf/gemm_sm90_qwen3_35a3_dense.jsonl"
+      "/data/bench-runs/fso_release_0.2.0_20261005/final/h200/perf/gemm_sm90_qwen3_35a3_dense.jsonl"
      ],
-     "end_utc": "2026-10-05T05:30:51.407Z",
+     "end_utc": "2026-10-05T18:14:46.607Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "dense_C",
      "rows": 84,
-     "start_utc": "2026-10-05T05:26:44.545Z"
+     "start_utc": "2026-10-05T18:11:30.077Z"
     }
    ],
    "window_utc": [
-    "2026-10-05T05:26:44.545Z",
-    "2026-10-05T05:30:51.407Z"
+    "2026-10-05T18:11:30.077Z",
+    "2026-10-05T18:14:46.607Z"
    ]
   },
   "gemm_sm90_qwen3_4b.jsonl": {
    "bench_env": {},
    "bench_tree": {
-    "bench_dirty": false,
-    "commit": "5f0fb8ac3674e52e4f11f5951276a975d8a0dbe8",
-    "fingerprint": "b965c43a9dc9bc21a34c3a2ead004c5318ef8b18914dec291938062baf4a3380",
-    "source": "git"
+    "bench_dirty": null,
+    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
+    "fingerprint": "e76a0e65b6535e0a82bbb7dcc20362463497b465b741ec310b3abe8a7b8d7f9e",
+    "source": "kit"
    },
    "card": {
     "clocks_max_sm_mhz": 1980,
@@ -304,8 +304,8 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T04:22:09Z",
-     "commit": "37e316bc3febff51427dd956305e076f467b402a",
+     "built_at": "2026-10-05T17:21:52Z",
+     "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
      "cuda_toolkit": "13.2.1",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
@@ -326,66 +326,66 @@
      "torch": "2.13.0+cu130",
      "version": "0.2.0"
     },
-    "commit": "37e316bc3febff51427dd956305e076f467b402a",
-    "extension_sha256": "801f51e6cf79de8444196b7a448995bb3685e202b7038d2f0bc54e315663ecf4",
+    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
+    "extension_sha256": "cd9e552802ef10a3b50b9dd8d48adaa9bb03319e5d199035ec45585c0bfb907b",
     "source_build": false,
     "version": "0.2.0"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-05T06:04:40Z",
-   "jit_compiler_sm90": "NVRTC 13.2 (/data/bench-runs/fso_release_0.2.0_20261005/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "4a19c904c27a439b59c42c403104e279bd5f62ebb8bc30fe47bec34f0576b02f",
+   "installed_utc": "2026-10-05T18:19:07Z",
+   "jit_compiler_sm90": "NVRTC 13.2 (/data/bench-runs/fso_release_0.2.0_20261005/final/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
+   "lock_sha256": "4f4f7d998694057ba132ed40df623fa82161b5ddf8bc24045f10b2867dc67923",
    "machine": "h200",
-   "manifest_sha256": "358168616169e129d8d67d20b8b1757dac25eb46e30a8696fc27883dac185788",
+   "manifest_sha256": "cec4b2ea08e8a5d8018dc17a818a0d60638750df5c3b6ccbbded73b0eea6c84a",
    "observed_clocks": {
     "dense_A": {
-     "busy_samples": 304,
+     "busy_samples": 302,
      "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 142,
-     "power_capped_share_of_busy": 0.4671,
-     "power_w_max": 710.25,
-     "samples": 1192,
+     "power_capped_busy_samples": 143,
+     "power_capped_share_of_busy": 0.4735,
+     "power_w_max": 713.88,
+     "samples": 993,
      "sm_mhz_max_busy": 1980,
-     "sm_mhz_median_busy": 1972.5,
-     "sm_mhz_min_busy": 1230,
-     "temperature_c_max": 64,
+     "sm_mhz_median_busy": 1980.0,
+     "sm_mhz_min_busy": 1125,
+     "temperature_c_max": 61,
      "thermal_busy_samples": 0
     }
    },
-   "run": "release-0.2.0-wheel-h200",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/release-0.2.0-wheel-h200",
+   "run": "final-0.2.0-h200",
+   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/final-0.2.0-h200",
    "steps": [
     {
      "command": [
       "/home/stone/venvs/apex-0520/bin/python",
-      "/home/stone/workspace/standalone/fso-sm90-fused-fc1/bench/gemm/python/bench_qwen3_4b_mlp.py",
+      "/data/bench-runs/fso_release_0.2.0_20261005/final/h200/suite/kit/fish_scales_ops-0.2.0-testkit-5253cd4/bench/gemm/python/bench_qwen3_4b_mlp.py",
       "--run",
       "--family",
       "qwen3-4b",
       "--out",
-      "/data/bench-runs/fso_release_0.2.0_20261005/h200/perf/gemm_sm90_qwen3_4b.jsonl"
+      "/data/bench-runs/fso_release_0.2.0_20261005/final/h200/perf/gemm_sm90_qwen3_4b.jsonl"
      ],
-     "end_utc": "2026-10-05T05:23:27.728Z",
+     "end_utc": "2026-10-05T18:08:40.779Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "dense_A",
      "rows": 80,
-     "start_utc": "2026-10-05T05:19:29.019Z"
+     "start_utc": "2026-10-05T18:05:21.951Z"
     }
    ],
    "window_utc": [
-    "2026-10-05T05:19:29.019Z",
-    "2026-10-05T05:23:27.728Z"
+    "2026-10-05T18:05:21.951Z",
+    "2026-10-05T18:08:40.779Z"
    ]
   },
   "gemm_sm90_qwen3_4b_mlp_fwd.jsonl": {
    "bench_env": {},
    "bench_tree": {
-    "bench_dirty": false,
-    "commit": "5f0fb8ac3674e52e4f11f5951276a975d8a0dbe8",
-    "fingerprint": "b965c43a9dc9bc21a34c3a2ead004c5318ef8b18914dec291938062baf4a3380",
-    "source": "git"
+    "bench_dirty": null,
+    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
+    "fingerprint": "e76a0e65b6535e0a82bbb7dcc20362463497b465b741ec310b3abe8a7b8d7f9e",
+    "source": "kit"
    },
    "card": {
     "clocks_max_sm_mhz": 1980,
@@ -430,8 +430,8 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T04:22:09Z",
-     "commit": "37e316bc3febff51427dd956305e076f467b402a",
+     "built_at": "2026-10-05T17:21:52Z",
+     "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
      "cuda_toolkit": "13.2.1",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
@@ -452,64 +452,64 @@
      "torch": "2.13.0+cu130",
      "version": "0.2.0"
     },
-    "commit": "37e316bc3febff51427dd956305e076f467b402a",
-    "extension_sha256": "801f51e6cf79de8444196b7a448995bb3685e202b7038d2f0bc54e315663ecf4",
+    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
+    "extension_sha256": "cd9e552802ef10a3b50b9dd8d48adaa9bb03319e5d199035ec45585c0bfb907b",
     "source_build": false,
     "version": "0.2.0"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-05T06:04:40Z",
-   "jit_compiler_sm90": "NVRTC 13.2 (/data/bench-runs/fso_release_0.2.0_20261005/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "4a19c904c27a439b59c42c403104e279bd5f62ebb8bc30fe47bec34f0576b02f",
+   "installed_utc": "2026-10-05T18:19:07Z",
+   "jit_compiler_sm90": "NVRTC 13.2 (/data/bench-runs/fso_release_0.2.0_20261005/final/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
+   "lock_sha256": "4f4f7d998694057ba132ed40df623fa82161b5ddf8bc24045f10b2867dc67923",
    "machine": "h200",
-   "manifest_sha256": "358168616169e129d8d67d20b8b1757dac25eb46e30a8696fc27883dac185788",
+   "manifest_sha256": "cec4b2ea08e8a5d8018dc17a818a0d60638750df5c3b6ccbbded73b0eea6c84a",
    "observed_clocks": {
     "mlp_fwd": {
-     "busy_samples": 54,
+     "busy_samples": 58,
      "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 19,
-     "power_capped_share_of_busy": 0.3519,
-     "power_w_max": 576.73,
-     "samples": 570,
+     "power_capped_busy_samples": 21,
+     "power_capped_share_of_busy": 0.3621,
+     "power_w_max": 572.72,
+     "samples": 512,
      "sm_mhz_max_busy": 1980,
      "sm_mhz_median_busy": 1980.0,
-     "sm_mhz_min_busy": 1545,
-     "temperature_c_max": 57,
+     "sm_mhz_min_busy": 1425,
+     "temperature_c_max": 53,
      "thermal_busy_samples": 0
     }
    },
-   "run": "release-0.2.0-wheel-h200",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/release-0.2.0-wheel-h200",
+   "run": "final-0.2.0-h200",
+   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/final-0.2.0-h200",
    "steps": [
     {
      "command": [
       "/home/stone/venvs/apex-0520/bin/python",
-      "/home/stone/workspace/standalone/fso-sm90-fused-fc1/bench/gemm/python/bench_qwen3_4b_mlp_forward.py",
+      "/data/bench-runs/fso_release_0.2.0_20261005/final/h200/suite/kit/fish_scales_ops-0.2.0-testkit-5253cd4/bench/gemm/python/bench_qwen3_4b_mlp_forward.py",
       "--run",
       "--out",
-      "/data/bench-runs/fso_release_0.2.0_20261005/h200/perf/gemm_sm90_qwen3_4b_mlp_fwd.jsonl"
+      "/data/bench-runs/fso_release_0.2.0_20261005/final/h200/perf/gemm_sm90_qwen3_4b_mlp_fwd.jsonl"
      ],
-     "end_utc": "2026-10-05T05:25:21.896Z",
+     "end_utc": "2026-10-05T18:10:23.378Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "mlp_fwd",
      "rows": 14,
-     "start_utc": "2026-10-05T05:23:27.832Z"
+     "start_utc": "2026-10-05T18:08:40.895Z"
     }
    ],
    "window_utc": [
-    "2026-10-05T05:23:27.832Z",
-    "2026-10-05T05:25:21.896Z"
+    "2026-10-05T18:08:40.895Z",
+    "2026-10-05T18:10:23.378Z"
    ]
   },
   "perf_moe_qwen3_30a3_h200.jsonl": {
    "bench_env": {},
    "bench_tree": {
-    "bench_dirty": false,
-    "commit": "5f0fb8ac3674e52e4f11f5951276a975d8a0dbe8",
-    "fingerprint": "b965c43a9dc9bc21a34c3a2ead004c5318ef8b18914dec291938062baf4a3380",
-    "source": "git"
+    "bench_dirty": null,
+    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
+    "fingerprint": "e76a0e65b6535e0a82bbb7dcc20362463497b465b741ec310b3abe8a7b8d7f9e",
+    "source": "kit"
    },
    "card": {
     "clocks_max_sm_mhz": 1980,
@@ -554,8 +554,8 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T04:22:09Z",
-     "commit": "37e316bc3febff51427dd956305e076f467b402a",
+     "built_at": "2026-10-05T17:21:52Z",
+     "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
      "cuda_toolkit": "13.2.1",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
@@ -576,66 +576,66 @@
      "torch": "2.13.0+cu130",
      "version": "0.2.0"
     },
-    "commit": "37e316bc3febff51427dd956305e076f467b402a",
-    "extension_sha256": "801f51e6cf79de8444196b7a448995bb3685e202b7038d2f0bc54e315663ecf4",
+    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
+    "extension_sha256": "cd9e552802ef10a3b50b9dd8d48adaa9bb03319e5d199035ec45585c0bfb907b",
     "source_build": false,
     "version": "0.2.0"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-05T06:04:40Z",
-   "jit_compiler_sm90": "NVRTC 13.2 (/data/bench-runs/fso_release_0.2.0_20261005/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "4a19c904c27a439b59c42c403104e279bd5f62ebb8bc30fe47bec34f0576b02f",
+   "installed_utc": "2026-10-05T18:19:07Z",
+   "jit_compiler_sm90": "NVRTC 13.2 (/data/bench-runs/fso_release_0.2.0_20261005/final/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
+   "lock_sha256": "4f4f7d998694057ba132ed40df623fa82161b5ddf8bc24045f10b2867dc67923",
    "machine": "h200",
-   "manifest_sha256": "358168616169e129d8d67d20b8b1757dac25eb46e30a8696fc27883dac185788",
+   "manifest_sha256": "cec4b2ea08e8a5d8018dc17a818a0d60638750df5c3b6ccbbded73b0eea6c84a",
    "observed_clocks": {
     "fso_30a3": {
-     "busy_samples": 62,
+     "busy_samples": 66,
      "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 3,
-     "power_capped_share_of_busy": 0.0484,
-     "power_w_max": 383.1,
-     "samples": 221,
+     "power_capped_busy_samples": 7,
+     "power_capped_share_of_busy": 0.1061,
+     "power_w_max": 355.67,
+     "samples": 214,
      "sm_mhz_max_busy": 1980,
      "sm_mhz_median_busy": 1980.0,
-     "sm_mhz_min_busy": 1740,
-     "temperature_c_max": 52,
+     "sm_mhz_min_busy": 1575,
+     "temperature_c_max": 48,
      "thermal_busy_samples": 0
     }
    },
-   "run": "release-0.2.0-wheel-h200",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/release-0.2.0-wheel-h200",
+   "run": "final-0.2.0-h200",
+   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/final-0.2.0-h200",
    "steps": [
     {
      "command": [
       "/home/stone/venvs/apex-0520/bin/python",
-      "/home/stone/workspace/standalone/fso-sm90-fused-fc1/bench/gemm/python/bench_moe_qwen3_30a3.py",
+      "/data/bench-runs/fso_release_0.2.0_20261005/final/h200/suite/kit/fish_scales_ops-0.2.0-testkit-5253cd4/bench/gemm/python/bench_moe_qwen3_30a3.py",
       "--run",
       "--impls",
       "fso_bsfp8_layer",
       "--out",
-      "/data/bench-runs/fso_release_0.2.0_20261005/h200/perf/perf_moe_qwen3_30a3_h200.jsonl"
+      "/data/bench-runs/fso_release_0.2.0_20261005/final/h200/perf/perf_moe_qwen3_30a3_h200.jsonl"
      ],
-     "end_utc": "2026-10-05T05:31:35.873Z",
+     "end_utc": "2026-10-05T18:15:29.668Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "fso_30a3",
      "rows": 15,
-     "start_utc": "2026-10-05T05:30:51.510Z"
+     "start_utc": "2026-10-05T18:14:46.723Z"
     }
    ],
    "window_utc": [
-    "2026-10-05T05:30:51.510Z",
-    "2026-10-05T05:31:35.873Z"
+    "2026-10-05T18:14:46.723Z",
+    "2026-10-05T18:15:29.668Z"
    ]
   },
   "perf_moe_qwen3_35a3_h200.jsonl": {
    "bench_env": {},
    "bench_tree": {
-    "bench_dirty": false,
-    "commit": "5f0fb8ac3674e52e4f11f5951276a975d8a0dbe8",
-    "fingerprint": "b965c43a9dc9bc21a34c3a2ead004c5318ef8b18914dec291938062baf4a3380",
-    "source": "git"
+    "bench_dirty": null,
+    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
+    "fingerprint": "e76a0e65b6535e0a82bbb7dcc20362463497b465b741ec310b3abe8a7b8d7f9e",
+    "source": "kit"
    },
    "card": {
     "clocks_max_sm_mhz": 1980,
@@ -680,8 +680,8 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T04:22:09Z",
-     "commit": "37e316bc3febff51427dd956305e076f467b402a",
+     "built_at": "2026-10-05T17:21:52Z",
+     "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
      "cuda_toolkit": "13.2.1",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
@@ -702,66 +702,66 @@
      "torch": "2.13.0+cu130",
      "version": "0.2.0"
     },
-    "commit": "37e316bc3febff51427dd956305e076f467b402a",
-    "extension_sha256": "801f51e6cf79de8444196b7a448995bb3685e202b7038d2f0bc54e315663ecf4",
+    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
+    "extension_sha256": "cd9e552802ef10a3b50b9dd8d48adaa9bb03319e5d199035ec45585c0bfb907b",
     "source_build": false,
     "version": "0.2.0"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-05T06:04:40Z",
-   "jit_compiler_sm90": "NVRTC 13.2 (/data/bench-runs/fso_release_0.2.0_20261005/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "4a19c904c27a439b59c42c403104e279bd5f62ebb8bc30fe47bec34f0576b02f",
+   "installed_utc": "2026-10-05T18:19:07Z",
+   "jit_compiler_sm90": "NVRTC 13.2 (/data/bench-runs/fso_release_0.2.0_20261005/final/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
+   "lock_sha256": "4f4f7d998694057ba132ed40df623fa82161b5ddf8bc24045f10b2867dc67923",
    "machine": "h200",
-   "manifest_sha256": "358168616169e129d8d67d20b8b1757dac25eb46e30a8696fc27883dac185788",
+   "manifest_sha256": "cec4b2ea08e8a5d8018dc17a818a0d60638750df5c3b6ccbbded73b0eea6c84a",
    "observed_clocks": {
     "fso_35a3": {
-     "busy_samples": 71,
+     "busy_samples": 69,
      "hw_slowdown_busy_samples": 0,
      "power_capped_busy_samples": 4,
-     "power_capped_share_of_busy": 0.0563,
-     "power_w_max": 340.48,
-     "samples": 240,
+     "power_capped_share_of_busy": 0.058,
+     "power_w_max": 313.14,
+     "samples": 226,
      "sm_mhz_max_busy": 1980,
      "sm_mhz_median_busy": 1980,
-     "sm_mhz_min_busy": 1860,
-     "temperature_c_max": 51,
+     "sm_mhz_min_busy": 1740,
+     "temperature_c_max": 45,
      "thermal_busy_samples": 0
     }
    },
-   "run": "release-0.2.0-wheel-h200",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/release-0.2.0-wheel-h200",
+   "run": "final-0.2.0-h200",
+   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/final-0.2.0-h200",
    "steps": [
     {
      "command": [
       "/home/stone/venvs/apex-0520/bin/python",
-      "/home/stone/workspace/standalone/fso-sm90-fused-fc1/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "/data/bench-runs/fso_release_0.2.0_20261005/final/h200/suite/kit/fish_scales_ops-0.2.0-testkit-5253cd4/bench/gemm/python/bench_moe_qwen3_35a3.py",
       "--run",
       "--impls",
       "fso_bsfp8_layer",
       "--out",
-      "/data/bench-runs/fso_release_0.2.0_20261005/h200/perf/perf_moe_qwen3_35a3_h200.jsonl"
+      "/data/bench-runs/fso_release_0.2.0_20261005/final/h200/perf/perf_moe_qwen3_35a3_h200.jsonl"
      ],
-     "end_utc": "2026-10-05T05:32:24.063Z",
+     "end_utc": "2026-10-05T18:16:15.153Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "fso_35a3",
      "rows": 15,
-     "start_utc": "2026-10-05T05:31:35.976Z"
+     "start_utc": "2026-10-05T18:15:29.783Z"
     }
    ],
    "window_utc": [
-    "2026-10-05T05:31:35.976Z",
-    "2026-10-05T05:32:24.063Z"
+    "2026-10-05T18:15:29.783Z",
+    "2026-10-05T18:16:15.153Z"
    ]
   },
   "perf_moe_qwen3_35a3_shared_h200.jsonl": {
    "bench_env": {},
    "bench_tree": {
-    "bench_dirty": false,
-    "commit": "5f0fb8ac3674e52e4f11f5951276a975d8a0dbe8",
-    "fingerprint": "b965c43a9dc9bc21a34c3a2ead004c5318ef8b18914dec291938062baf4a3380",
-    "source": "git"
+    "bench_dirty": null,
+    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
+    "fingerprint": "e76a0e65b6535e0a82bbb7dcc20362463497b465b741ec310b3abe8a7b8d7f9e",
+    "source": "kit"
    },
    "card": {
     "clocks_max_sm_mhz": 1980,
@@ -806,8 +806,8 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T04:22:09Z",
-     "commit": "37e316bc3febff51427dd956305e076f467b402a",
+     "built_at": "2026-10-05T17:21:52Z",
+     "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
      "cuda_toolkit": "13.2.1",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
@@ -828,57 +828,57 @@
      "torch": "2.13.0+cu130",
      "version": "0.2.0"
     },
-    "commit": "37e316bc3febff51427dd956305e076f467b402a",
-    "extension_sha256": "801f51e6cf79de8444196b7a448995bb3685e202b7038d2f0bc54e315663ecf4",
+    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
+    "extension_sha256": "cd9e552802ef10a3b50b9dd8d48adaa9bb03319e5d199035ec45585c0bfb907b",
     "source_build": false,
     "version": "0.2.0"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-05T06:04:40Z",
-   "jit_compiler_sm90": "NVRTC 13.2 (/data/bench-runs/fso_release_0.2.0_20261005/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "4a19c904c27a439b59c42c403104e279bd5f62ebb8bc30fe47bec34f0576b02f",
+   "installed_utc": "2026-10-05T18:19:07Z",
+   "jit_compiler_sm90": "NVRTC 13.2 (/data/bench-runs/fso_release_0.2.0_20261005/final/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
+   "lock_sha256": "4f4f7d998694057ba132ed40df623fa82161b5ddf8bc24045f10b2867dc67923",
    "machine": "h200",
-   "manifest_sha256": "358168616169e129d8d67d20b8b1757dac25eb46e30a8696fc27883dac185788",
+   "manifest_sha256": "cec4b2ea08e8a5d8018dc17a818a0d60638750df5c3b6ccbbded73b0eea6c84a",
    "observed_clocks": {
     "fso_35a3_shared": {
-     "busy_samples": 81,
+     "busy_samples": 79,
      "hw_slowdown_busy_samples": 0,
      "power_capped_busy_samples": 4,
-     "power_capped_share_of_busy": 0.0494,
-     "power_w_max": 358,
-     "samples": 654,
+     "power_capped_share_of_busy": 0.0506,
+     "power_w_max": 333.45,
+     "samples": 580,
      "sm_mhz_max_busy": 1980,
      "sm_mhz_median_busy": 1980,
-     "sm_mhz_min_busy": 1845,
-     "temperature_c_max": 51,
+     "sm_mhz_min_busy": 1710,
+     "temperature_c_max": 46,
      "thermal_busy_samples": 0
     }
    },
-   "run": "release-0.2.0-wheel-h200",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/release-0.2.0-wheel-h200",
+   "run": "final-0.2.0-h200",
+   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/final-0.2.0-h200",
    "steps": [
     {
      "command": [
       "/home/stone/venvs/apex-0520/bin/python",
-      "/home/stone/workspace/standalone/fso-sm90-fused-fc1/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "/data/bench-runs/fso_release_0.2.0_20261005/final/h200/suite/kit/fish_scales_ops-0.2.0-testkit-5253cd4/bench/gemm/python/bench_moe_qwen3_35a3.py",
       "--run",
       "--impls",
       "fso_bsfp8_layer_shared",
       "--out",
-      "/data/bench-runs/fso_release_0.2.0_20261005/h200/perf/perf_moe_qwen3_35a3_shared_h200.jsonl"
+      "/data/bench-runs/fso_release_0.2.0_20261005/final/h200/perf/perf_moe_qwen3_35a3_shared_h200.jsonl"
      ],
-     "end_utc": "2026-10-05T05:34:35.182Z",
+     "end_utc": "2026-10-05T18:18:11.265Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "fso_35a3_shared",
      "rows": 15,
-     "start_utc": "2026-10-05T05:32:24.168Z"
+     "start_utc": "2026-10-05T18:16:15.268Z"
     }
    ],
    "window_utc": [
-    "2026-10-05T05:32:24.168Z",
-    "2026-10-05T05:34:35.182Z"
+    "2026-10-05T18:16:15.268Z",
+    "2026-10-05T18:18:11.265Z"
    ]
   },
   "ref_mlp_qwen3_4b_h200.jsonl": {
