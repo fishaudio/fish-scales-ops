@@ -438,6 +438,13 @@ GemmConfig get_best_gemm_config(uint32_t shape_m, uint32_t shape_n, uint32_t sha
 //    weights keep 128 rows: 64-row tiles measured mixed at N = 5120-6144 and 3-34 % slower from N = 9216, where they
 //    exceed one wave.
 //
+// 3. Main path, M <= 128 with a narrow pick. A 128-row tile covers all of M in one M-block, and when the picker
+//    then chose block_n <= 32 (the narrow outputs, N up to about 4096) every CTA streams 128 rows of A for at most
+//    32 rows of B and runs WGMMAs at most 32 wide. Two 64-row tiles of twice the width keep the CTA count and the
+//    output area per CTA, cut the rows each CTA loads per k-block from 128 + block_n to 64 + 2 x block_n and double
+//    the WGMMA width (0.95-0.97 of the time with the 128-row tile on the five family cells where the rule applies,
+//    M = 128; multicast stays off at these M).
+//
 // The stage count is recomputed for the new tile with get_best_gemm_config's rule (the deepest of 8..4, or 6..4
 // when block_n does not divide 128, that fits the shared memory) and so is the multicast of rule 1 (2 when
 // M >= 1024 and N splits into pairs of 128-wide tiles). `swap_ab` selects the shape convention of the swap-AB call:
@@ -475,6 +482,12 @@ inline GemmConfig get_dense_gemm_config(
             restage();
             num_tma_multicast
                 = (shape_m >= 1024 && is_tma_multicast_legal(shape_n, block_n, 2, num_device_sms)) ? 2 : 1;
+        }
+        if (block_m == 128 && shape_m <= 128 && block_n <= 32)
+        {
+            block_m = 64;
+            block_n *= 2;
+            restage();
         }
     }
     else
