@@ -885,8 +885,8 @@
    "bench_env": {},
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "c6afcb07af51f7204fc6f6893dea99edc0312476",
-    "fingerprint": "32112caafebd51115e5183490e869ba0338f28cfa54c1a6c8419a18bcf9a0689",
+    "commit": "18e4b67bb9ec243f0fc33f5ecad2df0725dae7d6",
+    "fingerprint": "e76a0e65b6535e0a82bbb7dcc20362463497b465b741ec310b3abe8a7b8d7f9e",
     "source": "kit"
    },
    "card": {
@@ -960,90 +960,90 @@
     "version": "0.2.0"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-05T07:19:47Z",
+   "installed_utc": "2026-10-05T12:28:49Z",
    "jit_compiler_sm90": "NVRTC 13.2 (/data/bench-runs/fso_release_0.2.0_20261005/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
    "lock_sha256": "4f4f7d998694057ba132ed40df623fa82161b5ddf8bc24045f10b2867dc67923",
    "machine": "h200",
-   "manifest_sha256": "3b9e99e343695f925e286200eb5d1b32815c5b1d5d1bdd1edc6fda652c761e2d",
+   "manifest_sha256": "7f37aeef169a7e7f4f9df44730193e44b0dd497fdd79071e2088891b059e5690",
    "observed_clocks": {
     "mlp_ref_cublas": {
-     "busy_samples": 54,
+     "busy_samples": 42,
      "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 6,
-     "power_capped_share_of_busy": 0.1111,
-     "power_w_max": 429.97,
-     "samples": 747,
+     "power_capped_busy_samples": 4,
+     "power_capped_share_of_busy": 0.0952,
+     "power_w_max": 416.23,
+     "samples": 528,
      "sm_mhz_max_busy": 1980,
      "sm_mhz_median_busy": 1980.0,
-     "sm_mhz_min_busy": 1515,
-     "temperature_c_max": 52,
+     "sm_mhz_min_busy": 1530,
+     "temperature_c_max": 49,
      "thermal_busy_samples": 0
     },
     "mlp_ref_sgl": {
-     "busy_samples": 48,
+     "busy_samples": 40,
      "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 5,
-     "power_capped_share_of_busy": 0.1042,
-     "power_w_max": 383.95,
-     "samples": 1135,
+     "power_capped_busy_samples": 7,
+     "power_capped_share_of_busy": 0.175,
+     "power_w_max": 387.22,
+     "samples": 637,
      "sm_mhz_max_busy": 1980,
      "sm_mhz_median_busy": 1980.0,
-     "sm_mhz_min_busy": 1485,
-     "temperature_c_max": 52,
+     "sm_mhz_min_busy": 1470,
+     "temperature_c_max": 51,
      "thermal_busy_samples": 0
     }
    },
-   "run": "h200-mlp-cmp",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/h200-mlp-cmp",
+   "run": "h200-cmp-pdl",
+   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/h200-cmp-pdl",
    "steps": [
     {
      "command": [
       "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_release_0.2.0_20261005/kits/kit-c6afcb0/bench/gemm/python/bench_qwen3_4b_mlp_forward.py",
+      "/data/bench-runs/fso_release_0.2.0_20261005/kits/kit-18e4b67/bench/gemm/python/bench_qwen3_4b_mlp_forward.py",
       "--run",
       "--dtypes",
       "sgl_fp8b",
       "--out",
-      "/data/bench-runs/fso_release_0.2.0_20261005/runs/h200-mlpref/ref_mlp_sgl_h200.jsonl"
+      "/data/bench-runs/fso_release_0.2.0_20261005/runs/h200-cmp-pdl/ref_mlp_sgl_h200.jsonl"
      ],
-     "end_utc": "2026-10-05T07:14:25.689Z",
+     "end_utc": "2026-10-05T12:26:06.265Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "mlp_ref_sgl",
      "rows": 14,
-     "start_utc": "2026-10-05T07:10:38.384Z"
+     "start_utc": "2026-10-05T12:23:58.923Z"
     },
     {
      "command": [
       "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_release_0.2.0_20261005/kits/kit-c6afcb0/bench/gemm/python/bench_qwen3_4b_mlp_forward.py",
+      "/data/bench-runs/fso_release_0.2.0_20261005/kits/kit-18e4b67/bench/gemm/python/bench_qwen3_4b_mlp_forward.py",
       "--run",
       "--dtypes",
       "cublas_fp8b",
       "--out",
-      "/data/bench-runs/fso_release_0.2.0_20261005/runs/h200-mlpref/ref_mlp_cublas_h200.jsonl"
+      "/data/bench-runs/fso_release_0.2.0_20261005/runs/h200-cmp-pdl/ref_mlp_cublas_h200.jsonl"
      ],
-     "end_utc": "2026-10-05T07:16:55.470Z",
+     "end_utc": "2026-10-05T12:27:52.026Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "mlp_ref_cublas",
      "rows": 14,
-     "start_utc": "2026-10-05T07:14:25.824Z"
+     "start_utc": "2026-10-05T12:26:06.385Z"
     }
    ],
    "window_utc": [
-    "2026-10-05T07:10:38.384Z",
-    "2026-10-05T07:16:55.470Z"
+    "2026-10-05T12:23:58.923Z",
+    "2026-10-05T12:27:52.026Z"
    ]
   },
   "ref_moe_qwen3_30a3_h200.jsonl": {
    "bench_env": {},
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "b38066a590b7f37f4c8edaa583eaccdc2e850051",
-    "fingerprint": "d2572702decc2d2da0329e46fa1f53b4d0fcea97f37198bf6cf218a138d6642a",
+    "commit": "18e4b67bb9ec243f0fc33f5ecad2df0725dae7d6",
+    "fingerprint": "e76a0e65b6535e0a82bbb7dcc20362463497b465b741ec310b3abe8a7b8d7f9e",
     "source": "kit"
    },
    "card": {
@@ -1117,59 +1117,59 @@
     "version": "0.2.0"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-05T06:57:46Z",
+   "installed_utc": "2026-10-05T12:28:49Z",
    "jit_compiler_sm90": "NVRTC 13.2 (/data/bench-runs/fso_release_0.2.0_20261005/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
    "lock_sha256": "4f4f7d998694057ba132ed40df623fa82161b5ddf8bc24045f10b2867dc67923",
    "machine": "h200",
-   "manifest_sha256": "083a8dc26f521b59f9caef168f481e8f02ad08444a0e7b0580b3c476b8c93f3d",
+   "manifest_sha256": "7f37aeef169a7e7f4f9df44730193e44b0dd497fdd79071e2088891b059e5690",
    "observed_clocks": {
     "ref_30a3": {
-     "busy_samples": 300,
+     "busy_samples": 284,
      "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 17,
-     "power_capped_share_of_busy": 0.0567,
-     "power_w_max": 680.99,
-     "samples": 2443,
+     "power_capped_busy_samples": 18,
+     "power_capped_share_of_busy": 0.0634,
+     "power_w_max": 708.56,
+     "samples": 1787,
      "sm_mhz_max_busy": 1980,
      "sm_mhz_median_busy": 1980.0,
-     "sm_mhz_min_busy": 1350,
-     "temperature_c_max": 54,
+     "sm_mhz_min_busy": 1515,
+     "temperature_c_max": 52,
      "thermal_busy_samples": 0
     }
    },
-   "run": "h200-cmp-apexcfg",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/h200-cmp-apexcfg",
+   "run": "h200-cmp-pdl",
+   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/h200-cmp-pdl",
    "steps": [
     {
      "command": [
       "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_release_0.2.0_20261005/kits/kit-b38066a/bench/gemm/python/bench_moe_qwen3_30a3.py",
+      "/data/bench-runs/fso_release_0.2.0_20261005/kits/kit-18e4b67/bench/gemm/python/bench_moe_qwen3_30a3.py",
       "--run",
       "--impls",
       "triton_bf16,triton_fp8b,dg_fp8_layer",
       "--out",
-      "/data/bench-runs/fso_release_0.2.0_20261005/runs/h200-cmp-apexcfg/ref_new_30a3_h200.jsonl"
+      "/data/bench-runs/fso_release_0.2.0_20261005/runs/h200-cmp-pdl/ref_new_30a3_h200.jsonl"
      ],
-     "end_utc": "2026-10-05T06:49:32.619Z",
+     "end_utc": "2026-10-05T12:17:30.087Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "ref_30a3",
      "rows": 36,
-     "start_utc": "2026-10-05T06:41:23.405Z"
+     "start_utc": "2026-10-05T12:11:32.268Z"
     }
    ],
    "window_utc": [
-    "2026-10-05T06:41:23.405Z",
-    "2026-10-05T06:49:32.619Z"
+    "2026-10-05T12:11:32.268Z",
+    "2026-10-05T12:17:30.087Z"
    ]
   },
   "ref_moe_qwen3_35a3_h200.jsonl": {
    "bench_env": {},
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "b38066a590b7f37f4c8edaa583eaccdc2e850051",
-    "fingerprint": "d2572702decc2d2da0329e46fa1f53b4d0fcea97f37198bf6cf218a138d6642a",
+    "commit": "18e4b67bb9ec243f0fc33f5ecad2df0725dae7d6",
+    "fingerprint": "e76a0e65b6535e0a82bbb7dcc20362463497b465b741ec310b3abe8a7b8d7f9e",
     "source": "kit"
    },
    "card": {
@@ -1243,51 +1243,51 @@
     "version": "0.2.0"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-05T06:57:46Z",
+   "installed_utc": "2026-10-05T12:28:49Z",
    "jit_compiler_sm90": "NVRTC 13.2 (/data/bench-runs/fso_release_0.2.0_20261005/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
    "lock_sha256": "4f4f7d998694057ba132ed40df623fa82161b5ddf8bc24045f10b2867dc67923",
    "machine": "h200",
-   "manifest_sha256": "083a8dc26f521b59f9caef168f481e8f02ad08444a0e7b0580b3c476b8c93f3d",
+   "manifest_sha256": "7f37aeef169a7e7f4f9df44730193e44b0dd497fdd79071e2088891b059e5690",
    "observed_clocks": {
     "ref_35a3": {
-     "busy_samples": 414,
+     "busy_samples": 415,
      "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 13,
-     "power_capped_share_of_busy": 0.0314,
-     "power_w_max": 474.15,
-     "samples": 2229,
+     "power_capped_busy_samples": 12,
+     "power_capped_share_of_busy": 0.0289,
+     "power_w_max": 475.65,
+     "samples": 1942,
      "sm_mhz_max_busy": 1980,
-     "sm_mhz_median_busy": 1980.0,
-     "sm_mhz_min_busy": 1680,
-     "temperature_c_max": 53,
+     "sm_mhz_median_busy": 1980,
+     "sm_mhz_min_busy": 1710,
+     "temperature_c_max": 50,
      "thermal_busy_samples": 0
     }
    },
-   "run": "h200-cmp-apexcfg",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/h200-cmp-apexcfg",
+   "run": "h200-cmp-pdl",
+   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/h200-cmp-pdl",
    "steps": [
     {
      "command": [
       "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_release_0.2.0_20261005/kits/kit-b38066a/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "/data/bench-runs/fso_release_0.2.0_20261005/kits/kit-18e4b67/bench/gemm/python/bench_moe_qwen3_35a3.py",
       "--run",
       "--impls",
       "triton_bf16,triton_fp8b,dg_fp8_layer",
       "--out",
-      "/data/bench-runs/fso_release_0.2.0_20261005/runs/h200-cmp-apexcfg/ref_new_35a3_h200.jsonl"
+      "/data/bench-runs/fso_release_0.2.0_20261005/runs/h200-cmp-pdl/ref_new_35a3_h200.jsonl"
      ],
-     "end_utc": "2026-10-05T06:56:58.895Z",
+     "end_utc": "2026-10-05T12:23:58.806Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "ref_35a3",
      "rows": 36,
-     "start_utc": "2026-10-05T06:49:32.744Z"
+     "start_utc": "2026-10-05T12:17:30.205Z"
     }
    ],
    "window_utc": [
-    "2026-10-05T06:49:32.744Z",
-    "2026-10-05T06:56:58.895Z"
+    "2026-10-05T12:17:30.205Z",
+    "2026-10-05T12:23:58.806Z"
    ]
   }
  },

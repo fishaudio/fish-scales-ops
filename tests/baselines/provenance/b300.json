@@ -908,8 +908,8 @@
    },
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "c6afcb07af51f7204fc6f6893dea99edc0312476",
-    "fingerprint": "32112caafebd51115e5183490e869ba0338f28cfa54c1a6c8419a18bcf9a0689",
+    "commit": "18e4b67bb9ec243f0fc33f5ecad2df0725dae7d6",
+    "fingerprint": "e76a0e65b6535e0a82bbb7dcc20362463497b465b741ec310b3abe8a7b8d7f9e",
     "source": "kit"
    },
    "card": {
@@ -984,51 +984,51 @@
     "version": "0.2.0"
    },
    "host": "fish-dev-5f7c8f8bbf-w7jtr",
-   "installed_utc": "2026-10-05T07:19:48Z",
+   "installed_utc": "2026-10-05T12:15:46Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
-   "manifest_sha256": "7fcf5e3acaacd506320d5f021908c2b141c3c65173b69cb0a542769e304d07eb",
+   "manifest_sha256": "c1abf929c5356cd3fd471ab5386446445beed746bc6e12b23feaea945985a642",
    "observed_clocks": {
     "mlp_ref_sgl": {
      "busy_samples": 80,
      "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 4,
-     "power_capped_share_of_busy": 0.05,
-     "power_w_max": 761.41,
-     "samples": 847,
+     "power_capped_busy_samples": 3,
+     "power_capped_share_of_busy": 0.0375,
+     "power_w_max": 754.43,
+     "samples": 1141,
      "sm_mhz_max_busy": 2032,
      "sm_mhz_median_busy": 2032.0,
-     "sm_mhz_min_busy": 1342,
-     "temperature_c_max": 52,
+     "sm_mhz_min_busy": 1305,
+     "temperature_c_max": 53,
      "thermal_busy_samples": 0
     }
    },
-   "run": "b300-mlp-cmp",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/b300-mlp-cmp",
+   "run": "b300-mlp-cmp-pdl",
+   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/b300-mlp-cmp-pdl",
    "steps": [
     {
      "command": [
       "/home/fish-dev/bench-runs/drama_pcg_b300_2026-09-26/env0520/venv/bin/python",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/kit-c6afcb0/bench/gemm/python/bench_qwen3_4b_mlp_forward.py",
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/kit-18e4b67/bench/gemm/python/bench_qwen3_4b_mlp_forward.py",
       "--run",
       "--dtypes",
       "sgl_fp8b",
       "--out",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/perf_mlpref/ref_mlp_sgl_b300.jsonl"
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/perf_mlppdl/ref_mlp_sgl_b300.jsonl"
      ],
-     "end_utc": "2026-10-05T07:15:20.934Z",
+     "end_utc": "2026-10-05T12:15:24.288Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "mlp_ref_sgl",
      "rows": 14,
-     "start_utc": "2026-10-05T07:12:31.575Z"
+     "start_utc": "2026-10-05T12:11:36.167Z"
     }
    ],
    "window_utc": [
-    "2026-10-05T07:12:31.575Z",
-    "2026-10-05T07:15:20.934Z"
+    "2026-10-05T12:11:36.167Z",
+    "2026-10-05T12:15:24.288Z"
    ]
   },
   "ref_moe_qwen3_30a3_b300.jsonl": {
