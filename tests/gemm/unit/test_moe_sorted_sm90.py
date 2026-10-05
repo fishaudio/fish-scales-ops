@@ -123,6 +123,11 @@ def main():
         (512, 8, 64, 1024, True), (4096, 8, 16, 1024, True),
         (1024, 8, 64, 128, "all"),     # every entry masked: nothing routed
     ]
+    # moe_build_sorted runs on every architecture; the sorted gather-quantize it feeds is an sm_90-only op
+    # (quantize_1x128_sorted_gather_sm90 refuses other devices), so its check runs on sm_90 only.
+    gather_on_device = torch.cuda.get_device_capability(0)[0] == 9
+    if not gather_on_device:
+        print("  note: the sorted gather-quantize is sm_90 only; its check is skipped on this device")
     for M, topk, block_m, e_count, masked in cases:
         if masked == "all":
             topk_ids = torch.full((M, topk), -1, device="cuda", dtype=torch.int32)
@@ -132,7 +137,8 @@ def main():
         p_actual = int(npad.item())
         routed = reference_check(topk_ids.cpu(), e_count, block_m, se.cpu(), fts.cpu(), p_actual)
         hidden = torch.randn(M, H, device="cuda", dtype=torch.bfloat16)
-        gather_check(hidden, topk, fts, int(se.shape[0]))
+        if gather_on_device:
+            gather_check(hidden, topk, fts, int(se.shape[0]))
         ids = topk_ids.reshape(-1)
         ids = ids[(ids >= 0) & (ids < e_count)].long()
         active = int((torch.bincount(ids, minlength=e_count) > 0).sum())
