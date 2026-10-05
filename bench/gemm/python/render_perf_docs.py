@@ -184,7 +184,9 @@ def grouped_kernel_cmp_table(name):
 # and cuBLAS's, read from ref_mlp_qwen3_4b_<dev>.jsonl (perf_report.py merges one raw file per library into it) and
 # joined to the fso rows by M. A comparator's columns appear once the file has a timed cell of it, so the table
 # renders unchanged until then; its title names the GEMM backend its cells recorded; ×fso BSFP8 is its µs over fso's
-# BSFP8 µs (the same 1x128 / 128x128 block-FP8 recipe), so above 1 is fso ahead.
+# BSFP8 µs (the same 1x128 / 128x128 block-FP8 recipe), so above 1 is fso ahead. On Blackwell (sm != 90) a second
+# ratio, ×fso MXFP8, divides by fso's MXFP8 µs: fso.dense serves a block-FP8 checkpoint there by re-quantizing it to
+# MXFP8, so that is the column a caller of fso.dense gets.
 MLP_CMP = [("sgl_fp8b", "sglang block-FP8 linear"), ("vllm_fp8b", "vLLM block-FP8 linear"),
            ("cublas_fp8b", "cuBLAS scaled_mm block-FP8")]
 
@@ -212,7 +214,11 @@ def mlp_table(name, sm, ref_name=None):
     else:
         hdr = ["| M | BF16 (torch) µs | BSFP8 µs | BSFP8 TFLOPS | BSFP8 cos | model ms |", "|---:|---:|---:|---:|---:|---:|"]
     if cmp_cols:
-        hdr = [hdr[0] + "".join(f" {t} | ×fso BSFP8 |" for _, t in cmp_cols), hdr[1] + "---:|---:|" * len(cmp_cols)]
+        if sm != 90:
+            hdr = [hdr[0] + "".join(f" {t} | ×fso BSFP8 | ×fso MXFP8 |" for _, t in cmp_cols),
+                   hdr[1] + "---:|---:|---:|" * len(cmp_cols)]
+        else:
+            hdr = [hdr[0] + "".join(f" {t} | ×fso BSFP8 |" for _, t in cmp_cols), hdr[1] + "---:|---:|" * len(cmp_cols)]
     body = []
     for M in sorted(rows):
         r = rows[M]
@@ -227,6 +233,9 @@ def mlp_table(name, sm, ref_name=None):
         for dt, _ in cmp_cols:
             us, fso_us = ((cmp_rows.get(M) or {}).get(dt) or {}).get("graph_us"), s.get("graph_us")
             line += f" {f2(us)} | {f2(us / fso_us if us is not None and fso_us else None)} |"
+            if sm != 90:
+                mx_us = r["mxfp8"].get("graph_us")
+                line += f" {f2(us / mx_us if us is not None and mx_us else None)} |"
         body.append(line)
     return hdr, body
 

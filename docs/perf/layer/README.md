@@ -49,7 +49,9 @@ other comparators in `sm100.md`.
   layer's weights (`../README.md` §1). Rows of the single-copy protocol used
   before 2026-09-28 replayed one warm copy, and their small-M values were
   L2-resident optimism, `model ms` included; none of them is published any
-  more. See each file's provenance.
+  more. Each file's Provenance section lists its baseline files, and the
+  generated block [Environments of record](../README.md#environments-of-record)
+  names the run behind each.
 - Family C rows come in two flavours: routed-only and routed + shared. The
   difference is the price of the shared expert at that M (a K=512 `down` and a
   narrow `gate_up`, both poorly amortised — see the dense rows in `gemm/`).
@@ -62,17 +64,23 @@ other comparators in `sm100.md`.
   bench extends the fit test to that arch (before it they stopped at M = 4096),
   and sm_90's contiguous layout has always run to M = 8192. Comparator columns are published at M = 8192 where they
   were measured, next to an empty fso cell if that device has none.
-- Comparator columns differ per device and are not comparable across files: the
-  sm_90 file carries sglang triton and deep_gemm; the sm_120 file carries the MoE
-  implementations a torch or serving-stack user gets on that card — vLLM triton
-  `fused_experts`, sglang triton `fused_experts`, TensorRT-LLM's CUTLASS fused
-  MoE (JIT-built for sm_120 through the FlashInfer wheel), torch's own
-  `_grouped_mm` (eager, plain and `torch.compile`d; it cannot be graph-captured
-  on sm_120) —
-  plus a kernel-level section that puts fso's grouped GEMM next to the Triton
-  grouped GEMM those stacks run per projection; the B300 file carries torch
-  `scaled_grouped_mm` and `_grouped_mm`, because neither sglang nor vLLM is
-  installed on that pod. Each file's environment block records the versions and
-  the caveats (untuned default tile configs, eager timings).
+- Comparator columns differ per device and are not comparable across files. For
+  the MoE layers, the sm_90 file carries sglang triton `fused_experts` and the
+  deep_gemm masked pipeline; the sm_120 file carries the MoE implementations a
+  torch or serving-stack user gets on that card — vLLM triton `fused_experts`,
+  sglang triton `fused_experts`, TensorRT-LLM's CUTLASS fused MoE (JIT-built for
+  sm_120 through the FlashInfer wheel), torch's own `_grouped_mm` (eager, plain
+  and `torch.compile`d; it cannot be graph-captured on sm_120) — plus a
+  kernel-level section that puts fso's grouped GEMM next to the Triton grouped
+  GEMM those stacks run per projection; the B300 file carries TensorRT-LLM's
+  trtllm-gen fused MoE, sglang triton `fused_experts` and torch's
+  `scaled_grouped_mm` and `_grouped_mm`. For the Family A MLP block every file
+  carries sglang's block-FP8 linear, the sm_90 file also cuBLAS's block-FP8
+  `scaled_mm` (torch accepts that recipe on sm_90 only) and the sm_120 file also
+  vLLM's block-FP8 linear. The library versions each comparator ran under are in
+  the generated block
+  [Environments of record](../README.md#environments-of-record), and each file
+  states the comparator caveats (the backend each column ran, tuned or default
+  tile configs, eager timings) next to its columns.
 - Every B300 row is an unlocked-clock number; read it with the caveats in
   `../README.md` §8 before comparing it with anything.

@@ -29,10 +29,12 @@ The steps encode the chains that produced the 2026-10-01 tables, with the same b
         tables, with the expecttest overlay that the lock now gives every step) and stage2/run_stage2.sh (the
         torch-native comparators), one pass. The 2026-10-01 tables of record took pass 1 of two.
 
-The mlp_ref steps at the end of the file are new invocations, added for the 0.2.0 tables (2026-10-05): the
-serving libraries' block-FP8 dense linear (sglang on every machine, vLLM on the RTX 5090) and, on the H200 only,
-cuBLAS's block-FP8 scaled_mm, each driving the same Family A MLP block as the fso BSFP8 cell, in the environment
-where that library lives.
+Three sets of steps are new invocations, added for the 0.2.0 tables (2026-10-05): on the B300, the sglang 0.5.20
+Triton layers (sgl020_*) and TensorRT-LLM's trtllm-gen block-FP8 routed MoE (trt_*), the backends apex serves that
+card with when it does not use fso; and on every machine the mlp_ref steps at the end of the file, the serving
+libraries' block-FP8 dense linear (sglang everywhere, vLLM on the RTX 5090) and, on the H200 only, cuBLAS's
+block-FP8 scaled_mm, each driving the same Family A MLP block as the fso BSFP8 cell, in the environment where that
+library lives.
 """
 
 GROUPS = ("dense", "moe", "moe_ref", "moe_kern", "shared", "mlp_ref")

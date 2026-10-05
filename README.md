@@ -33,16 +33,11 @@ in this library.
 Numbers below are CUDA-graph replay medians with cold weights, taken on the
 H200 at its natural clock and on the RTX 5090 under its clock lock
 (`docs/perf/README.md` §5), and they measure the fish-scales-ops 0.2.0 release
-code: the H200 `gate_up` rows and every RTX 5090 row come from the release
-perf run of 2026-10-01 on the release build (commit `633f5ca`), and the H200
-MoE rows from a run of the same code earlier that day, which the release run
-re-measured and matched. The run behind each row is named in the provenance
-section of the `docs/perf/` file it comes from. On the RTX 5090 the Family A
-and Family B rows ran on one card and the Family C MoE rows on another, so
-their absolute prefill numbers are not comparable across families
-(`docs/perf/README.md` §5). The protocol, shape families
-and full tables are in [`docs/perf/`](docs/perf/README.md). The rows are
-generated from `tests/baselines/` by `bench/gemm/python/render_perf_docs.py`
+wheel. The run behind each row is named in the generated block
+[Environments of record](docs/perf/README.md#environments-of-record) of
+`docs/perf/README.md`, rendered from that run's manifest. The protocol, shape
+families and full tables are in [`docs/perf/`](docs/perf/README.md). The rows
+are generated from `tests/baselines/` by `bench/gemm/python/render_perf_docs.py`
 and change only when a baseline does.
 Attention rows are absent until `docs/perf/attention/sm120.md` has an accepted
 baseline.
@@ -51,24 +46,24 @@ baseline.
 
 | family            | op                                             | shape                                                        | M / S  | dtype           |     µs | TFLOPS |
 |-------------------|------------------------------------------------|--------------------------------------------------------------|--------|-----------------|-------:|-------:|
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | block-FP8 1×128 |  18.00 |      6 |
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 412.16 |    990 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | block-FP8 1×128 |  17.76 |      6 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 406.63 |   1003 |
 | B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | block-FP8 1×128 |   21.9 |    3.4 |
-| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | block-FP8 1×128 |  369.6 |  418.4 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | block-FP8 1×128 |   35.6 |    1.6 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | block-FP8 1×128 |  419.0 |  276.7 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | block-FP8 1×128 |  371.5 |  416.2 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | block-FP8 1×128 |   35.4 |    1.6 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | block-FP8 1×128 |  419.3 |  276.5 |
 
 ### sm_120 — NVIDIA RTX 5090 (170 SMs, 2400 MHz locked)
 
 | family            | op                                             | shape                                                        | M / S  | dtype           |     µs | TFLOPS |
 |-------------------|------------------------------------------------|--------------------------------------------------------------|--------|-----------------|-------:|-------:|
 | A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | MXFP8 1×32      |  35.68 |      3 |
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | MXFP8 1×32      | 663.12 |    615 |
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 647.57 |    630 |
-| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | MXFP8 1×32      |   32.4 |    2.3 |
-| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | MXFP8 1×32      |  564.2 |  274.0 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | MXFP8 1×32      |   38.7 |    1.5 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | MXFP8 1×32      |  717.4 |  161.6 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | MXFP8 1×32      | 664.83 |    614 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 649.47 |    628 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | MXFP8 1×32      |   32.5 |    2.3 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | MXFP8 1×32      |  563.9 |  274.2 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | MXFP8 1×32      |   38.6 |    1.5 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | MXFP8 1×32      |  710.8 |  163.1 |
 
 Row selection rule: per SM, one decode point and one prefill point per shape
 family for GEMM, one prefill and one decode row for attention where a native

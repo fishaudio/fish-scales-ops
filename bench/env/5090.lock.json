@@ -110,7 +110,7 @@
   },
   "notes": [
     "Filled on 2026-10-01 from the machine itself (pip list of each interpreter, nvidia-smi).",
-    "One card for every table: PCI 00000000:21:00.0. The two granted cards differ on heavy prefill cells (card 21 holds 2325-2400 MHz where card 22 drops to 2085-2272 MHz), so a run on the spare card 22:00.0 is not comparable and is not offered here.",
+    "One card for every table: PCI 00000000:21:00.0. The two granted cards differ on heavy prefill cells: on 2026-10-01 (500 ms sampler) card 21 held 2325-2400 MHz where card 22 dropped to 2085-2272 MHz, and on 2026-10-05 (200 ms sampler) card 21 itself dropped to 2092 MHz at M = 4096 and 1980 MHz at M = 8192 on the heaviest dense cells under the 575 W cap. A run on the spare card 22:00.0 is therefore not comparable and is not offered here.",
     "Every card of this host runs in Exclusive_Process compute mode; the chains left it so, and so does the harness (the preflight probes run with no GPU visible).",
     "Three interpreters, as in /data/bench-runs/fso_release_perf_20261001/5090_stage2/common2.sh: .venv-sgl (fso rows, vLLM, FlashInfer's TRT-LLM CUTLASS MoE, torch-native comparators), .venv-sglang (sglang 0.5.20), .venv-fi (FlashInfer with cuDNN 9.26, which the grouped MXFP8 comparator needs). CUDA_HOME must be exported for the sglang venv: without it deep_gemm's import fails.",
     "Package keys are distribution names: deep_gemm is the sgl-deep-gemm distribution. Every package of the harness's list that an environment has installed is pinned, plus nvidia-cublas and nvidia-cuda-nvrtc, and expecttest where the dense bench's cuBLAS MXFP8 columns import torch.testing._internal.",
