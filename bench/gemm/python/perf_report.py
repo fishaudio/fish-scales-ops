@@ -59,6 +59,7 @@ DASH = "—"
 
 # impl -> short column title (layer-level comparators, in report order)
 LAYER_IMPLS = [("vllm_fp8b", "vLLM triton FP8-block"), ("triton_fp8b", "sglang triton FP8-block"),
+               ("trtllm_gen_fp8b", "TRT-LLM trtllm-gen FP8-block"),
                ("trtllm_cutlass_fp8", "TRT-LLM CUTLASS FP8 per-tensor"),
                ("vllm_bf16", "vLLM triton BF16"), ("triton_bf16", "sglang triton BF16"),
                ("trtllm_cutlass_bf16", "TRT-LLM CUTLASS BF16"),

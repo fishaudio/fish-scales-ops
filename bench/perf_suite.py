@@ -135,6 +135,11 @@ B300 = [
     # expert parallelism; the same env0520 venv (sglang 0.5.20), on the same card as the fso rows
     step("sgl020_30a3", "main", MOE_B, ["--run", "--impls", "triton_bf16,triton_fp8b"], "ref_sgl020_30a3_b300.jsonl", "moe_ref"),
     step("sgl020_35a3", "main", MOE_C, ["--run", "--impls", "triton_bf16,triton_fp8b"], "ref_sgl020_35a3_b300.jsonl", "moe_ref"),
+    # TensorRT-LLM's trtllm-gen block-FP8 fused MoE as FlashInfer 0.6.18 ships it
+    # (flashinfer.fused_moe.trtllm_fp8_block_scale_routed_moe), the op apex serves a block-FP8 MoE with on this card
+    # when fso is off; same env0520 venv, same card as the fso rows, routed layer only (the op has no shared expert)
+    step("trt_30a3", "main", MOE_B, ["--run", "--impls", "trtllm_gen_fp8b"], "ref_trt_30a3_b300.jsonl", "moe_ref"),
+    step("trt_35a3", "main", MOE_C, ["--run", "--impls", "trtllm_gen_fp8b"], "ref_trt_35a3_b300.jsonl", "moe_ref"),
     step("ref_35a3_shared", "main", MOE_C, ["--run", "--impls", "torch_grouped_bf16_layer_shared,torch_smm_mxfp8_layer_shared"],
          "ref_new_35a3_shared_b300.jsonl", "shared"),
 ]

@@ -8,7 +8,7 @@ Targets (only the first table after each known heading is rewritten; prose is le
   docs/perf/layer/sm90.md   Family A MLP block, Family B MoE layer, Family C MoE block (+ comparators; Family A's
                             serving-library columns come from ref_mlp_qwen3_4b_<dev>.jsonl and appear once it has rows)
   docs/perf/layer/sm120.md  same for the RTX 5090, plus the grouped GEMM kernel-level comparison tables
-  docs/perf/layer/sm100.md  same for the B300 (torch scaled_grouped_mm / _grouped_mm comparators)
+  docs/perf/layer/sm100.md  same for the B300 (torch scaled_grouped_mm / _grouped_mm and TRT-LLM trtllm-gen comparators)
   README.md                 the two hot-shape tables (sm_90, sm_120) — no comparisons, by policy
   docs/perf/README.md       the "Environments of record" block between its BEGIN GENERATED / END GENERATED markers:
                             one table per machine, one row per installed baseline file, from
@@ -268,6 +268,15 @@ def cmp_rows_keys(cmp):
     return [k for k in _CMP_ROWS if k[0] in {c for c, _ in cmp}]
 
 
+def measured(cmp):
+    """The comparator columns that have at least one row in the current comparator files.
+
+    The B300 tables take a column only once its rows are installed, so a comparator
+    added to the suite (the trtllm-gen column) renders nothing until its baseline
+    exists, instead of a column of dashes."""
+    return [c for c in cmp if cmp_rows_keys([c])]
+
+
 def moe_block_table(fso, routed_impl, shared_impl, cmp, cmp_suffix=" (routed)"):
     """Family C: routed / routed + shared / comparators.
 
@@ -397,14 +406,25 @@ def render_gemm_sm90(lines):
 
 
 # Comparator columns per SM, allowed only in docs/perf/layer/ (docs/README.md rule 2). The sm_90 and
-# sm_120 hosts have sglang (and deep_gemm on sm_90); the B300 pod has neither, so its comparators are
-# the two grouped entry points torch 2.11 itself provides.
+# sm_120 hosts have sglang (and deep_gemm on sm_90). The B300 columns are the two grouped entry points
+# torch itself provides and TensorRT-LLM's trtllm-gen fused MoE through FlashInfer; render_layer shows
+# a B300 column only once its rows are installed (measured()).
 def layer_comparators(sm, shared=False):
     if sm == 100:
         sfxs = "_shared" if shared else ""
         where = " (routed + shared)" if shared else " (routed)"
-        return [(f"torch_smm_mxfp8_layer{sfxs}", f"torch scaled_grouped_mm MXFP8 µs{where}"),
-                (f"torch_grouped_bf16_layer{sfxs}", f"torch _grouped_mm BF16 µs{where}")]
+        cmp = [(f"torch_smm_mxfp8_layer{sfxs}", f"torch scaled_grouped_mm MXFP8 µs{where}"),
+               (f"torch_grouped_bf16_layer{sfxs}", f"torch _grouped_mm BF16 µs{where}")]
+        if not shared:
+            # The two backends apex serves this card with when it does not use fso, routed layer only (neither entry
+            # has a shared-expert path): TensorRT-LLM's trtllm-gen block-FP8 fused MoE through FlashInfer
+            # (trtllm_fp8_block_scale_routed_moe; apex without expert parallelism) and sglang 0.5.20's Triton
+            # fused_experts (apex with expert parallelism), the latter with apex's Triton config tree
+            # (SGLANG_MOE_CONFIG_DIR in bench/env/b300.lock.json). A column without rows is not rendered (measured()).
+            cmp = [("trtllm_gen_fp8b", f"TRT-LLM trtllm-gen fused MoE FP8 block µs{where}"),
+                   ("triton_fp8b", f"sglang triton FP8 w8a8-block µs{where}"),
+                   ("triton_bf16", f"sglang triton BF16 µs{where}")] + cmp
+        return cmp
     cmp = [("triton_bf16", "sglang triton BF16 µs"), ("triton_fp8b", "sglang triton FP8 w8a8-block µs")]
     if sm == 90:
         cmp.append(("dg_fp8_layer", "deep_gemm masked pipeline FP8 µs"))
@@ -443,6 +463,8 @@ def render_layer(lines, sm):
     fsoB = moe_rows(f"perf_moe_qwen3_30a3_{sfx}.jsonl")
     set_cmp_rows({**moe_rows(f"perf_moe_qwen3_30a3_{sfx}.jsonl"), **moe_rows(f"ref_moe_qwen3_30a3_{sfx}.jsonl")})
     cmpB = layer_comparators(sm)
+    if sm == 100:
+        cmpB = measured(cmpB)
     h, b = moe_layer_table(fsoB, cmpB, f"fso_{dt}_layer", sm)
     pos = replace_table_after(lines, starts("## Family B — Qwen3-30B-A3B routed MoE layer"), h + b, pos)
     fsoC = moe_rows(f"perf_moe_qwen3_35a3_{sfx}.jsonl", f"perf_moe_qwen3_35a3_shared_{sfx}.jsonl")
@@ -450,7 +472,7 @@ def render_layer(lines, sm):
     # file, and moe_rows() skips the ones that do not exist.
     set_cmp_rows(moe_rows(f"ref_moe_qwen3_35a3_{sfx}.jsonl", f"ref_moe_qwen3_35a3_shared_{sfx}.jsonl"))
     if sm == 100:
-        cmpC = layer_comparators(sm) + layer_comparators(sm, shared=True)
+        cmpC = measured(layer_comparators(sm) + layer_comparators(sm, shared=True))
         h, b = moe_block_table(fsoC, f"fso_{dt}_layer", f"fso_{dt}_layer_shared", cmpC, cmp_suffix="")
     else:
         h, b = moe_block_table(fsoC, f"fso_{dt}_layer", f"fso_{dt}_layer_shared", layer_comparators(sm))

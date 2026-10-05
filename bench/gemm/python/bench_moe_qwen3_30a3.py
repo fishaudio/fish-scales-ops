@@ -39,6 +39,14 @@ Implementations benchmarked (all from the serving venv, no fso code):
   dg_fp8_layer   production masked pipeline: moe_ep_deepgemm_preprocess ->
                  masked gemm -> silu_mul_quant -> masked gemm -> post_reorder
                  (mirrors sglang moe_runner/deep_gemm.py)     [whole layer]
+  trtllm_gen_fp8b  TensorRT-LLM's trtllm-gen fused MoE in its DeepSeek block-FP8
+                 mode (1x128 activation, 128x128 weight scales) as FlashInfer
+                 ships it, flashinfer.fused_moe.trtllm_fp8_block_scale_routed_moe:
+                 the op apex serves a block-FP8 MoE with on sm_100/103 when fso is
+                 off. Top-k given; sglang's per-token-group-128 activation quantize
+                 and the op (routing, FC1, SwiGLU, FC2, weighted combine) inside
+                 the capture; gemm1 rows [up; gate]; tactics autotuned. sm_100/103
+                 only, n/a elsewhere                          [whole layer]
   torch_smm_mxfp8_layer   torch 2.11 F.scaled_grouped_mm, MXFP8 1x32 blocked
                  scales, expert-sorted contiguous rows        [whole layer]
   torch_grouped_bf16_layer  torch 2.11 torch._grouped_mm, bf16, no quantize
@@ -132,7 +140,7 @@ CUDNN_GROUPED_IMPLS = ("fi_cudnn_grouped_mxfp8", "fi_cudnn_grouped_bf16")
 TRITON_GROUPED_IMPLS = ("sgl_triton_grouped_fp8b", "sgl_triton_grouped_bf16",
                         "vllm_triton_grouped_fp8b", "vllm_triton_grouped_bf16")
 LAYER_IMPLS = ("triton_bf16", "triton_fp8b", "vllm_bf16", "vllm_fp8b",
-               "trtllm_cutlass_bf16", "trtllm_cutlass_fp8", "dg_fp8_layer", "fso_mxfp8_layer",
+               "trtllm_cutlass_bf16", "trtllm_cutlass_fp8", "trtllm_gen_fp8b", "dg_fp8_layer", "fso_mxfp8_layer",
                "fso_bsfp8_layer", "fso_mxfp8_layer_shared", "fso_bsfp8_layer_shared",
                "fso_mxfp8_layer_op",
                "torch_smm_mxfp8_layer", "torch_grouped_bf16_layer",
@@ -230,7 +238,7 @@ def make_cells():
         for impl in TRITON_GROUPED_IMPLS + CUDNN_GROUPED_IMPLS:
             cells += [dict(impl=impl, proj=proj, M=m) for m in M_GRID]
     for impl in ("triton_bf16", "triton_fp8b", "vllm_bf16", "vllm_fp8b",
-                 "trtllm_cutlass_bf16", "trtllm_cutlass_fp8"):
+                 "trtllm_cutlass_bf16", "trtllm_cutlass_fp8", "trtllm_gen_fp8b"):
         cells += [dict(impl=impl, proj="layer", M=m) for m in M_GRID]
     cells += [dict(impl="dg_fp8_layer", proj="layer", M=m) for m in DECODE_M]
     cells += [dict(impl="fso_mxfp8_layer", proj="layer", M=m) for m in fso_M()]
@@ -513,6 +521,127 @@ def build_torch_shared_expert(kind, w13s, w2s):
                            swizzle_b=SW.SWIZZLE_32_4_4, output_dtype=torch.bfloat16)
 
     return shared_fn
+
+
+# --------------------------------------------------------------------------
+# TensorRT-LLM trtllm-gen fused MoE in block FP8, through FlashInfer (sm_100/103)
+# --------------------------------------------------------------------------
+#
+# `flashinfer.fused_moe.trtllm_fp8_block_scale_routed_moe` is TensorRT-LLM's
+# trtllm-gen MoE in its DeepSeek block-FP8 mode (1x128 activation groups,
+# 128x128 weight blocks, fp32 scales). One call runs TensorRT-LLM's routing
+# kernel on the given top-k, the FC1 batched GEMM, the SwiGLU, the FC2 batched
+# GEMM and the weighted combine; the two GEMMs are precompiled trtllm-gen cubins
+# from the flashinfer-cubin wheel. It is the op apex serves a block-FP8 MoE
+# checkpoint with on sm_100/103 when fso is off (`--moe-runner-backend
+# flashinfer_trtllm_routed`, apex sglang_fish/layers/moe/moe_runner/trtllm_fp8.py),
+# and the builder below makes the call that runner makes. What the 2026-09-16
+# study of this op established (/data/bench-runs/b300_thirdparty_20260916/G4/
+# REPORT.md), and how the cell follows it:
+#   * The kernel reads gemm1's 2*INTER rows as [up; gate] and applies the SiLU to
+#     the second half, while this bench's w13 is chunked [gate | up]. Fed the
+#     bench's order unchanged, the layer computes silu(up) * gate and still scores
+#     a plausible cos of 0.990, so the order is easy to get wrong silently. The
+#     halves are exchanged once at weight-load time, which is where a serving
+#     stack stacks the checkpoint's gate and up projections for this op (sglang's
+#     weight loader and apex both put up first for it), so it costs nothing per
+#     call. Because INTER is a multiple of 128, exchanging the bf16 halves before
+#     the 128x128 quantize produces exactly the blocks and scales that exchanging
+#     them after it would.
+#   * The kernel rounds the FC1 output to FP8 e4m3 before the SwiGLU and rounds
+#     the SwiGLU output to FP8 again for FC2, one FP8 rounding more than the fso
+#     layer makes. Its cos against this bench's reference therefore sits at
+#     0.9972-0.9975 (Family B M=1 reads 0.9968 on the draw after the warm-up
+#     spin), below the ~0.998 of the single-rounding layers. That is the kernel's
+#     floor, not a call error: every cell records its cos and none is dropped for it.
+#   * The op takes an already-quantized activation, so the activation quantize is
+#     inside the timed graph, as the fso layer's gather-quantize is. It is the
+#     kernel apex and sglang run in front of this op: sglang's per-token-group-128
+#     quantize with column-major fp32 scales, transposed to the [HIDDEN/128, M]
+#     layout the op asks for.
+#   * The pre-routed entry has no shared-expert path (it passes
+#     num_fused_shared_experts = 0), so this impl has no `_shared` variant.
+#   * The weights stay in the plain K-major layout (no shuffle), the layout apex
+#     and sglang serve this op with. FlashInfer's shuffled block-major layout gives
+#     the same results and measured up to ~3 % faster in that study; using it
+#     would be a load-time change only.
+# Tactics are autotuned per M before the capture, as the trtllm_cutlass cells do:
+# FlashInfer's autotuner profiles the token buckets up to the next power of two
+# of M (the bound sglang's own runner passes) and the capture replays the winner.
+# apex's runner does not autotune; the 2026-09-16 study found the tuned tactic
+# 4.4 % faster than the default one at M = 1024 and no different at M = 1, 64 and
+# 4096, the other token counts it compared.
+TRTLLM_GEN_OP = "flashinfer.fused_moe.trtllm_fp8_block_scale_routed_moe"
+TRTLLM_GEN_GROUP = 128   # activation group and weight block edge of the DeepSeek FP8 recipe
+
+
+def _dist_version(name):
+    """Installed version of a distribution, or None (recorded in the cell, never fatal)."""
+    try:
+        from importlib import metadata
+        return metadata.version(name)
+    except Exception:                            # noqa: BLE001 - a missing record is not an error
+        return None
+
+
+def build_trtllm_gen_moe_layer(M, hidden, w13, w2, topk_ids, topk_w):
+    """Whole routed MoE layer on the trtllm-gen block-FP8 op; returns (fn, info).
+
+    The expert weights are exchanged to [up; gate] and quantized to 128x128 block
+    FP8 here, outside the timed graph, like every other layer impl. The returned
+    closure quantizes the activation and runs the op, both inside the capture, and
+    returns the bf16 [M, HIDDEN] layer output. Off sm_100/103, where trtllm-gen has
+    no build, it raises RuntimeError('n/a: ...'), which the orchestrator stores in
+    the row's `error` field the way it stores any failing cell.
+    """
+    import torch
+    major, minor = torch.cuda.get_device_capability(0)
+    if major != 10:
+        raise RuntimeError(
+            f"n/a: {TRTLLM_GEN_OP} runs trtllm-gen kernels built for sm_100/sm_103 only "
+            f"(this device is sm_{major}{minor})")
+    import flashinfer
+    from flashinfer.autotuner import autotune
+    from flashinfer.fused_moe import trtllm_fp8_block_scale_routed_moe
+    from flashinfer.tllm_enums import RoutingMethodType, WeightLayout
+    from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+
+    w31 = w13.reshape(E, 2, INTER, HIDDEN).flip(1).reshape(E, 2 * INTER, HIDDEN)   # [gate | up] -> [up | gate]
+    w31_q, w31_s = quant_weights_fp8(w31)          # fp8 + fp32 [E, 2*INTER/128, HIDDEN/128]
+    w2_q, w2_s = quant_weights_fp8(w2)             # fp8 + fp32 [E, HIDDEN/128, INTER/128]
+    routing = (topk_ids.to(torch.int32).contiguous(), topk_w.to(torch.float32).contiguous())
+    tune_max = 1 << max(M - 1, 0).bit_length()     # the next power of two >= M
+
+    def layer_fn():
+        xq, xs = sglang_per_token_group_quant_fp8(hidden, TRTLLM_GEN_GROUP, column_major_scales=True)
+        out = trtllm_fp8_block_scale_routed_moe(
+            topk_ids=routing, routing_bias=None,
+            hidden_states=xq, hidden_states_scale=xs.t(),   # [HIDDEN/128, M], contiguous
+            gemm1_weights=w31_q, gemm1_weights_scale=w31_s,
+            gemm2_weights=w2_q, gemm2_weights_scale=w2_s,
+            num_experts=E, top_k=TOPK, n_group=None, topk_group=None,
+            intermediate_size=INTER, local_expert_offset=0, local_num_experts=E,
+            routed_scaling_factor=None,
+            # the routing method selects how logits become weights; with the top-k
+            # given it changes nothing (verified bit-identical in the 2026-09-16
+            # study), and apex passes Renormalize
+            routing_method_type=int(RoutingMethodType.Renormalize),
+            use_shuffled_weight=False, weight_layout=int(WeightLayout.MajorK),
+            do_finalize=True, tune_max_num_tokens=tune_max)
+        return out[0] if isinstance(out, (list, tuple)) else out
+
+    # The first call profiles the tactics; profiling cannot run inside a capture,
+    # so it comes before the bench's warm-ups. Every later call, the capture and
+    # the other weight copies included, finds the tactic in the tuner's cache.
+    with autotune(True):
+        layer_fn()
+    torch.cuda.synchronize()
+    info = {"op": TRTLLM_GEN_OP, "flashinfer": flashinfer.__version__,
+            "flashinfer_cubin": _dist_version("flashinfer-cubin"),
+            "act_quant": "sglang_per_token_group_quant_fp8", "sglang": _dist_version("sglang"),
+            "gemm1_order": "up_gate", "weight_layout": "MajorK",
+            "tactic_source": "autotuned", "tune_max_num_tokens": tune_max}
+    return layer_fn, info
 
 
 # --------------------------------------------------------------------------
@@ -1312,6 +1441,21 @@ def run_worker(cell):
                 torch.cuda.synchronize()
                 result["tactic_source"] = "autotuned"
                 result["fused_finalize"] = 1
+                fn()
+                torch.cuda.synchronize()
+                result["cos"] = cos_sim(out_holder["out"], ref)
+            elif impl == "trtllm_gen_fp8b":
+                # TensorRT-LLM's trtllm-gen block-FP8 MoE through FlashInfer, the call
+                # apex makes on sm_100/103 (build_trtllm_gen_moe_layer above). Same
+                # boundary as the other layer cells: top-k given, the activation
+                # quantize and everything after it inside the capture, only the expert
+                # weights prepared outside.
+                layer_fn, info = build_trtllm_gen_moe_layer(M, hidden, w13, w2, topk_ids, topk_w)
+                result.update(info)
+                out_holder = {}
+
+                def fn():
+                    out_holder["out"] = layer_fn()
                 fn()
                 torch.cuda.synchronize()
                 result["cos"] = cos_sim(out_holder["out"], ref)
