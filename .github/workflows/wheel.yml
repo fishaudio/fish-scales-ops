@@ -1,0 +1,94 @@
+# Build the fish-scales-ops wheel once, in the fixed container, and check everything that needs no GPU.
+#
+# The wheel this job uploads is the artifact the three serving machines install (H200, B300, RTX 5090): the GPU test
+# suite and the performance harness run on those machines against this file (scripts/ci/run_suite.py,
+# bench/run_perf.py), never against a per-machine source build. On a tag the wheel, its sha256, its BUILD_INFO.json
+# and the test kit are attached to the GitHub release of that tag.
+name: wheel
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobs:
+        description: "parallel compile jobs (nvcc takes 2 to 4 GB per job; the runner has 64 GB)"
+        default: "8"
+  push:
+    branches: [master]
+    tags: ["[0-9]*"]
+  pull_request:
+    paths:
+      - "csrc/**"
+      - "python/**"
+      - "scripts/**"
+      - "docker/**"
+      - "tests/**"
+      - "bench/**"
+      - "3rdparty/**"
+      - ".github/workflows/wheel.yml"
+
+concurrency:
+  group: wheel-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest-16c64g
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Build the wheel in the fixed container
+        run: scripts/build_wheel.sh --out dist --jobs "${{ inputs.jobs || '8' }}"
+
+      - name: Checks that need no GPU
+        run: scripts/ci/cpu_checks.sh --dist dist
+
+      - name: Summary
+        run: |
+          {
+            echo '### fish-scales-ops wheel'
+            echo '```'
+            ls -l dist
+            cat dist/*.whl.sha256
+            cat dist/BUILD_INFO.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fish-scales-ops-wheel
+          path: |
+            dist/*.whl
+            dist/*.whl.sha256
+            dist/BUILD_INFO.json
+            dist/*-testkit-*.tar.gz
+            dist/build.log
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: fish-scales-ops-wheel
+          path: dist
+      - name: Attach the wheel, its sha256, BUILD_INFO.json and the test kit to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "$tag" --notes "See CHANGELOG.md."
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber \
+            dist/*.whl dist/*.whl.sha256 dist/BUILD_INFO.json dist/*-testkit-*.tar.gz

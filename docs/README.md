@@ -20,6 +20,8 @@ docs/
   README.md                this file — placement rules
   guide.md                 integration guide for a serving engine: what to call, build, dense and
                            MoE serving, capture/compile, deployment variables, migrating call sites
+  harness.md               release harness: build the wheel once, test and measure that wheel on
+                           each machine, install the tables (the scripts and what each one pins)
   api/
     dense.md               fish_scales_ops.dense, the stable dense linear (no perf numbers)
     moe.md                 fish_scales_ops.moe, the stable MoE layer (no perf numbers)

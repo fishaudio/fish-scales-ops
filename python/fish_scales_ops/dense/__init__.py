@@ -45,7 +45,7 @@ from ..gemm.fp8 import quantize_128x128_fp8
 from ..gemm.mxfp8 import linear_mxfp8, quantize_1x32_fp8
 # One architecture probe and one parser of the ``arch`` argument, shared with fso.moe,
 # and the sm_90 JIT compiler line both describe() functions end with.
-from ..moe import _arch_label, _arch_major, _device_arch, _sm90_jit_compiler_line
+from ..moe import _arch_label, _arch_major, _build_line, _device_arch, _sm90_jit_compiler_line
 
 __all__ = ["FORMATS", "DenseWeight", "prepare_weight", "linear", "supported", "describe"]
 
@@ -91,9 +91,11 @@ def supported(format, arch=None) -> bool:
 def describe() -> str:
     """The architecture matrix of the dense routes as text, with this device's
     rows marked, for logs and for the messages of a caller that refuses a
-    configuration. On sm_90 the last line names the compiler of the deep_gemm
-    JIT (the bundled NVRTC and its path), or the error that keeps it from
-    loading; describe() itself never raises."""
+    configuration. The second line names the build (version, commit and the
+    torch the extension was built against, from
+    :func:`fish_scales_ops.build_info`). On sm_90 the last line names the
+    compiler of the deep_gemm JIT (the bundled NVRTC and its path), or the error
+    that keeps it from loading; describe() itself never raises."""
     arch = _device_arch()
     major = arch // 10
     name = ""
@@ -138,7 +140,7 @@ def describe() -> str:
                  "architecture",
     }
     lines = [f"fish_scales_ops.dense: one dense linear for every architecture; this device is "
-             f"{_arch_label(arch)}{name}."]
+             f"{_arch_label(arch)}{name}.", _build_line()]
     for fmt in FORMATS:
         lines.append(heads[fmt])
         for fam, label in families:

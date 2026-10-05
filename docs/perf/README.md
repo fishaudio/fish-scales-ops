@@ -279,8 +279,13 @@ with their reason), `diff --a baselines --b <dir>` prints every shared cell's
 delta with decode (M ≤ 128) and prefill (M > 128) medians and the cells beyond
 a threshold — the A/B of any change — `report [--run <dir>]` prints the
 comparison tables with ×fso and band geometric means, and `install --run <dir>`
-does merge → diff → copy into `tests/baselines/` → `render_perf_docs.py`
-(→ `--check`). The docstring carries the raw-file manifest. `report` and
+takes a run directory that `bench/run_perf.py` wrote (section 7c): it needs the
+run's `manifest.json`, takes the device from it, and does merge into
+`<dir>/merged` → diff → copy into `tests/baselines/` → the run's provenance
+into `tests/baselines/provenance/<device>.json` → `render_perf_docs.py`
+(→ `--check`). It refuses a smoke run, a run that did not complete, a file
+whose step exited non-zero or that no step wrote, and a drifted run unless
+`--accept-drift` is given. The docstring carries the raw-file manifest. `report` and
 `diff` never read a merged file that is lying in a run directory: a directory
 that was installed once keeps its `ref_moe_*` / `ref_kern_moe_*` from that
 install next to any raw files added later, so both commands rebuild the merged
@@ -295,6 +300,114 @@ prints the rows whose copies × weight bytes fall short of 2 × the device's L2
 and must not be published as cold (the 16-copy cap of 2026-09-28 produced
 exactly those rows for the 1–2 MB shared-expert projections and for the Family
 C `down` kernel cell at M = 1).
+
+## 7c. Reproducing the tables
+
+The tables of record are measured with one command per machine,
+`bench/run_perf.py`, under an environment lock that the run refuses to deviate
+from. Each machine's lock is `bench/env/<machine>.lock.json`, where the machine
+is `h200`, `5090` or `b300` (the device suffixes of the baseline files). It
+names the interpreter of every environment and the exact versions of the
+packages the tables depend on, the extra environment variables and `PYTHONPATH`
+overlays, the driver, the card, the clock and compute-mode policy, the GPU lock
+file, the bench environment, and on sm_90 the compiler `jit_compiler_sm90()`
+must report. `bench/perf_suite.py` lists every step of every table per machine:
+the bench, its arguments, the output file name and the table group.
+
+    python3 bench/run_perf.py --machine h200 --out /data/bench-runs/<run> --fso-path <dir>
+    python3 bench/run_perf.py --machine 5090 --out /mnt/share/stone-bench-runs/<run> --fso-path <dir>
+    python3 bench/run_perf.py --machine b300 --out ~/bench-runs/<run> --fso-path <dir>
+
+`--fso-path` is the directory that holds the `fish_scales_ops` package to
+measure; it goes first on `PYTHONPATH`. `--tables` selects table groups
+(`dense`, `moe`, `moe_ref`, `moe_kern`, `shared`; all by default). `--dry-run`
+prints the plan and the preflight result without touching the card.
+`--smoke` runs every step on M = 1 and 64 only, and such a run can never be
+installed.
+
+**What a refusal means.** Before the run takes the card, the preflight asks
+every interpreter, in a subprocess that sees no GPU, for its package versions
+and for the `fish_scales_ops` it imports, and asks `nvidia-smi` for the driver
+and the card. Any difference from the lock is drift: a package or Python
+version, the driver, or the sm_90 compiler. The run refuses drift with exit
+code 3 and prints every difference. `--allow-drift` proceeds instead and
+records the differences in the manifest. A blocker refuses the run in every
+case: another host, a missing interpreter or overlay, a `fish_scales_ops` that
+does not import or does not come from `--fso-path`, the wrong card, or a card
+with a compute process on it. The run takes the machine's GPU lock file with
+`flock` and never queues behind another process on the card.
+
+**What a run leaves.** `<run>/manifest.json` records the machine, the time
+window, the lock and its sha256, the versions found, the drift list, the
+fish-scales-ops version, `build_info()`, extension sha256 and sm_90 compiler,
+the card, the clock policy and the clocks a 200 ms sampler observed during
+every step, every step's command, window, rows and failures (`logs/`), and the
+commit of the tree or test kit that holds the benches. After the steps the run
+merges its raw files into `<run>/merged` and diffs them against the installed
+baselines; it installs nothing.
+
+**How install uses the manifest.** `perf_report.py install --run <run>`
+(section 7b) accepts only a run directory with a manifest and takes the device
+from it. It refuses a smoke run, a run that did not complete, a file whose
+step exited non-zero or that no step of the manifest wrote, and a drifted run
+unless `--accept-drift` is given. For every file it installs, it records the
+run's provenance in `tests/baselines/provenance/<device>.json` and keeps the
+entries of the files it does not install. `render_perf_docs.py` renders those
+files into the block below, and its `--check` covers the block.
+`tests/bench/test_run_perf_plan.py` checks the locks, the suite and the plan
+without a GPU.
+
+<!-- BEGIN GENERATED: environments of record (bench/gemm/python/render_perf_docs.py) -->
+### Environments of record
+
+Generated by `bench/gemm/python/render_perf_docs.py` from `tests/baselines/provenance/<device>.json`, which `perf_report.py install` writes from the `manifest.json` of the run it installs; do not edit it by hand. One row per installed baseline file: the run that produced it, its time window, the card, driver and clocks, the package versions of the environments its steps ran in, and the fish-scales-ops build.
+
+#### H200 (sm_90)
+
+| baseline file                           | run                                        | window (UTC) | card | driver | clocks | environments | fish-scales-ops | sm_90 JIT compiler |
+|-----------------------------------------|--------------------------------------------|--------------|------|--------|--------|--------------|-----------------|--------------------|
+| `gemm_sm90_qwen3_30a3_dense.jsonl`      | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               | —                  |
+| `gemm_sm90_qwen3_35a3_dense.jsonl`      | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               | —                  |
+| `gemm_sm90_qwen3_4b.jsonl`              | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               | —                  |
+| `gemm_sm90_qwen3_4b_mlp_fwd.jsonl`      | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               | —                  |
+| `perf_moe_qwen3_30a3_h200.jsonl`        | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               | —                  |
+| `perf_moe_qwen3_35a3_h200.jsonl`        | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               | —                  |
+| `perf_moe_qwen3_35a3_shared_h200.jsonl` | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               | —                  |
+| `ref_moe_qwen3_30a3_h200.jsonl`         | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               | —                  |
+| `ref_moe_qwen3_35a3_h200.jsonl`         | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               | —                  |
+
+#### RTX 5090 (sm_120)
+
+| baseline file                           | run                                        | window (UTC) | card | driver | clocks | environments | fish-scales-ops |
+|-----------------------------------------|--------------------------------------------|--------------|------|--------|--------|--------------|-----------------|
+| `gemm_sm120_qwen3_30a3_dense.jsonl`     | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               |
+| `gemm_sm120_qwen3_35a3_dense.jsonl`     | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               |
+| `gemm_sm120_qwen3_4b.jsonl`             | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               |
+| `gemm_sm120_qwen3_4b_mlp_fwd.jsonl`     | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               |
+| `perf_moe_qwen3_30a3_5090.jsonl`        | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               |
+| `perf_moe_qwen3_35a3_5090.jsonl`        | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               |
+| `perf_moe_qwen3_35a3_shared_5090.jsonl` | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               |
+| `ref_kern_moe_qwen3_30a3_5090.jsonl`    | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               |
+| `ref_kern_moe_qwen3_35a3_5090.jsonl`    | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               |
+| `ref_moe_qwen3_30a3_5090.jsonl`         | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               |
+| `ref_moe_qwen3_35a3_5090.jsonl`         | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               |
+
+#### B300 (sm_103; the dense files are tagged sm100)
+
+| baseline file                           | run                                        | window (UTC) | card | driver | clocks | environments | fish-scales-ops |
+|-----------------------------------------|--------------------------------------------|--------------|------|--------|--------|--------------|-----------------|
+| `gemm_sm100_qwen3_30a3_dense.jsonl`     | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               |
+| `gemm_sm100_qwen3_35a3_dense.jsonl`     | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               |
+| `gemm_sm100_qwen3_4b.jsonl`             | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               |
+| `gemm_sm100_qwen3_4b_mlp_fwd.jsonl`     | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               |
+| `perf_moe_qwen3_30a3_b300.jsonl`        | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               |
+| `perf_moe_qwen3_35a3_b300.jsonl`        | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               |
+| `perf_moe_qwen3_35a3_shared_b300.jsonl` | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               |
+| `ref_moe_qwen3_30a3_b300.jsonl`         | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               |
+| `ref_moe_qwen3_35a3_b300.jsonl`         | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               |
+| `ref_moe_qwen3_35a3_shared_b300.jsonl`  | installed before the harness (no manifest) | —            | —    | —      | —      | —            | —               |
+
+<!-- END GENERATED: environments of record -->
 
 ## 8. Reading the tables
 

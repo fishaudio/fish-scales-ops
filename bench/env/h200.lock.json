@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "machine": "h200",
+  "host_pattern": "39-gcp-h200-2",
+  "sm": 90,
+  "arch": "sm_90",
+  "device_name": "NVIDIA H200",
+  "driver": "595.58.03",
+  "gpu": {
+    "select": {
+      "by": "uuid",
+      "uuids": [
+        "GPU-f7556d6e-d480-6de1-0a17-1a04bafb2c91"
+      ]
+    },
+    "lock_file": "/data/bench-runs/.gpu6.lock",
+    "l2_bytes": 62914560,
+    "clock_policy": {
+      "mode": "natural",
+      "tolerance_mhz": 15,
+      "notes": "Datacenter card: natural clock, no lock (docs/perf/README.md section 5). There is no sudo on this box, so nothing is applied and any lock left by another session cannot be reset; the policy is verified by observation instead: a step whose busy samples, those free of power, thermal and slowdown limits, never reach the card's maximum SM clock is flagged in the manifest."
+    },
+    "compute_mode": null
+  },
+  "jit_compiler_sm90_prefix": "NVRTC 13.2 (",
+  "bench_env": {},
+  "environments": {
+    "main": {
+      "python": "/home/stone/venvs/apex-0520/bin/python",
+      "python_version": "3.12.3",
+      "packages": {
+        "torch": "2.13.0+cu130",
+        "triton": "3.7.1",
+        "sglang": "0.5.20",
+        "sglang-kernel": "0.4.7+cu130",
+        "sgl-deep-gemm": "0.2.0+cu130",
+        "flashinfer-python": "0.6.18",
+        "nvidia-cudnn-cu13": "9.20.0.48",
+        "nvidia-cudnn-frontend": "1.30.0",
+        "nvidia-cutlass-dsl": "4.6.2",
+        "numpy": "2.3.5",
+        "nvidia-cublas": "13.1.1.3",
+        "nvidia-cuda-nvrtc": "13.0.88"
+      },
+      "env": {
+        "CUDA_HOME": "/usr/local/cuda-13.2"
+      },
+      "path_prepend": [],
+      "pythonpath_overlays": [],
+      "fso": true
+    }
+  },
+  "notes": [
+    "Filled on 2026-10-01 from the machine itself (pip list of the interpreter, nvidia-smi).",
+    "Package keys are distribution names: deep_gemm is the sgl-deep-gemm distribution. Every package of the harness's list that the environment has installed is pinned, plus nvidia-cublas and nvidia-cuda-nvrtc (the cuBLAS and NVRTC builds torch loads); any change to one of them is drift.",
+    "The environment, the CUDA_HOME and the unset knobs are those of the chains that produced the 2026-10-01 tables: /data/bench-runs/fso_release_perf_20261001/h200/scripts/run_stage1.sh and /data/bench-runs/h200_moe_tables_20261001/scripts/run_chain.sh.",
+    "The sm_90 kernels are compiled by the NVRTC 13.2.78 bundled with fish_scales_ops since 9cf0a46, never by the NVRTC 13.0.88 of the torch wheel, so jit_compiler_sm90() must name NVRTC 13.2."
+  ],
+  "suite": {
+    "pythonpath_overlays": [],
+    "layer_ref": "/data/bench-runs/fso_release_0.2.0_20261001/h200/out_base.pt"
+  }
+}

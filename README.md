@@ -76,6 +76,33 @@ kernel exists; at most about ten rows per SM.
 
 ## Install
 
+Serving machines install a wheel built by `scripts/build_wheel.sh`, which runs
+without the source tree. The in-place build of the source tree is the
+development flow.
+
+### Build a wheel
+
+```bash
+scripts/build_wheel.sh --out dist/           # one wheel for sm_90, sm_100/sm_103 and sm_120, built in a container
+pip install --no-deps dist/fish_scales_ops-0.2.0-cp312-cp312-linux_x86_64.whl
+```
+
+The script builds the committed tree (`git archive HEAD`; `--allow-dirty`
+builds the working tree and marks the wheel dirty) inside the image of
+`docker/build-wheel.Dockerfile` (Ubuntu 22.04 with glibc 2.35, CUDA 13.2.1,
+Python 3.12, torch 2.13.0+cu130), for `9.0a;10.0f;12.0a`. CUTLASS comes from
+`3rdparty/cutlass` (or `--cutlass DIR`) at the commit the repository records.
+The wheel carries the bundled NVRTC, the sm_90 JIT headers (`_jit_include/`),
+the sm_100/sm_103 CuTe-DSL kernel (`_dsl/`) and `BUILD_INFO.json`, which
+`fso.build_info()` returns. It needs at most glibc 2.35 and `GLIBCXX_3.4.30`,
+and the torch it was built against: under another torch the import raises
+`ImportError`. Next to the wheel the script writes its sha256, a copy of
+`BUILD_INFO.json`, the build log and a test kit (`tests/`, `bench/`,
+`scripts/` and `docs/` of the same source) that runs against the installed
+wheel. The script's header lists every option.
+
+### Build in place (development)
+
 ```bash
 git clone <repo> fish-scales-ops
 cd fish-scales-ops
@@ -125,19 +152,21 @@ download the wheel elsewhere and pass it with
 ([`docs/api/compat.md`](docs/api/compat.md#environment-variables));
 `torch.ops.fish_scales_ops.jit_compiler_sm90()` reports the compiler in use.
 
-The built extension keeps reading files from the source tree that built it,
-so install in place (`EDITABLE=1`, or the default `build_ext --inplace`) and
-keep that tree where it is:
+An in-place build keeps reading files from the source tree that built it, so
+install in place (`EDITABLE=1`, or the default `build_ext --inplace`) and keep
+that tree where it is:
 
-- On sm_90 the JIT compiles each kernel from the CUTLASS headers and the
-  vendored deep_gemm headers. Their directories are recorded in the extension
-  at build time. If the tree moves, set `FSO_JIT_INCLUDE_DIRS` to the new
+- On sm_90 the JIT compiles each kernel from the vendored deep_gemm headers
+  and the CUDA headers. Their directories are recorded in the extension at
+  build time. If the tree moves, set `FSO_JIT_INCLUDE_DIRS` to the new
   colon-separated list.
 - On sm_100/sm_103 the CuTe-DSL tier loads
   `3rdparty/cutlass/examples/python/CuTeDSL/blackwell/dense_blockscaled_gemm_persistent.py`
   from the tree. `FSO_DSL_KERNEL_PATH` points it elsewhere.
 
-A wheel installed without the tree does not have these files.
+A wheel built by `scripts/build_wheel.sh` carries these files next to its
+extension instead, and the extension looks there before it looks at the
+recorded paths.
 
 ## Usage
 
@@ -175,7 +204,8 @@ if sm >= 10:                                          # MXFP8 1x32 (sm_100/103, 
 ```
 
 `fso.dense`, `fso.moe` and `fso.attention` are the three stable namespaces,
-independent of each other and without top-level re-exports. `fso.dense` is the
+independent of each other and without top-level re-exports; the one top-level
+function, `fso.build_info()`, says how the installed copy was built. `fso.dense` is the
 dense linear interface for every architecture: `prepare_weight` converts a
 weight for this device at load time, and `linear` is one torch custom op whose
 body quantizes the activation and runs the architecture's GEMM. `fso.moe` is the
@@ -267,7 +297,8 @@ fish-scales-ops/
 ├── tests/baselines/                     accepted perf runs (jsonl), the source of every table
 ├── bench/{gemm/python,attention}/       benches, tile sweeps, render_perf_docs.py
 ├── docs/                                docs/README.md is the map; api/, perf/{gemm,layer,attention}/
-└── scripts/                             build.sh, vendor_nvrtc.py (the bundled sm_90 NVRTC), gen_op_schemas.py (the generated torch.ops blocks of docs/api/)
+├── docker/                              build-wheel.Dockerfile, the fixed environment of the wheel build
+└── scripts/                             build.sh, build_wheel.sh (with build_wheel_inner.sh, build_wheel_package.py), vendor_nvrtc.py (the bundled sm_90 NVRTC), gen_op_schemas.py (the generated torch.ops blocks of docs/api/)
 ```
 
 ## Tests and benches
@@ -311,6 +342,7 @@ python tests/gemm/unit/test_fp8_fused_fc1_sm90.py           # H200: the fused Sw
 python tests/gemm/unit/test_fp8_fused_fc1_swapab_sm90.py    # H200: the fused swap-AB SwiGLU FC1 against the unfused chain
 python tests/gemm/unit/test_jit_cache_sm90.py               # H200: the JIT disk cache (subprocesses, temp dirs)
 python tests/gemm/unit/test_jit_nvrtc_pin_sm90.py           # every arch: no link-time NVRTC; H200: the bundled NVRTC 13.2 against torch's (subprocesses)
+python tests/gemm/unit/test_wheel_layout.py                 # every arch: an installed wheel's packaged files, build_info() and torch guard; H200: the packaged JIT headers; B300: the packaged DSL kernel (an in-place build checks build_info() only)
 # Attention (the MXFP8 kernels run on sm_120; elsewhere the tests check the refusals)
 python tests/attention/test_smoke.py
 python -m pytest tests/attention/

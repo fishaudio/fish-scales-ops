@@ -154,8 +154,12 @@ std::vector<std::filesystem::path> getJitIncludeDirs()
     static std::vector<std::filesystem::path> includeDirs;
     if (includeDirs.empty())
     {
-        // Standalone build: take include directories from a colon-separated env
-        // var, or a build-time-baked default (FSO_JIT_INCLUDE_DIRS_DEFAULT).
+        // The include directories of the JIT, the first of these that names any:
+        //   1. FSO_JIT_INCLUDE_DIRS, a colon-separated list;
+        //   2. the packaged tree <directory of the extension .so>/_jit_include, when it exists (bundledJitIncludePath
+        //      in jit_utils.cuh): a wheel carries every header the JIT includes there, in one include root;
+        //   3. the build-time default FSO_JIT_INCLUDE_DIRS_DEFAULT, the source-tree directories that python/setup.py
+        //      bakes in, which an in-place build uses.
         auto pushFromColonList = [&](char const* list)
         {
             if (list == nullptr)
@@ -173,16 +177,37 @@ std::vector<std::filesystem::path> getJitIncludeDirs()
                 start = end + 1;
             }
         };
+        char const* origin = "FSO_JIT_INCLUDE_DIRS";
         pushFromColonList(std::getenv("FSO_JIT_INCLUDE_DIRS"));
+        if (includeDirs.empty())
+        {
+            std::filesystem::path const packaged = bundledJitIncludePath();
+            std::error_code ec;
+            if (!packaged.empty() && std::filesystem::is_directory(packaged, ec))
+            {
+                includeDirs.push_back(packaged);
+                origin = "the include tree packaged with fish_scales_ops";
+            }
+        }
 #ifdef FSO_JIT_INCLUDE_DIRS_DEFAULT
         if (includeDirs.empty())
+        {
             pushFromColonList(FSO_JIT_INCLUDE_DIRS_DEFAULT);
+            origin = "the build-time default";
+        }
 #endif
         if (!includeDirs.empty())
         {
+            if (kJitDebugging)
+            {
+                std::string list;
+                for (auto const& dir : includeDirs)
+                    list += (list.empty() ? "" : ":") + dir.string();
+                TLLM_LOG_INFO("sm_90 JIT include directories (%s): %s", origin, list.c_str());
+            }
             // The baked default names directories of the source tree that built the extension
             // (python/setup.py). An install that moved or deleted that tree leaves NVRTC without
-            // the CUTLASS and deep_gemm headers, and every sm_90 kernel compile then fails with a
+            // the deep_gemm and CUDA headers, and every sm_90 kernel compile then fails with a
             // bare "cannot open source file". Name the missing directories and the remedy once per
             // process (this list is resolved once).
             std::string missing;
@@ -194,12 +219,14 @@ std::vector<std::filesystem::path> getJitIncludeDirs()
             }
             if (!missing.empty())
                 std::fprintf(stderr,
-                    "[fish_scales_ops] sm_90 JIT: these include directories do not exist:%s\n"
-                    "  The sm_90 kernels are compiled at run time from the headers of the source tree that built "
-                    "this extension. Keep that tree in place, or set FSO_JIT_INCLUDE_DIRS to a colon-separated "
-                    "list of the CUTLASS include and tools/util/include directories, "
-                    "csrc/gemm/include/blockscale_gemm/arch/sm90/fp8/jit and the CUDA include directory.\n",
-                    missing.c_str());
+                    "[fish_scales_ops] sm_90 JIT: these include directories (%s) do not exist:%s\n"
+                    "  The sm_90 kernels are compiled at run time. An in-place build takes their headers from the "
+                    "source tree that built it, so keep that tree in place; or install a wheel built by "
+                    "scripts/build_wheel.sh, which carries them in _jit_include/ next to the extension; or set "
+                    "FSO_JIT_INCLUDE_DIRS to a colon-separated list of the directory that holds deep_gemm/ "
+                    "(csrc/gemm/include/blockscale_gemm/arch/sm90/fp8/jit in the source tree), the CUDA include "
+                    "directory and its cccl/ subdirectory, and the CUTLASS include directory.\n",
+                    origin, missing.c_str());
             return includeDirs;
         }
 

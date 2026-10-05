@@ -102,6 +102,25 @@ def _sm90_jit_compiler_line() -> str:
     return f"sm_90 JIT compiler: {compiler}"
 
 
+def _build_line() -> str:
+    """The line that :func:`describe` and :func:`fish_scales_ops.dense.describe`
+    add after their first: the package version, the commit and the torch the
+    extension was built against (:func:`fish_scales_ops.build_info`), or, for an
+    in-place build, the running torch. Never raises."""
+    try:
+        from .. import build_info
+
+        info = build_info()
+        if info.get("source_build"):
+            return (f"build: fish-scales-ops {info.get('version')}, an in-place build of the source tree, "
+                    f"running torch {info.get('torch')}")
+        commit = str(info.get("commit") or "unknown")[:12] + (" (dirty)" if info.get("dirty") else "")
+        return (f"build: fish-scales-ops {info.get('version')}, commit {commit}, built against torch "
+                f"{info.get('torch')}")
+    except Exception as e:  # noqa: BLE001 - the description must never fail
+        return "build: unavailable: " + " ".join(str(e).splitlines())
+
+
 def _arch_major(arch) -> int:
     """The compute-capability major of an ``arch`` argument: an int major (9, 10,
     12), an int ``major * 10 + minor`` (90, 100, 103, 120, 121), a ``(major, minor)``
@@ -154,10 +173,11 @@ def supported(format, arch=None) -> bool:
 
 def describe() -> str:
     """The architecture matrix as text, with this device's rows marked, for logs
-    and for the messages of a caller that refuses a configuration. On sm_90 the
-    last line names the compiler of the deep_gemm JIT (the bundled NVRTC and its
-    path), or the error that keeps it from loading; describe() itself never
-    raises."""
+    and for the messages of a caller that refuses a configuration. The second
+    line names the build (version, commit and the torch the extension was built
+    against, from :func:`fish_scales_ops.build_info`). On sm_90 the last line
+    names the compiler of the deep_gemm JIT (the bundled NVRTC and its path), or
+    the error that keeps it from loading; describe() itself never raises."""
     arch = _device_arch()
     major = arch // 10
     name = ""
@@ -196,7 +216,7 @@ def describe() -> str:
                  "(the mxfp8 dialect)",
     }
     lines = [f"fish_scales_ops.moe: one MoE layer for every architecture; this device is "
-             f"{_arch_label(arch)}{name}."]
+             f"{_arch_label(arch)}{name}.", _build_line()]
     for fmt in FORMATS:
         lines.append(heads[fmt])
         for fam, label in families:

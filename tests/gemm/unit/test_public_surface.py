@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """The public surface of fish_scales_ops, pinned: the exported names of every
-namespace, the deprecated fso.gemm path of the 45 names that now live in
-fso.compat, the removal of fso.moe.lowlevel, the torch ops the two stable
-entries register, the arguments removed on 2026-09-30, and the architecture
-refusals of the entries that exist on some architectures only. Runs on any
-machine, a CPU-only one included; the refusal checks that need a particular
+namespace and the top-level build_info(), the deprecated fso.gemm path of the
+45 names that now live in fso.compat, the removal of fso.moe.lowlevel, the
+torch ops the two stable entries register, the arguments removed on
+2026-09-30, and the architecture refusals of the entries that exist on some
+architectures only. The package version is checked against python/pyproject.toml
+in the source tree, or against BUILD_INFO.json in an installed wheel. Runs on
+any machine, a CPU-only one included; the refusal checks that need a particular
 device say when they are skipped.
 
 The deprecation checks run first, because each fso.gemm name warns only on its
 first lookup in a process: nothing before them may touch fso.gemm.<name>."""
 import importlib
 import inspect
+import json
 import os
 import re
 import subprocess
@@ -21,7 +24,7 @@ import torch
 import fish_scales_ops as fso
 from fish_scales_ops._arch import sm_major
 
-TOP = ["dense", "moe", "attention", "compat"]
+TOP = ["dense", "moe", "attention", "compat", "build_info"]
 DENSE = {"FORMATS", "DenseWeight", "prepare_weight", "linear", "supported", "describe"}
 MOE = {"FORMATS", "MoeExperts", "prepare_experts", "layer", "transient_bytes", "supported",
        "describe"}
@@ -128,7 +131,14 @@ def main():
     check(fso.__all__ == TOP, f"fish_scales_ops.__all__ == {TOP}", failures)
     check(hasattr(fso, "gemm") and "gemm" not in fso.__all__,
           "fso.gemm is still an attribute of the package and is not in __all__", failures)
-    pyproject = os.path.join(os.path.dirname(os.path.abspath(fso.__file__)), os.pardir, "pyproject.toml")
+    info = fso.build_info()
+    check(isinstance(info, dict) and info.get("version") == fso.__version__
+          and (info.get("source_build") is True or bool(info.get("commit"))),
+          f"fso.build_info() names the version {info.get('version')} and "
+          + ("a source build" if info.get("source_build") else f"the commit {info.get('commit')}"), failures)
+    pkg_dir = os.path.dirname(os.path.abspath(fso.__file__))
+    pyproject = os.path.join(pkg_dir, os.pardir, "pyproject.toml")
+    build_info_json = os.path.join(pkg_dir, "BUILD_INFO.json")
     if os.path.exists(pyproject):
         text = open(pyproject).read()
         m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
@@ -139,8 +149,13 @@ def main():
             check(f'"{pkg}"' in text, f"python/pyproject.toml packages {pkg}", failures)
         check('"fish_scales_ops.moe.lowlevel"' not in text, "python/pyproject.toml does not list lowlevel",
               failures)
+    elif os.path.exists(build_info_json):
+        with open(build_info_json) as f:
+            built = json.load(f).get("version")
+        check(fso.__version__ == built, f"fish_scales_ops.__version__ {fso.__version__} matches the BUILD_INFO.json "
+                                        f"of the installed wheel ({built})", failures)
     else:
-        print(f"  skip: no pyproject.toml next to the package (installed copy); __version__ {fso.__version__}")
+        print(f"  skip: neither pyproject.toml nor BUILD_INFO.json next to the package; __version__ {fso.__version__}")
     for mod, want in ((fso.dense, DENSE), (fso.moe, MOE), (fso.compat, COMPAT), (fso.attention, ATTENTION)):
         got = set(mod.__all__)
         check(got == want and len(mod.__all__) == len(got),

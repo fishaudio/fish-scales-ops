@@ -162,11 +162,10 @@ def test_sm100_tier_knobs():
 
 
 def test_mid_band_notice():
-    import fish_scales_ops
-    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(fish_scales_ops.__file__))))
-    default_present = os.path.exists(os.path.join(
-        repo, "3rdparty", "cutlass", "examples", "python", "CuTeDSL", "blackwell",
-        "dense_blockscaled_gemm_persistent.py"))
+    # The default kernel is the copy a wheel carries in _dsl/, else the CUTLASS example in the source tree;
+    # _default_kernel_path() is the tier's own answer.
+    from fish_scales_ops.gemm import _sm100_dsl
+    default_present = os.path.exists(_sm100_dsl._default_kernel_path())
 
     v, err = _run("mid_band", FSO_DSL_KERNEL_PATH="/nonexistent/dense_blockscaled_gemm_persistent.py")
     lines = [ln for ln in err.splitlines() if ln.startswith(MID_TAG)]

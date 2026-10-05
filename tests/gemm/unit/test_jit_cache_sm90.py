@@ -247,7 +247,10 @@ def run_all(workdir, expect_pci_bus_id):
     copy_root = W("jit_copy")
     shutil.copytree(os.path.join(jit_dirs[0], "deep_gemm"), os.path.join(copy_root, "deep_gemm"))
     env3 = dict(env1)
-    env3["FSO_JIT_INCLUDE_DIRS"] = ":".join(copy_root if d == jit_dirs[0] else d for d in includes)
+    # The copy goes first and the original list follows it: NVRTC and the header digest both take deep_gemm/ from
+    # the first directory that holds it, and the directory the copy came from may hold other headers too (the
+    # packaged _jit_include/ of a wheel is one root with the CUDA headers in it), so it stays on the list.
+    env3["FSO_JIT_INCLUDE_DIRS"] = ":".join([copy_root] + includes)
     r3a = R.run("p3a_header_copy", env3)  # new -I path: new keys (the flags changed)
     check(sorted(r3a["compiled"]) == names and not r3a["loaded"], "p3a: the header copy reused cubins")
     R.same_outputs("p3a", r1["out"], r3a["out"])

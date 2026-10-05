@@ -63,6 +63,20 @@ existing name.
   - `torch.ops.fish_scales_ops.jit_compiler_sm90()` and `describe()` report the compiler in use.
   - The extension no longer links `libnvrtc`.
 - **`fish_scales_ops.__version__`.**
+- **One wheel for every serving machine.** `scripts/build_wheel.sh` builds a wheel for sm_90,
+  sm_100/sm_103 and sm_120 in a fixed container (`docker/build-wheel.Dockerfile`), and the wheel runs
+  without the source tree.
+  - It carries the sm_90 JIT headers in `_jit_include/` and the CuTe-DSL kernel in `_dsl/`; the extension
+    looks for both next to itself before it looks at the source tree.
+  - `fish_scales_ops.build_info()` returns its `BUILD_INFO.json` (commit, toolchain, the torch it was built
+    against, NVRTC, architectures), and both `describe()` texts name the build.
+  - Importing it under another torch than the one it was built against raises `ImportError`.
+- **Release harness.** One wheel is built, then tested and measured as that artifact on every machine
+  (`docs/harness.md`): `scripts/ci/run_suite.py` runs the whole test suite against an installed wheel,
+  `bench/run_perf.py` measures the tables of record under a per-machine environment lock
+  (`bench/env/<machine>.lock.json`) and refuses drift, and `perf_report.py install` records each table's
+  provenance, rendered into `docs/perf/README.md`. `.github/workflows/wheel.yml` builds the wheel and
+  runs the checks that need no GPU.
 
 ### Fixed
 
@@ -96,7 +110,10 @@ existing name.
 
 ### Install
 
-The extension reads files from the source tree that built it, so build in place (`EDITABLE=1` or the
+Serving machines install the wheel that `scripts/build_wheel.sh` builds (`pip install --no-deps`), into an
+environment with the torch it was built against (`fish_scales_ops.build_info()["torch"]`).
+
+An in-place build reads files from the source tree that built it, so build in place (`EDITABLE=1` or the
 default in-place build) and keep the tree where it is:
 - the sm_90 JIT headers; `FSO_JIT_INCLUDE_DIRS` overrides their location;
 - the bundled NVRTC 13.2.78 in `python/fish_scales_ops/_nvrtc/`, which `scripts/build.sh` downloads for an

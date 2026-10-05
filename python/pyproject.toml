@@ -24,6 +24,10 @@ sm100 = ["nvidia-cutlass-dsl>=4.8.0,<5"]
 
 [tool.setuptools]
 package-dir = { "" = "." }
+# Package data comes from the explicit package-data table below only. With the default (true) setuptools also scans
+# its file manifest, and warns once for every data directory with an importable name, which in _jit_include/ is
+# hundreds of warnings; the files shipped are the same either way.
+include-package-data = false
 packages = [
     "fish_scales_ops",
     "fish_scales_ops.dense",
@@ -37,6 +41,14 @@ packages = [
 ]
 
 [tool.setuptools.package-data]
+# What a wheel carries next to the extension so that it runs without the source tree. scripts/build_wheel.sh stages
+# all of it before the wheel is built; an in-place build has only _nvrtc/ (scripts/vendor_nvrtc.py), and a pattern
+# that matches nothing adds nothing.
+#   _nvrtc/        the bundled NVRTC 13.2.78 that compiles the sm_90 kernels
+#   _jit_include/  every header those kernels compile with: deep_gemm/, CUTLASS include/ and the CUDA headers
+#   _dsl/          the CUTLASS CuTe-DSL kernel of the sm_100/sm_103 mid-band tier
+#   BUILD_INFO.json  how the wheel was built; fish_scales_ops.build_info() returns it
+"fish_scales_ops" = ["_nvrtc/*", "_jit_include/**/*", "_dsl/*", "BUILD_INFO.json"]
 # The vendored kernels are BSD-3-Clause; their notice travels with them.
 "fish_scales_ops.gemm._vendor.flashinfer_sm100_blockscaled" = [
     "LICENSE", "README.md", "MANIFEST.md5",

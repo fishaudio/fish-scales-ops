@@ -96,22 +96,42 @@ inline constexpr char const* kNvrtcRemedy
 
 // A function with internal linkage, so its address always lies in the shared object this translation unit is linked
 // into (the extension); dladdr on it names that file.
-static void nvrtcLocatorAnchor() {}
+static void extensionLocatorAnchor() {}
 
-// Where the bundled NVRTC lives: <directory of the extension .so>/_nvrtc/libnvrtc.so.13, which scripts/vendor_nvrtc.py
-// fills. The directory is taken from the loaded extension itself rather than from a path baked in at build time, so the
-// library moves with the package.
-inline std::filesystem::path bundledNvrtcPath()
+// The directory of the loaded extension .so, from dladdr on a function of its own; an empty path when dladdr cannot
+// name the file. The files the package ships next to the extension (the bundled NVRTC, the packaged JIT include tree)
+// are found from here rather than from a path baked in at build time, so they move with the package.
+inline std::filesystem::path extensionDirectory()
 {
     Dl_info info{};
-    if (dladdr(reinterpret_cast<void const*>(&nvrtcLocatorAnchor), &info) == 0 || info.dli_fname == nullptr
+    if (dladdr(reinterpret_cast<void const*>(&extensionLocatorAnchor), &info) == 0 || info.dli_fname == nullptr
         || info.dli_fname[0] == '\0')
+        return {};
+    return std::filesystem::path(info.dli_fname).parent_path();
+}
+
+// Where the bundled NVRTC lives: <directory of the extension .so>/_nvrtc/libnvrtc.so.13, which scripts/vendor_nvrtc.py
+// fills.
+inline std::filesystem::path bundledNvrtcPath()
+{
+    std::filesystem::path const dir = extensionDirectory();
+    if (dir.empty())
     {
         TLLM_THROW("sm_90 JIT: cannot locate the fish_scales_ops extension (dladdr failed), so the NVRTC bundled next "
                    "to it cannot be found. %s",
             kNvrtcRemedy);
     }
-    return std::filesystem::path(info.dli_fname).parent_path() / "_nvrtc" / "libnvrtc.so.13";
+    return dir / "_nvrtc" / "libnvrtc.so.13";
+}
+
+// Where the packaged JIT include tree lives: <directory of the extension .so>/_jit_include. A wheel built by
+// scripts/build_wheel.sh carries every header the JIT compiles with there, in one include root (deep_gemm/, CUTLASS
+// and the CUDA headers); an in-place build of the source tree has no such directory. Empty when the extension cannot
+// be located.
+inline std::filesystem::path bundledJitIncludePath()
+{
+    std::filesystem::path const dir = extensionDirectory();
+    return dir.empty() ? dir : dir / "_jit_include";
 }
 
 // Loads the NVRTC library and resolves the table; nvrtc() calls it once per process, with debugLog = FSO_JIT_DEBUG.

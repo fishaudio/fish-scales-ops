@@ -23,14 +23,15 @@ Contracts:
   (validated: capture + NaN-clobber + replay → bit-identical cos).
 * ``FSO_DISABLE_DSL=1`` kills the route (falls back to the C++ cascade); like
   every boolean ``FSO_*`` switch, a value starting with ``0`` means off
-  (:mod:`fish_scales_ops._env`). The kernel source is the CUTLASS example under
-  ``3rdparty/cutlass`` in the source tree, or ``FSO_DSL_KERNEL_PATH``.
+  (:mod:`fish_scales_ops._env`). The kernel source is ``FSO_DSL_KERNEL_PATH``
+  when set, else the copy of the CUTLASS example that a wheel carries in
+  ``_dsl/``, else the example under ``3rdparty/cutlass`` in the source tree.
 * ``_init`` is silent only when the tier is switched off or the optional
   ``nvidia-cutlass-dsl`` package (the ``sm100`` extra) is not installed. Any
   other reason the tier cannot load — the kernel file is missing, as in an
-  installation without the source tree, loading it raises, or part of the DSL
-  stack fails to import — warns once per process with one ``fso:`` line on
-  stderr, and the router falls back to the remaining tiers.
+  in-place installation whose source tree moved, loading it raises, or part of
+  the DSL stack fails to import — warns once per process with one ``fso:``
+  line on stderr, and the router falls back to the remaining tiers.
 """
 from __future__ import annotations
 
@@ -45,10 +46,20 @@ from .._env import env_flag
 _STATE: Optional[dict] = None
 
 
+_KERNEL_FILE = "dense_blockscaled_gemm_persistent.py"
+
+
 def _default_kernel_path() -> str:
-    """The CUTLASS example the tier compiles, at its place in the source tree."""
+    """The CUTLASS example the tier compiles: the copy a wheel carries in
+    ``<package>/_dsl/`` (scripts/build_wheel.sh puts it there), else the file at
+    its place in the source tree's CUTLASS submodule. When neither exists the
+    source-tree path is returned, and ``_init`` names it in its notice."""
     here = os.path.dirname(os.path.abspath(__file__))
-    repo = os.path.dirname(os.path.dirname(os.path.dirname(here)))
+    package = os.path.dirname(here)
+    packaged = os.path.join(package, "_dsl", _KERNEL_FILE)
+    if os.path.isfile(packaged):
+        return packaged
+    repo = os.path.dirname(os.path.dirname(package))
     # Base persistent blockscaled kernel — pointer-based compile
     # via scaled_mm(), shape-generic. The prefetch variant is not
     # used: under the production torch.cudagraph protocol on the
@@ -57,7 +68,7 @@ def _default_kernel_path() -> str:
     # cubic shapes. Kept for a future retry, disabled.
     return os.path.join(
         repo, "3rdparty", "cutlass", "examples", "python", "CuTeDSL",
-        "blackwell", "dense_blockscaled_gemm_persistent.py")
+        "blackwell", _KERNEL_FILE)
 
 
 def _warn_unavailable(reason: str) -> None:

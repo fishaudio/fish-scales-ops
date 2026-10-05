@@ -50,6 +50,12 @@ INTERMEDIATE = 9728
 M_GRID = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]  # docs/perf/README.md §4
 
 
+def set_m_grid(ms):
+    """--Ms: these M values replace the M grid."""
+    global M_GRID
+    M_GRID = list(ms)
+
+
 def _make_bf16_weights(device="cuda"):
     torch.manual_seed(0xc0ffee)
     w_gate_up = (torch.randn(2 * INTERMEDIATE, HIDDEN, dtype=torch.bfloat16, device=device) / (HIDDEN ** 0.5)).contiguous()
@@ -376,6 +382,8 @@ def main():
     p.add_argument("--from", dest="srcs", nargs="+",
                    help="LABEL=jsonl pairs for format mode")
     p.add_argument("--md-out", default="-")
+    p.add_argument("--Ms", type=str, default=None,
+                   help="comma list of M values that replaces the M grid, e.g. 1,64 (with --run)")
     args = p.parse_args()
 
     if args.worker:
@@ -385,6 +393,8 @@ def main():
         return
 
     if args.run:
+        if args.Ms:
+            set_m_grid([int(m) for m in args.Ms.split(",")])
         run_grid(args.out)
         return
 

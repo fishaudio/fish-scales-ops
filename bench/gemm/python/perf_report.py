@@ -10,7 +10,18 @@ docs, and prints the comparison reports — so a rerun after any change is
   python bench/gemm/python/perf_report.py merge   --run <dir> [--out <dir>]      raw files -> canonical baseline files (n/a cells listed)
   python bench/gemm/python/perf_report.py diff    --a <dir|baselines> --b <dir>   cell-by-cell delta of every shared cell (A/B of an optimisation)
   python bench/gemm/python/perf_report.py report  [--run <dir>]                  layer-level and kernel-level comparison tables, ×fso and band geomeans
-  python bench/gemm/python/perf_report.py install --run <dir>                    merge + diff against the installed baselines + copy + render docs
+  python bench/gemm/python/perf_report.py install --run <dir> [--accept-drift]   merge + diff against the installed baselines + copy + provenance + render docs
+
+install takes only a run directory written by bench/run_perf.py: it reads <dir>/manifest.json, takes the device and
+the SM tag from it, and refuses a --smoke run always, a run that did not complete, a file whose producing step exited
+non-zero or that no step of the manifest wrote, and a run that deviated from its environment lock unless
+--accept-drift is given. It merges into
+<dir>/merged (the raw files are left as they are), copies the canonical files into tests/baselines/, and records for
+each file it installs where it came from in tests/baselines/provenance/<device>.json: the run, its time window, the
+machine, card, driver, clock policy and observed clocks, the versions of the environments of the steps that fed it,
+the fish-scales-ops version, commit and extension sha256, and the sm_90 JIT compiler. The entries of the files it did
+not install are kept, so a partial install (a run of some table groups) leaves the others' provenance alone.
+render_perf_docs.py renders those files into the "Environments of record" block of docs/perf/README.md.
 
 Raw-file manifest (device suffix `--device`, families 30a3 / 35a3):
   perf_moe_qwen3_<fam>_<dev>.jsonl            fso rows (fso_mxfp8_grouped + fso_mxfp8_layer; sm_90: fso_bsfp8_layer)  -> same name
@@ -24,7 +35,9 @@ Bands (stone, 2026-09-28): decode = M 1..128, prefill = M > 128.
 from __future__ import annotations
 
 import argparse
+import datetime
 import glob
+import hashlib
 import json
 import math
 import os
@@ -36,6 +49,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 BASELINES = os.path.join(ROOT, "tests", "baselines")
+PROVENANCE = os.path.join(BASELINES, "provenance")
 FAMILIES = {"30a3": "Family B — Qwen3-30B-A3B routed MoE layer (E=128, top-8, moe_inter 768)",
             "35a3": "Family C — Qwen3.5-35B-A3B routed MoE layer (E=256, top-8, moe_inter 512)"}
 BANDS = [("decode M 1–128", lambda m: m <= 128), ("prefill M > 128", lambda m: m > 128), ("all", lambda m: True)]
@@ -336,15 +350,142 @@ def cmd_report(args):
             print(kernel_report(perf, kern, title.split(" routed")[0]))
 
 
+# ----------------------------------------------------------------------------- install: manifest and provenance
+def load_run_manifest(run):
+    """(manifest dict, sha256 of the file) of a run directory written by bench/run_perf.py, or (None, None)."""
+    path = os.path.join(run, "manifest.json")
+    if not os.path.isfile(path):
+        return None, None
+    with open(path, "rb") as f:
+        raw = f.read()
+    return json.loads(raw.decode("utf-8")), hashlib.sha256(raw).hexdigest()
+
+
+def feeding_steps(man, raw_files):
+    """The manifest's steps whose output is one of a baseline file's raw files."""
+    srcs = {os.path.basename(f) for f in raw_files}
+    return [s for s in man.get("steps", []) if s.get("out") in srcs]
+
+
+def install_refusals(man, args, names, device_conflict):
+    """Every reason not to install this run, as sentences; an empty list means install may proceed."""
+    if man is None:
+        return [f"{args.run} has no manifest.json: install takes only run directories written by bench/run_perf.py, "
+                "because the baselines' provenance is taken from the manifest"]
+    why = []
+    if man.get("smoke"):
+        why.append(f"it is a --smoke run (M in {{{man.get('smoke_ms')}}} only); a smoke run is never installed")
+    if man.get("status") != "complete":
+        why.append(f"the run did not complete (status: {man.get('status')!r})")
+    if man.get("drift") and not args.accept_drift:
+        why.append(f"the run deviated from its environment lock in {len(man['drift'])} item(s) ("
+                   + "; ".join(d.get("text", str(d)) for d in man["drift"])
+                   + "); --accept-drift installs it anyway and stores the drift in the provenance")
+    why += device_conflict
+    written = {s.get("out") for s in man.get("steps", [])}
+    for name, files in sorted(names.items()):
+        bad = [s["name"] for s in feeding_steps(man, files) if s.get("exit_code") != 0]
+        if bad:
+            why.append(f"{name}: the step(s) that produced it exited non-zero ({', '.join(bad)})")
+        foreign = [os.path.basename(f) for f in files if os.path.basename(f) not in written]
+        if foreign:
+            why.append(f"{name}: no step of the manifest wrote {', '.join(foreign)}, so its provenance is unknown")
+    if not names:
+        why.append("the run directory holds no raw file of the manifest above")
+    return why
+
+
+def provenance_entry(man, man_sha, files, run):
+    """Where one installed baseline file came from, from the run's manifest."""
+    steps = feeding_steps(man, files)
+    pre_envs = (man.get("preflight") or {}).get("environments") or {}
+    lock = man.get("lock") or {}
+    fso = man.get("fso") or {}
+    cp = man.get("clock_policy") or {}
+    policy = cp.get("policy") or (lock.get("gpu") or {}).get("clock_policy") or {}
+    envs = {}
+    for e in sorted({s["env"] for s in steps}):
+        p = pre_envs.get(e) or {}
+        envs[e] = {"python": (lock.get("environments") or {}).get(e, {}).get("python"),
+                   "python_version": p.get("python_version"), "packages": p.get("packages")}
+    tree = man.get("bench_tree") or {}
+    return {
+        "run": os.path.basename(os.path.normpath(os.path.abspath(run))),
+        "run_dir": os.path.abspath(run),
+        "manifest_sha256": man_sha,
+        "window_utc": ([min(s["start_utc"] for s in steps), max(s["end_utc"] for s in steps)] if steps
+                       else [man.get("start_utc"), man.get("end_utc")]),
+        "machine": man.get("machine"),
+        "host": man.get("host"),
+        "card": man.get("card"),
+        "driver": (man.get("card") or {}).get("driver"),
+        "clock_policy": {"mode": policy.get("mode"), "mhz": policy.get("mhz"), "applied": cp.get("applied"),
+                         "max_sm_mhz": cp.get("max_sm_mhz")},
+        "observed_clocks": {s["name"]: s.get("clocks") for s in steps},
+        "clock_flags": {s["name"]: s["clock_flags"] for s in steps if s.get("clock_flags")},
+        "steps": [{k: s.get(k) for k in ("name", "env", "command", "start_utc", "end_utc", "exit_code", "rows",
+                                         "error_rows")} for s in steps],
+        "environments": envs,
+        "bench_env": lock.get("bench_env"),
+        "fso": {k: fso.get(k) for k in ("version", "commit", "source_build", "extension_sha256", "build_info")},
+        "jit_compiler_sm90": fso.get("jit_compiler_sm90"),
+        "bench_tree": {k: tree.get(k) for k in ("source", "commit", "bench_dirty", "fingerprint")},
+        "lock_sha256": man.get("lock_sha256"),
+        "drift_accepted": man.get("drift") or [],
+        "installed_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def write_provenance(dev, entries):
+    """Merge `entries` (baseline file name -> provenance) into tests/baselines/provenance/<dev>.json, keeping the
+    entries of every other file."""
+    os.makedirs(PROVENANCE, exist_ok=True)
+    path = os.path.join(PROVENANCE, f"{dev}.json")
+    prov = {"device": dev, "files": {}}
+    if os.path.isfile(path):
+        with open(path) as f:
+            prov = json.load(f)
+    prov["note"] = ("Written by bench/gemm/python/perf_report.py install from each run's manifest.json and rendered by "
+                    "render_perf_docs.py into docs/perf/README.md (Environments of record). Do not edit by hand.")
+    prov.setdefault("files", {}).update(entries)
+    with open(path, "w") as f:
+        json.dump(prov, f, indent=1, sort_keys=True)
+        f.write("\n")
+    return path
+
+
 def cmd_install(args):
+    man, man_sha = load_run_manifest(args.run)
+    conflict = []
+    if man is not None:
+        mdev, msm = man.get("machine"), str((man.get("lock") or {}).get("sm"))
+        if args.device and args.device != mdev:
+            conflict.append(f"--device {args.device} contradicts the manifest's machine {mdev}")
+        if args.sm and str(args.sm) != msm:
+            conflict.append(f"--sm {args.sm} contradicts the manifest's SM tag {msm}")
+        args.device, args.sm = mdev, msm
+    args.device, args.sm = args.device or "5090", args.sm or "120"
+    names = manifest(args.run, args.device, args.sm)
+    why = install_refusals(man, args, names, conflict)
+    if why:
+        print(f"install refused: {args.run}")
+        for w in why:
+            print(f" - {w}")
+        sys.exit(1)
+    args.out = args.out or os.path.join(args.run, "merged")
     cmd_merge(args)
     print("\n##### diff: installed baselines -> this run")
-    args.a, args.b = "baselines", args.out or args.run
+    args.a, args.b = "baselines", args.out
     cmd_diff(args)
-    for name in manifest(args.run, args.device, args.sm):
-        src = os.path.join(args.out or args.run, name)
+    entries = {}
+    for name, files in names.items():
+        src = os.path.join(args.out, name)
         if os.path.exists(src):
             shutil.copy(src, os.path.join(BASELINES, name))
+            entries[name] = provenance_entry(man, man_sha, files, args.run)
+    path = write_provenance(args.device, entries)
+    print(f"\nprovenance of {len(entries)} file(s) recorded in {os.path.relpath(path, ROOT)}"
+          + (f" (drift accepted: {len(man['drift'])} item(s))" if man.get("drift") else ""))
     subprocess.run([sys.executable, os.path.join(HERE, "render_perf_docs.py")], check=True)
     subprocess.run([sys.executable, os.path.join(HERE, "render_perf_docs.py"), "--check"], check=True)
     print("installed and rendered")
@@ -357,15 +498,21 @@ def main():
     ap.add_argument("--out", help="merge: where to write the canonical files (default: the run dir)")
     ap.add_argument("--a", help="diff: run dir, or 'baselines' for tests/baselines")
     ap.add_argument("--b", help="diff: run dir to compare against --a")
-    ap.add_argument("--device", default="5090", help="device suffix of the baseline files (5090 | h200 | b300)")
-    ap.add_argument("--sm", default="120", help="SM tag of the dense files (120 | 90 | 100)")
+    ap.add_argument("--device", default=None,
+                    help="device suffix of the baseline files (5090 | h200 | b300); default 5090, and install takes it from the manifest")
+    ap.add_argument("--sm", default=None,
+                    help="SM tag of the dense files (120 | 90 | 100); default 120, and install takes it from the manifest")
     ap.add_argument("--threshold", type=float, default=1.0, help="diff: list cells moving more than this percent")
     ap.add_argument("--show", type=int, default=40, help="diff: how many moved cells to list")
+    ap.add_argument("--accept-drift", action="store_true",
+                    help="install: install a run that deviated from its environment lock (the drift goes into the provenance)")
     args = ap.parse_args()
     if args.cmd in ("merge", "install") and not args.run:
         ap.error("--run is required")
     if args.cmd == "diff" and not (args.a and args.b):
         ap.error("--a and --b are required")
+    if args.cmd != "install":
+        args.device, args.sm = args.device or "5090", args.sm or "120"
     {"merge": cmd_merge, "diff": cmd_diff, "report": cmd_report, "install": cmd_install}[args.cmd](args)
 
 

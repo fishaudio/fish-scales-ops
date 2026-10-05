@@ -1,0 +1,124 @@
+{
+  "schema": 1,
+  "machine": "5090",
+  "host_pattern": "gpu5090-03",
+  "sm": 120,
+  "arch": "sm_120",
+  "device_name": "NVIDIA GeForce RTX 5090",
+  "driver": "595.58.03",
+  "gpu": {
+    "select": {
+      "by": "uuid",
+      "uuids": [
+        "GPU-bdc88aea-7478-c763-79e4-5c8a28bce484"
+      ]
+    },
+    "lock_file": "/mnt/share/stone-bench-runs/.gpu21.lock",
+    "l2_bytes": 100663296,
+    "clock_policy": {
+      "mode": "locked",
+      "mhz": 2407,
+      "tolerance_mhz": 30,
+      "sudo": true,
+      "notes": "Gaming card: locked at its no-boost frequency for the run with 'sudo -n nvidia-smi -i <pci> -lgc 2407' (the card then reads 2400 MHz, also at idle) and released with '-rgc' when the run ends, as the 2026-10-01 chain did."
+    },
+    "compute_mode": null
+  },
+  "jit_compiler_sm90_prefix": null,
+  "bench_env": {},
+  "environments": {
+    "main": {
+      "python": "/home/stone/workspace/standalone/.venv-sgl/bin/python",
+      "python_version": "3.12.3",
+      "packages": {
+        "torch": "2.13.0+cu130",
+        "triton": "3.7.1",
+        "vllm": "0.29.0",
+        "flashinfer-python": "0.6.18",
+        "nvidia-cudnn-cu13": "9.20.0.48",
+        "nvidia-cudnn-frontend": "1.30.0",
+        "nvidia-cutlass-dsl": "4.6.2",
+        "numpy": "2.3.5",
+        "nvidia-cublas": "13.1.1.3",
+        "nvidia-cuda-nvrtc": "13.0.88",
+        "expecttest": "0.3.0"
+      },
+      "env": {
+        "CUDA_HOME": "/home/stone/workspace/cuda-13.0",
+        "LD_LIBRARY_PATH": "/home/stone/workspace/cuda-13.0/lib64",
+        "FLASHINFER_CUDA_ARCH_LIST": "12.0a"
+      },
+      "path_prepend": [
+        "/home/stone/workspace/cuda-13.0/bin"
+      ],
+      "pythonpath_overlays": [],
+      "fso": true
+    },
+    "sglang": {
+      "python": "/home/stone/workspace/standalone/.venv-sglang/bin/python",
+      "python_version": "3.12.3",
+      "packages": {
+        "torch": "2.13.0+cu130",
+        "triton": "3.7.1",
+        "sglang": "0.5.20",
+        "sglang-kernel": "0.4.7",
+        "sgl-deep-gemm": "0.2.0",
+        "flashinfer-python": "0.6.18",
+        "nvidia-cudnn-cu13": "9.20.0.48",
+        "nvidia-cudnn-frontend": "1.30.0",
+        "nvidia-cutlass-dsl": "4.6.2",
+        "numpy": "2.3.5",
+        "nvidia-cublas": "13.1.1.3",
+        "nvidia-cuda-nvrtc": "13.0.88"
+      },
+      "env": {
+        "CUDA_HOME": "/home/stone/workspace/cuda-13.0",
+        "LD_LIBRARY_PATH": "/home/stone/workspace/cuda-13.0/lib64",
+        "FLASHINFER_CUDA_ARCH_LIST": "12.0a"
+      },
+      "path_prepend": [
+        "/home/stone/workspace/cuda-13.0/bin"
+      ],
+      "pythonpath_overlays": [],
+      "fso": true
+    },
+    "fi": {
+      "python": "/home/stone/workspace/standalone/.venv-fi/bin/python",
+      "python_version": "3.12.3",
+      "packages": {
+        "torch": "2.13.0+cu130",
+        "triton": "3.7.1",
+        "flashinfer-python": "0.6.18",
+        "nvidia-cudnn-cu13": "9.26.0.51",
+        "nvidia-cudnn-frontend": "1.30.0",
+        "nvidia-cutlass-dsl": "4.8.0",
+        "numpy": "2.5.3",
+        "nvidia-cublas": "13.1.1.3",
+        "nvidia-cuda-nvrtc": "13.0.88"
+      },
+      "env": {
+        "CUDA_HOME": "/home/stone/workspace/cuda-13.0",
+        "LD_LIBRARY_PATH": "/home/stone/workspace/cuda-13.0/lib64",
+        "FLASHINFER_CUDA_ARCH_LIST": "12.0a"
+      },
+      "path_prepend": [
+        "/home/stone/workspace/cuda-13.0/bin"
+      ],
+      "pythonpath_overlays": [],
+      "fso": true
+    }
+  },
+  "notes": [
+    "Filled on 2026-10-01 from the machine itself (pip list of each interpreter, nvidia-smi).",
+    "One card for every table: PCI 00000000:21:00.0. The two granted cards differ on heavy prefill cells (card 21 holds 2325-2400 MHz where card 22 drops to 2085-2272 MHz), so a run on the spare card 22:00.0 is not comparable and is not offered here.",
+    "Every card of this host runs in Exclusive_Process compute mode; the chains left it so, and so does the harness (the preflight probes run with no GPU visible).",
+    "Three interpreters, as in /data/bench-runs/fso_release_perf_20261001/5090_stage2/common2.sh: .venv-sgl (fso rows, vLLM, FlashInfer's TRT-LLM CUTLASS MoE, torch-native comparators), .venv-sglang (sglang 0.5.20), .venv-fi (FlashInfer with cuDNN 9.26, which the grouped MXFP8 comparator needs). CUDA_HOME must be exported for the sglang venv: without it deep_gemm's import fails.",
+    "Package keys are distribution names: deep_gemm is the sgl-deep-gemm distribution. Every package of the harness's list that an environment has installed is pinned, plus nvidia-cublas and nvidia-cuda-nvrtc, and expecttest where the dense bench's cuBLAS MXFP8 columns import torch.testing._internal."
+  ],
+  "suite": {
+    "pythonpath_overlays": [
+      "/mnt/share/stone-bench-runs/fso-harness/overlays/pytest"
+    ],
+    "layer_ref": "/mnt/share/stone-bench-runs/moe_single_path_20260930/out_old.pt"
+  }
+}

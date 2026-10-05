@@ -43,6 +43,14 @@ python/fish_scales_ops/_C.*.dylib
 python/fish_scales_ops/_nvrtc/
 python/fish_scales_ops/_nvrtc.*/
 
+# What scripts/build_wheel.sh stages into the package of a wheel build (its
+# container works on a copy of the source, so these appear here only when the
+# staging script is run by hand)
+python/fish_scales_ops/_jit_include/
+python/fish_scales_ops/_jit_include.staging/
+python/fish_scales_ops/_dsl/
+python/fish_scales_ops/BUILD_INFO.json
+
 # JIT extension cache (torch.utils.cpp_extension.load)
 .torch_extensions/
 

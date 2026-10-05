@@ -29,9 +29,11 @@ import fish_scales_ops as fso
 | shared expert of an MoE block | as a dense layer | its output enters `fso.moe.layer` as `bias=` / `bias_scale=` |
 | memory to reserve for the MoE layer | `fso.moe.transient_bytes(e, max_tokens, topk)` | — |
 | which formats this device serves | `fso.dense.supported(fmt)`, `fso.moe.supported(fmt)`, and `describe()` for logs | — |
+| how the installed copy was built | `fso.build_info()`: the wheel's commit, toolchain and the torch it was built against, or `source_build` | — |
 | attention | — | `fso.attention.flash_attn_fwd(q, k, v, ...)` (torch SDPA on every architecture); the sm_120/121 MXFP8 kernels in [`api/attention.md`](api/attention.md) |
 
-**Stable names.** These are the 0.2.0 stable names: `fso.dense`, `fso.moe` and `fso.attention`.
+**Stable names.** These are the 0.2.0 stable names: `fso.dense`, `fso.moe` and `fso.attention`, and the
+one top-level function `fso.build_info()`.
 - **Same code on every architecture.** The same calls run on sm_90 (H200), sm_100/sm_103 (B200/B300) and
   sm_120/sm_121 (RTX 5090). The architecture and shape dispatch happen inside one torch custom op per
   layer: `fish_scales_ops::dense_linear` and `fish_scales_ops::moe_layer`. A caller never names an
@@ -43,23 +45,41 @@ import fish_scales_ops as fso
 
 ## 2. Build and install
 
-```bash
-git clone --recursive https://github.com/fishaudio/fish-scales-ops
-cd fish-scales-ops
-ARCH="9.0a;10.0f;12.0a" EDITABLE=1 ./scripts/build.sh   # every serving architecture in one extension
-# or one machine only: ARCH=9.0a (H200), ARCH=10.0f (B200/B300), ARCH=12.0a (RTX 5090)
-```
+There are two ways in: a wheel, built once and installed on every serving machine, or an in-place build of
+the source tree.
+
+- **The wheel.** `scripts/build_wheel.sh` builds one wheel in a fixed container (CUDA 13.2.1, glibc 2.35,
+  Python 3.12, torch 2.13.0+cu130) with the kernels of every serving architecture (`9.0a;10.0f;12.0a`).
+  The wheel carries every file the extension reads at run time: the bundled NVRTC, the headers the sm_90
+  kernels compile with and the sm_100/sm_103 CuTe-DSL kernel. No source tree is needed where it runs.
+
+  ```bash
+  pip install --no-deps fish_scales_ops-0.2.0-cp312-cp312-linux_x86_64.whl
+  python -c "import fish_scales_ops as fso; print(fso.build_info())"
+  ```
+
+  The serving venv must hold the torch the wheel was built against (`fso.build_info()["torch"]`).
+  Importing the package under another torch raises `ImportError`, which names both versions.
+- **An in-place build**, for development or for a torch other than the wheel's:
+
+  ```bash
+  git clone --recursive https://github.com/fishaudio/fish-scales-ops
+  cd fish-scales-ops
+  ARCH="9.0a;10.0f;12.0a" EDITABLE=1 ./scripts/build.sh   # every serving architecture in one extension
+  # or one machine only: ARCH=9.0a (H200), ARCH=10.0f (B200/B300), ARCH=12.0a (RTX 5090)
+  ```
 
 - **Runtime.** torch 2.11 or newer with a CUDA 13 runtime. Build in the serving venv: the extension
   links against the venv's own torch (`build.sh` installs with `--no-build-isolation`).
-- **Keep the source tree in place.** The extension keeps reading two kinds of file from it:
-  - sm_90 compiles its kernels at run time from the CUTLASS and deep_gemm headers in the tree.
-    `FSO_JIT_INCLUDE_DIRS` points elsewhere if the tree moves.
+- **An in-place build keeps reading the source tree.** Two kinds of file come from it:
+  - sm_90 compiles its kernels at run time from the deep_gemm and CUDA headers whose directories the
+    build recorded. `FSO_JIT_INCLUDE_DIRS` points elsewhere if the tree moves.
   - sm_100/sm_103 load a CuTe-DSL kernel file from `3rdparty/cutlass`. `FSO_DSL_KERNEL_PATH` overrides
     its location.
 
-  Build in place (`EDITABLE=1` or the default in-place build). A container image that keeps the cloned
-  tree, as an image that installs with `pip install -e` does, satisfies this.
+  So build in place (`EDITABLE=1` or the default in-place build) and keep the tree. A container image
+  that keeps the cloned tree, as an image that installs with `pip install -e` does, satisfies this. A
+  wheel has neither dependency.
 - **The sm_90 compiler is bundled.** The sm_90 kernels are compiled at run time by NVRTC 13.2.78. The
   library bundles that NVRTC and loads it privately, so the NVRTC that torch ships (13.0 in the torch 2.13
   cu130 wheel) and the CUDA toolkit of the image play no part.
@@ -77,7 +97,8 @@ ARCH="9.0a;10.0f;12.0a" EDITABLE=1 ./scripts/build.sh   # every serving architec
   and the other tiers serve every shape. Any other reason a tier cannot load prints one `fso:` line on
   stderr.
 - **Check after install.** `print(fso.dense.describe()); print(fso.moe.describe())` on the serving
-  device. Both list the formats this device serves and the path each one takes.
+  device. Both list the formats this device serves and the path each one takes, and their second line
+  names the build (version, commit and the torch it was built against).
 
 ## 3. Dense layers: `fso.dense`
 
@@ -189,7 +210,7 @@ variable.
 | variable | when to set it |
 |---|---|
 | `FSO_MOE_FUSED_COMBINE=1` | sm_120/121: allows the fused-combine FC2 on the buckets whose down-projection slab would dominate the layer's memory. Those buckets are then not bit-reproducible run to run. `transient_bytes` follows the setting |
-| `FSO_JIT_INCLUDE_DIRS=a:b:c` | sm_90: the source tree that built the extension moved |
+| `FSO_JIT_INCLUDE_DIRS=a:b:c` | sm_90, an in-place build: the source tree that built the extension moved. A wheel carries its headers |
 | `FSO_JIT_NVRTC_LIB=/path/to/libnvrtc.so` | sm_90: compile with another NVRTC library than the bundled 13.2.78. A version other than 13.2 prints one notice. A path that cannot be loaded raises; nothing falls back to torch's NVRTC |
 | `FSO_STREAMK_POOL_MB=<n>` | sm_120/121: the dense GEMM's Stream-K scratch is allocated once. A later shape that needs more aborts the process. Size it for the largest dense shape, or make that shape's call the first |
 | `FSO_GROUPED_ARG_POOL_MB=<n>` | sm_100/103: the per-thread arena that every captured MoE GEMM pins a block of. Raise it if the process captures very many graphs |

@@ -1,0 +1,75 @@
+{
+  "schema": 1,
+  "machine": "b300",
+  "host_pattern": "fish-dev-*",
+  "sm": 100,
+  "arch": "sm_103",
+  "device_name": "NVIDIA B300 SXM6 AC",
+  "driver": "595.84",
+  "gpu": {
+    "select": {
+      "by": "index",
+      "index": 0
+    },
+    "lock_file": "/home/fish-dev/bench-runs/.gpu.lock",
+    "l2_bytes": 132644864,
+    "clock_policy": {
+      "mode": "natural",
+      "tolerance_mhz": 15,
+      "notes": "The pod cannot set a clock lock and never could; the datacenter-card policy is the natural clock in any case (docs/perf/README.md section 5). Verified by observation: a step whose busy samples, those free of power, thermal and slowdown limits, never reach the card's maximum SM clock is flagged in the manifest. FSO_BENCH_WARM_MS=300 settles the clock before every timed cell."
+    },
+    "compute_mode": {
+      "set": "DEFAULT",
+      "restore": true,
+      "sudo": true
+    }
+  },
+  "jit_compiler_sm90_prefix": null,
+  "bench_env": {
+    "FSO_BENCH_WARM_MS": "300"
+  },
+  "environments": {
+    "main": {
+      "python": "/home/fish-dev/bench-runs/drama_pcg_b300_2026-09-26/env0520/venv/bin/python",
+      "python_version": "3.12.13",
+      "packages": {
+        "torch": "2.13.0+cu130",
+        "triton": "3.7.1",
+        "sglang": "0.5.20",
+        "sglang-kernel": "0.4.7+cu130",
+        "sgl-deep-gemm": "0.2.0+cu130",
+        "flashinfer-python": "0.6.18",
+        "nvidia-cudnn-cu13": "9.20.0.48",
+        "nvidia-cudnn-frontend": "1.30.0",
+        "nvidia-cutlass-dsl": "4.6.2",
+        "numpy": "2.3.5",
+        "nvidia-cublas": "13.1.1.3",
+        "nvidia-cuda-nvrtc": "13.0.88",
+        "expecttest": "0.3.0"
+      },
+      "env": {
+        "CUDA_HOME": "/home/fish-dev/workspace/cuda-13.0",
+        "LD_LIBRARY_PATH": "/home/fish-dev/workspace/cuda-13.0/lib64"
+      },
+      "path_prepend": [
+        "/home/fish-dev/workspace/cuda-13.0/bin"
+      ],
+      "pythonpath_overlays": [
+        "/home/fish-dev/bench-runs/fso-harness/overlays/expecttest"
+      ],
+      "fso": true
+    }
+  },
+  "notes": [
+    "Filled on 2026-10-01 from the pod itself (pip list of the interpreter, nvidia-smi).",
+    "The card is selected by index 0, the pod's only GPU, and checked by name: its UUID and PCI id change whenever the pod is rescheduled (06:00.0 and 66:00.0 on earlier days, 16:00.0 on 2026-10-01 evening). The harness pins CUDA_VISIBLE_DEVICES to the UUID it finds and records UUID and PCI id in the manifest.",
+    "Compute mode: DEFAULT for the run and the mode found before the run restored after it, as /data/bench-runs/fso_release_perf_20261001/b300/run_stage1.sh did (it found Exclusive_Process); when the card is already in Default mode the restore is a no-op.",
+    "The PYTHONPATH overlay holds only expecttest 0.3.0 (pip install --no-deps --target): env0520 lacks it, and torch.testing._internal imports it for the reference MXFP8 quantize of the dense bench's cuBLAS columns and of the torch scaled_grouped_mm comparators. The overlay lives in the 2026-10-01 run directory; the preflight checks that expecttest resolves to 0.3.0 through it, so a moved or deleted overlay is a refusal, not a silent loss of those columns.",
+    "Package keys are distribution names: deep_gemm is the sgl-deep-gemm distribution. Every package of the harness's list that the environment has installed is pinned (sglang, deep_gemm and FlashInfer are installed but no B300 table uses them), plus nvidia-cublas, nvidia-cuda-nvrtc and the expecttest overlay.",
+    "The sm tag is 100: the B300 is sm_103, built for the 10.0f family target, and its dense baselines are named gemm_sm100_*."
+  ],
+  "suite": {
+    "pythonpath_overlays": [],
+    "layer_ref": "/home/fish-dev/bench-runs/moe_single_path_20260930/out_old.pt"
+  }
+}

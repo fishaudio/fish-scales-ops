@@ -56,6 +56,28 @@ unpacks from the pinned `nvidia-cuda-nvrtc==13.2.78` wheel. Nothing else is
 tried: a failed load raises `RuntimeError` with the remedy. A version other
 than 13.2 is used with one stderr line. `FSO_JIT_USE_NVCC` never loads NVRTC.
 
+## Which headers
+
+`getJitIncludeDirs()` in `compiler.cuh` resolves the include directories once
+per process and takes the first of these that names any:
+
+1. `FSO_JIT_INCLUDE_DIRS`, a colon-separated list;
+2. `_jit_include/` next to the extension (found with `dladdr`, like the
+   bundled NVRTC), when it exists. A wheel built by `scripts/build_wheel.sh`
+   carries one include root there: this `deep_gemm/` directory, the CUTLASS
+   `include/` directory and the CUDA 13.2.1 headers of the build container
+   (CCCL merged into the root, the CUDA library headers left out);
+3. `FSO_JIT_INCLUDE_DIRS_DEFAULT`, the source-tree directories
+   `python/setup.py` bakes into an in-place build.
+
+The kernels currently open seven headers of `deep_gemm/` (the generated
+source's `nvrtc_std.cuh`, `nvrtc_cutlass.cuh` and `fp8_gemm_impl.cuh`, and the
+four that one includes) and, from CUDA, `cuda_fp8.h`, `cuda_bf16.h` and
+`cuda_fp16.h` with their `.hpp` parts. The packaged tree still ships whole
+directories, so that a kernel that starts including another CUDA or CUTLASS
+header keeps compiling. With `FSO_JIT_DEBUG=1` the choice is logged as
+`sm_90 JIT include directories (<origin>): <list>`.
+
 ## Lint contract
 
 AOT code (anything outside this directory) must **not** include

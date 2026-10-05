@@ -129,6 +129,14 @@ M_GRID = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]  # docs
 CUBIC_GRID = [1024, 1536, 2048, 2560, 3072, 4096, 6144, 8192, 12288, 16384]
 
 
+def set_m_grid(ms):
+    """--Ms: these M values replace the M grid, and the cubic sweep keeps only the
+    sizes S that are among them (a smoke run's small M list drops it entirely)."""
+    global M_GRID, CUBIC_GRID
+    M_GRID = list(ms)
+    CUBIC_GRID = [s for s in CUBIC_GRID if s in ms]
+
+
 def _inject_outliers(t: torch.Tensor, *, channel_dim: int,
                      channel_frac: float = 0.01, channel_scale: float = 30.0,
                      element_frac: float = 0.003, element_scale: float = 8.0,
@@ -513,8 +521,13 @@ def main():
     p.add_argument("--md-out", default="-", help="markdown output (with --format)")
     p.add_argument("--family", choices=sorted(FAMILIES), default="qwen3-4b",
                    help="dense shape family (docs/perf/README.md §3); with --run")
+    p.add_argument("--Ms", type=str, default=None,
+                   help="comma list of M values that replaces the M grid, e.g. 1,64 (with --run); "
+                        "the cubic M=N=K cells are kept only where S is in the list")
     args = p.parse_args()
     set_family(args.family)
+    if args.Ms:
+        set_m_grid([int(m) for m in args.Ms.split(",")])
 
     if args.worker:
         line = sys.stdin.read().strip().split()
