@@ -26,7 +26,7 @@ export CUTLASS_DIR="${SRC}/3rdparty/cutlass"
 export TORCH_CUDA_ARCH_LIST="${FSO_BUILD_ARCH}"
 export MAX_JOBS
 # The nvidia/cuda image puts /usr/local/cuda/lib64 on LD_LIBRARY_PATH, which the dynamic loader searches before a
-# library's RUNPATH. The bundled libnvrtc.so.13 finds its libnvrtc-builtins.so.13.2 through RUNPATH $ORIGIN, so with
+# library's RUNPATH. The bundled libnvrtc.so.13 finds its libnvrtc-builtins.so.13.0 through RUNPATH $ORIGIN, so with
 # that variable set it would load the toolkit's copy instead, and scripts/vendor_nvrtc.py rightly refuses that.
 # Nothing in the build needs the variable.
 unset LD_LIBRARY_PATH

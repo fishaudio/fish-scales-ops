@@ -5,13 +5,15 @@
 #   - Ubuntu 22.04 has glibc 2.35 and gcc 11, so the extension needs no glibc newer than the oldest serving host has
 #     (the B300 pod runs Debian 12 with glibc 2.36 and GLIBCXX_3.4.30). An extension built on Ubuntu 24.04 needs
 #     GLIBC_2.38 and does not load there.
-#   - The CUDA 13.2.1 toolkit (nvcc and NVRTC 13.2.78) is the one the kernels are validated with. Its headers also
-#     become the packaged sm_90 JIT include tree.
+#   - The CUDA 13.0.3 toolkit (nvcc and NVRTC 13.0.88) is the CUDA 13.0 that torch 2.13.0+cu130 is built with: its
+#     runtime libraries are the ones that torch wheel pins (cudart 13.0.96, cuBLAS 13.1.1.3, NVRTC 13.0.88), so the
+#     extension and torch are compiled by the same toolkit. Its headers also become the packaged sm_90 JIT include
+#     tree.
 #   - Python 3.12 and torch 2.13.0+cu130 match the three serving environments.
 # The image holds the toolchain only. scripts/build_wheel.sh mounts the source when it runs the build; it builds
 # this file into the image fso-build-wheel:<first 12 hex digits of this file's sha256>.
 
-FROM nvidia/cuda:13.2.1-devel-ubuntu22.04@sha256:3805e62773832c404db8785c63190aaba49bff02bb199b0d187ab897170c6cd1
+FROM nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8
 
 ARG DEBIAN_FRONTEND=noninteractive
 

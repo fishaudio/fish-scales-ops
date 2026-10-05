@@ -52,9 +52,10 @@ NVRTC functions the JIT calls into a table; every call in `compiler.cuh` goes
 through that table, so none can bind to the `libnvrtc.so.13` torch loaded.
 The library is `FSO_JIT_NVRTC_LIB` when set, else `_nvrtc/libnvrtc.so.13`
 next to the extension (found with `dladdr`), which `scripts/vendor_nvrtc.py`
-unpacks from the pinned `nvidia-cuda-nvrtc==13.2.78` wheel. Nothing else is
+unpacks from the pinned `nvidia-cuda-nvrtc==13.0.88` wheel (the NVRTC torch 2.13.0+cu130
+depends on). Nothing else is
 tried: a failed load raises `RuntimeError` with the remedy. A version other
-than 13.2 is used with one stderr line. `FSO_JIT_USE_NVCC` never loads NVRTC.
+than 13.0 is used with one stderr line. `FSO_JIT_USE_NVCC` never loads NVRTC.
 
 ## Which headers
 
@@ -65,7 +66,7 @@ per process and takes the first of these that names any:
 2. `_jit_include/` next to the extension (found with `dladdr`, like the
    bundled NVRTC), when it exists. A wheel built by `scripts/build_wheel.sh`
    carries one include root there: this `deep_gemm/` directory, the CUTLASS
-   `include/` directory and the CUDA 13.2.1 headers of the build container
+   `include/` directory and the CUDA 13.0.3 headers of the build container
    (CCCL merged into the root, the CUDA library headers left out);
 3. `FSO_JIT_INCLUDE_DIRS_DEFAULT`, the source-tree directories
    `python/setup.py` bakes into an in-place build.

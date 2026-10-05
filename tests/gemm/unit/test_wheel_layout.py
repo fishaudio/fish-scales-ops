@@ -36,7 +36,7 @@ import fish_scales_ops as fso
 
 KEYS = ("version", "commit", "dirty", "built_at", "image", "cuda_toolkit", "nvcc", "gcc", "python", "torch",
         "cutlass_commit", "nvrtc", "arch_list", "glibc_required")
-PACKAGED = ("BUILD_INFO.json", "_nvrtc/libnvrtc.so.13", "_nvrtc/libnvrtc-builtins.so.13.2", "_nvrtc/VERSION",
+PACKAGED = ("BUILD_INFO.json", "_nvrtc/libnvrtc.so.13", "_nvrtc/libnvrtc-builtins.so.13.0", "_nvrtc/VERSION",
             "_jit_include/THIRD_PARTY_NOTICES", "_jit_include/deep_gemm/fp8_gemm_impl.cuh",
             "_jit_include/cuda_fp8.h", "_jit_include/cuda_bf16.h", "_jit_include/cuda_fp16.h",
             "_jit_include/cutlass/cutlass.h", "_dsl/dense_blockscaled_gemm_persistent.py")
@@ -182,8 +182,8 @@ def packaged_jit_includes():
     check("FINITE True" in out, f"the GEMM output is not finite:\n{out}")
     compiler = next((ln[len("COMPILER "):] for ln in out.splitlines() if ln.startswith("COMPILER ")), "")
     bundled = os.path.join(PKG, "_nvrtc", "libnvrtc.so.13")
-    check(compiler.startswith("NVRTC 13.2 (") and os.path.realpath(compiler[len("NVRTC 13.2 ("):-1])
-          == os.path.realpath(bundled), f"jit_compiler_sm90() = {compiler!r}, want NVRTC 13.2 ({bundled})")
+    check(compiler.startswith("NVRTC 13.0 (") and os.path.realpath(compiler[len("NVRTC 13.0 ("):-1])
+          == os.path.realpath(bundled), f"jit_compiler_sm90() = {compiler!r}, want NVRTC 13.0 ({bundled})")
     print(f"[3] sm_90 JIT: FSO_JIT_INCLUDE_DIRS unset -> {origin}: {listed}; {len(flags)} -I flags, all inside the "
           f"package; output finite; {compiler}")
 

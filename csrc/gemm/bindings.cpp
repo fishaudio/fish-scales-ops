@@ -52,7 +52,7 @@ std::tuple<at::Tensor, at::Tensor> quantize_1x128_sorted_gather_sm90(
     at::Tensor x, at::Tensor flat_to_sorted, int64_t p_max, int64_t topk);
 std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x128_sorted_sm90(
     at::Tensor gu, at::Tensor flat_to_sorted);
-// The compiler of the sm_90 deep_gemm JIT in this process: "NVRTC 13.2 (<path>)", or "nvcc <path>".
+// The compiler of the sm_90 deep_gemm JIT in this process: "NVRTC 13.0 (<path>)", or "nvcc <path>".
 std::string jit_compiler_sm90();
 at::Tensor linear_qx(at::Tensor x_bf16, at::Tensor w_fp8, at::Tensor sw);
 std::tuple<at::Tensor, at::Tensor> quantize_1x128(at::Tensor x, bool use_ue8m0);

@@ -39,11 +39,11 @@
 #                    Sites with multiarch headers (e.g. Debian/Ubuntu python-dev)
 #                    may also need PYTHON_INCLUDE_MULTIARCH for pyconfig.h.
 #
-#   The sm_90 JIT compiles its kernels at run time with the NVRTC 13.2.78 that
+#   The sm_90 JIT compiles its kernels at run time with the NVRTC 13.0.88 that
 #   the package bundles in python/fish_scales_ops/_nvrtc/ (never with the NVRTC
 #   torch loaded). When ARCH contains 9.0, this script runs
 #   scripts/vendor_nvrtc.py BEFORE it compiles: the script downloads the
-#   nvidia-cuda-nvrtc==13.2.78 wheel with pip, checks its pinned sha256 and
+#   nvidia-cuda-nvrtc==13.0.88 wheel with pip, checks its pinned sha256 and
 #   unpacks the library (about 120 MB). A failed step stops the build before
 #   any _C*.so is produced. Two variables control it:
 #
@@ -51,7 +51,7 @@
 #                          download). Same as `vendor_nvrtc.py --wheel PATH`.
 #   FSO_SKIP_NVRTC_VENDOR  1 → skip the step. The extension then has no bundled
 #                          NVRTC, and every process that runs sm_90 GEMMs must
-#                          set FSO_JIT_NVRTC_LIB to a CUDA 13.2 libnvrtc.so.13.
+#                          set FSO_JIT_NVRTC_LIB to a CUDA 13.0 libnvrtc.so.13.
 #
 # Probes only standard system locations. No hard-coded user paths.
 

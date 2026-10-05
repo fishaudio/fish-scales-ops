@@ -15,7 +15,7 @@
 #   --arch LIST     development only: build these TORCH_CUDA_ARCH_LIST entries instead of "9.0a;10.0f;12.0a".
 #
 # Environment:
-#   FSO_NVRTC_WHEEL  the nvidia-cuda-nvrtc 13.2.78 wheel to bundle. The container then runs without a network.
+#   FSO_NVRTC_WHEEL  the nvidia-cuda-nvrtc 13.0.88 wheel to bundle. The container then runs without a network.
 #                    Otherwise the container downloads the wheel with pip. scripts/vendor_nvrtc.py checks its pinned
 #                    sha256 either way.
 #
@@ -26,7 +26,7 @@
 #   2. CUTLASS is exported from the --cutlass checkout at the recorded commit: include/, tools/util/include/,
 #      LICENSE.txt and the CuTe-DSL kernel of the sm_100 mid-band tier.
 #   3. Unless it exists, the image fso-build-wheel:<first 12 hex digits of the Dockerfile's sha256> is built from
-#      docker/build-wheel.Dockerfile: Ubuntu 22.04 (glibc 2.35, gcc 11), CUDA 13.2.1, Python 3.12, torch 2.13.0+cu130.
+#      docker/build-wheel.Dockerfile: Ubuntu 22.04 (glibc 2.35, gcc 11), CUDA 13.0.3, Python 3.12, torch 2.13.0+cu130.
 #      It holds the toolchain only, no fish-scales-ops source.
 #   4. scripts/build_wheel_inner.sh runs in a container of that image, as the invoking user, without a GPU or a
 #      driver. It bundles NVRTC (scripts/vendor_nvrtc.py), stages _jit_include/, _dsl/ and BUILD_INFO.json into the

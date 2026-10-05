@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The sm_90 JIT compiles with the NVRTC 13.2.78 bundled with fish_scales_ops, never with the NVRTC torch loaded.
+"""The sm_90 JIT compiles with the NVRTC 13.0.88 bundled with fish_scales_ops, never with the NVRTC torch loaded.
 
 The extension does not link libnvrtc. On its first sm_90 compile the deep_gemm JIT (arch/sm90/fp8/jit/deep_gemm/
 jit_utils.cuh and compiler.cuh) loads <package>/_nvrtc/libnvrtc.so.13, which scripts/vendor_nvrtc.py unpacks from the
@@ -12,17 +12,16 @@ falling back to the libnvrtc.so.13 already in the process. This script checks:
     2. `nm -D --undefined-only` lists no nvrtc symbol. A direct call left behind would bind to torch's NVRTC at run
        time without any error;
   sm_90 only, each case in its own child process (the library is loaded once per process):
-    3. default: torch's own libnvrtc.so.13 is loaded first with RTLD_GLOBAL and must report a version older than the
-       bundled one (13.0 in the torch cu130 wheel; this precondition is skipped with a note when the environment's
-       torch NVRTC is not older than 13.2).
-       A dense FP8 GEMM and a small MoE layer then run. jit_compiler_sm90() must report NVRTC 13.2 and the bundled
-       path, /proc/self/maps must hold the bundled libnvrtc.so.13 and libnvrtc-builtins.so.13.2, every cubin the run
-       dumps must carry the 13.2 toolkit note, both describe() texts must end with the compiler line, and torch's
-       library must still report its own version;
-    4. override: with FSO_JIT_NVRTC_LIB set to torch's library the same calls give bit-identical outputs, exactly one
-       stderr line carries the version notice, and the bundled library is not mapped. Both cases run with
-       FSO_JIT_DUMP_CUBIN=1 and a cache directory of their own, and the cubin of every kernel differs between them in
-       its cache key directory and in its bytes;
+    3. default: torch's own libnvrtc.so.13 is loaded first with RTLD_GLOBAL. A dense FP8 GEMM and a small MoE layer
+       then run. jit_compiler_sm90() must report NVRTC 13.0 and the bundled path, /proc/self/maps must hold the
+       bundled libnvrtc.so.13 and libnvrtc-builtins.so.13.0, every cubin the run dumps must carry the 13.0 toolkit
+       note, and both describe() texts must end with the compiler line. When torch's NVRTC has another version than
+       the bundled one, it must also report its own version before and after the run;
+    4. override: with FSO_JIT_NVRTC_LIB set to torch's library the same calls give bit-identical outputs and the
+       bundled library is not mapped. Both cases run with FSO_JIT_DUMP_CUBIN=1 and a cache directory of their own.
+       When torch's NVRTC has another version than the bundled one (torch 2.13.0+cu130 ships the same 13.0.88, so
+       this part is skipped there with a note), exactly one stderr line carries the version notice and the cubin of
+       every kernel differs between the cases in its cache key directory and in its bytes;
     5. missing library: FSO_JIT_NVRTC_LIB=/nonexistent/libnvrtc.so.13 makes jit_compiler_sm90() and the GEMM raise a
        RuntimeError that names the path and the remedy (no fallback), and describe() still returns, with the error in
        its compiler line.
@@ -42,7 +41,9 @@ import tempfile
 
 NAME_DIR = re.compile(r"^([0-9a-f]{16})_(gemm_.+)$")
 KERNEL = "nvrtc_kernel.cubin"
-NOTICE = "the sm_90 kernels are validated and measured with NVRTC 13.2"
+BUNDLED = (13, 0)
+BUNDLED_TEXT = f"{BUNDLED[0]}.{BUNDLED[1]}"
+NOTICE = f"the sm_90 kernels are validated and measured with NVRTC {BUNDLED_TEXT}"
 DEBUG_LINE = "sm_90 JIT compiler: NVRTC"
 REMEDY = ("scripts/vendor_nvrtc.py", "FSO_JIT_NVRTC_LIB")
 MISSING = "/nonexistent/libnvrtc.so.13"
@@ -238,33 +239,34 @@ def run_all(workdir):
     torch_ver = None
     if torch_nvrtc:
         torch_ver = nvrtc_version(ctypes.CDLL(torch_nvrtc, mode=os.RTLD_NOW | ctypes.RTLD_GLOBAL))
-    older = torch_ver is not None and torch_ver < (13, 2)
+    differs = torch_ver is not None and torch_ver != BUNDLED
     print(f"torch {torch.__version__}: NVRTC {torch_ver} at {torch_nvrtc}")
-    if not older:
-        print("  note: the environment's torch NVRTC is not older than 13.2 (or was not found), so the 13.0 "
-              "precondition and the checks that need a second compiler version are skipped")
+    if not differs:
+        print(f"  note: the environment's torch NVRTC has the bundled version {BUNDLED_TEXT} (or was not found), so "
+              "the checks that need a second compiler version are skipped")
     R = Runner(workdir, torch_nvrtc)
     bundled = os.path.join(R.pythonpath, "fish_scales_ops", "_nvrtc")
     bundled_lib = os.path.realpath(os.path.join(bundled, "libnvrtc.so.13"))
-    bundled_builtins = os.path.realpath(os.path.join(bundled, "libnvrtc-builtins.so.13.2"))
+    bundled_builtins = os.path.realpath(os.path.join(bundled, f"libnvrtc-builtins.so.{BUNDLED_TEXT}"))
     check(os.path.isfile(bundled_lib) and os.path.isfile(bundled_builtins),
           f"no bundled NVRTC in {bundled}: run `python scripts/vendor_nvrtc.py` (scripts/build.sh does it)")
 
     # 3. default
     c1 = os.path.join(workdir, "cache_default")
     r1 = R.run("default", R.env(FSO_JIT_DUMP_CUBIN="1", FSO_JIT_CACHE_DIR=c1, FSO_JIT_DEBUG="1"))
-    if older:
+    if differs:
         check(tuple(r1["torch_nvrtc_before"]) == torch_ver,
               f"default: torch's NVRTC reported {r1['torch_nvrtc_before']} before the run, want {torch_ver}")
         check(tuple(r1["torch_nvrtc_after"]) == torch_ver, f"default: torch's NVRTC now reports "
                                                            f"{r1['torch_nvrtc_after']}")
-    check(r1["compiler"].startswith("NVRTC 13.2 (") and r1["compiler"].endswith(")")
-          and os.path.realpath(r1["compiler"][len("NVRTC 13.2 ("):-1]) == bundled_lib,
-          f"default: jit_compiler_sm90() = {r1['compiler']!r}, want NVRTC 13.2 ({bundled_lib})")
+    want_prefix = f"NVRTC {BUNDLED_TEXT} ("
+    check(r1["compiler"].startswith(want_prefix) and r1["compiler"].endswith(")")
+          and os.path.realpath(r1["compiler"][len(want_prefix):-1]) == bundled_lib,
+          f"default: jit_compiler_sm90() = {r1['compiler']!r}, want NVRTC {BUNDLED_TEXT} ({bundled_lib})")
     check(bundled_lib in r1["mapped_nvrtc"], f"default: {bundled_lib} not mapped: {r1['mapped_nvrtc']}")
     check(bundled_builtins in r1["mapped_builtins"],
           f"default: {bundled_builtins} not mapped: {r1['mapped_builtins']}")
-    check(NOTICE not in r1["stderr"], "default: the version notice printed for the bundled 13.2")
+    check(NOTICE not in r1["stderr"], f"default: the version notice printed for the bundled {BUNDLED_TEXT}")
     check(r1["stderr"].count(DEBUG_LINE) == 1, f"default: the FSO_JIT_DEBUG compiler line printed "
                                                f"{r1['stderr'].count(DEBUG_LINE)} times, want once")
     for which, line in r1["describe"].items():
@@ -273,10 +275,11 @@ def run_all(workdir):
     check(len(k1) >= 4, f"default: only {len(k1)} cubins dumped: {sorted(k1)}")
     for name, (_key, blob) in k1.items():
         notes = {m.groups() for m in TOOLKIT_NOTE.finditer(blob)}
-        check(notes == {(b"13", b"2")}, f"default: {name} carries the toolkit notes {notes}, want release 13.2")
+        want_note = (str(BUNDLED[0]).encode(), str(BUNDLED[1]).encode())
+        check(notes == {want_note}, f"default: {name} carries the toolkit notes {notes}, want release {BUNDLED_TEXT}")
     print(f"[3] default: {r1['compiler']}; mapped {os.path.basename(bundled_lib)} and "
-          f"{os.path.basename(bundled_builtins)} from {bundled}; {len(k1)} cubins, each noted release 13.2; "
-          + (f"torch's NVRTC reports {'.'.join(map(str, torch_ver))} before and after" if older else
+          f"{os.path.basename(bundled_builtins)} from {bundled}; {len(k1)} cubins, each noted release {BUNDLED_TEXT}; "
+          + (f"torch's NVRTC reports {'.'.join(map(str, torch_ver))} before and after" if differs else
              "torch's NVRTC version check skipped"))
 
     # 4. override with torch's library
@@ -292,7 +295,7 @@ def run_all(workdir):
         names = same_outputs(r1["out"], r2["out"])
         k2 = cubins(c2)
         check(sorted(k2) == sorted(k1), f"override: kernels {sorted(k2)} differ from the default case's {sorted(k1)}")
-        if older:
+        if differs:
             n = r2["stderr"].count(NOTICE)
             check(n == 1, f"override: the version notice printed {n} times, want once")
             for name in k1:
@@ -305,8 +308,8 @@ def run_all(workdir):
                   f"notice; the {len(k1)} cubins differ from [3] in key and bytes and are noted release "
                   f"{torch_ver[0]}.{torch_ver[1]}")
         else:
-            print(f"[4] override: {r2['compiler']}; outputs bit-identical to [3] (torch's NVRTC is not older than "
-                  "13.2, so the notice and the cubin differences are not checked)")
+            print(f"[4] override: {r2['compiler']}; outputs bit-identical to [3] (torch's NVRTC has the bundled "
+                  f"version {BUNDLED_TEXT}, so the notice and the cubin differences are not checked)")
     else:
         print("[4] SKIP: torch's NVRTC was not found, so there is no second library to override with")
 

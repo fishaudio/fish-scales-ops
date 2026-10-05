@@ -13,7 +13,7 @@
             glibc_required into the wheel's BUILD_INFO.json (python -m wheel unpack and pack, which regenerates
             RECORD) and into the source package's copy.
   check     WHEEL: the post-build checks, one line each; the exit status is 1 when any fails:
-              the wheel holds the extension, _nvrtc/libnvrtc.so.13, _nvrtc/libnvrtc-builtins.so.13.2, _jit_include/,
+              the wheel holds the extension, _nvrtc/libnvrtc.so.13, _nvrtc/libnvrtc-builtins.so.13.0, _jit_include/,
               _dsl/dense_blockscaled_gemm_persistent.py and BUILD_INFO.json with every key;
               the extension needs at most GLIBC_2.35 and GLIBCXX_3.4.30, and glibc_required names its newest GLIBC;
               it has no libnvrtc among its NEEDED libraries and no undefined nvrtc* symbol;
@@ -346,7 +346,7 @@ def check(args) -> int:
         sizes = {i.filename: i.file_size for i in z.infolist()}
         sos = sorted(n for n in names if re.fullmatch(r"fish_scales_ops/_C\.[^/]*\.so", n))
         record(len(sos) == 1, f"one extension: {sos}")
-        for member in ("_nvrtc/libnvrtc.so.13", "_nvrtc/libnvrtc-builtins.so.13.2", "_nvrtc/VERSION",
+        for member in ("_nvrtc/libnvrtc.so.13", "_nvrtc/libnvrtc-builtins.so.13.0", "_nvrtc/VERSION",
                        "_dsl/dense_blockscaled_gemm_persistent.py", "_dsl/THIRD_PARTY_NOTICES", "BUILD_INFO.json"):
             record(f"fish_scales_ops/{member}" in names,
                    f"fish_scales_ops/{member} ({sizes.get('fish_scales_ops/' + member, 0)} bytes)")

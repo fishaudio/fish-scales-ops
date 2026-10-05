@@ -192,7 +192,7 @@ def test_drift_is_listed():
     probe = {"executable": "/x/python", "prefix": "/x", "python_version": lock["environments"]["main"]["python_version"],
              "packages": dict(_locks()["h200"]["environments"]["main"]["packages"]),
              "fso": {"file": "/fso/fish_scales_ops/__init__.py", "version": "0.2.0", "build_info": None,
-                     "extension_sha256": "0" * 64, "jit_compiler_sm90": "NVRTC 13.2 (/fso/fish_scales_ops/_nvrtc/libnvrtc.so.13)"}}
+                     "extension_sha256": "0" * 64, "jit_compiler_sm90": "NVRTC 13.0 (/fso/fish_scales_ops/_nvrtc/libnvrtc.so.13)"}}
     saved = (run_perf.run_probe, run_perf.query_cards, run_perf.compute_apps)
     card = {"index": "6", "pci": "00000000:CB:00.0", "uuid": lock["gpu"]["select"]["uuids"][0], "name": lock["device_name"],
             "driver": lock["driver"], "compute_mode": "Default", "clocks_max_sm_mhz": 1980, "power_limit_w": 700,

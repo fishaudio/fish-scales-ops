@@ -92,7 +92,7 @@ inline NvrtcApi const& nvrtc();
 // What to do when the NVRTC library cannot be loaded; part of every loader error.
 inline constexpr char const* kNvrtcRemedy
     = "Run `python scripts/vendor_nvrtc.py` in the fish-scales-ops source tree (scripts/build.sh does it for an sm_90 "
-      "build), or set FSO_JIT_NVRTC_LIB to a CUDA 13.2 libnvrtc.so.13.";
+      "build), or set FSO_JIT_NVRTC_LIB to a CUDA 13.0 libnvrtc.so.13.";
 
 // A function with internal linkage, so its address always lies in the shared object this translation unit is linked
 // into (the extension); dladdr on it names that file.
@@ -138,7 +138,7 @@ inline std::filesystem::path bundledJitIncludePath()
 // The library is, in this order: the file FSO_JIT_NVRTC_LIB names, when that is set and non-empty; the copy bundled
 // next to the extension. Nothing else is tried. In particular a failure never falls back to the libnvrtc.so.13 already
 // in the process or to $CUDA_HOME: it throws a RuntimeError with the path, the dlerror() text and the remedy. A version
-// other than 13.2 is the caller's explicit choice (an override, or a replaced bundled file): it is used, with one line
+// other than 13.0 is the caller's explicit choice (an override, or a replaced bundled file): it is used, with one line
 // on stderr.
 inline NvrtcApi loadNvrtcApi(bool debugLog)
 {
@@ -192,10 +192,10 @@ inline NvrtcApi loadNvrtcApi(bool debugLog)
     if (versionResult != NVRTC_SUCCESS)
         TLLM_THROW("sm_90 JIT: nvrtcVersion failed in the NVRTC library %s (%s): %s", api.path.c_str(), origin,
             api.nvrtcGetErrorString(versionResult));
-    if (api.major != 13 || api.minor != 2)
+    if (api.major != 13 || api.minor != 0)
         std::fprintf(stderr,
             "[fish_scales_ops] sm_90 JIT: compiling with NVRTC %d.%d from %s (%s); the sm_90 kernels are validated "
-            "and measured with NVRTC 13.2\n",
+            "and measured with NVRTC 13.0\n",
             api.major, api.minor, api.path.c_str(), origin);
     if (debugLog)
         TLLM_LOG_INFO("sm_90 JIT compiler: NVRTC %d.%d from %s (%s)", api.major, api.minor, api.path.c_str(), origin);

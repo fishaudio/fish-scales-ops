@@ -38,7 +38,7 @@ python/fish_scales_ops/_C.*.so
 python/fish_scales_ops/_C.*.pyd
 python/fish_scales_ops/_C.*.dylib
 
-# NVRTC 13.2.78 unpacked by scripts/vendor_nvrtc.py (the sm_90 JIT compiler), and
+# NVRTC 13.0.88 unpacked by scripts/vendor_nvrtc.py (the sm_90 JIT compiler), and
 # the staging directories the script renames into place
 python/fish_scales_ops/_nvrtc/
 python/fish_scales_ops/_nvrtc.*/

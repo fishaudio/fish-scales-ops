@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bundle the NVRTC that the sm_90 JIT compiles with: nvidia-cuda-nvrtc 13.2.78, unpacked next to the extension.
+"""Bundle the NVRTC that the sm_90 JIT compiles with: nvidia-cuda-nvrtc 13.0.88, unpacked next to the extension.
 
 fish_scales_ops compiles its sm_90 GEMM kernels at run time with NVRTC. The extension does not link libnvrtc: on its
 first sm_90 compile it loads ``python/fish_scales_ops/_nvrtc/libnvrtc.so.13`` privately (dlopen with RTLD_LOCAL), so
@@ -7,12 +7,12 @@ the kernels always come from the same compiler, whatever NVRTC torch or the CUDA
 that library there. It uses the standard library only and needs no GPU.
 
 1. The wheel: ``--wheel PATH``, else the file the ``FSO_NVRTC_WHEEL`` environment variable names (offline builds),
-   else ``python -m pip download nvidia-cuda-nvrtc==13.2.78 --no-deps --only-binary=:all:`` into a temporary
+   else ``python -m pip download nvidia-cuda-nvrtc==13.0.88 --no-deps --only-binary=:all:`` into a temporary
    directory, with the interpreter that runs this script.
-2. Its sha256 must equal the hash pinned below for its file name (the hashes PyPI publishes for 13.2.78); any other
+2. Its sha256 must equal the hash pinned below for its file name (the hashes PyPI publishes for 13.0.88); any other
    file is refused.
 3. ``libnvrtc.so.13``, ``libnvrtc-builtins.so.13.2`` and the wheel's license file are unpacked into a staging
-   directory beside ``_nvrtc/``. The staged library is loaded with ctypes (RTLD_LOCAL), must report version 13.2, and
+   directory beside ``_nvrtc/``. The staged library is loaded with ctypes (RTLD_LOCAL), must report version 13.0, and
    must compile a trivial kernel for sm_90a with the builtins library staged next to it. A missing or foreign builtins
    library therefore fails here, not in a serving process.
 4. A ``VERSION`` file (package version, wheel file name, sha256) is written, and the staging directory replaces
@@ -21,7 +21,7 @@ that library there. It uses the standard library only and needs no GPU.
 When ``_nvrtc/VERSION`` already names the wheel this run would use and both libraries exist, the script does nothing.
 Every failure prints a message and exits non-zero, leaving an existing ``_nvrtc/`` as it was. ``scripts/build.sh``
 runs this script before it compiles an sm_90 build; ``FSO_SKIP_NVRTC_VENDOR=1`` skips that step, and a process then
-needs ``FSO_JIT_NVRTC_LIB`` pointing at a CUDA 13.2 ``libnvrtc.so.13``.
+needs ``FSO_JIT_NVRTC_LIB`` pointing at a CUDA 13.0 ``libnvrtc.so.13``.
 
 usage: python scripts/vendor_nvrtc.py [--wheel PATH]
 """
@@ -42,27 +42,27 @@ import zipfile
 from pathlib import Path
 
 PACKAGE = "nvidia-cuda-nvrtc"
-VERSION = "13.2.78"
-# file name -> (sha256, machine, download URL), from https://pypi.org/pypi/nvidia-cuda-nvrtc/13.2.78/json. Every Linux
-# wheel of the release is listed.
+VERSION = "13.0.88"
+# file name -> (sha256, machine, download URL), from https://pypi.org/pypi/nvidia-cuda-nvrtc/13.0.88/json. Every Linux
+# wheel of the release is listed. 13.0.88 is the NVRTC that torch 2.13.0+cu130 itself depends on.
 WHEELS = {
-    "nvidia_cuda_nvrtc-13.2.78-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl": (
-        "a9049031da08cbedd0c20e3470e5a978dc330af0e0326b3b05774718c665dc3e",
+    "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl": (
+        "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
         "x86_64",
-        "https://files.pythonhosted.org/packages/5f/96/237b40b171e06eb65905375c4ad5c96f78c2f861ac6e8ae7f650d95e1dfd/"
-        "nvidia_cuda_nvrtc-13.2.78-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl",
+        "https://files.pythonhosted.org/packages/c3/68/483a78f5e8f31b08fb1bb671559968c0ca3a065ac7acabfc7cee55214fd6/"
+        "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl",
     ),
-    "nvidia_cuda_nvrtc-13.2.78-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl": (
-        "a50367a7e2a0bd00fb27e5648179149cc7a60e7c7811740a5ff559f06234526d",
+    "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl": (
+        "d27f20a0ca67a4bb34268a5e951033496c5b74870b868bacd046b1b8e0c3267b",
         "aarch64",
-        "https://files.pythonhosted.org/packages/af/be/8476aa006686fb264d61de43e0408a8dbd001003a702574759b25e645587/"
-        "nvidia_cuda_nvrtc-13.2.78-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
+        "https://files.pythonhosted.org/packages/b7/dc/6bb80850e0b7edd6588d560758f17e0550893a1feaf436807d64d2da040f/"
+        "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
     ),
 }
 LIBRARY = "libnvrtc.so.13"
-BUILTINS = "libnvrtc-builtins.so.13.2"
+BUILTINS = "libnvrtc-builtins.so.13.0"
 LICENSE = "License.txt"
-WANT_VERSION = (13, 2)
+WANT_VERSION = (13, 0)
 
 REPO = Path(__file__).resolve().parent.parent
 DEST = REPO / "python" / "fish_scales_ops" / "_nvrtc"
@@ -206,7 +206,7 @@ def self_check(stage: Path) -> str:
         lib.nvrtcDestroyProgram(ctypes.byref(prog))
 
     # NVRTC finds its builtins library through the normal library search, in which a system copy (an ld.so.cache
-    # entry of a CUDA 13.2 toolkit, say) can stand in for a missing staged one; insist on the staged file.
+    # entry of another CUDA toolkit, say) can stand in for a missing staged one; insist on the staged file.
     builtins = mapped_files("libnvrtc-builtins")
     if builtins is not None:
         want = os.path.realpath(stage / BUILTINS)
