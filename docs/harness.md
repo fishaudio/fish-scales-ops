@@ -22,16 +22,33 @@ scripts/build_wheel.sh --out dist            # committed tree only; --allow-dirt
 ```
 
 The build runs in a fixed container: Ubuntu 22.04 (glibc 2.35, so the extension loads on every serving host), the
-CUDA 13.2.1 toolkit, Python 3.12 and torch 2.13.0+cu130. One extension carries the kernels of all three
-architectures.
+CUDA 13.0.3 toolkit (nvcc 13.0.88, the CUDA 13.0 that torch 2.13.0+cu130 is built with), Python 3.12 and
+torch 2.13.0+cu130. One extension carries the kernels of all three architectures.
 
 - **What the wheel carries.** Everything the package needs at run time, so no machine needs the source tree: the
-  NVRTC 13.2.78 that compiles the sm_90 kernels, the sm_90 JIT include tree, the sm_100 CuTe-DSL kernel and
+  NVRTC 13.0.88 that compiles the sm_90 kernels, the sm_90 JIT include tree, the sm_100 CuTe-DSL kernel and
   `BUILD_INFO.json`. `fish_scales_ops.build_info()` returns that file's content.
 - **Outputs in `dist/`.** The wheel, `<wheel>.sha256`, `BUILD_INFO.json`, the build log and a test kit. The test kit
   is the `tests/`, `bench/`, `scripts/` and `docs/` of the same commit; steps 3 and 4 run from it.
 - **Torch guard.** The wheel is tied to the torch it was built against. Importing it under another torch raises
   `ImportError`.
+- **Memory.** Each architecture pass of `csrc/gemm/ops/mxfp8_kernel.cu` peaks near 16 GB on its own, and four jobs
+  together peaked near 29 GB: give one job 16 GB and each further job about 12 GB. More than four jobs barely shortens
+  the build, because that one translation unit takes most of it. `--cpus N --memory SIZE` limit the container, for
+  example to reproduce a CI runner.
+- **Compiler cache.** `--ccache DIR --ccache-bin FILE` compiles the CUDA translation units through ccache, with the
+  cache in `DIR` outside the repository. `FILE` must be a static ccache build, such as
+  `ccache-4.14.1-linux-x86_64-musl-static` from the ccache releases, because it also runs inside the container. A
+  rebuild whose CUDA sources did not change then compiles nothing. The cache does not change the result: ccache runs
+  in depend mode, which keys every object on every header that any architecture's pass reads, and a hit returns the
+  bytes of an earlier compile. `build.log` ends with the cache statistics.
+- **Same commit, different bytes.** Two builds of one commit, with or without the cache, hold the same code but are
+  not the same file. nvcc names a temporary file after its process id, and that name ends up in the local symbol
+  names of the extension (`.strtab`); nothing else differs. To compare two builds, mask those names:
+
+  ```bash
+  unzip -p W.whl 'fish_scales_ops/_C*.so' | sed -E 's/tmpxft_[0-9a-f]{8}/tmpxft_XXXXXXXX/g' | sha256sum
+  ```
 
 ## 2. Checks without a GPU
 
@@ -43,8 +60,24 @@ It runs in the build image:
 - the source-tree checks (the JIT-isolation lint, the generated doc blocks, the rendered performance tables);
 - the device-independent tests against the installed wheel, with no source tree on the path.
 
+### In CI
+
 `.github/workflows/wheel.yml` runs steps 1 and 2 on every push to `master`, on pull requests that touch code, and on
 tags. On a tag it attaches the outputs to the GitHub release.
+
+- **Runner.** `ubuntu-latest`, with 4 vCPUs and 16 GB of memory. To build on another runner, such as a larger runner
+  of the organization, set the repository variable `FSO_WHEEL_RUNNER` to its label (Settings, Secrets and variables,
+  Actions, Variables); the workflow file does not change. The job first deletes preinstalled toolchains it does not
+  use, because the build image needs about 19 GB of disk, and adds swap until memory and swap reach 24 GiB, because
+  the largest compile peaks near 16 GB.
+- **Compile jobs.** One per 12 GiB of the runner's memory after 2 GiB for the system, at least one and at most one per
+  core: one on `ubuntu-latest`. The `jobs` input of a manual run overrides the choice.
+- **Compiler cache.** Before the build the job restores the ccache directory from the Actions cache: this commit's
+  entry, or else the newest entry made with the same `docker/build-wheel.Dockerfile`. After the build it saves the
+  directory whenever the build compiled anything, also when the build failed or ran out of time. Entries saved on
+  `master` serve every pull request and tag; an entry saved by a pull request serves only that pull request.
+  On `ubuntu-latest`, expect about two hours for a build without usable entries and about 20 minutes for a build
+  whose CUDA sources did not change, most of it spent building the image.
 
 ## 3. Test on each machine
 
@@ -85,7 +118,12 @@ python3 bench/run_perf.py --machine h200 --out /data/bench-runs/<run> --fso-path
 - **Steps.** The steps of every table of record are listed once, in `bench/perf_suite.py`.
 - **Manifest.** `manifest.json` in the run directory records what ran and on what.
 
-`docs/perf/README.md` §7c describes the lock files and the refusals in full.
+**The lock.** `bench/env/<machine>.lock.json` pins, for every environment a step uses, the interpreter and the exact
+package versions, and for the machine the driver, the card, the clock and compute-mode policy, the GPU lock file and
+the benches' environment variables. `run_perf.py` refuses to run when the preflight finds drift from the lock (exit
+3; with `--allow-drift` it runs, and `install` then refuses the run unless given `--accept-drift`), when the card
+already runs a compute process (exit 5), and when the GPU lock file stays busy (exit 4). A `--smoke` run measures
+only M = 1 and 64, and `install` refuses it.
 
 ## 5. Install the tables
 
@@ -97,8 +135,11 @@ python bench/gemm/python/perf_report.py install --run /data/bench-runs/<run>
 `install` requires the run's manifest. It refuses a smoke run, an incomplete run, and a run with drift unless
 `--accept-drift`. It writes the provenance of each installed baseline file into
 `tests/baselines/provenance/<machine>.json`, and `render_perf_docs.py` renders the "Environments of record" block
-of `docs/perf/README.md` from it. The acceptance rule of a performance change is unchanged: every affected cell
-faster than, or within ±1 % of, the installed baseline (`docs/perf/README.md`).
+of `docs/perf/README.md` from it.
+
+**Acceptance rule.** A change that can affect runtime performance is accepted only if every affected cell of the
+tables of record is faster than, or within ±1 % of, the committed baseline, measured with the same protocol on the
+same card.
 
 ## Changing a pinned environment
 

@@ -1150,7 +1150,7 @@ inline void gemm_dispatch_sm120_mxfp8_grouped(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m
         // -7.4% for em=64, yet in the layer those picks cost +2.8% and +0.5%
         // ((16,64,4) at em=64 is +16% in the layer) — so this rule and any
         // future grouped tile change is accepted on the layer cell only (see
-        // docs/perf/README.md section 8). em=64: (32,64,4) is 0.4% better than the
+        // the layer tables). em=64: (32,64,4) is 0.4% better than the
         // (32,128,4) pick in the layer, inside the noise floor, unchanged.
         // gate_up (K=2048) and the Family B down (K=768, 6 k-tiles) are outside
         // the gate.

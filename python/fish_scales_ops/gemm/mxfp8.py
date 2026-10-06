@@ -676,8 +676,6 @@ def moe_layer_fused_combine_engages_sm120(m: int, topk: int, hidden: int) -> boo
     The scatter is issued from the store warp and the spare fourth TMA warp, so it
     overlaps the next tile's mainloop the way the asynchronous TMA store it
     replaces does; ``FSO_MOE_SCATTER_WARP=0`` moves it to the math warps for an A/B.
-    The measured memory and time of both routes are in
-    ``docs/perf/layer/sm120.md``.
 
     Below the threshold it does not engage at all, which is why a caller may pass
     ``fused_combine=True`` for every bucket and still get bit-identical results on
@@ -1427,8 +1425,7 @@ def moe_layer_mxfp8_sm120(
             :func:`moe_layer_fused_combine_engages_sm120` takes it. Those buckets
             allocate less transient memory, which lowers what a caller reserves for
             a large prefill bucket (:func:`moe_layer_transient_bytes_mxfp8` with
-            ``fused_combine=True`` gives the figure; the measured memory and time
-            are in ``docs/perf/layer/sm120.md``). Off by default for two reasons:
+            ``fused_combine=True`` gives the figure). Off by default for two reasons:
             below the threshold it changes nothing, and the adds being atomic make
             the result stable in aggregate but not bit-reproducible run to run,
             which the rest of this surface guarantees.

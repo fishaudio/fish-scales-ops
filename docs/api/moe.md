@@ -183,8 +183,6 @@ are stable in aggregate and not bit-reproducible run to run.
 rule then decides per bucket; unset, every bucket keeps the slab and the combine
 kernel and is reproducible. `fso.moe.transient_bytes` follows the setting, so a
 caller that allows the fused combine reserves less for the buckets that take it.
-The measured memory and time of both routes are in
-[`../perf/layer/sm120.md`](../perf/layer/sm120.md).
 
 *Capture and compile.* The op can be captured into a CUDA graph after one eager
 call of the same shape on the capturing thread, like every op in this library:
@@ -204,7 +202,7 @@ device. The query never raises for a format it does not know (it answers
 `arch` that names no compute capability raises `ValueError`. `describe()`
 returns the same matrix as text with this device's rows marked. On sm_90 its
 last line names the compiler of the JIT that builds the sm_90 kernels
-(`torch.ops.fish_scales_ops.jit_compiler_sm90()`: the bundled NVRTC 13.2 and its
+(`torch.ops.fish_scales_ops.jit_compiler_sm90()`: the bundled NVRTC 13.0 and its
 path), or the error that keeps that compiler from loading; `describe()` itself
 never raises.
 

@@ -4,14 +4,21 @@
 # suite and the performance harness run on those machines against this file (scripts/ci/run_suite.py,
 # bench/run_perf.py), never against a per-machine source build. On a tag the wheel, its sha256, its BUILD_INFO.json
 # and the test kit are attached to the GitHub release of that tag.
+#
+# The job runs on ubuntu-latest unless the repository variable FSO_WHEEL_RUNNER names another runner label, such as a
+# larger runner of the organization. The CUDA translation units are compiled through ccache
+# (scripts/build_wheel.sh --ccache). The cache directory is restored before the build: this commit's entry if there is
+# one, otherwise the newest entry made with the same build image. It is saved after the build whenever the build
+# compiled something, also when the build failed. A cache hit returns the bytes an earlier compile produced, so the
+# cache changes how long the build takes, never what it produces.
 name: wheel
 
 on:
   workflow_dispatch:
     inputs:
       jobs:
-        description: "parallel compile jobs (nvcc takes 2 to 4 GB per job; the runner has 64 GB)"
-        default: "8"
+        description: "parallel compile jobs (empty: derived from the runner's cores and memory)"
+        default: ""
   push:
     branches: [master]
     tags: ["[0-9]*"]
@@ -35,16 +42,122 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest-16c64g
+    runs-on: ${{ vars.FSO_WHEEL_RUNNER || 'ubuntu-latest' }}
+    # GitHub-hosted runners end a job after 6 hours. The build step has a shorter limit of its own, so that the steps
+    # after it, the cache save included, still run when the build runs out of time.
     timeout-minutes: 350
+    env:
+      CCACHE_VERSION: "4.14.1"
+      CCACHE_SHA256: fa1443c9fbea879c9bff6619d1284eda3102992e91831b9f6e546879972195cc
+      # One full build stores about 14 MB of objects, so this keeps many builds' worth and a small cache entry.
+      FSO_CCACHE_MAXSIZE: 500MiB
     steps:
+      - name: Free disk space
+        # The build image is about 19 GB unpacked; none of these preinstalled trees is used.
+        run: |
+          echo "before:"; df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          docker image prune --all --force
+          echo "after:"; df -h /
+
+      - name: Add swap
+        # Each architecture pass of csrc/gemm/ops/mxfp8_kernel.cu peaks near 16 GB, more than a 16 GB runner has free
+        # next to its system. Memory plus swap is raised to at least 24 GiB.
+        run: |
+          have_kib=$(awk '/^(MemTotal|SwapTotal):/ { n += $2 } END { print n }' /proc/meminfo)
+          want_kib=$(( 24 * 1048576 ))
+          if (( have_kib < want_kib )); then
+            sudo fallocate -l "$(( (want_kib - have_kib) / 1024 + 1 ))M" /swapfile-fso
+            sudo chmod 600 /swapfile-fso
+            sudo mkswap /swapfile-fso
+            sudo swapon /swapfile-fso
+          fi
+          free -h
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 0
 
+      - name: Fetch ccache
+        # A static build, so that the same binary also runs inside the build container; pinned by its sha256.
+        run: |
+          name="ccache-${CCACHE_VERSION}-linux-x86_64-musl-static"
+          dir="${RUNNER_TEMP}/ccache-bin"
+          mkdir -p "${dir}"
+          curl -fsSL --retry 3 -o "${dir}/${name}.tar.xz" \
+            "https://github.com/ccache/ccache/releases/download/v${CCACHE_VERSION}/${name}.tar.xz"
+          echo "${CCACHE_SHA256}  ${dir}/${name}.tar.xz" | sha256sum -c -
+          tar -xJf "${dir}/${name}.tar.xz" -C "${dir}" --strip-components=1 "${name}/ccache"
+          "${dir}/ccache" --version | head -1
+          echo "FSO_CCACHE_BIN=${dir}/ccache" >> "${GITHUB_ENV}"
+
+      - name: Restore the compiler cache
+        id: ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/fso-ccache
+          key: fso-ccache-${{ runner.os }}-${{ hashFiles('docker/build-wheel.Dockerfile') }}-${{ github.sha }}
+          restore-keys: |
+            fso-ccache-${{ runner.os }}-${{ hashFiles('docker/build-wheel.Dockerfile') }}-
+
+      - name: Choose the number of compile jobs
+        id: jobs
+        env:
+          JOBS_INPUT: ${{ inputs.jobs }}
+        # Each architecture pass of csrc/gemm/ops/mxfp8_kernel.cu peaks near 16 GB on its own, the next translation
+        # units near 13, 11 and 11 GB, and four jobs together peaked at 29 GB. So: one job per 12 GiB of memory after
+        # 2 GiB for the system, at least one, at most one per core. On ubuntu-latest (4 vCPUs, 16 GB) that is one job,
+        # whose 16 GB peaks use the swap of the step above.
+        run: |
+          cores="$(nproc)"
+          mem_gib="$(awk '/^MemTotal:/ { printf "%d", $2 / 1048576 }' /proc/meminfo)"
+          jobs=$(( (mem_gib - 2) / 12 ))
+          (( jobs <= cores )) || jobs="${cores}"
+          (( jobs >= 1 )) || jobs=1
+          if [[ -n "${JOBS_INPUT}" ]]; then
+            [[ "${JOBS_INPUT}" =~ ^[1-9][0-9]*$ ]] || { echo "::error::jobs must be a positive number"; exit 1; }
+            jobs="${JOBS_INPUT}"
+          fi
+          echo "${cores} cores and ${mem_gib} GiB of memory: ${jobs} compile jobs"
+          echo "jobs=${jobs}" >> "${GITHUB_OUTPUT}"
+
       - name: Build the wheel in the fixed container
-        run: scripts/build_wheel.sh --out dist --jobs "${{ inputs.jobs || '8' }}"
+        id: build
+        timeout-minutes: 300
+        env:
+          JOBS: ${{ steps.jobs.outputs.jobs }}
+        run: scripts/build_wheel.sh --out dist --jobs "${JOBS}" --ccache "${RUNNER_TEMP}/fso-ccache"
+
+      - name: Decide whether to save the compiler cache
+        id: compiled
+        if: always()
+        env:
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          EXACT_HIT: ${{ steps.ccache.outputs.cache-hit }}
+        # Saved when the build ran and compiled anything (a cache miss; build_wheel.sh zeroes the statistics when it
+        # starts), unless this commit's entry was restored as it is.
+        run: |
+          misses=0
+          if [[ "${BUILD_OUTCOME}" =~ ^(success|failure|cancelled)$ && -n "${FSO_CCACHE_BIN:-}" \
+                && -d "${RUNNER_TEMP}/fso-ccache" ]]; then
+            misses="$(CCACHE_CONFIGPATH=/dev/null "${FSO_CCACHE_BIN}" --dir "${RUNNER_TEMP}/fso-ccache" --print-stats \
+              | awk '$1 == "cache_miss" { print $2 }')"
+          fi
+          save=false
+          if [[ "${misses:-0}" -gt 0 && "${EXACT_HIT}" != "true" ]]; then
+            save=true
+          fi
+          echo "compiled ${misses:-0} translation units; save the cache: ${save}"
+          echo "save=${save}" >> "${GITHUB_OUTPUT}"
+
+      - name: Save the compiler cache
+        if: always() && steps.compiled.outputs.save == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/fso-ccache
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
 
       - name: Checks that need no GPU
         run: scripts/ci/cpu_checks.sh --dist dist

@@ -1,25 +1,39 @@
 #!/usr/bin/env python3
-"""Regenerate the fish-scales-ops performance tables from tests/baselines/*.jsonl.
+"""Regenerate the fish-scales-ops performance tables and summaries from tests/baselines/*.jsonl.
 
-Targets (only the first table after each known heading is rewritten; prose is left alone):
+Targets (only the first table after each known heading and the generated blocks are rewritten; prose is left alone):
   docs/perf/gemm/sm90.md    Family A / B / C dense sections
   docs/perf/gemm/sm120.md   Family A / B / C dense sections, Family B / C grouped kernel tables
   docs/perf/gemm/sm100.md   same structure as sm120.md, from the B300 baselines
   docs/perf/layer/sm90.md   Family A MLP block, Family B MoE layer, Family C MoE block (+ comparators; Family A's
-                            serving-library columns come from ref_mlp_qwen3_4b_<dev>.jsonl and appear once it has rows)
-  docs/perf/layer/sm120.md  same for the RTX 5090, plus the grouped GEMM kernel-level comparison tables
+                            serving-library columns come from ref_mlp_qwen3_4b_<dev>.jsonl and appear once it has rows),
+                            and directly after each of the three tables its summary block, between the markers
+                            `<!-- BEGIN GENERATED: summary Family X (bench/gemm/python/render_perf_docs.py) -->` and
+                            `<!-- END GENERATED: summary Family X -->` (inserted there when the page has none): one row
+                            per comparator column of the table, with its ×fso geomean over the decode and the prefill
+                            band and every M at which it is more than 1 % faster than fso (layer_sections, summary_row)
+  docs/perf/layer/sm120.md  same for the RTX 5090, plus the grouped GEMM kernel-level comparison tables (no summary)
   docs/perf/layer/sm100.md  same for the B300 (torch scaled_grouped_mm / _grouped_mm and TRT-LLM trtllm-gen comparators)
   README.md                 the two hot-shape tables (sm_90, sm_120) — no comparisons, by policy
-  docs/perf/README.md       the "Environments of record" block between its BEGIN GENERATED / END GENERATED markers:
-                            one table per machine, one row per installed baseline file, from
-                            tests/baselines/provenance/<device>.json (written by perf_report.py install)
+  docs/perf/README.md       two blocks between their BEGIN GENERATED / END GENERATED markers:
+                            - the cross-machine summary: the summary rows of the three layer pages, one table per
+                              machine (H200, B300, RTX 5090) with a family column, from the same layer_sections() call
+                              that renders the pages, so the two cannot disagree;
+                            - the "Environments of record": one table per machine, one row per installed baseline
+                              file, from tests/baselines/provenance/<device>.json (written by perf_report.py install)
 
-usage: python bench/gemm/python/render_perf_docs.py [--check]
-  --check   regenerate into memory and exit 1 if any target would change (CI-style drift check)
+usage: python bench/gemm/python/render_perf_docs.py [--check] [--only <target> ...]
+  --check   regenerate into memory and exit 1 if any target would change (CI-style drift check); it covers the
+            summary blocks and the environments block as well as the tables
+  --only    render only the listed targets (paths as in TARGETS)
+
+Only targets whose content changes are written, so a second run changes nothing.
 
 Numbers are formatted exactly as the docs print them (dense µs 2 decimals, layer µs 1 decimal, TFLOPS
 integer for dense / 1 decimal for layers, GB/s integer, cos 4 decimals, model ms 2 decimals).
-Layers per model for `model ms`: A 36, B 48, C 40 (docs/perf/layer/README.md).
+Layers per model for `model ms`: A 36, B 48, C 40 (docs/perf/layer/README.md). The summaries print ×fso geomeans with
+2 decimals and the "faster" percentages with 1 decimal, computed from the unrounded µs of the baseline files, with
+perf_report.py's band split and geometric mean, so they equal the band geomeans `perf_report.py report` prints.
 """
 from __future__ import annotations
 
@@ -27,6 +41,11 @@ import argparse
 import json
 import os
 import sys
+
+# The decode / prefill band split and the geometric mean of the summaries are perf_report.py's own, so a summary row
+# and `perf_report.py report` cannot disagree on a band or on how its mean is taken. perf_report.py imports only the
+# standard library, and this directory is sys.path[0] however the script is started.
+from perf_report import BANDS, geo
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 BASE = os.path.join(ROOT, "tests", "baselines")
@@ -135,7 +154,8 @@ def dims(rows):
 
 # ----------------------------------------------------------------------------- grouped kernel table (sm_120)
 def grouped_kernel_table(name):
-    """gemm/sm120.md: the per-projection grouped GEMM cells, fso only (rule 2: no comparison columns in gemm/)."""
+    """gemm/sm120.md: the per-projection grouped GEMM cells, fso only (docs/README.md, Rules: comparisons live in
+    docs/perf/layer/ and the summary of docs/perf/README.md, never in gemm/)."""
     hdr = ["| op | M | m_cap | MXFP8 µs | TFLOPS | weight GB/s | cos |", "|---|---:|---:|---:|---:|---:|---:|"]
     body = []
     for proj in ("gate_up", "down"):
@@ -150,8 +170,9 @@ def grouped_kernel_table(name):
 # The Triton block-scaled grouped GEMM that sglang's and vLLM's fused_experts run per
 # projection, on moe_align-sorted rows with no routing weight, so the cell is one grouped
 # GEMM over exactly the rows the fso cell computes. Read from `ref_kern_<same suffix>`
-# next to the fso perf file; rendered into layer/sm120.md, the one place comparisons are
-# allowed (docs/README.md rule 2), under its "Grouped GEMM kernel-level comparison" section.
+# next to the fso perf file; rendered into layer/sm120.md (comparison tables live in
+# docs/perf/layer/ only, docs/README.md Rules), under its "Grouped GEMM kernel-level comparison"
+# section. These kernel-level columns get no summary block.
 KERN_CMP = [("fi_cudnn_grouped_mxfp8", "FlashInfer cuDNN MXFP8 1×32 µs"),
             ("sgl_triton_grouped_fp8b", "sglang triton FP8 w8a8-block µs"),
             ("vllm_triton_grouped_fp8b", "vLLM triton FP8 w8a8-block µs"),
@@ -180,7 +201,8 @@ def grouped_kernel_cmp_table(name):
 
 
 # ----------------------------------------------------------------------------- layer tables
-# Family A MLP-block comparators (docs/README.md rule 2: layer/ only): the serving libraries' block-FP8 dense linear
+# Family A MLP-block comparators (comparison tables live in layer/ only, docs/README.md Rules; their summaries are
+# also gathered into the cross-machine summary of docs/perf/README.md): the serving libraries' block-FP8 dense linear
 # and cuBLAS's, read from ref_mlp_qwen3_4b_<dev>.jsonl (perf_report.py merges one raw file per library into it) and
 # joined to the fso rows by M. A comparator's columns appear once the file has a timed cell of it, so the table
 # renders unchanged until then; its title names the GEMM backend its cells recorded; ×fso BSFP8 is its µs over fso's
@@ -204,15 +226,23 @@ def mlp_cmp_columns(ref_name):
     return rows, cols
 
 
+# The comparator columns of the Family A table that come from its own jsonl (dtype key, column title); mlp_table and
+# mlp_summary both read them from here, so a summary row carries its column's title exactly.
+MLP_OWN_CMP = [("bf16", "BF16 (torch) µs")]
+MLP_OWN_CMP_BLACKWELL = [("smm", "cuBLAS scaled_mm MXFP8 + reference quantize µs"),
+                         ("smm_fast", "cuBLAS scaled_mm MXFP8 + torch.compile quantize µs")]
+
+
 def mlp_table(name, sm, ref_name=None):
     rows = {r["M"]: r for r in load(name) if "M" in r}
     cmp_rows, cmp_cols = mlp_cmp_columns(ref_name)
+    bf16_t = MLP_OWN_CMP[0][1]
     if sm != 90:
-        hdr = ["| M | BF16 (torch) µs | BSFP8 µs | BSFP8 TFLOPS | BSFP8 cos | model ms | MXFP8 µs | MXFP8 TFLOPS | MXFP8 cos | model ms | "
-               "cuBLAS scaled_mm MXFP8 + reference quantize µs | cuBLAS scaled_mm MXFP8 + torch.compile quantize µs |",
+        hdr = [f"| M | {bf16_t} | BSFP8 µs | BSFP8 TFLOPS | BSFP8 cos | model ms | MXFP8 µs | MXFP8 TFLOPS | MXFP8 cos | model ms | "
+               + "".join(f"{t} | " for _, t in MLP_OWN_CMP_BLACKWELL).rstrip(),
                "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     else:
-        hdr = ["| M | BF16 (torch) µs | BSFP8 µs | BSFP8 TFLOPS | BSFP8 cos | model ms |", "|---:|---:|---:|---:|---:|---:|"]
+        hdr = [f"| M | {bf16_t} | BSFP8 µs | BSFP8 TFLOPS | BSFP8 cos | model ms |", "|---:|---:|---:|---:|---:|---:|"]
     if cmp_cols:
         if sm != 90:
             hdr = [hdr[0] + "".join(f" {t} | ×fso BSFP8 | ×fso MXFP8 |" for _, t in cmp_cols),
@@ -310,6 +340,84 @@ def moe_block_table(fso, routed_impl, shared_impl, cmp, cmp_suffix=" (routed)"):
     return hdr, body
 
 
+# ----------------------------------------------------------------------------- comparison summaries
+# One summary row per comparator column of a layer table: ×fso = comparator µs / fso µs at the same M (above 1 is fso
+# ahead), its geometric mean over the decode and the prefill band (perf_report.BANDS, the M rows where both have a
+# value), and every M at which the comparator is more than 1 % faster than the fso reference. The reference is the fso
+# column the table already sets the comparator against: Family A's BSFP8 block on sm_90 and its MXFP8 block on sm_100
+# and sm_120 (the path fso.dense serves a block-FP8 checkpoint through there), where the block-FP8 serving libraries,
+# the columns with a ×fso BSFP8 ratio, get a second row against the BSFP8 block; Family B's fso layer; Family C's fso
+# routed layer, or its routed + shared block for the comparators that ran that block.
+FASTER_THAN = 0.99
+SUMMARY_COLS = (["comparator", "against"] + [f"{name} ×fso" for name, _ in BANDS[:2]]
+                + ["faster than fso by more than 1 % at"])
+
+
+def summary_row(key, label, against, family, fso, cmp):
+    """fso, cmp: {M: µs}, None (or no entry) where the table prints a dash. `key` is the comparator's impl or dtype key
+    in its baseline file, `label` its column title in the table, `against` the fso column it is divided by, `family`
+    the row's family label in the cross-machine summary."""
+    both = [M for M in sorted(fso) if fso[M] and cmp.get(M) is not None]
+    ratio = {M: cmp[M] / fso[M] for M in both}
+    return {"key": key, "label": label, "against": against, "family": family,
+            "bands": [geo([x for M, x in ratio.items() if pred(M)]) for _, pred in BANDS[:2]],
+            "faster": [(M, (1.0 - ratio[M]) * 100.0) for M in both if cmp[M] < FASTER_THAN * fso[M]]}
+
+
+def fx(x):
+    return DASH if x is None else f"{x:.2f}×"
+
+
+def summary_label(label):
+    """The comparator's column title without its unit: "torch _grouped_mm BF16 µs (eager)" -> "torch _grouped_mm BF16 (eager)"."""
+    return " ".join(w for w in label.split(" ") if w != "µs")
+
+
+def summary_cells(r):
+    faster = ("M = " + ", ".join(f"{M} ({p:.1f} %)" for M, p in r["faster"])) if r["faster"] else "none"
+    return [summary_label(r["label"]), r["against"]] + [fx(g) for g in r["bands"]] + [faster]
+
+
+def summary_table(rows, family=False):
+    cols = (["family"] if family else []) + SUMMARY_COLS
+    out = ["| " + " | ".join(cols) + " |", "|" + "---|" * (len(cols) - 3) + "---:|---:|---|"]
+    for r in rows:
+        out.append("| " + " | ".join(([r["family"]] if family else []) + summary_cells(r)) + " |")
+    return align(out)
+
+
+def mlp_summary(name, sm, ref_name=None):
+    """Family A: the summary rows of the columns mlp_table prints, from the same files."""
+    rows = {r["M"]: r for r in load(name) if "M" in r}
+    cmp_rows, cmp_cols = mlp_cmp_columns(ref_name)
+
+    def col(src, dt):
+        return {M: ((src.get(M) or {}).get(dt) or {}).get("graph_us") for M in rows}
+
+    against = {"bsfp8": "fso BSFP8 block", "mxfp8": "fso MXFP8 block"}
+    ref = "bsfp8" if sm == 90 else "mxfp8"
+    own = MLP_OWN_CMP + (MLP_OWN_CMP_BLACKWELL if sm != 90 else [])
+    comps = [(dt, t, col(rows, dt)) for dt, t in own] + [(dt, t, col(cmp_rows, dt)) for dt, t in cmp_cols]
+    out = [summary_row(dt, t, against[ref], "A MLP block", col(rows, ref), c) for dt, t, c in comps]
+    if sm != 90:
+        out += [summary_row(dt, t, against["bsfp8"], "A MLP block", col(rows, "bsfp8"), col(cmp_rows, dt))
+                for dt, t in cmp_cols]
+    return out
+
+
+def moe_summary(fso, fso_impl, cmp, against, cmp_suffix="", shared=(), shared_impl=None):
+    """Families B and C: the summary rows of the comparator columns moe_layer_table / moe_block_table print, read from
+    the same rows (fso, and the comparator rows set_cmp_rows() installed), titled as those tables title them (the
+    column title plus `cmp_suffix`). against: [(fso column label, family label)] for `fso_impl`, then for
+    `shared_impl`; a comparator listed in `shared` ran the routed + shared block and is divided by `shared_impl`."""
+    out = []
+    for c, t in cmp:
+        impl, (ag, fam) = (shared_impl, against[1]) if c in shared else (fso_impl, against[0])
+        f = {M: r.get("us") for (i, M), r in fso.items() if i == impl}
+        out.append(summary_row(c, f"{t}{cmp_suffix}", ag, fam, f, {M: (cmp_rows_get(c, M) or {}).get("us") for M in f}))
+    return out
+
+
 # ----------------------------------------------------------------------------- document surgery
 def align(table):
     """Pad every cell to its column width so the markdown source reads as a table.
@@ -355,6 +463,35 @@ def replace_table_after(lines, pred, table, start=0):
 
 def starts(prefix):
     return lambda s, p=prefix: s.startswith(p)
+
+
+def summary_markers(family):
+    return (f"<!-- BEGIN GENERATED: summary Family {family} (bench/gemm/python/render_perf_docs.py) -->",
+            f"<!-- END GENERATED: summary Family {family} -->")
+
+
+def put_block_after(lines, at, begin, end, body):
+    """Write `body` between the markers `begin` / `end` of the block that starts at line `at` (after blank lines), or
+    insert a new block there (one blank line, the markers around `body`) when the document has none. A block with
+    these markers anywhere else is an error: the summary belongs directly after its table. Returns the index after
+    the block's end marker."""
+    i = at
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    if i < len(lines) and lines[i].strip() == begin:
+        e = next((j for j in range(i + 1, len(lines)) if lines[j].strip() == end), None)
+        if e is None:
+            raise SystemExit(f"the marker {end!r} is missing after {begin!r}")
+        lines[i + 1:e] = body
+        return i + 2 + len(body)
+    if any(l.strip() in (begin, end) for l in lines):
+        raise SystemExit(f"the block {begin!r} is not directly after its table")
+    lines[at:at] = ["", begin] + body + [end]
+    return at + 3 + len(body)
+
+
+def summary_body(rows):
+    return [""] + (summary_table(rows) if rows else ["No comparator column."]) + [""]
 
 
 def render_gemm_3dtype(lines, sm):
@@ -414,7 +551,8 @@ def render_gemm_sm90(lines):
         pos = replace_table_after(lines, starts(head), h + b, pos)
 
 
-# Comparator columns per SM, allowed only in docs/perf/layer/ (docs/README.md rule 2). The sm_90 and
+# Comparator columns per SM, as tables in docs/perf/layer/ only (docs/README.md Rules; their summaries are also
+# gathered into the cross-machine summary of docs/perf/README.md). The sm_90 and
 # sm_120 hosts have sglang (and deep_gemm on sm_90). The B300 columns are the two grouped entry points
 # torch itself provides and TensorRT-LLM's trtllm-gen fused MoE through FlashInfer; render_layer shows
 # a B300 column only once its rows are installed (measured()).
@@ -459,7 +597,11 @@ def layer_comparators(sm, shared=False):
     return cmp
 
 
-def render_layer(lines, sm):
+def layer_sections(sm):
+    """What layer/sm<sm>.md holds, in page order: for each family its heading, its main table and the rows of its
+    summary block; on sm_120 also the kernel-level comparison tables (no summary). render_layer writes these into the
+    page and summary_block_lines gathers the summary rows of all three pages, so a page and the cross-machine summary
+    always come from one computation."""
     sfx = SFX[sm]
     dt = "bsfp8" if sm == 90 else "mxfp8"
     check_device(sm, f"gemm_sm{sm}_qwen3_4b_mlp_fwd.jsonl", f"ref_mlp_qwen3_4b_{sfx}.jsonl", f"perf_moe_qwen3_30a3_{sfx}.jsonl",
@@ -467,30 +609,48 @@ def render_layer(lines, sm):
                  f"perf_moe_qwen3_35a3_shared_{sfx}.jsonl", f"ref_moe_qwen3_35a3_{sfx}.jsonl",
                  f"ref_moe_qwen3_35a3_shared_{sfx}.jsonl", f"ref_kern_moe_qwen3_30a3_{sfx}.jsonl",
                  f"ref_kern_moe_qwen3_35a3_{sfx}.jsonl")
-    h, b = mlp_table(f"gemm_sm{sm}_qwen3_4b_mlp_fwd.jsonl", sm, f"ref_mlp_qwen3_4b_{sfx}.jsonl")
-    pos = replace_table_after(lines, starts("## Family A — Qwen3-4B dense MLP block"), h + b)
+    out = []
+    mlp, ref_mlp = f"gemm_sm{sm}_qwen3_4b_mlp_fwd.jsonl", f"ref_mlp_qwen3_4b_{sfx}.jsonl"
+    h, b = mlp_table(mlp, sm, ref_mlp)
+    out.append({"heading": "## Family A — Qwen3-4B dense MLP block", "family": "A", "table": h + b,
+                "summary": mlp_summary(mlp, sm, ref_mlp)})
     fsoB = moe_rows(f"perf_moe_qwen3_30a3_{sfx}.jsonl")
     set_cmp_rows({**moe_rows(f"perf_moe_qwen3_30a3_{sfx}.jsonl"), **moe_rows(f"ref_moe_qwen3_30a3_{sfx}.jsonl")})
     cmpB = layer_comparators(sm)
     if sm == 100:
         cmpB = measured(cmpB)
     h, b = moe_layer_table(fsoB, cmpB, f"fso_{dt}_layer", sm)
-    pos = replace_table_after(lines, starts("## Family B — Qwen3-30B-A3B routed MoE layer"), h + b, pos)
+    out.append({"heading": "## Family B — Qwen3-30B-A3B routed MoE layer", "family": "B", "table": h + b,
+                "summary": moe_summary(fsoB, f"fso_{dt}_layer", cmpB, [("fso block", "B routed MoE layer")])})
     fsoC = moe_rows(f"perf_moe_qwen3_35a3_{sfx}.jsonl", f"perf_moe_qwen3_35a3_shared_{sfx}.jsonl")
     # The B300 comparator run measured the shared-expert block as well; sm_90 / sm_120 have no such
     # file, and moe_rows() skips the ones that do not exist.
     set_cmp_rows(moe_rows(f"ref_moe_qwen3_35a3_{sfx}.jsonl", f"ref_moe_qwen3_35a3_shared_{sfx}.jsonl"))
+    routed, shared = f"fso_{dt}_layer", f"fso_{dt}_layer_shared"
+    against = [("fso routed", "C routed MoE layer"), ("fso routed + shared", "C routed + shared block")]
     if sm == 100:
-        cmpC = measured(layer_comparators(sm) + layer_comparators(sm, shared=True))
-        h, b = moe_block_table(fsoC, f"fso_{dt}_layer", f"fso_{dt}_layer_shared", cmpC, cmp_suffix="")
+        shared_cmp = {c for c, _ in layer_comparators(sm, shared=True)}
+        cmpC, suffix = measured(layer_comparators(sm) + layer_comparators(sm, shared=True)), ""
     else:
-        h, b = moe_block_table(fsoC, f"fso_{dt}_layer", f"fso_{dt}_layer_shared", layer_comparators(sm))
-    pos = replace_table_after(lines, starts("## Family C — Qwen3.5-35B-A3B MoE block"), h + b, pos)
+        shared_cmp, cmpC, suffix = set(), layer_comparators(sm), " (routed)"
+    h, b = moe_block_table(fsoC, routed, shared, cmpC, cmp_suffix=suffix)
+    out.append({"heading": "## Family C — Qwen3.5-35B-A3B MoE block", "family": "C", "table": h + b,
+                "summary": moe_summary(fsoC, routed, cmpC, against, suffix, shared_cmp, shared)})
     for fam, letter in (("30a3", "B"), ("35a3", "C")):
         name = f"perf_moe_qwen3_{fam}_{sfx}.jsonl"
         if os.path.exists(os.path.join(BASE, name.replace("perf_moe_", "ref_kern_moe_", 1))):
             h, b = grouped_kernel_cmp_table(name)
-            pos = replace_table_after(lines, starts(f"### Family {letter} — `moe.gate_up` / `moe.down` against the Triton grouped GEMM"), h + b, pos)
+            out.append({"heading": f"### Family {letter} — `moe.gate_up` / `moe.down` against the Triton grouped GEMM",
+                        "family": letter, "table": h + b, "summary": None})
+    return out
+
+
+def render_layer(lines, sm):
+    pos = 0
+    for sec in layer_sections(sm):
+        pos = replace_table_after(lines, starts(sec["heading"]), sec["table"], pos)
+        if sec["summary"] is not None:
+            pos = put_block_after(lines, pos, *summary_markers(sec["family"]), summary_body(sec["summary"]))
 
 
 # ----------------------------------------------------------------------------- README hot rows (no comparisons)
@@ -618,12 +778,42 @@ def env_block_lines():
     return out
 
 
-def render_env_block(lines):
-    b = next((i for i, l in enumerate(lines) if l.strip() == ENV_BEGIN), None)
-    e = next((i for i in range(b + 1, len(lines)) if lines[i].strip() == ENV_END), None) if b is not None else None
+def render_block(lines, begin, end, body):
+    b = next((i for i, l in enumerate(lines) if l.strip() == begin), None)
+    e = next((i for i in range(b + 1, len(lines)) if lines[i].strip() == end), None) if b is not None else None
     if b is None or e is None:
-        raise SystemExit(f"docs/perf/README.md: the markers {ENV_BEGIN!r} and {ENV_END!r} are missing")
-    lines[b + 1:e] = env_block_lines()
+        raise SystemExit(f"docs/perf/README.md: the markers {begin!r} and {end!r} are missing")
+    lines[b + 1:e] = body
+
+
+def render_env_block(lines):
+    render_block(lines, ENV_BEGIN, ENV_END, env_block_lines())
+
+
+# ----------------------------------------------------------------------------- docs/perf/README.md: cross-machine summary
+SUM_BEGIN = "<!-- BEGIN GENERATED: cross-machine summary (bench/gemm/python/render_perf_docs.py) -->"
+SUM_END = "<!-- END GENERATED: cross-machine summary -->"
+SUM_MACHINES = [(90, "H200 (sm_90)", "layer/sm90.md"), (100, "B300 (sm_103)", "layer/sm100.md"),
+                (120, "RTX 5090 (sm_120)", "layer/sm120.md")]
+
+
+def summary_block_lines():
+    out = ["", "Generated by `bench/gemm/python/render_perf_docs.py` from the baseline files and comparator columns of "
+           "the layer tables, the same rows as the summary under each table of `layer/sm90.md`, `layer/sm100.md` and "
+           "`layer/sm120.md`; do not edit it by hand. One row per comparator column: ×fso is the comparator's µs "
+           "divided by fso's µs at the same M, so above 1 means fso is faster; the two band columns are its "
+           f"geometric mean over the M rows of the band where both have a value ({BANDS[0][0]}, {BANDS[1][0]}); "
+           "the last column lists every M at which the comparator is more than 1 % faster than the fso column named "
+           "under `against`.", ""]
+    for sm, title, page in SUM_MACHINES:
+        rows = [r for sec in layer_sections(sm) if sec["summary"] for r in sec["summary"]]
+        out += [f"### {title}", "", f"From [`{page}`]({page}).", ""] + summary_table(rows, family=True) + [""]
+    return out
+
+
+def render_perf_readme(lines):
+    render_block(lines, SUM_BEGIN, SUM_END, summary_block_lines())
+    render_env_block(lines)
 
 
 TARGETS = {
@@ -634,7 +824,7 @@ TARGETS = {
     "docs/perf/layer/sm90.md": lambda L: render_layer(L, 90),
     "docs/perf/layer/sm100.md": lambda L: render_layer(L, 100),
     "README.md": render_readme,
-    "docs/perf/README.md": render_env_block,
+    "docs/perf/README.md": render_perf_readme,
 }
 
 

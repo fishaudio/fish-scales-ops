@@ -41,7 +41,7 @@ production `(N, K)` pair would need an explicit instantiation in the
 .so — feasible, but a separate refactor. It was scoped as a follow-up when
 the library was extracted from blockscale_gemm and has not been started; the
 JIT remains the only sm_90 path, and the NVRTC build that compiles it is
-therefore part of the measured kernel (see `docs/perf/README.md` §8).
+therefore part of the measured kernel: another NVRTC version emits different code.
 
 ## Which NVRTC
 

@@ -84,7 +84,7 @@ import statistics
 import subprocess
 import sys
 
-# Routed-expert geometry per model (docs/perf/README.md §3). Shared experts
+# Routed-expert geometry per model (docs/perf/README.md, Shape families). Shared experts
 # (Qwen3.5) are dense GEMMs on every token and are benched by
 # bench_qwen3_4b_mlp.py --family, not here.
 MODELS = {
@@ -112,7 +112,7 @@ def set_model(name):
 
 set_model(MODEL)
 
-M_GRID = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]  # docs/perf/README.md §4; off-grid points via --Ms
+M_GRID = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]  # docs/perf/README.md, What is measured; off-grid points via --Ms
 DECODE_M = [m for m in M_GRID if m <= 128]
 
 KERNEL_IMPLS = ("dg_fp8_cont", "dg_bf16_cont", "dg_fp8_masked", "dg_bf16_masked",
@@ -1842,7 +1842,7 @@ def main():
     ap.add_argument("--projs", type=str, default=None,
                     help="comma list filter, e.g. gate_up or down,layer")
     ap.add_argument("--model", choices=sorted(MODELS), default="qwen3-30a3",
-                    help="routed-expert geometry (docs/perf/README.md §3): "
+                    help="routed-expert geometry (docs/perf/README.md, Shape families): "
                          "qwen3-30a3 = Family B, qwen3.5-35a3 = Family C")
     args = ap.parse_args()
     # The chains run each venv by its absolute interpreter path, so the venv's

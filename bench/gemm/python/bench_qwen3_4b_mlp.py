@@ -80,7 +80,7 @@ def time_fn_graph(fn, iters=50, warmup=15, repeats=3):
     return statistics.median(samples)
 
 
-# Dense shape families (docs/perf/README.md §3). (tag, N, K).
+# Dense shape families (docs/perf/README.md, Shape families). (tag, N, K).
 FAMILIES = {
     # Family A — Qwen3-4B: 32 Q-heads + 8 KV-heads, head_dim=128, hidden=2560
     # → WQKV out = (32 + 2*8)*128 = 6144; WO in = 32*128 = 4096;
@@ -122,7 +122,7 @@ def set_family(name):
     FAMILY = name
     SHAPES = FAMILIES[name]
     RUN_CUBIC = (name == "qwen3-4b")
-M_GRID = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]  # docs/perf/README.md §4
+M_GRID = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]  # docs/perf/README.md, What is measured
 
 # Cubic (M=N=K) sizes covering small-and-host-bound (1024) through peak-MFU
 # (16384). Single cell per S; not crossed with M_GRID.
@@ -520,7 +520,7 @@ def main():
                    help="LABEL=jsonl pairs, e.g. Blackwell=sm120.jsonl H200=h200.jsonl")
     p.add_argument("--md-out", default="-", help="markdown output (with --format)")
     p.add_argument("--family", choices=sorted(FAMILIES), default="qwen3-4b",
-                   help="dense shape family (docs/perf/README.md §3); with --run")
+                   help="dense shape family (docs/perf/README.md, Shape families); with --run")
     p.add_argument("--Ms", type=str, default=None,
                    help="comma list of M values that replaces the M grid, e.g. 1,64 (with --run); "
                         "the cubic M=N=K cells are kept only where S is in the list")

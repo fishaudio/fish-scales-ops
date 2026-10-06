@@ -48,7 +48,7 @@ one top-level function `fso.build_info()`.
 There are two ways in: a wheel, built once and installed on every serving machine, or an in-place build of
 the source tree.
 
-- **The wheel.** `scripts/build_wheel.sh` builds one wheel in a fixed container (CUDA 13.2.1, glibc 2.35,
+- **The wheel.** `scripts/build_wheel.sh` builds one wheel in a fixed container (CUDA 13.0.3, glibc 2.35,
   Python 3.12, torch 2.13.0+cu130) with the kernels of every serving architecture (`9.0a;10.0f;12.0a`).
   The wheel carries every file the extension reads at run time: the bundled NVRTC, the headers the sm_90
   kernels compile with and the sm_100/sm_103 CuTe-DSL kernel. No source tree is needed where it runs.
@@ -80,18 +80,17 @@ the source tree.
   So build in place (`EDITABLE=1` or the default in-place build) and keep the tree. A container image
   that keeps the cloned tree, as an image that installs with `pip install -e` does, satisfies this. A
   wheel has neither dependency.
-- **The sm_90 compiler is bundled.** The sm_90 kernels are compiled at run time by NVRTC 13.2.78. The
-  library bundles that NVRTC and loads it privately, so the NVRTC that torch ships (13.0 in the torch 2.13
-  cu130 wheel) and the CUDA toolkit of the image play no part.
-  - For an `ARCH` with `9.0a`, `build.sh` downloads the `nvidia-cuda-nvrtc==13.2.78` wheel with pip, checks
+- **The sm_90 compiler is bundled.** The sm_90 kernels are compiled at run time by NVRTC 13.0.88, the
+  same version the torch 2.13.0+cu130 wheel ships; the whole extension is compiled with the same CUDA 13.0
+  as that torch. The library bundles this NVRTC and loads it privately, so neither another NVRTC on the
+  host nor the CUDA toolkit of the image decides the compiler.
+  - For an `ARCH` with `9.0a`, `build.sh` downloads the `nvidia-cuda-nvrtc==13.0.88` wheel with pip, checks
     its pinned sha256 and unpacks it into `python/fish_scales_ops/_nvrtc/` (about 120 MB), before it
     compiles.
   - An offline build passes the wheel with `FSO_NVRTC_WHEEL=/path/to/wheel`.
   - `torch.ops.fish_scales_ops.jit_compiler_sm90()` and both `describe()` texts report the compiler in use.
-  - Driver: the bundled compiler is validated on driver 595 (the CUDA 13.2 driver). CUDA's minor-version
-    compatibility should let a CUDA 13.0 driver (580) load its cubins, but that combination was not
-    tested. On such a host, check one sm_90 GEMM call before rollout; `FSO_JIT_NVRTC_LIB` can point at
-    torch's own `libnvrtc.so.13` as a fallback.
+  - Driver: any driver that runs torch 2.13.0+cu130 runs the extension; the tables were measured on
+    driver 595.
 - **B200/B300 extra.** The CuTe-DSL tiers need `nvidia-cutlass-dsl` (the `sm100` extra in
   `python/pyproject.toml`: `pip install "nvidia-cutlass-dsl>=4.8.0,<5"`). Without it those tiers stay off
   and the other tiers serve every shape. Any other reason a tier cannot load prints one `fso:` line on
@@ -211,7 +210,7 @@ variable.
 |---|---|
 | `FSO_MOE_FUSED_COMBINE=1` | sm_120/121: allows the fused-combine FC2 on the buckets whose down-projection slab would dominate the layer's memory. Those buckets are then not bit-reproducible run to run. `transient_bytes` follows the setting |
 | `FSO_JIT_INCLUDE_DIRS=a:b:c` | sm_90, an in-place build: the source tree that built the extension moved. A wheel carries its headers |
-| `FSO_JIT_NVRTC_LIB=/path/to/libnvrtc.so` | sm_90: compile with another NVRTC library than the bundled 13.2.78. A version other than 13.2 prints one notice. A path that cannot be loaded raises; nothing falls back to torch's NVRTC |
+| `FSO_JIT_NVRTC_LIB=/path/to/libnvrtc.so` | sm_90: compile with another NVRTC library than the bundled 13.0.88. A version other than 13.0 prints one notice. A path that cannot be loaded raises; nothing falls back to torch's NVRTC |
 | `FSO_STREAMK_POOL_MB=<n>` | sm_120/121: the dense GEMM's Stream-K scratch is allocated once. A later shape that needs more aborts the process. Size it for the largest dense shape, or make that shape's call the first |
 | `FSO_GROUPED_ARG_POOL_MB=<n>` | sm_100/103: the per-thread arena that every captured MoE GEMM pins a block of. Raise it if the process captures very many graphs |
 | `FSO_FC1_FUSED=0` | A/B runs only: the unfused FC1 on every architecture. Set it before `prepare_experts`, because it decides the weight layout |

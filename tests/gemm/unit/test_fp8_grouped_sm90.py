@@ -24,9 +24,8 @@ it runs on any sm_90 device whether `deep_gemm` is importable or not. The
 masked GEMM's numerical correctness is covered in both worlds:
 `test_vs_dequant_reference` runs the same shape list as `test_vs_deepgemm`
 and compares each group's defined rows against an FP32 matmul of the
-dequantised operands, which is the comparison docs/perf/README.md section 8
-asks for (the BF16 truth alone cannot separate quantization error from a
-kernel or scale bug).
+dequantised operands (the BF16 truth alone cannot separate quantization error
+from a kernel or scale bug).
 
 The exit code reflects what ran: every section that was not skipped must have
 passed, and the last line names the sections that ran and the sections that

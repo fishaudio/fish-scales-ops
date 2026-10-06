@@ -209,7 +209,7 @@ chooses this path; an `arch` that names no compute capability raises
 `ValueError`. Without a CUDA device it answers `False` for every format.
 `describe()` returns the matrix as text, with this device's rows marked. On
 sm_90 its last line names the compiler of the JIT that builds the sm_90 kernels
-(`torch.ops.fish_scales_ops.jit_compiler_sm90()`: the bundled NVRTC 13.2 and its
+(`torch.ops.fish_scales_ops.jit_compiler_sm90()`: the bundled NVRTC 13.0 and its
 path), or the error that keeps that compiler from loading; `describe()` itself
 never raises.
 

@@ -174,7 +174,7 @@ L2_BYTES = {"5090": 96 * 1024 * 1024, "h200": 60 * 1024 * 1024, "b300": 13264486
 
 def cold_protocol_check(path, dev, mult=2.0):
     """Rows whose weight rotation does not reach `mult` x the device L2 (the cold
-    protocol's target, ../../../docs/perf/README.md section 2): a row measured with
+    protocol's target, ../../../docs/perf/README.md, What is measured): a row measured with
     fewer copies than that was served from L2 for part of its replay and is not a
     cold number. Returns (n_timed_rows_with_copies, [short rows]). The 2026-09-28
     copy cap of 16 left the 1-2 MB shared-expert projections warm on every device

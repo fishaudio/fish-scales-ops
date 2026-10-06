@@ -113,7 +113,7 @@ inline ForcedTile read_force_tile() noexcept
 // (e.g. moe.down, K=512) while the other GEMMs in the captured graph keep
 // their cascade picks. Added 2026-09-04 after the Family C sweep showed that
 // kernel-bench tile rankings do not transfer to the layer for the grouped
-// down GEMM (see docs/perf/README.md section 8). Read once per process.
+// down GEMM, so the layer cell is the measure. Read once per process.
 inline bool force_tile_applies(ForcedTile const& forced, uint32_t shape_k) noexcept
 {
     static int const s_k = []

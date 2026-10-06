@@ -47,7 +47,7 @@ import torch.nn.functional as F
 
 import fish_scales_ops as fso
 
-# Family A dense projections (docs/perf/README.md §3) plus the two Family B/C
+# Family A dense projections (docs/perf/README.md, Shape families) plus the two Family B/C
 # widths that share their classes.
 SHAPES = [
     ("wqkv",     6144, 2560),   # wide N  (tiles_n = 48)  → persistent kernel

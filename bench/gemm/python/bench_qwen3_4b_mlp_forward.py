@@ -81,7 +81,7 @@ import torch.nn.functional as F
 # Qwen3-4B
 HIDDEN = 2560
 INTERMEDIATE = 9728
-M_GRID = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]  # docs/perf/README.md §4
+M_GRID = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]  # docs/perf/README.md, What is measured
 
 # The default set: the fso rows and their torch / cuBLAS columns, what a run without --dtypes measures.
 FSO_DTYPES = ("bf16", "bsfp8", "mxfp8", "smm", "smm_fast")

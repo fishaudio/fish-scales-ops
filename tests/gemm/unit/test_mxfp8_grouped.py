@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import os
 import sys
+import zlib
 
 import torch
 import torch.nn.functional as F
@@ -617,7 +618,8 @@ def fused_cell(fam: str, M: int, draw: str, chain: bool = False) -> None:
     m_cap = (M + 3) // 4 * 4
     expected_m = max(1, (M * topk + G - 1) // G)
     mag = min(M * topk, G)
-    torch.manual_seed(hash((fam, M, draw)) % (2 ** 31))
+    # A stable seed: Python's hash() of a string differs per process, which made every run draw other weights.
+    torch.manual_seed(zlib.crc32(repr((fam, M, draw)).encode()) % (2 ** 31))
 
     x = torch.randn(M, hidden, dtype=torch.bfloat16, device="cuda") * 0.1
     w13 = torch.randn(G, 2 * inter, hidden, dtype=torch.bfloat16, device="cuda") / (hidden ** 0.5)
@@ -703,7 +705,10 @@ def fused_cell(fam: str, M: int, draw: str, chain: bool = False) -> None:
         cc_f = _cos(torch.cat(got_f), want_c)
         cc_t = _cos(torch.cat(got_t), want_c)
         assert cc_f >= COS_FUSED, f"fused chain {fam} M={M} {draw}: cos={cc_f:.7f}"
-        assert cc_f >= cc_t - 1e-6, \
+        # The fused chain is not more accurate than the two-kernel one on every draw: over 320 seeded draws of these
+        # cells (2026-10-06, B300) fused minus two-kernel cos ranged from -3.3e-6 to +1.9e-5, median +8.6e-6. A wrong
+        # scale or store moves the cos by orders of magnitude more.
+        assert cc_f >= cc_t - 5e-6, \
             f"fused chain {fam} M={M} {draw}: cos {cc_f:.7f} below the two-kernel chain's {cc_t:.7f}"
         print(f"  fused-chain {fam} M={M:>4} {draw:<6} FC1->FC2 cos={cc_f:.7f} "
               f"(two-kernel chain {cc_t:.7f})  OK")

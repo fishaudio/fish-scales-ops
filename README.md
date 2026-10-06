@@ -1,167 +1,52 @@
 # fish-scales-ops
 
 Block-scaled FP8 / MXFP8 GEMM, MoE layer and FlashAttention kernels for LLM
-serving on NVIDIA Hopper (H200, sm_90a) and Blackwell (RTX 5090 sm_120a;
-B200 / B300 sm_100 / sm_103), as a PyTorch extension. Current version: 0.2.0;
-the changes of each release are in [`CHANGELOG.md`](CHANGELOG.md). A serving
+serving on NVIDIA Hopper (H200, sm_90) and Blackwell (B200 / B300, sm_100 /
+sm_103; RTX 5090, sm_120), as a PyTorch extension. Current version: 0.2.0.
+The changes of each release are in [`CHANGELOG.md`](CHANGELOG.md); a serving
 engine starts with the integration guide, [`docs/guide.md`](docs/guide.md).
 
-<!-- Status: the tables in the Performance section are rendered from
-     tests/baselines/ by bench/gemm/python/render_perf_docs.py and change only
-     when a baseline does; `render_perf_docs.py --check` reports any drift.
-     Every other section follows the placement rules in docs/README.md. -->
+<!-- The tables in the Performance section are rendered from tests/baselines/ by
+     bench/gemm/python/render_perf_docs.py; `render_perf_docs.py --check` reports
+     any drift. Every other section follows the placement rules in docs/README.md. -->
 
-## Supported hardware and dtypes
+## Supported hardware
 
-| SM | device | GEMM | attention |
+| feature | H200 (sm_90) | B200 / B300 (sm_100 / sm_103) | RTX 5090 (sm_120) |
 |---|---|---|---|
-| sm_90 | H200 | block-FP8 1×128 (dense + grouped MoE); `linear_bf16` (bf16 in and out, block-FP8 inside) | torch SDPA fallback |
-| sm_120 | RTX 5090 | block-FP8 1×128, MXFP8 1×32 (dense + grouped MoE); `linear_bf16` (bf16 in and out, block-FP8 inside) | MXFP8 prefill / paged decode / paged prefill |
-| sm_100 / sm_103 | B300 | MXFP8 1×32 (dense + grouped MoE since 2026-09-15), block-FP8 1×128 (dense; runs on the MXFP8 tcgen05 tiers with replicated scales, added 2026-09-05); `linear_bf16` (bf16 in and out, block-FP8 inside) | torch SDPA fallback |
+| dense linear, `fso.dense` | block-FP8 1×128 | MXFP8 1×32; block-FP8 checkpoints are requantized to MXFP8 at load | MXFP8 1×32; block-FP8 checkpoints are requantized to MXFP8 at load |
+| MoE layer, `fso.moe` | block-FP8 experts | MXFP8 (block-FP8 or bf16 experts) | MXFP8 (block-FP8 or bf16 experts) |
+| attention, `fso.attention` | torch SDPA | torch SDPA | MXFP8 prefill, paged prefill and paged decode; torch SDPA |
 
-`linear_bf16` takes and returns bf16 but quantizes both operands to block-FP8
-on every call, so its precision is block-FP8's; there is no BF16-precision GEMM
-in this library.
-
-## Performance
-
-<!-- POLICY (docs/README.md rule 2): this section covers sm_90 and sm_120 only,
-     lists a few hot shapes with absolute µs and TFLOPS, and contains NO
-     comparison against any other library. Every row is copied from
-     docs/perf/<domain>/<sm>.md at the same commit; docs/perf is the source. -->
-
-Numbers below are CUDA-graph replay medians with cold weights, taken on the
-H200 at its natural clock and on the RTX 5090 under its clock lock
-(`docs/perf/README.md` §5), and they measure the fish-scales-ops 0.2.0 release
-wheel. The run behind each row is named in the generated block
-[Environments of record](docs/perf/README.md#environments-of-record) of
-`docs/perf/README.md`, rendered from that run's manifest. The protocol, shape
-families and full tables are in [`docs/perf/`](docs/perf/README.md). The rows
-are generated from `tests/baselines/` by `bench/gemm/python/render_perf_docs.py`
-and change only when a baseline does.
-Attention rows are absent until `docs/perf/attention/sm120.md` has an accepted
-baseline.
-
-### sm_90 — NVIDIA H200 (132 SMs, natural clock)
-
-| family            | op                                             | shape                                                        | M / S  | dtype           |     µs | TFLOPS |
-|-------------------|------------------------------------------------|--------------------------------------------------------------|--------|-----------------|-------:|-------:|
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | block-FP8 1×128 |  17.21 |      6 |
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 373.67 |   1092 |
-| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | block-FP8 1×128 |   21.9 |    3.5 |
-| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | block-FP8 1×128 |  328.7 |  470.4 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | block-FP8 1×128 |   30.1 |    1.9 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | block-FP8 1×128 |  373.2 |  310.7 |
-
-### sm_120 — NVIDIA RTX 5090 (170 SMs, 2400 MHz locked)
-
-| family            | op                                             | shape                                                        | M / S  | dtype           |     µs | TFLOPS |
-|-------------------|------------------------------------------------|--------------------------------------------------------------|--------|-----------------|-------:|-------:|
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | MXFP8 1×32      |  35.69 |      3 |
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | MXFP8 1×32      | 663.54 |    615 |
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 651.22 |    627 |
-| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | MXFP8 1×32      |   32.4 |    2.3 |
-| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | MXFP8 1×32      |  564.0 |  274.1 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | MXFP8 1×32      |   38.5 |    1.5 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | MXFP8 1×32      |  711.3 |  163.0 |
-
-Row selection rule: per SM, one decode point and one prefill point per shape
-family for GEMM, one prefill and one decode row for attention where a native
-kernel exists; at most about ten rows per SM.
+`fso.dense.linear` and `fso.moe.layer` take and return bf16 and quantize the
+activations inside; there is no BF16-precision GEMM in this library.
 
 ## Install
 
-Serving machines install a wheel built by `scripts/build_wheel.sh`, which runs
-without the source tree. The in-place build of the source tree is the
-development flow.
-
-### Build a wheel
+Requirements: Linux x86_64, Python 3.12, torch **2.13.0+cu130** (the wheel is
+built against it and its import refuses another torch), glibc 2.35 or newer,
+and an NVIDIA driver for CUDA 13.0 (the tables were measured with driver 595).
 
 ```bash
-scripts/build_wheel.sh --out dist/           # one wheel for sm_90, sm_100/sm_103 and sm_120, built in a container
-pip install --no-deps dist/fish_scales_ops-0.2.0-cp312-cp312-linux_x86_64.whl
+pip install --no-deps fish_scales_ops-0.2.0-cp312-cp312-linux_x86_64.whl   # the wheel of the GitHub release
+python -c "import fish_scales_ops as fso; print(fso.__version__, fso.build_info()['commit'])"
 ```
 
-The script builds the committed tree (`git archive HEAD`; `--allow-dirty`
-builds the working tree and marks the wheel dirty) inside the image of
-`docker/build-wheel.Dockerfile` (Ubuntu 22.04 with glibc 2.35, CUDA 13.2.1,
-Python 3.12, torch 2.13.0+cu130), for `9.0a;10.0f;12.0a`. CUTLASS comes from
-`3rdparty/cutlass` (or `--cutlass DIR`) at the commit the repository records.
-The wheel carries the bundled NVRTC, the sm_90 JIT headers (`_jit_include/`),
-the sm_100/sm_103 CuTe-DSL kernel (`_dsl/`) and `BUILD_INFO.json`, which
-`fso.build_info()` returns. It needs at most glibc 2.35 and `GLIBCXX_3.4.30`,
-and the torch it was built against: under another torch the import raises
-`ImportError`. Next to the wheel the script writes its sha256, a copy of
-`BUILD_INFO.json`, the build log and a test kit (`tests/`, `bench/`,
-`scripts/` and `docs/` of the same source) that runs against the installed
-wheel. The script's header lists every option.
+One wheel serves all three architectures. It is compiled with the same CUDA
+13.0 that torch 2.13.0+cu130 is built with, and it carries the NVRTC 13.0.88
+that compiles the sm_90 kernels at their first call. `fso.build_info()` returns
+how the installed copy was built (commit, toolchain, torch, architectures).
 
-### Build in place (development)
+To build the wheel yourself (Docker, about 40 minutes on a large machine):
 
 ```bash
-git clone <repo> fish-scales-ops
-cd fish-scales-ops
-git submodule update --init --recursive      # 3rdparty/cutlass (v4.4.2)
-
-EDITABLE=1 ./scripts/build.sh                # pip install -e python/ (development)
-ARCH=12.0a ./scripts/build.sh                # single-arch build, fastest turnaround
-ARCH="9.0a;10.0f;12.0a" ./scripts/build.sh   # every deployment arch in one extension
+git submodule update --init --recursive      # 3rdparty/cutlass
+scripts/build_wheel.sh --out dist/           # the wheel, its sha256, BUILD_INFO.json and a test kit
 ```
 
-`scripts/build.sh` probes `CUDA_HOME`, CUTLASS and the Python headers and
-stops early with a clear message when one is missing.
-
-| variable | purpose | default |
-|---|---|---|
-| `ARCH` | `TORCH_CUDA_ARCH_LIST`; `10.0f` is the sm_100f family target that serves B200 and B300 with one cubin (CUDA ≥ 12.9) | `9.0a;12.0a` |
-| `CUDA_HOME` | CUDA toolkit root | `nvcc` on `PATH`, else `/usr/local/cuda` |
-| `CUTLASS_DIR` (`BSGEMM_CUTLASS_DIR` accepted) | CUTLASS 4.x root | `3rdparty/cutlass` |
-| `PYTHON_INCLUDE`, `PYTHON_INCLUDE_MULTIARCH` | override for `Python.h` / `pyconfig.h` | `sysconfig` |
-| `MAX_JOBS` | ninja parallelism | `nproc` |
-| `EDITABLE` | `pip install -e` instead of `build_ext --inplace` | `0` |
-| `FSO_NVRTC_WHEEL` | path of the `nvidia-cuda-nvrtc` 13.2.78 wheel, for an offline sm_90 build | unset: `pip download` |
-| `FSO_SKIP_NVRTC_VENDOR` | `1` skips bundling NVRTC; every process then needs `FSO_JIT_NVRTC_LIB` | `0` |
-
-Two things the build depends on: `ninja` must be on `PATH` (without it
-setuptools falls back to distutils, which does not track header dependencies,
-so an edited `.cuh` is not recompiled), and `--no-build-isolation` is
-deliberate so the extension links against the active venv's torch instead of
-a fresh one pulled into a build sandbox (c10 ABI mismatch otherwise). Runtime
-requirement: torch 2.11+cu130 or newer with a CUDA 13 runtime.
-
-On sm_90 the GEMM kernels are compiled in the process at their first call,
-and the NVRTC build that compiles them affects their speed (see
-`docs/perf/README.md` §8). The package therefore bundles NVRTC 13.2.78 in
-`python/fish_scales_ops/_nvrtc/`, next to the extension, and the extension
-loads that library privately instead of linking NVRTC. Neither the
-`libnvrtc.so.13` that torch loads nor the CUDA toolkit that built the
-extension decides the compiler. For a build whose `ARCH` contains 9.0,
-`scripts/build.sh` runs `scripts/vendor_nvrtc.py` before it compiles. The
-script downloads the `nvidia-cuda-nvrtc==13.2.78` wheel with pip, checks its
-pinned sha256, unpacks the library (about 120 MB) and test-compiles a kernel
-with it; a failure stops the build before anything is compiled. Offline,
-download the wheel elsewhere and pass it with
-`FSO_NVRTC_WHEEL=/path/to/nvidia_cuda_nvrtc-13.2.78-…whl` (or
-`python scripts/vendor_nvrtc.py --wheel <path>`). To use another
-`libnvrtc.so`, set `FSO_JIT_NVRTC_LIB` at run time
-([`docs/api/compat.md`](docs/api/compat.md#environment-variables));
-`torch.ops.fish_scales_ops.jit_compiler_sm90()` reports the compiler in use.
-
-An in-place build keeps reading files from the source tree that built it, so
-install in place (`EDITABLE=1`, or the default `build_ext --inplace`) and keep
-that tree where it is:
-
-- On sm_90 the JIT compiles each kernel from the vendored deep_gemm headers
-  and the CUDA headers. Their directories are recorded in the extension at
-  build time. If the tree moves, set `FSO_JIT_INCLUDE_DIRS` to the new
-  colon-separated list.
-- On sm_100/sm_103 the CuTe-DSL tier loads
-  `3rdparty/cutlass/examples/python/CuTeDSL/blackwell/dense_blockscaled_gemm_persistent.py`
-  from the tree. `FSO_DSL_KERNEL_PATH` points it elsewhere.
-
-A wheel built by `scripts/build_wheel.sh` carries these files next to its
-extension instead, and the extension looks there before it looks at the
-recorded paths.
+[`docs/harness.md`](docs/harness.md) covers building, the GPU test suite and
+the performance harness; [`docs/guide.md`](docs/guide.md) §2 covers the
+in-place development build.
 
 ## Usage
 
@@ -169,221 +54,124 @@ recorded paths.
 import torch
 import fish_scales_ops as fso
 
-# ----- Dense linear, every arch: prepare once per weight, then one call per batch ---
-weight = fso.dense.prepare_weight(w_fp8, format="bsfp8", scale=w_scale)  # block-FP8 checkpoint
-# weight = fso.dense.prepare_weight(w_bf16, format="mxfp8")             # bf16 weight -> MXFP8 (Blackwell)
-y = fso.dense.linear(x, weight)     # bf16 [..., K] -> bf16 [..., N]; the arch dispatch is inside the torch op
+# Dense linear, every architecture: prepare once per weight at load time, then one call per batch.
+weight = fso.dense.prepare_weight(w_fp8, format="bsfp8", scale=w_scale)  # a block-FP8 checkpoint
+# weight = fso.dense.prepare_weight(w_bf16, format="mxfp8")             # a bf16 weight, as MXFP8 (Blackwell)
+y = fso.dense.linear(x, weight)              # bf16 [..., K] -> bf16 [..., N]
 
-# ----- MoE layer, every arch: prepare once per layer, then one call per batch ---
+# MoE layer, every architecture: prepare once per layer at load time, then one call per batch.
 experts = fso.moe.prepare_experts(w13, w2, format="bsfp8", sw13=sw13, sw2=sw2)  # or format="mxfp8" (bf16 experts)
-out = fso.moe.layer(hidden, experts, topk_ids, topk_w)    # the arch dispatch is inside the torch op
+out = fso.moe.layer(hidden, experts, topk_ids, topk_w)
 reserve = fso.moe.transient_bytes(experts, max_tokens, topk)   # bytes one call allocates
 
-# ----- Attention -------------------------------------------------------------
-o = fso.attention.flash_attn_fwd(q, k, v, causal=True)      # torch SDPA on every arch
-o = fso.attention.mxfp8_fwd(q_fp8, q_sc, k_fp8, k_sc, v_fp8, v_sc, causal=True)   # sm_120/121 MXFP8, pre-quantized inputs
-
-# ----- Explicit, format-specific GEMM ops (fso.compat) -------------------------
-sm = torch.cuda.get_device_capability(0)[0]          # 9 = H200, 10 = B200/B300, 12 = RTX 5090
-wq, sw = fso.compat.quantize_128x128_fp8(w_bf16)      # UE8M0 scales on Blackwell, FP32 on Hopper
-if sm >= 10:
-    sw = fso.compat.repack_fp8_wgt_scales(sw)         # pre-pack once at load time
-    xq, sx = fso.compat.quantize_1x128_fp8_packed(x_bf16)
-else:
-    xq, sx = fso.compat.quantize_1x128_fp8(x_bf16)
-y = fso.compat.linear_fp8(xq, wq, sx, sw)             # bf16 [M, N]
-if sm >= 10:                                          # MXFP8 1x32 (sm_100/103, sm_120/121)
-    wqm, swm = fso.compat.quantize_1x32_fp8(w_bf16)
-    xqm, sxm = fso.compat.quantize_1x32_fp8(x_bf16)
-    ym = fso.compat.linear_mxfp8(xqm, wqm, sxm, swm)
+# Attention.
+o = fso.attention.flash_attn_fwd(q, k, v, causal=True)                              # torch SDPA, every architecture
+o = fso.attention.mxfp8_fwd(q_fp8, q_sc, k_fp8, k_sc, v_fp8, v_sc, causal=True)    # RTX 5090, pre-quantized inputs
 ```
 
-`fso.dense`, `fso.moe` and `fso.attention` are the three stable namespaces,
-independent of each other and without top-level re-exports; the one top-level
-function, `fso.build_info()`, says how the installed copy was built. `fso.dense` is the
-dense linear interface for every architecture: `prepare_weight` converts a
-weight for this device at load time, and `linear` is one torch custom op whose
-body quantizes the activation and runs the architecture's GEMM. `fso.moe` is the
-MoE layer interface for every architecture, built the same way: `prepare_experts`
-converts a layer's local experts at load time, and `layer` is one torch custom op
-whose body runs the architecture's chain. Both ops ship their own fake
-implementations, so `torch.compile` needs nothing from the caller. `fso.attention`
-holds torch SDPA on every architecture and the sm_120/121 MXFP8 kernels, which
-refuse other architectures.
-
-`fso.compat` keeps the names existing callers use: the explicit, format-specific
-dense ops (`linear_fp8`, `linear_qx`, `linear_mxfp8`, their quantizers and scale
-repacks, `linear_bf16`), which keep their signatures, and the MoE per-step pieces
-(the per-arch layer entries, the sm_120 block, the grouped GEMMs, the routing
-builders, the combines and the router), which are building blocks whose
-arguments follow the kernels. Before 0.2.0 these names were exported from
-`fso.gemm`, where they still resolve with a `DeprecationWarning` until 0.3.0
-removes `fso.gemm`. The contracts, scale layouts and constraints are in
+`fso.dense`, `fso.moe` and `fso.attention` are the stable interface. The
+architecture dispatch happens inside the library: `fso.dense.linear` and
+`fso.moe.layer` are torch custom ops with their own fake implementations, so
+they work under `torch.compile` and inside CUDA graphs without help from the
+caller. `fso.compat` keeps the explicit, format-specific ops that existing
+callers use (`linear_fp8`, the quantizers, the MoE per-step pieces); the old
+path `fso.gemm` still resolves to them with a `DeprecationWarning` until 0.3.0.
+The contracts, scale layouts and constraints are in
 [`docs/api/dense.md`](docs/api/dense.md), [`docs/api/moe.md`](docs/api/moe.md),
 [`docs/api/attention.md`](docs/api/attention.md) and
 [`docs/api/compat.md`](docs/api/compat.md).
 
-## Status
+Rules worth knowing up front:
 
-| path | Hopper sm_90 | Blackwell sm_120 | Blackwell datacenter sm_100 / sm_103 |
-|---|---|---|---|
-| block-FP8 1×128 GEMM | ✓ deep_gemm WGMMA, NVRTC JIT, FP32 scales | ✓ CUTLASS `Sm120BlockScaledKernel`, UE8M0 scales | ✓ since 2026-09-05, on the MXFP8 tcgen05 path with replicated scales |
-| `linear_qx` (bf16 activation quantized inside the op, block-FP8 weight) | ✓ bit-identical to `quantize_1x128_fp8` + `linear_fp8` (`tests/gemm/unit/test_linear_qx.py`) | ✓ bit-identical to `quantize_1x128_fp8` + `linear_fp8` (same test) | — refused with a `RuntimeError`; use `quantize_1x128_fp8_packed` + `linear_fp8` |
-| MXFP8 1×32 GEMM | — | ✓ CUTLASS block-scaled | ✓ an M ≤ 64 CuTe-DSL decode row in front of three tiers: cuBLAS `scaled_mm`, CuTe DSL, C++ cascade |
-| dense linear surface `fso.dense` | ✓ `format="bsfp8"` (block-FP8 checkpoints and bf16 weights), run by `linear_qx` | ✓ `format="bsfp8"` (block-FP8 checkpoints, requantized to MXFP8 at load, and bf16 weights) and `format="mxfp8"` (bf16 weights and MXFP8 checkpoints) | ✓ the same formats and the same code path as sm_120, through the MXFP8 router; validated on the B300 by `test_dense.py` |
-| MoE layer surface `fso.moe` | ✓ block-FP8 experts (`format="bsfp8"`) | ✓ block-FP8 experts, requantized to MXFP8 at load, and bf16 experts (`format="mxfp8"`) | ✓ the same formats and the same code path as sm_120, with the sm_100 routing extras; validated on the B300 by the unit tests below (`test_moe_unified.py`, `test_moe_transient_bytes.py`, `test_mxfp8_grouped.py` among them) |
-| grouped MoE layer (the `fso.compat` per-step pieces) | ✓ expert-sorted contiguous layout with swap-AB decode path (`moe_layer_fp8_sm90`) | ✓ masked slab layout, MXFP8, composed layer and whole-block entries (`moe_layer_mxfp8_sm120`, `moe_block_mxfp8_sm120`) | ✓ since 2026-09-15 (milestone M3): masked slab layout, MXFP8, CUTLASS pointer-array kernel |
-| BF16 attention | torch SDPA | torch SDPA | torch SDPA |
-| MXFP8 attention prefill | — | ✓ D ∈ {32, 64, 128, 256}, native GQA | — |
-| MXFP8 paged prefill (extend) | — | ✓ page_size a multiple of 32 | — |
-| MXFP8 paged decode | — | ✓ split-K across CTAs, plan/run API | — |
+- `K` must be a multiple of 128 everywhere, and `N` a multiple of 128 for the
+  Blackwell GEMMs and for every MoE GEMM.
+- Capture a call into a CUDA graph only after one eager call of the same shape
+  on the capturing thread. That first call creates the library's pools and, on
+  sm_90, compiles the kernels.
+- On Blackwell the GEMMs consume power-of-two (UE8M0) scales; the quantizers
+  default to them there. Quantize on the architecture that runs the GEMM.
+- The MXFP8 attention kernels run on the RTX 5090 only. The paged KV cache
+  needs a page size that is a multiple of 32, and the decode kernel supports a
+  query-to-KV head ratio of at most 64.
+- A deployment normally sets no environment variable.
+  [`docs/guide.md`](docs/guide.md) §6 lists the few it may set, and
+  [`docs/api/compat.md`](docs/api/compat.md#environment-variables) lists every
+  variable the library reads.
 
-Constraints worth knowing up front:
+## Performance
 
-- Blackwell GEMMs consume UE8M0 (power-of-two) scales on both operands; the
-  quantizers default to them there and the pre-pack ops reject anything else.
-  Scale tensors are arch-native handles — quantize on the arch that runs the
-  GEMM.
-- `K % 128 == 0` everywhere; `N % 128 == 0` for the Blackwell GEMMs and every
-  grouped GEMM.
-- Every op can be captured into a CUDA graph after one eager call of the same
-  shape on the capturing thread, which creates the library's pools and, on
-  sm_90, JIT-compiles the kernels
-  ([`docs/api/compat.md`](docs/api/compat.md#cuda-graph-compatibility)). That
-  includes `linear_fp8` given FP32 scales and `linear_bf16` on sm_100/103,
-  which pack their scales inside the call without a device sync, as on
-  sm_120/121. The explicit pre-pack ops `repack_fp8_act_scales` /
-  `repack_fp8_wgt_scales` check their scales with a device sync and belong at
-  weight-load time, outside any capture.
-- MXFP8 attention is sm_120-only; the paged KV cache needs `page_size ≥ 32`
-  (the MXFP8 scale vector), matching sglang's `--page-size 32`; the decode
-  kernel caps `H_q / H_kv` at 64.
-- B200 / B300 builds use `ARCH="10.0f"`. B300 numbers are published only in
-  [`docs/perf/gemm/sm100.md`](docs/perf/gemm/sm100.md) and
-  [`docs/perf/layer/sm100.md`](docs/perf/layer/sm100.md), never in the section
-  above, because that section covers sm_90 and sm_120 only
-  (`docs/README.md` rule 2). Like the H200, the B300 is measured at its
-  natural clock (`docs/perf/README.md` §5 and §8).
-- Performance work follows [`docs/perf/README.md`](docs/perf/README.md): same
-  device, the clock policy of its §5 (the RTX 5090 locked, datacenter cards at
-  their natural clock with a clock sampler), CUDA-graph replay median with cold
-  weights, every cell traceable to a baseline jsonl, and a change is accepted
-  only if every affected cell is faster or within ±1 % of the committed
-  baseline.
+<!-- POLICY (docs/README.md rule 2): this section covers sm_90 and sm_120 only,
+     lists a few hot shapes with absolute µs and TFLOPS, and contains NO
+     comparison against any other library. -->
 
-## Repository layout
+CUDA-graph replay medians with cold weights, for the 0.2.0 release wheel; the
+H200 runs at its natural clock and the RTX 5090 under its clock lock. The
+B300 tables, the comparisons against vLLM, SGLang, TensorRT-LLM and
+torch/cuBLAS, and a per-machine summary of where fso is faster or slower are
+in [`docs/perf/`](docs/perf/README.md).
 
-```
-fish-scales-ops/
-├── 3rdparty/cutlass/                    submodule, v4.4.2
-├── csrc/
-│   ├── common/compat/                   vendored TensorRT-LLM-style compat headers
-│   ├── gemm/                            block-FP8 1x128 + MXFP8 1x32, dense and grouped
-│   │   ├── include/blockscale_gemm/arch/{sm90,sm100,sm120}/   per-arch kernels and cascades
-│   │   └── ops/                         PyTorch ops (fp8.cu, mxfp8.cu, quant_kernels.cu, moe_glue.cu)
-│   └── attention/                       sm_120 MXFP8 prefill, paged prefill, paged decode
-├── python/fish_scales_ops/
-│   ├── dense/                           fso.dense: prepare_weight, linear (the dense_linear custom op)
-│   ├── moe/                             fso.moe: prepare_experts, layer (the moe_layer custom op)
-│   ├── compat/                          fso.compat: the explicit dense ops and the MoE per-step pieces
-│   ├── gemm/                            implementation: fp8.py, mxfp8.py, bf16.py, sm_100 tier router (fso.gemm: deprecated path of fso.compat)
-│   └── attention/                       fso.attention: SDPA wrapper and the sm_120 MXFP8 entries (backends/)
-├── tests/{gemm/unit,attention}/         correctness, two-reference FP8 gates, CUDA-graph replay
-├── tests/baselines/                     accepted perf runs (jsonl), the source of every table
-├── bench/{gemm/python,attention}/       benches, tile sweeps, render_perf_docs.py
-├── docs/                                docs/README.md is the map; api/, perf/{gemm,layer,attention}/
-├── docker/                              build-wheel.Dockerfile, the fixed environment of the wheel build
-└── scripts/                             build.sh, build_wheel.sh (with build_wheel_inner.sh, build_wheel_package.py), vendor_nvrtc.py (the bundled sm_90 NVRTC), gen_op_schemas.py (the generated torch.ops blocks of docs/api/)
-```
+### sm_90 — NVIDIA H200 (132 SMs, natural clock)
 
-## Tests and benches
+| family            | op                                             | shape                                                        | M / S  | dtype           |     µs | TFLOPS |
+|-------------------|------------------------------------------------|--------------------------------------------------------------|--------|-----------------|-------:|-------:|
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | block-FP8 1×128 |  17.40 |      6 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 373.12 |   1094 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | block-FP8 1×128 |   21.9 |    3.4 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | block-FP8 1×128 |  326.2 |  474.0 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | block-FP8 1×128 |   30.7 |    1.8 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | block-FP8 1×128 |  374.8 |  309.4 |
+
+### sm_120 — NVIDIA RTX 5090 (170 SMs, 2400 MHz locked)
+
+| family            | op                                             | shape                                                        | M / S  | dtype           |     µs | TFLOPS |
+|-------------------|------------------------------------------------|--------------------------------------------------------------|--------|-----------------|-------:|-------:|
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | MXFP8 1×32      |  35.66 |      3 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | MXFP8 1×32      | 663.23 |    615 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 648.54 |    629 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | MXFP8 1×32      |   32.4 |    2.3 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | MXFP8 1×32      |  564.5 |  273.9 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | MXFP8 1×32      |   38.6 |    1.5 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | MXFP8 1×32      |  711.9 |  162.9 |
+
+## TODO
+
+Open items after 0.2.0: the known issues of [`CHANGELOG.md`](CHANGELOG.md),
+whose measured gaps are in the summaries of [`docs/perf/`](docs/perf/README.md),
+and two build items.
+
+- **H200 MoE layer at some decode batch sizes**, against sglang's Triton FP8 MoE layer
+  ([`docs/perf/layer/sm90.md`](docs/perf/layer/sm90.md), Families B and C).
+- **H200 dense MLP block at M = 64–256 and from M = 1024 up**, against sglang's block-FP8 linear (DeepGEMM)
+  ([`docs/perf/layer/sm90.md`](docs/perf/layer/sm90.md), Family A).
+- **B300 MoE layer at middle batch sizes**, against TensorRT-LLM's trtllm-gen MoE
+  ([`docs/perf/layer/sm100.md`](docs/perf/layer/sm100.md), Families B and C).
+- **RTX 5090 Family C MoE layer at M = 1024**, against the Triton FP8 MoE layers of vLLM and sglang
+  ([`docs/perf/layer/sm120.md`](docs/perf/layer/sm120.md), Family C).
+- **Blackwell dense MLP block at some batch sizes**, against sglang's DeepGEMM linear on the B300 and vLLM's on the
+  RTX 5090 ([`docs/perf/layer/sm100.md`](docs/perf/layer/sm100.md),
+  [`docs/perf/layer/sm120.md`](docs/perf/layer/sm120.md), Family A).
+- **Pin the PTX at build time.** Compile the kernels to PTX once with a pinned front end and turn that PTX into SASS
+  with one pinned `ptxas`, so that a toolkit update changes only that last step. 0.2.0 compiles everything with the
+  CUDA 13.0 that torch 2.13.0+cu130 uses.
+- **Byte-identical rebuilds.** nvcc puts temporary file names into the extension's local symbol names, so two builds
+  of one commit hold the same code but are different files ([`docs/harness.md`](docs/harness.md) §1).
+
+## Development
 
 ```bash
-export PYTHONPATH=python
-# GEMM correctness (dense BF16/FP8, MXFP8, block-FP8 two-reference gate, grouped MoE, CUDA-graph replay)
-# One script per command: `python a.py b.py` runs a.py only.
-python tests/gemm/unit/test_public_surface.py          # any machine: the exported names, the deprecated fso.gemm path, the arch refusals
-python tests/gemm/unit/test_dense.py                   # every arch: fso.dense against the explicit fso.compat composition, compile, graphs, refusals
-python tests/gemm/unit/test_correctness.py
-python tests/gemm/unit/test_mxfp8_correctness.py
-python tests/gemm/unit/test_fp8_quantization.py
-python tests/gemm/unit/test_linear_qx.py             # sm_90 / sm_120: bf16-in GEMM against quantize + linear_fp8; sm_100 refuses
-python tests/gemm/unit/test_fp8_k128_sm120.py          # sm_100 / sm_120
-python tests/gemm/unit/test_cuda_graph.py
-python tests/gemm/unit/test_env_knobs.py               # every arch: the boolean FSO_* switches; sm_100/103: the CuTe-DSL tier notices
-python tests/gemm/unit/test_sm100_workspace_growth.py  # sm_100 / sm_103: split-K workspace growth around a captured graph
-python tests/gemm/unit/test_sm120_pack_pool_growth.py  # sm_120 / sm_121: linear_bf16 scale-scratch growth around a captured graph
-python tests/gemm/unit/test_mxfp8_grouped.py           # sm_100 / sm_120
-python tests/gemm/unit/test_mxfp8_decode_sm100.py      # sm_100 / sm_103: the M <= 64 decode row
-python tests/gemm/unit/test_moe_routing_threads.py     # every arch: the single-CTA builder; sm_100/103 and sm_120/121: the multi-CTA builder under two threads / two streams
-python tests/gemm/unit/test_moe_routing_masked_ids.py  # every arch: expert ids outside [0, E) through the builders and the gather
-python tests/gemm/unit/test_moe_router_topk.py         # every arch: fused router top-k vs the torch reference
-python tests/gemm/unit/test_moe_unified.py             # every arch: fso.moe against the per-arch entries, the bsfp8 double quantization, the refusals
-python tests/gemm/unit/test_moe_transient_bytes.py     # every arch: fso.moe.transient_bytes against the measured peak
-python tests/gemm/unit/test_moe_block_sm120.py         # RTX 5090: the composed block and its tp / ep / dp contracts
-python tests/gemm/unit/test_moe_layer_determinism_sm120.py   # RTX 5090
-python tests/gemm/unit/test_moe_layer_padded_ids_sm120.py    # RTX 5090
-python tests/gemm/unit/test_mxfp8_fused_fc1_sm120.py         # RTX 5090
-python tests/gemm/unit/test_mxfp8_fused_combine_sm120.py     # RTX 5090
-python tests/gemm/unit/test_fp8_grouped_sm90.py              # H200
-python tests/gemm/unit/test_fp8_contiguous_sm90.py           # H200
-python tests/gemm/unit/test_fp8_contiguous_swapab_sm90.py    # H200
-python tests/gemm/unit/test_moe_sorted_sm90.py               # H200
-python tests/gemm/unit/test_moe_layer_dispatch_sm90.py       # H200
-python tests/gemm/unit/test_moe_layer_determinism_sm90.py    # H200
-python tests/gemm/unit/test_moe_layer_padded_ids_sm90.py     # H200
-python tests/gemm/unit/test_fp8_contiguous_2wg_sm90.py      # H200: the two-warp-group FC1
-python tests/gemm/unit/test_fp8_fused_fc1_sm90.py           # H200: the fused SwiGLU FC1 against the unfused chain
-python tests/gemm/unit/test_fp8_fused_fc1_swapab_sm90.py    # H200: the fused swap-AB SwiGLU FC1 against the unfused chain
-python tests/gemm/unit/test_jit_cache_sm90.py               # H200: the JIT disk cache (subprocesses, temp dirs)
-python tests/gemm/unit/test_jit_nvrtc_pin_sm90.py           # every arch: no link-time NVRTC; H200: the bundled NVRTC 13.2 against torch's (subprocesses)
-python tests/gemm/unit/test_wheel_layout.py                 # every arch: an installed wheel's packaged files, build_info() and torch guard; H200: the packaged JIT headers; B300: the packaged DSL kernel (an in-place build checks build_info() only)
-# Attention (the MXFP8 kernels run on sm_120; elsewhere the tests check the refusals)
-python tests/attention/test_smoke.py
-python -m pytest tests/attention/
-
-# Benches (write jsonl outside the git tree; one process per cell, graph-replay median)
-python bench/gemm/python/bench_qwen3_4b_mlp.py --family {qwen3-4b,qwen3-30a3,qwen3.5-35a3} --run --out <dir>/x.jsonl
-python bench/gemm/python/bench_qwen3_4b_mlp_forward.py --run --out <dir>/x.jsonl
-python bench/gemm/python/bench_moe_qwen3_30a3.py --run --out <dir>/x.jsonl        # Family B MoE layer + kernels
-python bench/gemm/python/bench_moe_qwen3_35a3.py --run --out <dir>/x.jsonl        # Family C (routed + shared expert)
-python bench/attention/bench_qwen3_llama3.py
-python bench/gemm/python/render_perf_docs.py --check   # tables in docs/ and this README match tests/baselines/
-python scripts/gen_op_schemas.py --check               # the generated torch.ops schema blocks of docs/api/ match the source
+EDITABLE=1 ./scripts/build.sh                                      # in-place build for development (docs/guide.md §2)
+python scripts/ci/run_suite.py --wheel <whl> --testkit <kit> --machine <h200|b300|5090> --work <dir>   # the GPU test suite against a wheel
+python bench/run_perf.py --machine <h200|b300|5090> --out <dir>   # the tables of record, under the machine's environment lock
+python bench/gemm/python/perf_report.py install --run <dir>       # install a run's tables and render the docs
 ```
 
-The measurement protocol, shape families, clock policy and the acceptance
-rule for a performance change are in
-[`docs/perf/README.md`](docs/perf/README.md).
-
-## Environment variables
-
-Every variable the library reads is listed with its scope, default, read time
-and consequence in
-[`docs/api/compat.md`](docs/api/compat.md#environment-variables). They come in two
-kinds:
-
-- **Production switches and capacities**, which a deployment may set on
-  purpose: `FSO_MOE_FUSED_COMBINE=1` (the only way to enable the fused combine
-  of `fso.moe.layer` on sm_120/121), `FSO_FC1_FUSED` (the fused FC1, and with
-  it the weight layout `fso.moe.prepare_experts` writes), `FSO_MOE_BLOCK_OVERLAP`,
-  `FSO_DISABLE_DECODE_DSL`, `FSO_JIT_INCLUDE_DIRS`, `FSO_JIT_NVRTC_LIB`, and the two pool sizes
-  `FSO_STREAMK_POOL_MB` and `FSO_GROUPED_ARG_POOL_MB`, whose exhaustion aborts
-  the process.
-- **Debugging and A/B knobs** (`FSO_FORCE_TILE`, `FSO_FORCE_KSPLIT`,
-  `FSO_DISABLE_STREAMK`, `FSO_DISABLE_PDL`, `FSO_PRINT_TILE_INFO`, the sm_100
-  tier switches, the deep_gemm JIT diagnostics and the rest), which a correct
-  deployment does not need.
-
-Most are read once per process; `FSO_SWAP_BN`, `FSO_SWAP_STAGES`,
-`FSO_SWAPAB_CTAS_PER_SM`, `FSO_MOE_SCATTER_WARP` and
-`FSO_CHECK_PROBLEM_SHAPES` are read on every call. Set them before the first
-call and keep them unchanged between a CUDA-graph capture and its replays.
+[`docs/harness.md`](docs/harness.md) describes each step;
+[`docs/perf/README.md`](docs/perf/README.md) describes how the tables are
+measured.
 
 ## License
 
-Apache-2.0 (declared in `python/pyproject.toml`). A top-level `LICENSE` file
-lands before the first tagged release. Vendored upstream files under
+Apache-2.0 (declared in `python/pyproject.toml`). Vendored upstream files under
 `csrc/gemm/.../jit/deep_gemm/` keep their original Apache-2.0 NVIDIA copyright
 headers.
 
@@ -394,26 +182,21 @@ ports or close adaptations of the projects below, and files that carry
 upstream copyright headers keep them.
 
 - **[DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)** — the sm_90 block-FP8
-  NVRTC-JIT path under `csrc/gemm/include/blockscale_gemm/arch/sm90/fp8/jit/deep_gemm/`
-  (compiler driver, JIT utilities, TMA utilities, schedulers, the NVRTC
-  C++ / CUTLASS shim) derives from DeepGEMM's WGMMA kernels; the grouped MoE
-  schedulers were revived from the same tree.
+  path derives from DeepGEMM's WGMMA kernels and its JIT driver, and the sm_90
+  dense GEMM's output store follows DeepGEMM's `sm90_fp8_gemm_1d2d`.
 - **[TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM)** — the compat shim
   under `csrc/common/compat/include/tensorrt_llm/` is a minimal vendored subset
-  of TRT-LLM's common headers; the block-scaled GEMM runner shape was extracted
-  from its `CutlassFp8BlockScaleGemmRunner` interface.
+  of TRT-LLM's common headers, and the block-scaled GEMM runner follows its
+  `CutlassFp8BlockScaleGemmRunner` interface.
 - **[CUTLASS](https://github.com/NVIDIA/cutlass)** — submodule at
-  `3rdparty/cutlass`; the sm_120 and sm_100 kernels build on `cute`, the
-  block-scaled MMA atoms, `Sm120BlockScaledKernel` and the tcgen05 collectives,
-  and the sm_100 DSL tier on the CuTe DSL block-scaled example.
+  `3rdparty/cutlass`; the sm_120 and sm_100 kernels build on CuTe, its
+  block-scaled MMA atoms and collectives, and the sm_100 DSL tier on the CuTe
+  DSL block-scaled example.
 - **[FlashAttention](https://github.com/Dao-AILab/flash-attention)** — the
-  online softmax, KV-tile pipelining and rescale-skip in the sm_120 MXFP8
-  attention kernel follow the FlashAttention v2 / v3 algorithm.
+  sm_120 MXFP8 attention kernel follows the FlashAttention v2 / v3 algorithm.
 - **[SGLang](https://github.com/sgl-project/sglang)** and
   **[FlashInfer](https://github.com/flashinfer-ai/flashinfer)** — the paged
-  prefill / decode APIs follow their extend-phase and paged-KV `indptr`
-  conventions (`BatchPrefillWithPagedKVCache` planner shape), so integration
-  into an sglang attention backend stays mechanical; their triton and
-  FlashInfer kernels are the same-day comparators in `docs/perf/layer/`.
+  prefill / decode APIs follow their paged-KV conventions, so integration into
+  an sglang attention backend stays mechanical.
 
 If you spot upstream code that is not credited correctly, please open an issue.

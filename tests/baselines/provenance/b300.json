@@ -7,8 +7,8 @@
    },
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-    "fingerprint": "e76a0e65b6535e0a82bbb7dcc20362463497b465b741ec310b3abe8a7b8d7f9e",
+    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+    "fingerprint": "c801228f6cf29df78df911843545f7f68da38400e33b242a6aadf6ff6825d406",
     "source": "kit"
    },
    "card": {
@@ -55,79 +55,79 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T17:21:52Z",
-     "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-     "cuda_toolkit": "13.2.1",
+     "built_at": "2026-10-05T23:52:55Z",
+     "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+     "cuda_toolkit": "13.0.3",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
      "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
      "glibc_required": "GLIBC_2.34",
      "image": {
-      "base": "nvidia/cuda:13.2.1-devel-ubuntu22.04@sha256:3805e62773832c404db8785c63190aaba49bff02bb199b0d187ab897170c6cd1",
-      "id": "sha256:eb44d6a2d3470cd65a712b7c631a5fad4b6ff6cdeff54a78ec11385f6c6bb885",
-      "name": "fso-build-wheel:3536082a1d73"
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
      },
-     "nvcc": "Cuda compilation tools, release 13.2, V13.2.78",
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
      "nvrtc": {
-      "sha256": "a9049031da08cbedd0c20e3470e5a978dc330af0e0326b3b05774718c665dc3e",
-      "version": "13.2.78",
-      "wheel": "nvidia_cuda_nvrtc-13.2.78-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
      },
      "python": "CPython 3.12.15",
      "torch": "2.13.0+cu130",
      "version": "0.2.0"
     },
-    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-    "extension_sha256": "cd9e552802ef10a3b50b9dd8d48adaa9bb03319e5d199035ec45585c0bfb907b",
+    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+    "extension_sha256": "0f7a715cc7c135f6877db36f5d9760e8b8575ea82ad862f5811546eff8777b84",
     "source_build": false,
     "version": "0.2.0"
    },
    "host": "fish-dev-5f7c8f8bbf-gffrg",
-   "installed_utc": "2026-10-05T19:08:44Z",
+   "installed_utc": "2026-10-06T01:31:58Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
-   "manifest_sha256": "0f617e0fafe487167ba85817fec437e759da1c23c1b5f04ea4d6330827a5a24e",
+   "manifest_sha256": "62449f8fae5c6829f92cdbda84a4fb78d0b1c42ccb957420ddbaca1494ef4dc6",
    "observed_clocks": {
     "dense_B": {
      "busy_samples": 174,
      "hw_slowdown_busy_samples": 0,
      "power_capped_busy_samples": 23,
      "power_capped_share_of_busy": 0.1322,
-     "power_w_max": 878.13,
-     "samples": 494,
+     "power_w_max": 823.91,
+     "samples": 566,
      "sm_mhz_max_busy": 2032,
      "sm_mhz_median_busy": 2032.0,
-     "sm_mhz_min_busy": 1260,
-     "temperature_c_max": 53,
+     "sm_mhz_min_busy": 1267,
+     "temperature_c_max": 48,
      "thermal_busy_samples": 0
     }
    },
-   "run": "final-0.2.0-b300",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/final-0.2.0-b300",
+   "run": "cu130-b300",
+   "run_dir": "/data/bench-runs/fso_release_0.2.0_cu130_20261005/runs/cu130-b300",
    "steps": [
     {
      "command": [
       "/home/fish-dev/bench-runs/drama_pcg_b300_2026-09-26/env0520/venv/bin/python",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/suite/kit/fish_scales_ops-0.2.0-testkit-5253cd4/bench/gemm/python/bench_qwen3_4b_mlp.py",
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/suite/kit/fish_scales_ops-0.2.0-testkit-7162cce/bench/gemm/python/bench_qwen3_4b_mlp.py",
       "--run",
       "--family",
       "qwen3-30a3",
       "--out",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/perf/gemm_sm100_qwen3_30a3_dense.jsonl"
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/perf/gemm_sm100_qwen3_30a3_dense.jsonl"
      ],
-     "end_utc": "2026-10-05T18:28:24.292Z",
+     "end_utc": "2026-10-06T00:54:59.644Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "dense_B",
      "rows": 28,
-     "start_utc": "2026-10-05T18:26:45.278Z"
+     "start_utc": "2026-10-06T00:53:06.400Z"
     }
    ],
    "window_utc": [
-    "2026-10-05T18:26:45.278Z",
-    "2026-10-05T18:28:24.292Z"
+    "2026-10-06T00:53:06.400Z",
+    "2026-10-06T00:54:59.644Z"
    ]
   },
   "gemm_sm100_qwen3_35a3_dense.jsonl": {
@@ -136,8 +136,8 @@
    },
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-    "fingerprint": "e76a0e65b6535e0a82bbb7dcc20362463497b465b741ec310b3abe8a7b8d7f9e",
+    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+    "fingerprint": "c801228f6cf29df78df911843545f7f68da38400e33b242a6aadf6ff6825d406",
     "source": "kit"
    },
    "card": {
@@ -184,79 +184,79 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T17:21:52Z",
-     "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-     "cuda_toolkit": "13.2.1",
+     "built_at": "2026-10-05T23:52:55Z",
+     "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+     "cuda_toolkit": "13.0.3",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
      "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
      "glibc_required": "GLIBC_2.34",
      "image": {
-      "base": "nvidia/cuda:13.2.1-devel-ubuntu22.04@sha256:3805e62773832c404db8785c63190aaba49bff02bb199b0d187ab897170c6cd1",
-      "id": "sha256:eb44d6a2d3470cd65a712b7c631a5fad4b6ff6cdeff54a78ec11385f6c6bb885",
-      "name": "fso-build-wheel:3536082a1d73"
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
      },
-     "nvcc": "Cuda compilation tools, release 13.2, V13.2.78",
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
      "nvrtc": {
-      "sha256": "a9049031da08cbedd0c20e3470e5a978dc330af0e0326b3b05774718c665dc3e",
-      "version": "13.2.78",
-      "wheel": "nvidia_cuda_nvrtc-13.2.78-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
      },
      "python": "CPython 3.12.15",
      "torch": "2.13.0+cu130",
      "version": "0.2.0"
     },
-    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-    "extension_sha256": "cd9e552802ef10a3b50b9dd8d48adaa9bb03319e5d199035ec45585c0bfb907b",
+    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+    "extension_sha256": "0f7a715cc7c135f6877db36f5d9760e8b8575ea82ad862f5811546eff8777b84",
     "source_build": false,
     "version": "0.2.0"
    },
    "host": "fish-dev-5f7c8f8bbf-gffrg",
-   "installed_utc": "2026-10-05T19:08:44Z",
+   "installed_utc": "2026-10-06T01:31:58Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
-   "manifest_sha256": "0f617e0fafe487167ba85817fec437e759da1c23c1b5f04ea4d6330827a5a24e",
+   "manifest_sha256": "62449f8fae5c6829f92cdbda84a4fb78d0b1c42ccb957420ddbaca1494ef4dc6",
    "observed_clocks": {
     "dense_C": {
-     "busy_samples": 596,
+     "busy_samples": 566,
      "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 70,
-     "power_capped_share_of_busy": 0.1174,
-     "power_w_max": 884.36,
-     "samples": 1524,
+     "power_capped_busy_samples": 67,
+     "power_capped_share_of_busy": 0.1184,
+     "power_w_max": 887.04,
+     "samples": 1595,
      "sm_mhz_max_busy": 2032,
      "sm_mhz_median_busy": 2032.0,
-     "sm_mhz_min_busy": 1170,
-     "temperature_c_max": 54,
+     "sm_mhz_min_busy": 1200,
+     "temperature_c_max": 50,
      "thermal_busy_samples": 0
     }
    },
-   "run": "final-0.2.0-b300",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/final-0.2.0-b300",
+   "run": "cu130-b300",
+   "run_dir": "/data/bench-runs/fso_release_0.2.0_cu130_20261005/runs/cu130-b300",
    "steps": [
     {
      "command": [
       "/home/fish-dev/bench-runs/drama_pcg_b300_2026-09-26/env0520/venv/bin/python",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/suite/kit/fish_scales_ops-0.2.0-testkit-5253cd4/bench/gemm/python/bench_qwen3_4b_mlp.py",
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/suite/kit/fish_scales_ops-0.2.0-testkit-7162cce/bench/gemm/python/bench_qwen3_4b_mlp.py",
       "--run",
       "--family",
       "qwen3.5-35a3",
       "--out",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/perf/gemm_sm100_qwen3_35a3_dense.jsonl"
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/perf/gemm_sm100_qwen3_35a3_dense.jsonl"
      ],
-     "end_utc": "2026-10-05T18:33:29.241Z",
+     "end_utc": "2026-10-06T01:00:18.814Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "dense_C",
      "rows": 84,
-     "start_utc": "2026-10-05T18:28:24.310Z"
+     "start_utc": "2026-10-06T00:54:59.665Z"
     }
    ],
    "window_utc": [
-    "2026-10-05T18:28:24.310Z",
-    "2026-10-05T18:33:29.241Z"
+    "2026-10-06T00:54:59.665Z",
+    "2026-10-06T01:00:18.814Z"
    ]
   },
   "gemm_sm100_qwen3_4b.jsonl": {
@@ -265,8 +265,8 @@
    },
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-    "fingerprint": "e76a0e65b6535e0a82bbb7dcc20362463497b465b741ec310b3abe8a7b8d7f9e",
+    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+    "fingerprint": "c801228f6cf29df78df911843545f7f68da38400e33b242a6aadf6ff6825d406",
     "source": "kit"
    },
    "card": {
@@ -313,79 +313,79 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T17:21:52Z",
-     "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-     "cuda_toolkit": "13.2.1",
+     "built_at": "2026-10-05T23:52:55Z",
+     "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+     "cuda_toolkit": "13.0.3",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
      "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
      "glibc_required": "GLIBC_2.34",
      "image": {
-      "base": "nvidia/cuda:13.2.1-devel-ubuntu22.04@sha256:3805e62773832c404db8785c63190aaba49bff02bb199b0d187ab897170c6cd1",
-      "id": "sha256:eb44d6a2d3470cd65a712b7c631a5fad4b6ff6cdeff54a78ec11385f6c6bb885",
-      "name": "fso-build-wheel:3536082a1d73"
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
      },
-     "nvcc": "Cuda compilation tools, release 13.2, V13.2.78",
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
      "nvrtc": {
-      "sha256": "a9049031da08cbedd0c20e3470e5a978dc330af0e0326b3b05774718c665dc3e",
-      "version": "13.2.78",
-      "wheel": "nvidia_cuda_nvrtc-13.2.78-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
      },
      "python": "CPython 3.12.15",
      "torch": "2.13.0+cu130",
      "version": "0.2.0"
     },
-    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-    "extension_sha256": "cd9e552802ef10a3b50b9dd8d48adaa9bb03319e5d199035ec45585c0bfb907b",
+    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+    "extension_sha256": "0f7a715cc7c135f6877db36f5d9760e8b8575ea82ad862f5811546eff8777b84",
     "source_build": false,
     "version": "0.2.0"
    },
    "host": "fish-dev-5f7c8f8bbf-gffrg",
-   "installed_utc": "2026-10-05T19:08:44Z",
+   "installed_utc": "2026-10-06T01:31:58Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
-   "manifest_sha256": "0f617e0fafe487167ba85817fec437e759da1c23c1b5f04ea4d6330827a5a24e",
+   "manifest_sha256": "62449f8fae5c6829f92cdbda84a4fb78d0b1c42ccb957420ddbaca1494ef4dc6",
    "observed_clocks": {
     "dense_A": {
-     "busy_samples": 544,
+     "busy_samples": 513,
      "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 126,
-     "power_capped_share_of_busy": 0.2316,
-     "power_w_max": 1111,
-     "samples": 1436,
+     "power_capped_busy_samples": 132,
+     "power_capped_share_of_busy": 0.2573,
+     "power_w_max": 1097.77,
+     "samples": 1396,
      "sm_mhz_max_busy": 2032,
-     "sm_mhz_median_busy": 2032.0,
-     "sm_mhz_min_busy": 1057,
-     "temperature_c_max": 58,
+     "sm_mhz_median_busy": 2032,
+     "sm_mhz_min_busy": 1035,
+     "temperature_c_max": 55,
      "thermal_busy_samples": 0
     }
    },
-   "run": "final-0.2.0-b300",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/final-0.2.0-b300",
+   "run": "cu130-b300",
+   "run_dir": "/data/bench-runs/fso_release_0.2.0_cu130_20261005/runs/cu130-b300",
    "steps": [
     {
      "command": [
       "/home/fish-dev/bench-runs/drama_pcg_b300_2026-09-26/env0520/venv/bin/python",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/suite/kit/fish_scales_ops-0.2.0-testkit-5253cd4/bench/gemm/python/bench_qwen3_4b_mlp.py",
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/suite/kit/fish_scales_ops-0.2.0-testkit-7162cce/bench/gemm/python/bench_qwen3_4b_mlp.py",
       "--run",
       "--family",
       "qwen3-4b",
       "--out",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/perf/gemm_sm100_qwen3_4b.jsonl"
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/perf/gemm_sm100_qwen3_4b.jsonl"
      ],
-     "end_utc": "2026-10-05T18:26:45.260Z",
+     "end_utc": "2026-10-06T00:53:06.381Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "dense_A",
      "rows": 80,
-     "start_utc": "2026-10-05T18:21:57.899Z"
+     "start_utc": "2026-10-06T00:48:27.143Z"
     }
    ],
    "window_utc": [
-    "2026-10-05T18:21:57.899Z",
-    "2026-10-05T18:26:45.260Z"
+    "2026-10-06T00:48:27.143Z",
+    "2026-10-06T00:53:06.381Z"
    ]
   },
   "gemm_sm100_qwen3_4b_mlp_fwd.jsonl": {
@@ -394,8 +394,8 @@
    },
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-    "fingerprint": "e76a0e65b6535e0a82bbb7dcc20362463497b465b741ec310b3abe8a7b8d7f9e",
+    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+    "fingerprint": "c801228f6cf29df78df911843545f7f68da38400e33b242a6aadf6ff6825d406",
     "source": "kit"
    },
    "card": {
@@ -442,77 +442,77 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T17:21:52Z",
-     "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-     "cuda_toolkit": "13.2.1",
+     "built_at": "2026-10-05T23:52:55Z",
+     "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+     "cuda_toolkit": "13.0.3",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
      "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
      "glibc_required": "GLIBC_2.34",
      "image": {
-      "base": "nvidia/cuda:13.2.1-devel-ubuntu22.04@sha256:3805e62773832c404db8785c63190aaba49bff02bb199b0d187ab897170c6cd1",
-      "id": "sha256:eb44d6a2d3470cd65a712b7c631a5fad4b6ff6cdeff54a78ec11385f6c6bb885",
-      "name": "fso-build-wheel:3536082a1d73"
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
      },
-     "nvcc": "Cuda compilation tools, release 13.2, V13.2.78",
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
      "nvrtc": {
-      "sha256": "a9049031da08cbedd0c20e3470e5a978dc330af0e0326b3b05774718c665dc3e",
-      "version": "13.2.78",
-      "wheel": "nvidia_cuda_nvrtc-13.2.78-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
      },
      "python": "CPython 3.12.15",
      "torch": "2.13.0+cu130",
      "version": "0.2.0"
     },
-    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-    "extension_sha256": "cd9e552802ef10a3b50b9dd8d48adaa9bb03319e5d199035ec45585c0bfb907b",
+    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+    "extension_sha256": "0f7a715cc7c135f6877db36f5d9760e8b8575ea82ad862f5811546eff8777b84",
     "source_build": false,
     "version": "0.2.0"
    },
    "host": "fish-dev-5f7c8f8bbf-gffrg",
-   "installed_utc": "2026-10-05T19:08:44Z",
+   "installed_utc": "2026-10-06T01:31:58Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
-   "manifest_sha256": "0f617e0fafe487167ba85817fec437e759da1c23c1b5f04ea4d6330827a5a24e",
+   "manifest_sha256": "62449f8fae5c6829f92cdbda84a4fb78d0b1c42ccb957420ddbaca1494ef4dc6",
    "observed_clocks": {
     "mlp_fwd": {
-     "busy_samples": 258,
+     "busy_samples": 224,
      "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 17,
-     "power_capped_share_of_busy": 0.0659,
-     "power_w_max": 957.44,
-     "samples": 801,
+     "power_capped_busy_samples": 18,
+     "power_capped_share_of_busy": 0.0804,
+     "power_w_max": 968.5,
+     "samples": 639,
      "sm_mhz_max_busy": 2032,
      "sm_mhz_median_busy": 2032.0,
-     "sm_mhz_min_busy": 1327,
-     "temperature_c_max": 54,
+     "sm_mhz_min_busy": 1350,
+     "temperature_c_max": 52,
      "thermal_busy_samples": 0
     }
    },
-   "run": "final-0.2.0-b300",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/final-0.2.0-b300",
+   "run": "cu130-b300",
+   "run_dir": "/data/bench-runs/fso_release_0.2.0_cu130_20261005/runs/cu130-b300",
    "steps": [
     {
      "command": [
       "/home/fish-dev/bench-runs/drama_pcg_b300_2026-09-26/env0520/venv/bin/python",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/suite/kit/fish_scales_ops-0.2.0-testkit-5253cd4/bench/gemm/python/bench_qwen3_4b_mlp_forward.py",
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/suite/kit/fish_scales_ops-0.2.0-testkit-7162cce/bench/gemm/python/bench_qwen3_4b_mlp_forward.py",
       "--run",
       "--out",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/perf/gemm_sm100_qwen3_4b_mlp_fwd.jsonl"
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/perf/gemm_sm100_qwen3_4b_mlp_fwd.jsonl"
      ],
-     "end_utc": "2026-10-05T18:36:09.377Z",
+     "end_utc": "2026-10-06T01:02:26.785Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "mlp_fwd",
      "rows": 14,
-     "start_utc": "2026-10-05T18:33:29.259Z"
+     "start_utc": "2026-10-06T01:00:18.833Z"
     }
    ],
    "window_utc": [
-    "2026-10-05T18:33:29.259Z",
-    "2026-10-05T18:36:09.377Z"
+    "2026-10-06T01:00:18.833Z",
+    "2026-10-06T01:02:26.785Z"
    ]
   },
   "perf_moe_qwen3_30a3_b300.jsonl": {
@@ -521,8 +521,8 @@
    },
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-    "fingerprint": "e76a0e65b6535e0a82bbb7dcc20362463497b465b741ec310b3abe8a7b8d7f9e",
+    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+    "fingerprint": "c801228f6cf29df78df911843545f7f68da38400e33b242a6aadf6ff6825d406",
     "source": "kit"
    },
    "card": {
@@ -569,79 +569,79 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T17:21:52Z",
-     "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-     "cuda_toolkit": "13.2.1",
+     "built_at": "2026-10-05T23:52:55Z",
+     "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+     "cuda_toolkit": "13.0.3",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
      "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
      "glibc_required": "GLIBC_2.34",
      "image": {
-      "base": "nvidia/cuda:13.2.1-devel-ubuntu22.04@sha256:3805e62773832c404db8785c63190aaba49bff02bb199b0d187ab897170c6cd1",
-      "id": "sha256:eb44d6a2d3470cd65a712b7c631a5fad4b6ff6cdeff54a78ec11385f6c6bb885",
-      "name": "fso-build-wheel:3536082a1d73"
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
      },
-     "nvcc": "Cuda compilation tools, release 13.2, V13.2.78",
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
      "nvrtc": {
-      "sha256": "a9049031da08cbedd0c20e3470e5a978dc330af0e0326b3b05774718c665dc3e",
-      "version": "13.2.78",
-      "wheel": "nvidia_cuda_nvrtc-13.2.78-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
      },
      "python": "CPython 3.12.15",
      "torch": "2.13.0+cu130",
      "version": "0.2.0"
     },
-    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-    "extension_sha256": "cd9e552802ef10a3b50b9dd8d48adaa9bb03319e5d199035ec45585c0bfb907b",
+    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+    "extension_sha256": "0f7a715cc7c135f6877db36f5d9760e8b8575ea82ad862f5811546eff8777b84",
     "source_build": false,
     "version": "0.2.0"
    },
    "host": "fish-dev-5f7c8f8bbf-gffrg",
-   "installed_utc": "2026-10-05T19:08:44Z",
+   "installed_utc": "2026-10-06T01:31:58Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
-   "manifest_sha256": "0f617e0fafe487167ba85817fec437e759da1c23c1b5f04ea4d6330827a5a24e",
+   "manifest_sha256": "62449f8fae5c6829f92cdbda84a4fb78d0b1c42ccb957420ddbaca1494ef4dc6",
    "observed_clocks": {
     "fso_30a3": {
-     "busy_samples": 206,
+     "busy_samples": 198,
      "hw_slowdown_busy_samples": 0,
      "power_capped_busy_samples": 2,
-     "power_capped_share_of_busy": 0.0097,
-     "power_w_max": 403.52,
-     "samples": 639,
+     "power_capped_share_of_busy": 0.0101,
+     "power_w_max": 399.02,
+     "samples": 624,
      "sm_mhz_max_busy": 2032,
      "sm_mhz_median_busy": 2032.0,
-     "sm_mhz_min_busy": 1665,
-     "temperature_c_max": 45,
+     "sm_mhz_min_busy": 1410,
+     "temperature_c_max": 41,
      "thermal_busy_samples": 0
     }
    },
-   "run": "final-0.2.0-b300",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/final-0.2.0-b300",
+   "run": "cu130-b300",
+   "run_dir": "/data/bench-runs/fso_release_0.2.0_cu130_20261005/runs/cu130-b300",
    "steps": [
     {
      "command": [
       "/home/fish-dev/bench-runs/drama_pcg_b300_2026-09-26/env0520/venv/bin/python",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/suite/kit/fish_scales_ops-0.2.0-testkit-5253cd4/bench/gemm/python/bench_moe_qwen3_30a3.py",
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/suite/kit/fish_scales_ops-0.2.0-testkit-7162cce/bench/gemm/python/bench_moe_qwen3_30a3.py",
       "--run",
       "--impls",
       "fso_mxfp8_grouped,fso_mxfp8_layer",
       "--out",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/perf/perf_moe_qwen3_30a3_b300.jsonl"
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/perf/perf_moe_qwen3_30a3_b300.jsonl"
      ],
-     "end_utc": "2026-10-05T18:18:53.031Z",
+     "end_utc": "2026-10-06T00:45:28.714Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "fso_30a3",
      "rows": 45,
-     "start_utc": "2026-10-05T18:16:45.162Z"
+     "start_utc": "2026-10-06T00:43:23.948Z"
     }
    ],
    "window_utc": [
-    "2026-10-05T18:16:45.162Z",
-    "2026-10-05T18:18:53.031Z"
+    "2026-10-06T00:43:23.948Z",
+    "2026-10-06T00:45:28.714Z"
    ]
   },
   "perf_moe_qwen3_35a3_b300.jsonl": {
@@ -650,8 +650,8 @@
    },
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-    "fingerprint": "e76a0e65b6535e0a82bbb7dcc20362463497b465b741ec310b3abe8a7b8d7f9e",
+    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+    "fingerprint": "c801228f6cf29df78df911843545f7f68da38400e33b242a6aadf6ff6825d406",
     "source": "kit"
    },
    "card": {
@@ -698,79 +698,79 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T17:21:52Z",
-     "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-     "cuda_toolkit": "13.2.1",
+     "built_at": "2026-10-05T23:52:55Z",
+     "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+     "cuda_toolkit": "13.0.3",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
      "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
      "glibc_required": "GLIBC_2.34",
      "image": {
-      "base": "nvidia/cuda:13.2.1-devel-ubuntu22.04@sha256:3805e62773832c404db8785c63190aaba49bff02bb199b0d187ab897170c6cd1",
-      "id": "sha256:eb44d6a2d3470cd65a712b7c631a5fad4b6ff6cdeff54a78ec11385f6c6bb885",
-      "name": "fso-build-wheel:3536082a1d73"
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
      },
-     "nvcc": "Cuda compilation tools, release 13.2, V13.2.78",
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
      "nvrtc": {
-      "sha256": "a9049031da08cbedd0c20e3470e5a978dc330af0e0326b3b05774718c665dc3e",
-      "version": "13.2.78",
-      "wheel": "nvidia_cuda_nvrtc-13.2.78-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
      },
      "python": "CPython 3.12.15",
      "torch": "2.13.0+cu130",
      "version": "0.2.0"
     },
-    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-    "extension_sha256": "cd9e552802ef10a3b50b9dd8d48adaa9bb03319e5d199035ec45585c0bfb907b",
+    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+    "extension_sha256": "0f7a715cc7c135f6877db36f5d9760e8b8575ea82ad862f5811546eff8777b84",
     "source_build": false,
     "version": "0.2.0"
    },
    "host": "fish-dev-5f7c8f8bbf-gffrg",
-   "installed_utc": "2026-10-05T19:08:44Z",
+   "installed_utc": "2026-10-06T01:31:58Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
-   "manifest_sha256": "0f617e0fafe487167ba85817fec437e759da1c23c1b5f04ea4d6330827a5a24e",
+   "manifest_sha256": "62449f8fae5c6829f92cdbda84a4fb78d0b1c42ccb957420ddbaca1494ef4dc6",
    "observed_clocks": {
     "fso_35a3": {
-     "busy_samples": 219,
+     "busy_samples": 218,
      "hw_slowdown_busy_samples": 0,
      "power_capped_busy_samples": 3,
-     "power_capped_share_of_busy": 0.0137,
-     "power_w_max": 388.21,
-     "samples": 650,
+     "power_capped_share_of_busy": 0.0138,
+     "power_w_max": 383.57,
+     "samples": 628,
      "sm_mhz_max_busy": 2032,
-     "sm_mhz_median_busy": 2032,
-     "sm_mhz_min_busy": 1837,
-     "temperature_c_max": 44,
+     "sm_mhz_median_busy": 2032.0,
+     "sm_mhz_min_busy": 1807,
+     "temperature_c_max": 41,
      "thermal_busy_samples": 0
     }
    },
-   "run": "final-0.2.0-b300",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/final-0.2.0-b300",
+   "run": "cu130-b300",
+   "run_dir": "/data/bench-runs/fso_release_0.2.0_cu130_20261005/runs/cu130-b300",
    "steps": [
     {
      "command": [
       "/home/fish-dev/bench-runs/drama_pcg_b300_2026-09-26/env0520/venv/bin/python",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/suite/kit/fish_scales_ops-0.2.0-testkit-5253cd4/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/suite/kit/fish_scales_ops-0.2.0-testkit-7162cce/bench/gemm/python/bench_moe_qwen3_35a3.py",
       "--run",
       "--impls",
       "fso_mxfp8_grouped,fso_mxfp8_layer",
       "--out",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/perf/perf_moe_qwen3_35a3_b300.jsonl"
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/perf/perf_moe_qwen3_35a3_b300.jsonl"
      ],
-     "end_utc": "2026-10-05T18:21:03.281Z",
+     "end_utc": "2026-10-06T00:47:34.424Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "fso_35a3",
      "rows": 45,
-     "start_utc": "2026-10-05T18:18:53.052Z"
+     "start_utc": "2026-10-06T00:45:28.730Z"
     }
    ],
    "window_utc": [
-    "2026-10-05T18:18:53.052Z",
-    "2026-10-05T18:21:03.281Z"
+    "2026-10-06T00:45:28.730Z",
+    "2026-10-06T00:47:34.424Z"
    ]
   },
   "perf_moe_qwen3_35a3_shared_b300.jsonl": {
@@ -779,8 +779,8 @@
    },
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-    "fingerprint": "e76a0e65b6535e0a82bbb7dcc20362463497b465b741ec310b3abe8a7b8d7f9e",
+    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+    "fingerprint": "c801228f6cf29df78df911843545f7f68da38400e33b242a6aadf6ff6825d406",
     "source": "kit"
    },
    "card": {
@@ -827,79 +827,79 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T17:21:52Z",
-     "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-     "cuda_toolkit": "13.2.1",
+     "built_at": "2026-10-05T23:52:55Z",
+     "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+     "cuda_toolkit": "13.0.3",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
      "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
      "glibc_required": "GLIBC_2.34",
      "image": {
-      "base": "nvidia/cuda:13.2.1-devel-ubuntu22.04@sha256:3805e62773832c404db8785c63190aaba49bff02bb199b0d187ab897170c6cd1",
-      "id": "sha256:eb44d6a2d3470cd65a712b7c631a5fad4b6ff6cdeff54a78ec11385f6c6bb885",
-      "name": "fso-build-wheel:3536082a1d73"
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
      },
-     "nvcc": "Cuda compilation tools, release 13.2, V13.2.78",
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
      "nvrtc": {
-      "sha256": "a9049031da08cbedd0c20e3470e5a978dc330af0e0326b3b05774718c665dc3e",
-      "version": "13.2.78",
-      "wheel": "nvidia_cuda_nvrtc-13.2.78-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
      },
      "python": "CPython 3.12.15",
      "torch": "2.13.0+cu130",
      "version": "0.2.0"
     },
-    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-    "extension_sha256": "cd9e552802ef10a3b50b9dd8d48adaa9bb03319e5d199035ec45585c0bfb907b",
+    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+    "extension_sha256": "0f7a715cc7c135f6877db36f5d9760e8b8575ea82ad862f5811546eff8777b84",
     "source_build": false,
     "version": "0.2.0"
    },
    "host": "fish-dev-5f7c8f8bbf-gffrg",
-   "installed_utc": "2026-10-05T19:08:44Z",
+   "installed_utc": "2026-10-06T01:31:58Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
-   "manifest_sha256": "0f617e0fafe487167ba85817fec437e759da1c23c1b5f04ea4d6330827a5a24e",
+   "manifest_sha256": "62449f8fae5c6829f92cdbda84a4fb78d0b1c42ccb957420ddbaca1494ef4dc6",
    "observed_clocks": {
     "fso_35a3_shared": {
-     "busy_samples": 85,
+     "busy_samples": 81,
      "hw_slowdown_busy_samples": 0,
      "power_capped_busy_samples": 1,
-     "power_capped_share_of_busy": 0.0118,
-     "power_w_max": 406.54,
-     "samples": 272,
+     "power_capped_share_of_busy": 0.0123,
+     "power_w_max": 399.16,
+     "samples": 264,
      "sm_mhz_max_busy": 2032,
      "sm_mhz_median_busy": 2032,
-     "sm_mhz_min_busy": 1957,
-     "temperature_c_max": 43,
+     "sm_mhz_min_busy": 1867,
+     "temperature_c_max": 42,
      "thermal_busy_samples": 0
     }
    },
-   "run": "final-0.2.0-b300",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/final-0.2.0-b300",
+   "run": "cu130-b300",
+   "run_dir": "/data/bench-runs/fso_release_0.2.0_cu130_20261005/runs/cu130-b300",
    "steps": [
     {
      "command": [
       "/home/fish-dev/bench-runs/drama_pcg_b300_2026-09-26/env0520/venv/bin/python",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/suite/kit/fish_scales_ops-0.2.0-testkit-5253cd4/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/suite/kit/fish_scales_ops-0.2.0-testkit-7162cce/bench/gemm/python/bench_moe_qwen3_35a3.py",
       "--run",
       "--impls",
       "fso_mxfp8_layer_shared",
       "--out",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/perf/perf_moe_qwen3_35a3_shared_b300.jsonl"
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/perf/perf_moe_qwen3_35a3_shared_b300.jsonl"
      ],
-     "end_utc": "2026-10-05T18:21:57.883Z",
+     "end_utc": "2026-10-06T00:48:27.127Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "fso_35a3_shared",
      "rows": 15,
-     "start_utc": "2026-10-05T18:21:03.304Z"
+     "start_utc": "2026-10-06T00:47:34.441Z"
     }
    ],
    "window_utc": [
-    "2026-10-05T18:21:03.304Z",
-    "2026-10-05T18:21:57.883Z"
+    "2026-10-06T00:47:34.441Z",
+    "2026-10-06T00:48:27.127Z"
    ]
   },
   "ref_mlp_qwen3_4b_b300.jsonl": {
@@ -908,8 +908,8 @@
    },
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-    "fingerprint": "e76a0e65b6535e0a82bbb7dcc20362463497b465b741ec310b3abe8a7b8d7f9e",
+    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+    "fingerprint": "c801228f6cf29df78df911843545f7f68da38400e33b242a6aadf6ff6825d406",
     "source": "kit"
    },
    "card": {
@@ -956,79 +956,79 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T17:21:52Z",
-     "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-     "cuda_toolkit": "13.2.1",
+     "built_at": "2026-10-05T23:52:55Z",
+     "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+     "cuda_toolkit": "13.0.3",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
      "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
      "glibc_required": "GLIBC_2.34",
      "image": {
-      "base": "nvidia/cuda:13.2.1-devel-ubuntu22.04@sha256:3805e62773832c404db8785c63190aaba49bff02bb199b0d187ab897170c6cd1",
-      "id": "sha256:eb44d6a2d3470cd65a712b7c631a5fad4b6ff6cdeff54a78ec11385f6c6bb885",
-      "name": "fso-build-wheel:3536082a1d73"
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
      },
-     "nvcc": "Cuda compilation tools, release 13.2, V13.2.78",
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
      "nvrtc": {
-      "sha256": "a9049031da08cbedd0c20e3470e5a978dc330af0e0326b3b05774718c665dc3e",
-      "version": "13.2.78",
-      "wheel": "nvidia_cuda_nvrtc-13.2.78-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
      },
      "python": "CPython 3.12.15",
      "torch": "2.13.0+cu130",
      "version": "0.2.0"
     },
-    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-    "extension_sha256": "cd9e552802ef10a3b50b9dd8d48adaa9bb03319e5d199035ec45585c0bfb907b",
+    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+    "extension_sha256": "0f7a715cc7c135f6877db36f5d9760e8b8575ea82ad862f5811546eff8777b84",
     "source_build": false,
     "version": "0.2.0"
    },
    "host": "fish-dev-5f7c8f8bbf-gffrg",
-   "installed_utc": "2026-10-05T19:08:44Z",
+   "installed_utc": "2026-10-06T01:31:58Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
-   "manifest_sha256": "0f617e0fafe487167ba85817fec437e759da1c23c1b5f04ea4d6330827a5a24e",
+   "manifest_sha256": "62449f8fae5c6829f92cdbda84a4fb78d0b1c42ccb957420ddbaca1494ef4dc6",
    "observed_clocks": {
     "mlp_ref_sgl": {
-     "busy_samples": 90,
+     "busy_samples": 83,
      "hw_slowdown_busy_samples": 0,
      "power_capped_busy_samples": 4,
-     "power_capped_share_of_busy": 0.0444,
-     "power_w_max": 769.26,
-     "samples": 828,
+     "power_capped_share_of_busy": 0.0482,
+     "power_w_max": 765.7,
+     "samples": 731,
      "sm_mhz_max_busy": 2032,
-     "sm_mhz_median_busy": 2032.0,
-     "sm_mhz_min_busy": 1267,
-     "temperature_c_max": 51,
+     "sm_mhz_median_busy": 2032,
+     "sm_mhz_min_busy": 1222,
+     "temperature_c_max": 49,
      "thermal_busy_samples": 0
     }
    },
-   "run": "final-0.2.0-b300",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/final-0.2.0-b300",
+   "run": "cu130-b300",
+   "run_dir": "/data/bench-runs/fso_release_0.2.0_cu130_20261005/runs/cu130-b300",
    "steps": [
     {
      "command": [
       "/home/fish-dev/bench-runs/drama_pcg_b300_2026-09-26/env0520/venv/bin/python",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/suite/kit/fish_scales_ops-0.2.0-testkit-5253cd4/bench/gemm/python/bench_qwen3_4b_mlp_forward.py",
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/suite/kit/fish_scales_ops-0.2.0-testkit-7162cce/bench/gemm/python/bench_qwen3_4b_mlp_forward.py",
       "--run",
       "--dtypes",
       "sgl_fp8b",
       "--out",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/perf/ref_mlp_sgl_b300.jsonl"
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/perf/ref_mlp_sgl_b300.jsonl"
      ],
-     "end_utc": "2026-10-05T19:08:31.272Z",
+     "end_utc": "2026-10-06T01:31:26.030Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "mlp_ref_sgl",
      "rows": 14,
-     "start_utc": "2026-10-05T19:05:45.490Z"
+     "start_utc": "2026-10-06T01:28:59.839Z"
     }
    ],
    "window_utc": [
-    "2026-10-05T19:05:45.490Z",
-    "2026-10-05T19:08:31.272Z"
+    "2026-10-06T01:28:59.839Z",
+    "2026-10-06T01:31:26.030Z"
    ]
   },
   "ref_moe_qwen3_30a3_b300.jsonl": {
@@ -1037,8 +1037,8 @@
    },
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-    "fingerprint": "e76a0e65b6535e0a82bbb7dcc20362463497b465b741ec310b3abe8a7b8d7f9e",
+    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+    "fingerprint": "c801228f6cf29df78df911843545f7f68da38400e33b242a6aadf6ff6825d406",
     "source": "kit"
    },
    "card": {
@@ -1085,141 +1085,141 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T17:21:52Z",
-     "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-     "cuda_toolkit": "13.2.1",
+     "built_at": "2026-10-05T23:52:55Z",
+     "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+     "cuda_toolkit": "13.0.3",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
      "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
      "glibc_required": "GLIBC_2.34",
      "image": {
-      "base": "nvidia/cuda:13.2.1-devel-ubuntu22.04@sha256:3805e62773832c404db8785c63190aaba49bff02bb199b0d187ab897170c6cd1",
-      "id": "sha256:eb44d6a2d3470cd65a712b7c631a5fad4b6ff6cdeff54a78ec11385f6c6bb885",
-      "name": "fso-build-wheel:3536082a1d73"
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
      },
-     "nvcc": "Cuda compilation tools, release 13.2, V13.2.78",
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
      "nvrtc": {
-      "sha256": "a9049031da08cbedd0c20e3470e5a978dc330af0e0326b3b05774718c665dc3e",
-      "version": "13.2.78",
-      "wheel": "nvidia_cuda_nvrtc-13.2.78-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
      },
      "python": "CPython 3.12.15",
      "torch": "2.13.0+cu130",
      "version": "0.2.0"
     },
-    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-    "extension_sha256": "cd9e552802ef10a3b50b9dd8d48adaa9bb03319e5d199035ec45585c0bfb907b",
+    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+    "extension_sha256": "0f7a715cc7c135f6877db36f5d9760e8b8575ea82ad862f5811546eff8777b84",
     "source_build": false,
     "version": "0.2.0"
    },
    "host": "fish-dev-5f7c8f8bbf-gffrg",
-   "installed_utc": "2026-10-05T19:08:44Z",
+   "installed_utc": "2026-10-06T01:31:58Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
-   "manifest_sha256": "0f617e0fafe487167ba85817fec437e759da1c23c1b5f04ea4d6330827a5a24e",
+   "manifest_sha256": "62449f8fae5c6829f92cdbda84a4fb78d0b1c42ccb957420ddbaca1494ef4dc6",
    "observed_clocks": {
     "ref_30a3": {
-     "busy_samples": 218,
+     "busy_samples": 167,
      "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 3,
-     "power_capped_share_of_busy": 0.0138,
-     "power_w_max": 553.64,
-     "samples": 1304,
+     "power_capped_busy_samples": 2,
+     "power_capped_share_of_busy": 0.012,
+     "power_w_max": 522.56,
+     "samples": 1144,
      "sm_mhz_max_busy": 2032,
-     "sm_mhz_median_busy": 2032.0,
-     "sm_mhz_min_busy": 1710,
-     "temperature_c_max": 47,
+     "sm_mhz_median_busy": 2032,
+     "sm_mhz_min_busy": 1665,
+     "temperature_c_max": 44,
      "thermal_busy_samples": 0
     },
     "sgl020_30a3": {
-     "busy_samples": 150,
+     "busy_samples": 153,
      "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 6,
-     "power_capped_share_of_busy": 0.04,
-     "power_w_max": 732.94,
-     "samples": 1759,
+     "power_capped_busy_samples": 5,
+     "power_capped_share_of_busy": 0.0327,
+     "power_w_max": 731.38,
+     "samples": 1549,
      "sm_mhz_max_busy": 2032,
-     "sm_mhz_median_busy": 2032.0,
-     "sm_mhz_min_busy": 1935,
-     "temperature_c_max": 50,
+     "sm_mhz_median_busy": 2032,
+     "sm_mhz_min_busy": 1950,
+     "temperature_c_max": 47,
      "thermal_busy_samples": 0
     },
     "trt_30a3": {
-     "busy_samples": 192,
+     "busy_samples": 189,
      "hw_slowdown_busy_samples": 0,
      "power_capped_busy_samples": 0,
      "power_capped_share_of_busy": 0.0,
-     "power_w_max": 810.2,
-     "samples": 767,
+     "power_w_max": 800.62,
+     "samples": 727,
      "sm_mhz_max_busy": 2032,
-     "sm_mhz_median_busy": 2032.0,
+     "sm_mhz_median_busy": 2032,
      "sm_mhz_min_busy": 2032,
-     "temperature_c_max": 51,
+     "temperature_c_max": 49,
      "thermal_busy_samples": 0
     }
    },
-   "run": "final-0.2.0-b300",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/final-0.2.0-b300",
+   "run": "cu130-b300",
+   "run_dir": "/data/bench-runs/fso_release_0.2.0_cu130_20261005/runs/cu130-b300",
    "steps": [
     {
      "command": [
       "/home/fish-dev/bench-runs/drama_pcg_b300_2026-09-26/env0520/venv/bin/python",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/suite/kit/fish_scales_ops-0.2.0-testkit-5253cd4/bench/gemm/python/bench_moe_qwen3_30a3.py",
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/suite/kit/fish_scales_ops-0.2.0-testkit-7162cce/bench/gemm/python/bench_moe_qwen3_30a3.py",
       "--run",
       "--impls",
       "torch_grouped_bf16_layer,torch_smm_mxfp8_layer",
       "--out",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/perf/ref_new_30a3_b300.jsonl"
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/perf/ref_new_30a3_b300.jsonl"
      ],
-     "end_utc": "2026-10-05T18:40:30.445Z",
+     "end_utc": "2026-10-06T01:06:15.791Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "ref_30a3",
      "rows": 28,
-     "start_utc": "2026-10-05T18:36:09.396Z"
+     "start_utc": "2026-10-06T01:02:26.803Z"
     },
     {
      "command": [
       "/home/fish-dev/bench-runs/drama_pcg_b300_2026-09-26/env0520/venv/bin/python",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/suite/kit/fish_scales_ops-0.2.0-testkit-5253cd4/bench/gemm/python/bench_moe_qwen3_30a3.py",
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/suite/kit/fish_scales_ops-0.2.0-testkit-7162cce/bench/gemm/python/bench_moe_qwen3_30a3.py",
       "--run",
       "--impls",
       "triton_bf16,triton_fp8b",
       "--out",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/perf/ref_sgl020_30a3_b300.jsonl"
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/perf/ref_sgl020_30a3_b300.jsonl"
      ],
-     "end_utc": "2026-10-05T18:50:41.395Z",
+     "end_utc": "2026-10-06T01:15:14.058Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "sgl020_30a3",
      "rows": 28,
-     "start_utc": "2026-10-05T18:44:49.576Z"
+     "start_utc": "2026-10-06T01:10:04.069Z"
     },
     {
      "command": [
       "/home/fish-dev/bench-runs/drama_pcg_b300_2026-09-26/env0520/venv/bin/python",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/suite/kit/fish_scales_ops-0.2.0-testkit-5253cd4/bench/gemm/python/bench_moe_qwen3_30a3.py",
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/suite/kit/fish_scales_ops-0.2.0-testkit-7162cce/bench/gemm/python/bench_moe_qwen3_30a3.py",
       "--run",
       "--impls",
       "trtllm_gen_fp8b",
       "--out",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/perf/ref_trt_30a3_b300.jsonl"
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/perf/ref_trt_30a3_b300.jsonl"
      ],
-     "end_utc": "2026-10-05T18:58:52.772Z",
+     "end_utc": "2026-10-06T01:22:41.361Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "trt_30a3",
      "rows": 14,
-     "start_utc": "2026-10-05T18:56:19.304Z"
+     "start_utc": "2026-10-06T01:20:15.867Z"
     }
    ],
    "window_utc": [
-    "2026-10-05T18:36:09.396Z",
-    "2026-10-05T18:58:52.772Z"
+    "2026-10-06T01:02:26.803Z",
+    "2026-10-06T01:22:41.361Z"
    ]
   },
   "ref_moe_qwen3_35a3_b300.jsonl": {
@@ -1228,8 +1228,8 @@
    },
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-    "fingerprint": "e76a0e65b6535e0a82bbb7dcc20362463497b465b741ec310b3abe8a7b8d7f9e",
+    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+    "fingerprint": "c801228f6cf29df78df911843545f7f68da38400e33b242a6aadf6ff6825d406",
     "source": "kit"
    },
    "card": {
@@ -1276,141 +1276,141 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T17:21:52Z",
-     "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-     "cuda_toolkit": "13.2.1",
+     "built_at": "2026-10-05T23:52:55Z",
+     "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+     "cuda_toolkit": "13.0.3",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
      "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
      "glibc_required": "GLIBC_2.34",
      "image": {
-      "base": "nvidia/cuda:13.2.1-devel-ubuntu22.04@sha256:3805e62773832c404db8785c63190aaba49bff02bb199b0d187ab897170c6cd1",
-      "id": "sha256:eb44d6a2d3470cd65a712b7c631a5fad4b6ff6cdeff54a78ec11385f6c6bb885",
-      "name": "fso-build-wheel:3536082a1d73"
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
      },
-     "nvcc": "Cuda compilation tools, release 13.2, V13.2.78",
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
      "nvrtc": {
-      "sha256": "a9049031da08cbedd0c20e3470e5a978dc330af0e0326b3b05774718c665dc3e",
-      "version": "13.2.78",
-      "wheel": "nvidia_cuda_nvrtc-13.2.78-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
      },
      "python": "CPython 3.12.15",
      "torch": "2.13.0+cu130",
      "version": "0.2.0"
     },
-    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-    "extension_sha256": "cd9e552802ef10a3b50b9dd8d48adaa9bb03319e5d199035ec45585c0bfb907b",
+    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+    "extension_sha256": "0f7a715cc7c135f6877db36f5d9760e8b8575ea82ad862f5811546eff8777b84",
     "source_build": false,
     "version": "0.2.0"
    },
    "host": "fish-dev-5f7c8f8bbf-gffrg",
-   "installed_utc": "2026-10-05T19:08:44Z",
+   "installed_utc": "2026-10-06T01:31:58Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
-   "manifest_sha256": "0f617e0fafe487167ba85817fec437e759da1c23c1b5f04ea4d6330827a5a24e",
+   "manifest_sha256": "62449f8fae5c6829f92cdbda84a4fb78d0b1c42ccb957420ddbaca1494ef4dc6",
    "observed_clocks": {
     "ref_35a3": {
-     "busy_samples": 200,
+     "busy_samples": 178,
      "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 4,
-     "power_capped_share_of_busy": 0.02,
-     "power_w_max": 495.17,
-     "samples": 1292,
+     "power_capped_busy_samples": 5,
+     "power_capped_share_of_busy": 0.0281,
+     "power_w_max": 496.36,
+     "samples": 1141,
      "sm_mhz_max_busy": 2032,
      "sm_mhz_median_busy": 2032.0,
-     "sm_mhz_min_busy": 1942,
-     "temperature_c_max": 45,
+     "sm_mhz_min_busy": 1935,
+     "temperature_c_max": 43,
      "thermal_busy_samples": 0
     },
     "sgl020_35a3": {
-     "busy_samples": 155,
+     "busy_samples": 152,
      "hw_slowdown_busy_samples": 0,
      "power_capped_busy_samples": 3,
-     "power_capped_share_of_busy": 0.0194,
-     "power_w_max": 482.94,
-     "samples": 1688,
+     "power_capped_share_of_busy": 0.0197,
+     "power_w_max": 480.48,
+     "samples": 1508,
      "sm_mhz_max_busy": 2032,
-     "sm_mhz_median_busy": 2032,
-     "sm_mhz_min_busy": 1950,
-     "temperature_c_max": 46,
+     "sm_mhz_median_busy": 2032.0,
+     "sm_mhz_min_busy": 1897,
+     "temperature_c_max": 42,
      "thermal_busy_samples": 0
     },
     "trt_35a3": {
-     "busy_samples": 204,
+     "busy_samples": 211,
      "hw_slowdown_busy_samples": 0,
      "power_capped_busy_samples": 0,
      "power_capped_share_of_busy": 0.0,
-     "power_w_max": 778.11,
-     "samples": 776,
+     "power_w_max": 781.31,
+     "samples": 746,
      "sm_mhz_max_busy": 2032,
-     "sm_mhz_median_busy": 2032.0,
+     "sm_mhz_median_busy": 2032,
      "sm_mhz_min_busy": 2032,
-     "temperature_c_max": 51,
+     "temperature_c_max": 48,
      "thermal_busy_samples": 0
     }
    },
-   "run": "final-0.2.0-b300",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/final-0.2.0-b300",
+   "run": "cu130-b300",
+   "run_dir": "/data/bench-runs/fso_release_0.2.0_cu130_20261005/runs/cu130-b300",
    "steps": [
     {
      "command": [
       "/home/fish-dev/bench-runs/drama_pcg_b300_2026-09-26/env0520/venv/bin/python",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/suite/kit/fish_scales_ops-0.2.0-testkit-5253cd4/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/suite/kit/fish_scales_ops-0.2.0-testkit-7162cce/bench/gemm/python/bench_moe_qwen3_35a3.py",
       "--run",
       "--impls",
       "torch_grouped_bf16_layer,torch_smm_mxfp8_layer",
       "--out",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/perf/ref_new_35a3_b300.jsonl"
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/perf/ref_new_35a3_b300.jsonl"
      ],
-     "end_utc": "2026-10-05T18:44:49.140Z",
+     "end_utc": "2026-10-06T01:10:04.050Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "ref_35a3",
      "rows": 28,
-     "start_utc": "2026-10-05T18:40:30.464Z"
+     "start_utc": "2026-10-06T01:06:15.810Z"
     },
     {
      "command": [
       "/home/fish-dev/bench-runs/drama_pcg_b300_2026-09-26/env0520/venv/bin/python",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/suite/kit/fish_scales_ops-0.2.0-testkit-5253cd4/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/suite/kit/fish_scales_ops-0.2.0-testkit-7162cce/bench/gemm/python/bench_moe_qwen3_35a3.py",
       "--run",
       "--impls",
       "triton_bf16,triton_fp8b",
       "--out",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/perf/ref_sgl020_35a3_b300.jsonl"
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/perf/ref_sgl020_35a3_b300.jsonl"
      ],
-     "end_utc": "2026-10-05T18:56:19.285Z",
+     "end_utc": "2026-10-06T01:20:15.848Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "sgl020_35a3",
      "rows": 28,
-     "start_utc": "2026-10-05T18:50:41.414Z"
+     "start_utc": "2026-10-06T01:15:14.076Z"
     },
     {
      "command": [
       "/home/fish-dev/bench-runs/drama_pcg_b300_2026-09-26/env0520/venv/bin/python",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/suite/kit/fish_scales_ops-0.2.0-testkit-5253cd4/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/suite/kit/fish_scales_ops-0.2.0-testkit-7162cce/bench/gemm/python/bench_moe_qwen3_35a3.py",
       "--run",
       "--impls",
       "trtllm_gen_fp8b",
       "--out",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/perf/ref_trt_35a3_b300.jsonl"
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/perf/ref_trt_35a3_b300.jsonl"
      ],
-     "end_utc": "2026-10-05T19:01:28.049Z",
+     "end_utc": "2026-10-06T01:25:10.748Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "trt_35a3",
      "rows": 14,
-     "start_utc": "2026-10-05T18:58:52.791Z"
+     "start_utc": "2026-10-06T01:22:41.378Z"
     }
    ],
    "window_utc": [
-    "2026-10-05T18:40:30.464Z",
-    "2026-10-05T19:01:28.049Z"
+    "2026-10-06T01:06:15.810Z",
+    "2026-10-06T01:25:10.748Z"
    ]
   },
   "ref_moe_qwen3_35a3_shared_b300.jsonl": {
@@ -1419,8 +1419,8 @@
    },
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-    "fingerprint": "e76a0e65b6535e0a82bbb7dcc20362463497b465b741ec310b3abe8a7b8d7f9e",
+    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+    "fingerprint": "c801228f6cf29df78df911843545f7f68da38400e33b242a6aadf6ff6825d406",
     "source": "kit"
    },
    "card": {
@@ -1467,79 +1467,79 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T17:21:52Z",
-     "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-     "cuda_toolkit": "13.2.1",
+     "built_at": "2026-10-05T23:52:55Z",
+     "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+     "cuda_toolkit": "13.0.3",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
      "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
      "glibc_required": "GLIBC_2.34",
      "image": {
-      "base": "nvidia/cuda:13.2.1-devel-ubuntu22.04@sha256:3805e62773832c404db8785c63190aaba49bff02bb199b0d187ab897170c6cd1",
-      "id": "sha256:eb44d6a2d3470cd65a712b7c631a5fad4b6ff6cdeff54a78ec11385f6c6bb885",
-      "name": "fso-build-wheel:3536082a1d73"
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
      },
-     "nvcc": "Cuda compilation tools, release 13.2, V13.2.78",
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
      "nvrtc": {
-      "sha256": "a9049031da08cbedd0c20e3470e5a978dc330af0e0326b3b05774718c665dc3e",
-      "version": "13.2.78",
-      "wheel": "nvidia_cuda_nvrtc-13.2.78-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
      },
      "python": "CPython 3.12.15",
      "torch": "2.13.0+cu130",
      "version": "0.2.0"
     },
-    "commit": "5253cd48104238fdc6a57f152b5cc971913ed961",
-    "extension_sha256": "cd9e552802ef10a3b50b9dd8d48adaa9bb03319e5d199035ec45585c0bfb907b",
+    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+    "extension_sha256": "0f7a715cc7c135f6877db36f5d9760e8b8575ea82ad862f5811546eff8777b84",
     "source_build": false,
     "version": "0.2.0"
    },
    "host": "fish-dev-5f7c8f8bbf-gffrg",
-   "installed_utc": "2026-10-05T19:08:44Z",
+   "installed_utc": "2026-10-06T01:31:58Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
-   "manifest_sha256": "0f617e0fafe487167ba85817fec437e759da1c23c1b5f04ea4d6330827a5a24e",
+   "manifest_sha256": "62449f8fae5c6829f92cdbda84a4fb78d0b1c42ccb957420ddbaca1494ef4dc6",
    "observed_clocks": {
     "ref_35a3_shared": {
-     "busy_samples": 177,
+     "busy_samples": 156,
      "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 4,
-     "power_capped_share_of_busy": 0.0226,
-     "power_w_max": 515.29,
-     "samples": 1287,
+     "power_capped_busy_samples": 3,
+     "power_capped_share_of_busy": 0.0192,
+     "power_w_max": 512.44,
+     "samples": 1145,
      "sm_mhz_max_busy": 2032,
-     "sm_mhz_median_busy": 2032,
-     "sm_mhz_min_busy": 1920,
-     "temperature_c_max": 46,
+     "sm_mhz_median_busy": 2032.0,
+     "sm_mhz_min_busy": 1897,
+     "temperature_c_max": 42,
      "thermal_busy_samples": 0
     }
    },
-   "run": "final-0.2.0-b300",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/final-0.2.0-b300",
+   "run": "cu130-b300",
+   "run_dir": "/data/bench-runs/fso_release_0.2.0_cu130_20261005/runs/cu130-b300",
    "steps": [
     {
      "command": [
       "/home/fish-dev/bench-runs/drama_pcg_b300_2026-09-26/env0520/venv/bin/python",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/suite/kit/fish_scales_ops-0.2.0-testkit-5253cd4/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/suite/kit/fish_scales_ops-0.2.0-testkit-7162cce/bench/gemm/python/bench_moe_qwen3_35a3.py",
       "--run",
       "--impls",
       "torch_grouped_bf16_layer_shared,torch_smm_mxfp8_layer_shared",
       "--out",
-      "/home/fish-dev/bench-runs/fso_release_0.2.0_20261005/final/perf/ref_new_35a3_shared_b300.jsonl"
+      "/home/fish-dev/bench-runs/fso_release_0.2.0_cu130_20261005/perf/ref_new_35a3_shared_b300.jsonl"
      ],
-     "end_utc": "2026-10-05T19:05:45.460Z",
+     "end_utc": "2026-10-06T01:28:59.821Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "ref_35a3_shared",
      "rows": 28,
-     "start_utc": "2026-10-05T19:01:28.070Z"
+     "start_utc": "2026-10-06T01:25:10.770Z"
     }
    ],
    "window_utc": [
-    "2026-10-05T19:01:28.070Z",
-    "2026-10-05T19:05:45.460Z"
+    "2026-10-06T01:25:10.770Z",
+    "2026-10-06T01:28:59.821Z"
    ]
   }
  },
