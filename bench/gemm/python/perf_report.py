@@ -10,7 +10,7 @@ docs, and prints the comparison reports — so a rerun after any change is
   python bench/gemm/python/perf_report.py merge   --run <dir> [--out <dir>]      raw files -> canonical baseline files (n/a cells listed)
   python bench/gemm/python/perf_report.py diff    --a <dir|baselines> --b <dir>   cell-by-cell delta of every shared cell (A/B of an optimisation)
   python bench/gemm/python/perf_report.py report  [--run <dir>]                  MLP-block, layer-level and kernel-level comparison tables, ×fso and band geomeans
-  python bench/gemm/python/perf_report.py install --run <dir> [--accept-drift]   merge + diff against the installed baselines + copy + provenance + render docs
+  python bench/gemm/python/perf_report.py install --run <dir> [--groups G,...] [--accept-drift]   merge + diff against the installed baselines + copy + provenance + render docs
 
 install takes only a run directory written by bench/run_perf.py: it reads <dir>/manifest.json, takes the device and
 the SM tag from it, and refuses a --smoke run always, a run that did not complete, a file whose producing step exited
@@ -561,6 +561,11 @@ def cmd_install(args):
         args.device, args.sm = mdev, msm
     args.device, args.sm = args.device or "5090", args.sm or "120"
     names = manifest(args.run, args.device, args.sm)
+    if args.groups and man is not None:
+        # Only the files every producing step of which belongs to the named table groups; the others keep their
+        # installed numbers and provenance (for example a run that also re-measured unchanged kernels).
+        keep = {g.strip() for g in args.groups.split(",") if g.strip()}
+        names = {n: f for n, f in names.items() if {s.get("group") for s in feeding_steps(man, f)} <= keep}
     why = install_refusals(man, args, names, conflict)
     if why:
         print(f"install refused: {args.run}")
@@ -599,6 +604,9 @@ def main():
                     help="SM tag of the dense files (120 | 90 | 100); default 120, and install takes it from the manifest")
     ap.add_argument("--threshold", type=float, default=1.0, help="diff: list cells moving more than this percent")
     ap.add_argument("--show", type=int, default=40, help="diff: how many moved cells to list")
+    ap.add_argument("--groups", default=None,
+                    help="install: only the baseline files whose producing steps all belong to these table groups "
+                         "(comma list); the other files keep their installed numbers and provenance")
     ap.add_argument("--accept-drift", action="store_true",
                     help="install: install a run that deviated from its environment lock (the drift goes into the provenance)")
     args = ap.parse_args()

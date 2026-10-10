@@ -141,7 +141,9 @@ python bench/gemm/python/perf_report.py install --run /data/bench-runs/<run>
 `install` requires the run's manifest. It refuses a smoke run, an incomplete run, and a run with drift unless
 `--accept-drift`. It writes the provenance of each installed baseline file into
 `tests/baselines/provenance/<machine>.json`, and `render_perf_docs.py` renders the "Environments of record" block
-of `docs/perf/README.md` from it.
+of `docs/perf/README.md` from it. `--groups moe,shared,…` installs only the files that those table groups produced;
+the other files keep their installed numbers and provenance. Use it when a run also re-measured kernels whose machine
+code did not change, so that their tables stay those of the run that first measured that code.
 
 **Acceptance rule.** A change that can affect runtime performance is accepted only if every affected cell of the
 tables of record is faster than, or within ±1 % of, the committed baseline, measured with the same protocol on the
