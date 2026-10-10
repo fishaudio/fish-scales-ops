@@ -12,6 +12,11 @@ bench/run_perf.py resolves from them, and the raw-file manifest of bench/gemm/py
   - The plan resolves for every machine (no preflight), a smoke plan adds --Ms 1,64 to every step, and the step
     environment drops every FSO_* knob but the lock's bench environment.
   - The preflight's drift detection lists a package whose version differs from the lock.
+  - A step's clock summary carries the busy power, the mean busy clock and the throttle shares, every key the
+    provenance already reads stays, and a step whose busy samples hit the power cap gets a power flag.
+  - The serving group: every machine runs fso's layer under each serving-shaped family for both models, and its
+    comparator steps hold exactly the machine's comparators that serving_cases.py says serve the family; a
+    padded-bucket row is keyed by its live rows as well, so two cells of one bucket stay apart in a diff.
   - run_perf.py --dry-run runs for the local machine's lock (when this host is one of the locked machines) and
     prints the complete plan and a preflight verdict; it creates nothing.
 
@@ -209,6 +214,57 @@ def test_drift_is_listed():
     assert torch_drift and torch_drift[0]["lock"] == "2.12.0+cu130" and torch_drift[0]["found"] == "2.13.0+cu130", pre["drift"]
     assert run_perf.verdict(pre, allow_drift=False)[0] is False
     assert run_perf.verdict(pre, allow_drift=True)[0] is (not pre["blockers"])
+
+
+def test_power_summary_and_flag():
+    """Synthetic sampler rows (epoch, SM MHz, W, deg C, utilization %, event reasons): two idle samples, four busy
+    ones of which one is power-capped and one thermally limited."""
+    policy = {"mode": "natural", "tolerance_mhz": 15}
+    rows = [(0.0, 345, 80.0, 30, 0, 0x1), (0.2, 1980, 420.0, 40, 90, 0x0), (0.4, 1980, 500.0, 41, 95, 0x0),
+            (0.6, 1755, 700.0, 45, 99, run_perf.REASON_SW_POWER_CAP), (0.8, 1900, 610.0, 70, 97, run_perf.REASON_SW_THERMAL),
+            (1.0, 345, 90.0, 35, 0, 0x1)]
+    st, flags = run_perf.clock_stats(rows, policy, 1980, power_limit_w=700)
+    for k in ("samples", "busy_samples", "sm_mhz_median_busy", "sm_mhz_min_busy", "sm_mhz_max_busy",
+              "power_capped_busy_samples", "power_capped_share_of_busy", "hw_slowdown_busy_samples",
+              "thermal_busy_samples", "power_w_max", "temperature_c_max"):
+        assert k in st, f"{k}: a key the provenance and the renderer read is gone"
+    assert st["busy_samples"] == 4 and st["sm_mhz_min_busy"] == 1755 and st["sm_mhz_mean_busy"] == 1903.8, st
+    assert st["power_w_mean_busy"] == 557.5 and st["power_w_max_busy"] == 700.0 and st["power_limit_w"] == 700, st
+    assert st["power_throttle_share_of_busy"] == 0.25 and st["thermal_throttle_share_of_busy"] == 0.25, st
+    assert st["throttle_share_of_busy"] == 0.5 and st["throttle_reason_busy_samples"]["sw_power_cap"] == 1, st
+    assert not flags, flags
+    pf = run_perf.power_flags(st)
+    assert len(pf) == 1 and "1 of 4 busy samples (25 %)" in pf[0] and "700 W limit" in pf[0], pf
+    st2, _ = run_perf.clock_stats([r for r in rows if not r[5] & run_perf.REASON_SW_POWER_CAP], policy, 1980, 700)
+    assert run_perf.power_flags(st2) == [], "a step that never hit the power cap got a power flag"
+
+
+def test_serving_steps_follow_serving_cases():
+    sys.path.insert(0, os.path.join(ROOT, "bench", "gemm", "python"))
+    import serving_cases
+    fso = {"h200": "fso_bsfp8_layer", "5090": "fso_mxfp8_layer", "b300": "fso_mxfp8_layer"}
+    for m, steps in perf_suite.SUITES.items():
+        srv = [s for s in steps if s["group"] == "serving"]
+        for routing, tag in serving_cases.TAGS.items():
+            for fam in ("30a3", "35a3"):
+                own = [s for s in srv if s["out"] == f"perf_moe_qwen3_{fam}_{tag}_{m}.jsonl"]
+                refs = [s for s in srv if s["out"] in (f"ref_{tag}_{fam}_{m}.jsonl", f"ref_sgl020_{tag}_{fam}_{m}.jsonl")]
+                assert len(own) == 1 and own[0]["args"][own[0]["args"].index("--impls") + 1] == fso[m], (m, routing, fam)
+                assert all(s["args"][s["args"].index("--routing") + 1] == routing for s in own + refs), own + refs
+                ran = sorted(i for s in refs for i in s["args"][s["args"].index("--impls") + 1].split(","))
+                want = sorted(c for c in serving_cases.DEVICE_COMPARATORS[m] if serving_cases.na_reason(c, routing) is None)
+                assert ran == want, (m, routing, fam, ran, want)
+    tmp = tempfile.mkdtemp(prefix="perf_plan_padded_")
+    try:
+        path = os.path.join(tmp, "perf_moe_qwen3_35a3_padded_h200.jsonl")
+        with open(path, "w") as f:
+            f.write(json.dumps({"kind": "meta"}) + "\n")
+            for live, us in ((1, 30.0), (8, 60.0)):
+                f.write(json.dumps({"impl": "fso_bsfp8_layer", "proj": "layer", "M": 256, "live": live, "us": us}) + "\n")
+        cells = perf_report.cells_of(path)
+        assert cells == {("fso_bsfp8_layer", "layer", 256, 1): 30.0, ("fso_bsfp8_layer", "layer", 256, 8): 60.0}, cells
+    finally:
+        shutil.rmtree(tmp)
 
 
 def local_machine():

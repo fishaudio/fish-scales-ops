@@ -32,6 +32,10 @@ Raw-file manifest (device suffix `--device`, families 30a3 / 35a3):
   gemm_sm<sm>_qwen3_4b.jsonl, gemm_sm<sm>_qwen3_4b_mlp_fwd.jsonl, gemm_sm<sm>_qwen3_{30a3,35a3}_dense.jsonl   dense tables -> same name
   ref_mlp_sgl_<dev>.jsonl, ref_mlp_vllm_<dev>.jsonl, ref_mlp_cublas_<dev>.jsonl   Family A MLP-block comparators, one
                                               row per M with one entry per dtype, merged by M -> ref_mlp_qwen3_4b_<dev>.jsonl
+  perf_moe_qwen3_<fam>_<tag>_<dev>.jsonl      fso rows of a serving-shaped family (tag skew / padded / ep2,
+                                              serving_cases.py)                                     -> same name
+  ref_<tag>_<fam>_<dev>.jsonl, ref_sgl020_<tag>_<fam>_<dev>.jsonl   its comparators -> ref_moe_qwen3_<fam>_<tag>_<dev>.jsonl
+A padded-bucket row is keyed by its executed rows M and its live rows (`live`), so two cells of one bucket stay apart.
 Bands (stone, 2026-09-28): decode = M 1..128, prefill = M > 128.
 """
 from __future__ import annotations
@@ -49,6 +53,9 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import serving_cases  # noqa: E402  (beside this file; standard library only)
+
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 BASELINES = os.path.join(ROOT, "tests", "baselines")
 PROVENANCE = os.path.join(BASELINES, "provenance")
@@ -152,6 +159,9 @@ def manifest(run, dev, sm):
                                                  f"ref_torchma_smm_{fam}_{dev}.jsonl"]
         m[f"ref_kern_moe_qwen3_{fam}_{dev}.jsonl"] = [f"ref_kern_c1_vllm_{fam}_{dev}.jsonl", f"ref_kern_c1_sgl_{fam}_{dev}.jsonl",
                                                       f"ref_kern_c1_fi_{fam}_{dev}.jsonl"]
+        for tag in serving_cases.TAGS.values():     # the serving-shaped cases (bench/perf_suite.py, group serving)
+            m[f"perf_moe_qwen3_{fam}_{tag}_{dev}.jsonl"] = [f"perf_moe_qwen3_{fam}_{tag}_{dev}.jsonl"]
+            m[f"ref_moe_qwen3_{fam}_{tag}_{dev}.jsonl"] = [f"ref_{tag}_{fam}_{dev}.jsonl", f"ref_sgl020_{tag}_{fam}_{dev}.jsonl"]
     m[f"perf_moe_qwen3_35a3_shared_{dev}.jsonl"] = [f"perf_moe_qwen3_35a3_shared_{dev}.jsonl"]
     m[f"ref_moe_qwen3_35a3_shared_{dev}.jsonl"] = [f"ref_new_35a3_shared_{dev}.jsonl"]   # the block's comparators (sm_100: torch-native)
     for n in (f"gemm_sm{sm}_qwen3_4b.jsonl", f"gemm_sm{sm}_qwen3_4b_mlp_fwd.jsonl",
@@ -246,14 +256,14 @@ def cmd_merge(args):
 
 # ----------------------------------------------------------------------------- cells of any baseline file
 def cells_of(path):
-    """(key, µs) for every timed cell: MoE rows keyed (impl, proj, M); dense rows
-    keyed (tag, M, dtype); MLP-block rows keyed ('mlp', M, dtype)."""
+    """(key, µs) for every timed cell: MoE rows keyed (impl, proj, M), plus the live rows of a padded-bucket row
+    (impl, proj, M, live); dense rows keyed (tag, M, dtype); MLP-block rows keyed ('mlp', M, dtype)."""
     out = {}
     for r in load(path):
         if r.get("kind") == "meta":
             continue
         if "impl" in r and r.get("us") is not None:
-            out[(r["impl"], r.get("proj", "layer"), r["M"])] = r["us"]
+            out[(r["impl"], r.get("proj", "layer"), r["M"]) + ((r["live"],) if "live" in r else ())] = r["us"]
         elif "tag" in r and "M" in r:
             for dt, v in r.items():
                 if isinstance(v, dict) and v.get("us") is not None:
@@ -507,6 +517,7 @@ def provenance_entry(man, man_sha, files, run):
                          "max_sm_mhz": cp.get("max_sm_mhz")},
         "observed_clocks": {s["name"]: s.get("clocks") for s in steps},
         "clock_flags": {s["name"]: s["clock_flags"] for s in steps if s.get("clock_flags")},
+        "power_flags": {s["name"]: s["power_flags"] for s in steps if s.get("power_flags")},
         "steps": [{k: s.get(k) for k in ("name", "env", "command", "start_utc", "end_utc", "exit_code", "rows",
                                          "error_rows")} for s in steps],
         "environments": envs,

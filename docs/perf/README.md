@@ -28,7 +28,8 @@ generated from `tests/baselines/*.jsonl` by
 - **Quantities.** TFLOPS = FLOPs / µs × 1e-6, with 2·M·N·K FLOPs per GEMM; the
   layer columns are defined in [`layer/README.md`](layer/README.md).
 - **Comparators.** fso and every comparator get the same inputs and, on the
-  MoE layers, the same uniform random routing draw.
+  MoE layers, the same routing draw: the uniform one in the main tables, a
+  serving-shaped one in the serving-shaped cases (Routing, below).
 
 ## Shape families
 
@@ -41,6 +42,26 @@ generated from `tests/baselines/*.jsonl` by
 The layer pages time Family A's MLP block, Family B's routed MoE layer and
 Family C's MoE block with its shared expert; [`layer/README.md`](layer/README.md)
 defines each block.
+
+## Routing
+
+The MoE tables route every token to 8 distinct experts drawn uniformly at
+random, one seeded draw per M. The serving-shaped cases at the end of each
+layer page run the routed layer of Families B and C under three routing
+families that look like a serving engine's calls instead, each also seeded per
+M (`bench/gemm/python/serving_cases.py`):
+
+| family | what the layer receives | parameters |
+|---|---|---|
+| skewed routing | every token takes 8 distinct experts, sampled without replacement in proportion to a Zipf popularity `(rank + 1)^-s` over a seeded ranking of the experts | `s` = 0.451 (B), 0.386 (C), calibrated so that the hottest expert receives on average 3.8 times the rows of the uniform draw's hottest expert over M = 1024–8192, the prefill skew apex reported in issue #8; the ratio `h` grows with M and is printed per row |
+| padded bucket | a captured bucket of B rows of which the first L are live: the live rows carry the uniform draw of M = L, the other rows carry the id −1, the padding id sglang writes into a captured bucket under expert parallelism | (B, L) = (8, 1), (32, 1), (64, 1), (64, 16), (128, 1), (256, 1), (256, 8), (256, 64), (512, 1), (512, 128) |
+| expert-parallel rank | one of two ranks: the uniform draw over all experts, every id of an expert the rank does not own mapped to −1, and a layer that holds the rank's half of the experts | 64 local experts (B), 128 (C) |
+
+fso skips every id outside its local experts. A comparator runs a case only
+through the call a serving engine makes for it — trtllm-gen takes the global
+ids with its local expert range, sglang's Triton layer the ids mapped to −1
+with the rank's local expert count — and where a comparator does not serve a
+case natively, the page names it under the table with the reason.
 
 ## Summary
 

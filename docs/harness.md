@@ -115,8 +115,14 @@ python3 bench/run_perf.py --machine h200 --out /data/bench-runs/<run> --fso-path
 - **Preflight.** The run first compares the machine with its lock: the interpreter and the exact package versions
   of every environment a step uses, the driver, the card, the clock policy, and on sm_90 the compiler the JIT loaded.
   A difference is drift, and the run refuses it. `--dry-run` prints the plan and that verdict without touching a GPU.
-- **Steps.** The steps of every table of record are listed once, in `bench/perf_suite.py`.
-- **Manifest.** `manifest.json` in the run directory records what ran and on what.
+- **Steps.** The steps of every table of record are listed once, in `bench/perf_suite.py`. `--tables` selects
+  table groups; `serving` is the serving-shaped cases of the MoE layer (skewed routing, padded buckets, one
+  expert-parallel rank; `docs/perf/README.md`, Routing).
+- **Manifest.** `manifest.json` in the run directory records what ran and on what. Per step it also records the
+  clocks, power and throttling the sampler saw: the SM clock over the busy samples (median, minimum, mean,
+  maximum), the board power (busy mean and maximum, and the card's limit), and the share of busy samples that a
+  power or a thermal limiter held. A step whose busy samples hit the power cap carries a power flag naming that
+  share, so its numbers are read as measured under the cap.
 
 **The lock.** `bench/env/<machine>.lock.json` pins, for every environment a step uses, the interpreter and the exact
 package versions, and for the machine the driver, the card, the clock and compute-mode policy, the GPU lock file and

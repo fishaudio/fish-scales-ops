@@ -74,6 +74,20 @@ Run inside the tiny_sglang serving venv (needs deep_gemm + sglang + triton):
 Cell-level fields: us (graph-replay median), cos (vs unquantized bf16
 reference), tflops (useful flops only: 2*8M*N*K, padding excluded), and
 w_gbps (active-expert weight bytes / us — the decode-side roofline metric).
+
+Routing (--routing, serving_cases.py): `uniform` (the default) is the draw of
+every table of record and runs every cell above. The serving-shaped families
+run the routed layer only (fso_*_layer and the block-FP8 serving comparators
+serving_cases.py lists; any other impl records n/a with the reason):
+  --routing skew [--skew-s S]       Zipf-skewed top-k, S calibrated per model
+  --routing padded [--bucket B,..] [--live L,..]   a bucket of B executed rows,
+                                    L live (the uniform draw of M = L), the rest -1
+  --routing ep [--ep-size 2]        one expert-parallel rank: E / ep_size local
+                                    experts, the other ranks' ids -1
+A serving-shaped row adds `routing` and the family's fields (skew_s and h;
+live and bucket; ep_size, E_global and E_local), `pairs` (the routed pairs the
+layer computes) and `max_rows` (its hottest expert's rows); M is the executed
+rows. flops count the routed pairs only.
 """
 
 import argparse
@@ -83,6 +97,9 @@ import os
 import statistics
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import serving_cases  # noqa: E402  (beside this file; standard library only)
 
 # Routed-expert geometry per model (docs/perf/README.md, Shape families). Shared experts
 # (Qwen3.5) are dense GEMMs on every token and are benched by
@@ -97,17 +114,28 @@ MODELS = {
 }
 MODEL = "qwen3-30a3"
 E = TOPK = HIDDEN = INTER = LAYERS = None
+# E is the number of experts the layer holds; E_GLOBAL the model's. They differ only for an expert-parallel cell
+# (--routing ep), where the layer holds one rank's E_GLOBAL / ep_size experts (set_expert_parallel).
+E_GLOBAL = None
 SHARED_INTER = 0
 PROJ = {}   # proj -> (N, K)
 
 
 def set_model(name):
-    global MODEL, E, TOPK, HIDDEN, INTER, LAYERS, PROJ, SHARED_INTER
+    global MODEL, E, E_GLOBAL, TOPK, HIDDEN, INTER, LAYERS, PROJ, SHARED_INTER
     g = MODELS[name]
     MODEL = name
     E, TOPK, HIDDEN, INTER, LAYERS = g["E"], g["TOPK"], g["HIDDEN"], g["INTER"], g["LAYERS"]
+    E_GLOBAL = E
     SHARED_INTER = g.get("SHARED_INTER", 0)
     PROJ = {"gate_up": (2 * INTER, HIDDEN), "down": (HIDDEN, INTER)}
+
+
+def set_expert_parallel(ep_size):
+    """One expert-parallel rank: the layer holds E_GLOBAL / ep_size experts (rank 0's), E_GLOBAL stays the model's."""
+    global E
+    assert E_GLOBAL % ep_size == 0, (E_GLOBAL, ep_size)
+    E = E_GLOBAL // ep_size
 
 
 set_model(MODEL)
@@ -225,6 +253,41 @@ def fso_M():
 # sm_90 expert-sorted contiguous layer (moe_layer_fp8_sm90): no slab, the full
 # grid incl. M=8192 fits.
 FSO_SM90_M = sorted(set(M_GRID + [96, 256]))
+
+
+def make_serving_cells(args):
+    """The cells of a serving-shaped family (serving_cases.py): the routed layer only, each impl on its uniform
+    M grid (padded: on the (bucket, live) pairs), every cell carrying its routing in the cell dict so the worker
+    rebuilds the same draw. Impls the family does not run get cells too and record n/a with the reason."""
+    routing = args.routing
+    impls = (serving_cases.FSO_IMPLS + tuple(serving_cases.COMPARATORS)
+             + ("triton_bf16", "vllm_bf16", "trtllm_cutlass_bf16", "trtllm_cutlass_fp8") + TORCH_IMPLS)
+
+    def grid(impl):
+        if impl == "fso_mxfp8_layer":
+            return fso_M()
+        if impl == "fso_bsfp8_layer":
+            return FSO_SM90_M
+        return DECODE_M if impl in serving_cases.DECODE_ONLY else M_GRID
+
+    cells = []
+    if routing == "padded":
+        buckets = sorted({int(b) for b in args.bucket.split(",")}) if args.bucket else None
+        if args.live:
+            lives = sorted({int(x) for x in args.live.split(",")})
+            pairs = [(b, l) for b in (buckets or sorted({b for b, _ in serving_cases.PADDED_CELLS}))
+                     for l in lives if l <= b]
+        else:
+            pairs = [(b, l) for b, l in serving_cases.PADDED_CELLS if buckets is None or b in buckets]
+        for impl in impls:
+            cells += [dict(impl=impl, proj="layer", M=b, routing="padded", live=l)
+                      for b, l in pairs if b in grid(impl)]
+        return cells
+    extra = ({"skew_s": args.skew_s if args.skew_s is not None else serving_cases.SKEW_S[MODEL]}
+             if routing == "skew" else {"ep_size": args.ep_size})
+    for impl in impls:
+        cells += [dict(impl=impl, proj="layer", M=m, routing=routing, **extra) for m in grid(impl)]
+    return cells
 
 
 def make_cells():
@@ -584,7 +647,7 @@ def _dist_version(name):
         return None
 
 
-def build_trtllm_gen_moe_layer(M, hidden, w13, w2, topk_ids, topk_w):
+def build_trtllm_gen_moe_layer(M, hidden, w13, w2, topk_ids, topk_w, global_ids=None):
     """Whole routed MoE layer on the trtllm-gen block-FP8 op; returns (fn, info).
 
     The expert weights are exchanged to [up; gate] and quantized to 128x128 block
@@ -593,6 +656,13 @@ def build_trtllm_gen_moe_layer(M, hidden, w13, w2, topk_ids, topk_w):
     returns the bf16 [M, HIDDEN] layer output. Off sm_100/103, where trtllm-gen has
     no build, it raises RuntimeError('n/a: ...'), which the orchestrator stores in
     the row's `error` field the way it stores any failing cell.
+
+    Expert parallelism (`global_ids` given, the layer holding E of the model's E_GLOBAL
+    experts): the op takes the GLOBAL ids with num_experts = E_GLOBAL and this rank's
+    range (local_expert_offset = 0 for rank 0, local_num_experts = E), and skips every
+    id outside the range itself -- the call sglang's flashinfer_trtllm_routed runner
+    makes (it skips the -1 mapping for this backend). A padded row's -1 id is outside
+    every range and is skipped the same way.
     """
     import torch
     major, minor = torch.cuda.get_device_capability(0)
@@ -609,7 +679,8 @@ def build_trtllm_gen_moe_layer(M, hidden, w13, w2, topk_ids, topk_w):
     w31 = w13.reshape(E, 2, INTER, HIDDEN).flip(1).reshape(E, 2 * INTER, HIDDEN)   # [gate | up] -> [up | gate]
     w31_q, w31_s = quant_weights_fp8(w31)          # fp8 + fp32 [E, 2*INTER/128, HIDDEN/128]
     w2_q, w2_s = quant_weights_fp8(w2)             # fp8 + fp32 [E, HIDDEN/128, INTER/128]
-    routing = (topk_ids.to(torch.int32).contiguous(), topk_w.to(torch.float32).contiguous())
+    routing = ((topk_ids if global_ids is None else global_ids).to(torch.int32).contiguous(),
+               topk_w.to(torch.float32).contiguous())
     tune_max = 1 << max(M - 1, 0).bit_length()     # the next power of two >= M
 
     def layer_fn():
@@ -619,7 +690,7 @@ def build_trtllm_gen_moe_layer(M, hidden, w13, w2, topk_ids, topk_w):
             hidden_states=xq, hidden_states_scale=xs.t(),   # [HIDDEN/128, M], contiguous
             gemm1_weights=w31_q, gemm1_weights_scale=w31_s,
             gemm2_weights=w2_q, gemm2_weights_scale=w2_s,
-            num_experts=E, top_k=TOPK, n_group=None, topk_group=None,
+            num_experts=E_GLOBAL, top_k=TOPK, n_group=None, topk_group=None,
             intermediate_size=INTER, local_expert_offset=0, local_num_experts=E,
             routed_scaling_factor=None,
             # the routing method selects how logits become weights; with the top-k
@@ -740,13 +811,67 @@ def graph_time_us(fn, warmup=15, stream_warm=3, reps=3, iters=50):
     return statistics.median(vals)
 
 
-def make_routing(M, seed):
-    """topk_ids [M, TOPK] int32 (no replacement), topk_weights [M, TOPK] fp32."""
+def make_routing(M, seed, n_experts=None):
+    """topk_ids [M, TOPK] int32 (no replacement), topk_weights [M, TOPK] fp32.
+
+    The uniform draw of every table of record; `n_experts` (default: the layer's E) is the expert count drawn
+    over, which only the expert-parallel family sets (to the model's E_GLOBAL)."""
     import torch
     g = torch.Generator(device="cpu").manual_seed(seed)
-    ids = torch.stack([torch.randperm(E, generator=g)[:TOPK] for _ in range(M)])
+    ids = torch.stack([torch.randperm(E if n_experts is None else n_experts, generator=g)[:TOPK] for _ in range(M)])
     w = torch.softmax(torch.randn(M, TOPK, generator=g, dtype=torch.float32), dim=-1)
     return ids.to("cuda", torch.int32), w.cuda()
+
+
+def make_routing_skew(M, seed, s, n_experts=None):
+    """The skewed draw (serving_cases.py, skew): every token takes TOPK distinct experts sampled without
+    replacement in proportion to p_e ~ (rank_e + 1) ** -s over a seeded random ranking of the experts.
+    topk_ids [M, TOPK] int32, topk_weights [M, TOPK] fp32 (a softmax of a normal draw, as make_routing's)."""
+    import torch
+    n = E if n_experts is None else n_experts
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    rank = torch.randperm(n, generator=g)
+    p = (rank.to(torch.float64) + 1.0).pow(-s)
+    ids = torch.multinomial((p / p.sum()).expand(M, n), TOPK, replacement=False, generator=g)
+    w = torch.softmax(torch.randn(M, TOPK, generator=g, dtype=torch.float32), dim=-1)
+    return ids.to("cuda", torch.int32), w.cuda()
+
+
+def serving_routing(cell):
+    """The routing of a serving-shaped cell (cell["routing"] in skew / padded / ep; serving_cases.py).
+
+    Returns (topk_ids, topk_w, info, global_ids): the ids and weights the layer receives, the row fields that
+    describe the draw, and for an expert-parallel cell the ids before the -1 mapping (the form trtllm-gen's
+    expert-parallel call takes), else None. An expert-parallel cell first sets the layer's E to one rank's
+    experts. Every family is seeded from the cell's M (padded: from its live rows), like the uniform draw."""
+    import torch
+    routing, M = cell["routing"], cell["M"]
+    info = {}
+    global_ids = None
+    if routing == "skew":
+        topk_ids, topk_w = make_routing_skew(M, M * 7919 + 3, cell["skew_s"])
+        uni, _ = make_routing(M, seed=M * 7919 + 3)       # the uniform cell's draw at this M, for h
+        u_max = int(torch.bincount(uni.flatten().long(), minlength=E).max())
+        s_max = int(torch.bincount(topk_ids.flatten().long(), minlength=E).max())
+        info.update(uniform_max_rows=u_max, h=round(s_max / u_max, 4))
+    elif routing == "padded":
+        L = cell["live"]
+        assert 1 <= L <= M, cell
+        live_ids, live_w = make_routing(L, seed=L * 7919 + 3)    # the uniform cell of M = L, row for row
+        topk_ids = torch.cat([live_ids, torch.full((M - L, TOPK), -1, device="cuda", dtype=torch.int32)])
+        topk_w = torch.cat([live_w, torch.zeros(M - L, TOPK, device="cuda", dtype=torch.float32)])
+        info.update(bucket=M)
+    elif routing == "ep":
+        set_expert_parallel(cell["ep_size"])
+        global_ids, topk_w = make_routing(M, seed=M * 7919 + 3, n_experts=E_GLOBAL)   # the uniform cell's tokens
+        topk_ids = torch.where(global_ids < E, global_ids, torch.full_like(global_ids, -1))   # rank 0 owns [0, E)
+        info.update(E_global=E_GLOBAL, E_local=E)
+    else:
+        raise ValueError(f"unknown routing {routing!r}")
+    flat = topk_ids.flatten().long()
+    valid = flat[(flat >= 0) & (flat < E)]
+    info.update(pairs=int(valid.numel()), max_rows=int(torch.bincount(valid, minlength=E).max()) if valid.numel() else 0)
+    return topk_ids, topk_w, info, global_ids
 
 
 def quant_weights_fp8(w):
@@ -776,12 +901,15 @@ def grouped_ref(x_rows, w, row_expert):
 
 
 def moe_layer_ref(hidden, w13, w2, topk_ids, topk_w):
-    """fp32 whole-layer reference (chunked gate|up, silu, weighted combine)."""
+    """fp32 whole-layer reference (chunked gate|up, silu, weighted combine). Ids outside [0, E) (padded rows,
+    another expert-parallel rank's experts) contribute nothing, as in every layer under test."""
     import torch
     M = hidden.shape[0]
     out = torch.zeros(M, HIDDEN, device=hidden.device, dtype=torch.float32)
     hf = hidden.float()
     for e in torch.unique(topk_ids).tolist():
+        if not 0 <= e < E:
+            continue
         tok, slot = (topk_ids == e).nonzero(as_tuple=True)
         gu = hf[tok] @ w13[e].float().t()
         act = torch.nn.functional.silu(gu[:, :INTER]) * gu[:, INTER:]
@@ -875,7 +1003,7 @@ def init_sglang_shim():
     d = tempfile.mkdtemp(prefix="fso-sglang-shim-")
     cfg = {"architectures": ["Qwen3MoeForCausalLM"], "model_type": "qwen3_moe",
            "hidden_size": HIDDEN, "intermediate_size": 8 * INTER,
-           "moe_intermediate_size": INTER, "num_experts": E,
+           "moe_intermediate_size": INTER, "num_experts": E_GLOBAL,
            "num_experts_per_tok": TOPK, "num_hidden_layers": LAYERS,
            "num_attention_heads": 32, "num_key_value_heads": 4, "head_dim": 128,
            "vocab_size": 151936, "max_position_embeddings": 40960,
@@ -927,15 +1055,30 @@ def run_worker(cell):
         dg = None
 
     impl, proj, M = cell["impl"], cell["proj"], cell["M"]
+    routing = cell.get("routing", "uniform")
+    na = serving_cases.na_reason(impl, routing)
+    if na:
+        raise RuntimeError(f"n/a: {na}")
     torch.manual_seed(M * 1009 + len(proj) * 17 + 5)
     busy_warm(int(os.environ.get("FSO_BENCH_WARM_MS", "0")))
 
-    topk_ids, topk_w = make_routing(M, seed=M * 7919 + 3)
-    counts = torch.bincount(topk_ids.flatten().long(), minlength=E).int()
+    global_ids = None
+    if routing == "uniform":
+        topk_ids, topk_w = make_routing(M, seed=M * 7919 + 3)
+        counts = torch.bincount(topk_ids.flatten().long(), minlength=E).int()
+        pairs, routing_info = M * TOPK, {}
+    else:
+        # serving-shaped cells (serving_cases.py): ids outside [0, E) are padded rows or another rank's experts;
+        # the expert-parallel draw sets E to this rank's experts before anything below reads it
+        topk_ids, topk_w, routing_info, global_ids = serving_routing(cell)
+        flat = topk_ids.flatten().long()
+        counts = torch.bincount(flat[(flat >= 0) & (flat < E)], minlength=E).int()
+        pairs = routing_info["pairs"]
     active = int((counts > 0).sum())
-    rows = M * TOPK
+    rows = M * TOPK     # the executed (token, slot) pairs: what the host-static hints of every layer are sized from
 
     result = dict(cell)
+    result.update(routing_info)
     result["active_experts"] = active
 
     if impl in KERNEL_IMPLS:
@@ -1217,7 +1360,7 @@ def run_worker(cell):
                           dtype=torch.bfloat16) / math.sqrt(HIDDEN)
         w2 = torch.randn(E, HIDDEN, INTER, device="cuda",
                          dtype=torch.bfloat16) / math.sqrt(INTER)
-        result["flops"] = 2.0 * rows * (2 * INTER * HIDDEN + HIDDEN * INTER)
+        result["flops"] = 2.0 * pairs * (2 * INTER * HIDDEN + HIDDEN * INTER)   # useful work: skipped ids excluded
         wbytes_e = (2 * INTER * HIDDEN + HIDDEN * INTER)
         bf16_weights = impl in ("triton_bf16", "vllm_bf16", "torch_grouped_bf16_layer",
                                 "torch_grouped_bf16_layer_compiled",
@@ -1303,7 +1446,9 @@ def run_worker(cell):
                     fused_experts)
                 from sglang.srt.layers.moe.topk import StandardTopKOutput
                 import dataclasses as _dc
-                cfg_kw = dict(num_experts=E, num_local_experts=E, top_k=TOPK,
+                # num_experts is the model's and num_local_experts the layer's: they differ only under expert
+                # parallelism, which is what turns on sglang's skip of -1 ids (filter_expert)
+                cfg_kw = dict(num_experts=E_GLOBAL, num_local_experts=E, top_k=TOPK,
                               hidden_size=HIDDEN,
                               intermediate_size_per_partition=INTER,
                               activation="silu", is_gated=True, inplace=False,
@@ -1458,7 +1603,7 @@ def run_worker(cell):
                 # boundary as the other layer cells: top-k given, the activation
                 # quantize and everything after it inside the capture, only the expert
                 # weights prepared outside.
-                layer_fn, info = build_trtllm_gen_moe_layer(M, hidden, w13, w2, topk_ids, topk_w)
+                layer_fn, info = build_trtllm_gen_moe_layer(M, hidden, w13, w2, topk_ids, topk_w, global_ids)
                 result.update(info)
                 out_holder = {}
 
@@ -1779,7 +1924,10 @@ def derive(row):
 
 def run_all(args):
     import torch
-    cells = make_cells()
+    routing = args.routing
+    if routing == "ep":
+        set_expert_parallel(args.ep_size)       # the fso grid is sized for the rank's experts
+    cells = make_cells() if routing == "uniform" else make_serving_cells(args)
     if args.impls:
         keep = set(args.impls.split(","))
         cells = [c for c in cells if c["impl"] in keep]
@@ -1791,10 +1939,19 @@ def run_all(args):
         cells = [c for c in cells if c["proj"] in keep_p]
 
     meta = dict(kind="meta", protocol="cold-L2 weight rotation: R weight copies with R*active >= 2*L2 in one graph, us = replay/R",
-                model=MODEL, E=E, topk=TOPK, hidden=HIDDEN,
+                model=MODEL, E=E_GLOBAL, topk=TOPK, hidden=HIDDEN,
                 inter=INTER, layers=LAYERS,
                 device=torch.cuda.get_device_name(0),
                 torch=torch.__version__)
+    if routing != "uniform":
+        meta.update(routing=routing, routing_tag=serving_cases.TAGS[routing])
+        if routing == "skew":
+            meta.update(skew_s=args.skew_s if args.skew_s is not None else serving_cases.SKEW_S[MODEL],
+                        skew_target_h=serving_cases.SKEW_TARGET_H)
+        elif routing == "ep":
+            meta.update(ep_size=args.ep_size, E_local=E)
+        else:
+            meta.update(padded_cells=sorted({(c["M"], c["live"]) for c in cells}))
     rows = [meta]
     out_f = open(args.out, "w") if args.out else None
     if out_f:
@@ -1802,6 +1959,16 @@ def run_all(args):
         out_f.flush()
 
     for i, cell in enumerate(cells):
+        na = serving_cases.na_reason(cell["impl"], routing)
+        if na:
+            # a serving-shaped family this impl does not serve: recorded as n/a without starting a worker
+            row = dict(cell, error=f"n/a: {na}")
+            print(f"[{i+1}/{len(cells)}] {cell['impl']:14s} {cell['proj']:8s} M={cell['M']:<5d} n/a ({routing})")
+            rows.append(row)
+            if out_f:
+                out_f.write(json.dumps(row) + "\n")
+                out_f.flush()
+            continue
         cmd = [sys.executable, os.path.abspath(__file__), "--worker",
                "--model", MODEL, "--cell", json.dumps(cell)]
         p = subprocess.run(cmd, capture_output=True, text=True)
@@ -1844,6 +2011,18 @@ def main():
     ap.add_argument("--model", choices=sorted(MODELS), default="qwen3-30a3",
                     help="routed-expert geometry (docs/perf/README.md, Shape families): "
                          "qwen3-30a3 = Family B, qwen3.5-35a3 = Family C")
+    ap.add_argument("--routing", choices=serving_cases.ROUTINGS, default="uniform",
+                    help="routing family (serving_cases.py): uniform = the tables of record (default); skew, padded "
+                         "and ep run the routed layer's serving-shaped cells")
+    ap.add_argument("--skew-s", type=float, default=None,
+                    help="--routing skew: the Zipf exponent (default: the calibrated one of --model)")
+    ap.add_argument("--bucket", type=str, default=None,
+                    help="--routing padded: comma list of bucket rows to keep (default: every bucket of the family)")
+    ap.add_argument("--live", type=str, default=None,
+                    help="--routing padded: comma list of live rows; with it the cells are every bucket x live pair "
+                         "with live <= bucket instead of the family's pairs")
+    ap.add_argument("--ep-size", type=int, default=serving_cases.EP_SIZE,
+                    help="--routing ep: expert-parallel ranks; the layer holds E / ep-size experts (rank 0's)")
     args = ap.parse_args()
     # The chains run each venv by its absolute interpreter path, so the venv's
     # console scripts are not on PATH the way an activated venv puts them; the
