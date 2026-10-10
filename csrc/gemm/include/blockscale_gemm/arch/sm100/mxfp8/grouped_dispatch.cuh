@@ -873,6 +873,599 @@ inline int device_sm_count() noexcept
 }
 
 // ---------------------------------------------------------------------------
+// The compact activation layout (fso 0.2.1): per-call activation arrays and
+// weight-keyed argument blocks
+// ---------------------------------------------------------------------------
+//
+// The layout. The masked slab gives every expert m_cap rows; the compact layout
+// gives expert g the ceil(cnt[g] / 128) consecutive 128-row blocks starting at
+// block blk0[g] of ONE group of R = 128 * B_alloc rows (a fp8 [R, K], its scales
+// the Sm1xx atom slab of an R-row tensor, D [R, N]). Expert g's routed rows are
+// rows blk0[g] * 128 + r, r < cnt[g]. The weights keep their batch index g.
+//
+// What the pointer-array kernel needs per group, and where each piece now comes
+// from:
+//
+//   * problem[g] = (cnt[g], N, K)          per call, from moe_build_routing_compact
+//   * ptr_a / ptr_sfa / ptr_d [g]          per call, from the same op: the
+//                                          activation, its scale atom and the output
+//                                          row of the expert's first block
+//   * ptr_b / ptr_sfb [g], stride_a/b/d,   a function of the WEIGHT tensors and
+//     layout_sfb [g], layout_sfa [g]       (G, N, K) only, built once per weight set
+//                                          into a `WeightArena` block
+//
+// `layout_sfa` is the one array that needed a decision to land in the weight
+// block. In the masked path it carries a row extent derived from m_cap (or from
+// masked_m[g]), which is a property of the bucket. Its strides depend on K
+// alone -- one 512-byte atom per 128 rows x 128 K, (K/128) atoms per 128-row
+// block -- so the row extent is nothing but the bound of the scale-factor TMA
+// descriptor. The compact block therefore builds it from ONE constant extent,
+// kCompactSfaRows, that is at least the row span any tile of any call can
+// address from ptr_sfa[g]:
+//
+//   * a tile of expert g starts at relative row m_tile * TileM < cnt[g] and ends
+//     at most at round_up(cnt[g], 256) (2-SM tiles, and the two-CTA cluster of
+//     ST 11, cover 256 rows); cnt[g] <= R, and the op refuses R > kCompactSfaRows
+//     on the host, so the descriptor never clips a scale byte a live row needs;
+//   * at that extent the layout's int32 batch stride, rows * K / 32 bytes, stays
+//     below 2^31 for every K < 65536, which the op also checks.
+//
+// The consequence, and why it is harmless. The scale-factor descriptor no longer
+// zero-fills past an expert's rows: the rows of a tile at or past cnt[g] read the
+// next expert's scale bytes, the expert's own unwritten padding, or the one block
+// of allocation slack, against data rows the A descriptor (extent cnt[g]) has
+// already zero-filled. A block-scaled MMA row depends on that row's operands only,
+// so those accumulator rows are garbage-or-NaN and never stored: the epilogue
+// clips its stores at the problem shape's cnt[g], and the fused FC1 store returns
+// for m >= cnt[g]. Only the scale reads needed the slack block (a 256-row tile of
+// the last expert reads one block past its region); the data and output
+// descriptors are bounded by (cnt, N, K).
+//
+// Why the arena no longer grows with captures. The masked path's static block is
+// keyed by the five operand addresses and m_cap, so every capture (whose
+// activations come from the graph's private pool) pins a new block. A compact
+// block is keyed by (weights, weight scales, G, N, K): a serving process holds
+// exactly two per layer, bound at the first call that sees the weights, and no
+// capture, bucket or routing ever adds another. Growth past the first chunk
+// happens only with more distinct weight sets than one chunk holds, it is a
+// cudaMalloc made outside the capture's accounting (relaxed capture mode, as the
+// caching allocator does), and nothing aborts.
+
+// The constant row extent of every compact `layout_sfa` (see above).
+constexpr int kCompactSfaRows = 1 << 20;
+
+// Whether a compact call of R rows and this K stays inside the constant
+// extent and inside the int32 range of the scale layout's strides.
+inline bool compact_sfa_extent_fits(long long rows, int shape_k) noexcept
+{
+    return rows >= 0 && rows <= kCompactSfaRows && shape_k > 0
+        && static_cast<long long>(kCompactSfaRows) / 32 * static_cast<long long>(shape_k) < (1LL << 31);
+}
+
+// The weight-side arrays of one compact block. One thread per group.
+__global__ void sm100_grouped_weight_kernel(void const** __restrict__ ptr_b, void const** __restrict__ ptr_sfb,
+    GStrideA* __restrict__ stride_a, GStrideB* __restrict__ stride_b, GStrideD* __restrict__ stride_d,
+    GLayoutSFA* __restrict__ layout_sfa, GLayoutSFB* __restrict__ layout_sfb, int groups, int shape_n, int shape_k,
+    char* b_base, char* sfb_base, int64_t b_bytes, int64_t sfb_bytes)
+{
+    int const g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= groups)
+        return;
+    // A prvalue copy: binding the namespace-scope constant to make_shape's
+    // reference parameter would odr-use a host variable in device code.
+    int const sfa_rows = static_cast<int>(kCompactSfaRows);
+    ptr_b[g] = b_base + static_cast<int64_t>(g) * b_bytes;
+    ptr_sfb[g] = sfb_base + static_cast<int64_t>(g) * sfb_bytes;
+    stride_a[g] = cute::make_stride(static_cast<int64_t>(shape_k), cute::Int<1>{}, cute::Int<0>{});
+    stride_b[g] = cute::make_stride(static_cast<int64_t>(shape_k), cute::Int<1>{}, cute::Int<0>{});
+    stride_d[g] = cute::make_stride(static_cast<int64_t>(shape_n), cute::Int<1>{}, cute::Int<0>{});
+    layout_sfb[g] = GSfConfig::tile_atom_to_shape_SFB(cute::make_shape(128, shape_n, shape_k, 1));
+    layout_sfa[g] = GSfConfig::tile_atom_to_shape_SFA(cute::make_shape(sfa_rows, shape_n, shape_k, 1));
+}
+
+// The compact call WITHOUT routing-supplied arrays: every array of the call
+// into one `ArgPool` slot, from masked_m and blk0. The same split around the
+// grid-dependency barrier as `sm100_grouped_prep_kernel`: the weight-side half
+// (which does not depend on the routing) executes first, then the barrier, then
+// the routing-dependent half. Used by a caller that hands the op neither
+// `problem_shapes` nor `ptr_arrays`; the layer always hands both.
+__global__ void sm100_grouped_compact_prep_kernel(GProblemShape* __restrict__ problem,
+    void const** __restrict__ ptr_a, void const** __restrict__ ptr_b, void const** __restrict__ ptr_sfa,
+    void const** __restrict__ ptr_sfb, void** __restrict__ ptr_d, GStrideA* __restrict__ stride_a,
+    GStrideB* __restrict__ stride_b, GStrideD* __restrict__ stride_d, GLayoutSFA* __restrict__ layout_sfa,
+    GLayoutSFB* __restrict__ layout_sfb, int32_t const* __restrict__ masked_m, int32_t const* __restrict__ blk0,
+    int groups, int shape_n, int shape_k, char* a_base, char* b_base, char* sfa_base, char* sfb_base, char* d_base,
+    int64_t a_row_bytes, int64_t b_bytes, int64_t sfa_blk_bytes, int64_t sfb_bytes, int64_t d_row_bytes, bool pdl)
+{
+    int const g = blockIdx.x * blockDim.x + threadIdx.x;
+    bool const live = (g < groups);
+    int const sfa_rows = static_cast<int>(kCompactSfaRows);
+    if (live)
+    {
+        ptr_b[g] = b_base + static_cast<int64_t>(g) * b_bytes;
+        ptr_sfb[g] = sfb_base + static_cast<int64_t>(g) * sfb_bytes;
+        stride_a[g] = cute::make_stride(static_cast<int64_t>(shape_k), cute::Int<1>{}, cute::Int<0>{});
+        stride_b[g] = cute::make_stride(static_cast<int64_t>(shape_k), cute::Int<1>{}, cute::Int<0>{});
+        stride_d[g] = cute::make_stride(static_cast<int64_t>(shape_n), cute::Int<1>{}, cute::Int<0>{});
+        layout_sfb[g] = GSfConfig::tile_atom_to_shape_SFB(cute::make_shape(128, shape_n, shape_k, 1));
+        layout_sfa[g] = GSfConfig::tile_atom_to_shape_SFA(cute::make_shape(sfa_rows, shape_n, shape_k, 1));
+    }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    if (pdl)
+        cudaGridDependencySynchronize();
+#endif
+    if (live)
+    {
+        int m = masked_m[g];
+        m = m < 0 ? 0 : m;
+        int64_t const b0 = blk0[g];
+        problem[g] = cute::make_shape(m, shape_n, shape_k);
+        ptr_a[g] = a_base + b0 * 128 * a_row_bytes;
+        ptr_sfa[g] = sfa_base + b0 * sfa_blk_bytes;
+        ptr_d[g] = d_base + b0 * 128 * d_row_bytes;
+    }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    if (pdl && threadIdx.x == 0)
+        cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+// A weight block's key. Zero-filled before use so its padding compares equal.
+struct WeightKey
+{
+    void const* b;
+    void const* sfb;
+    int groups;
+    int shape_n;
+    int shape_k;
+    int sfa_rows; // kCompactSfaRows, carried so the key names everything the block encodes
+};
+
+struct WeightBlock
+{
+    WeightKey key;
+    ArgSlot arrays; // problem, ptr_a, ptr_sfa, ptr_d stay nullptr: those are per call
+    std::size_t bytes = 0;
+    bool pinned = false;
+    unsigned long long last_use = 0;
+};
+
+// The weight-keyed argument arena of the compact path.
+//
+// Thread-local, like `StaticArena`, and with the same capture discipline: a
+// block first bound (or first referenced) inside a capture is written OUTSIDE
+// the capture, on the arena's own stream with a host wait under the relaxed
+// capture mode, so the graph carries no writer of its arrays, and from then on it
+// is pinned because the graph's kernel node keeps reading it. Two differences:
+//
+//   * memory comes in chunks that are added when a block does not fit, at any
+//     time, including inside a capture (the cudaMalloc is made under the relaxed
+//     capture mode, which is what the PyTorch caching allocator does); there is
+//     no fixed capacity and no abort;
+//   * eviction (of blocks only eager calls have used, least recently used first,
+//     same size only) starts only once the carved bytes reach the soft cap
+//     FSO_GROUPED_ARG_POOL_MB (default 128 MB). With weight keys that takes
+//     thousands of distinct weight sets; a serving process holds two per layer.
+//
+// FSO_PRINT_TILE_INFO=1 prints one line per block bound, with the running block
+// count and byte totals; the arena test reads them.
+struct WeightArena
+{
+    std::vector<char*> chunks;
+    std::size_t chunk_cap = 0;  // bytes of the newest chunk
+    std::size_t chunk_used = 0; // bytes carved from the newest chunk
+    std::size_t carved = 0;     // bytes carved into blocks, all chunks
+    std::size_t reserved = 0;   // bytes allocated, all chunks
+    std::vector<WeightBlock> blocks;
+    unsigned long long tick = 0;
+    cudaStream_t side = nullptr;
+
+    static WeightArena& instance()
+    {
+        static thread_local WeightArena a;
+        return a;
+    }
+
+    static constexpr std::size_t kChunkBytes = std::size_t(4) << 20;
+
+    static std::size_t block_bytes(int groups)
+    {
+        std::size_t off = 0;
+        auto take = [&](std::size_t bytes) { off = ArgPool::align_up(off, 16) + bytes; };
+        take(sizeof(void*) * groups); // ptr_b
+        take(sizeof(void*) * groups); // ptr_sfb
+        take(sizeof(GStrideA) * groups);
+        take(sizeof(GStrideB) * groups);
+        take(sizeof(GStrideD) * groups);
+        take(sizeof(GLayoutSFA) * groups);
+        take(sizeof(GLayoutSFB) * groups);
+        return ArgPool::align_up(off, 256);
+    }
+
+    static void carve(char* raw, int groups, ArgSlot& s)
+    {
+        std::size_t off = 0;
+        auto take = [&](std::size_t bytes) -> char*
+        {
+            off = ArgPool::align_up(off, 16);
+            char* p = raw + off;
+            off += bytes;
+            return p;
+        };
+        s = ArgSlot{};
+        s.ptr_b = reinterpret_cast<void const**>(take(sizeof(void*) * groups));
+        s.ptr_sfb = reinterpret_cast<void const**>(take(sizeof(void*) * groups));
+        s.stride_a = reinterpret_cast<GStrideA*>(take(sizeof(GStrideA) * groups));
+        s.stride_b = reinterpret_cast<GStrideB*>(take(sizeof(GStrideB) * groups));
+        s.stride_d = reinterpret_cast<GStrideD*>(take(sizeof(GStrideD) * groups));
+        s.layout_sfa = reinterpret_cast<GLayoutSFA*>(take(sizeof(GLayoutSFA) * groups));
+        s.layout_sfb = reinterpret_cast<GLayoutSFB*>(take(sizeof(GLayoutSFB) * groups));
+    }
+
+    static std::size_t soft_cap() { return StaticArena::pool_bytes(); }
+
+    // A device allocation (chunk or side stream) that is legal whether or not
+    // this thread is capturing: the call is made under the relaxed capture mode,
+    // which turns the "potentially unsafe" cudaMalloc into an ordinary one.
+    static cudaError_t relaxed_malloc(void** p, std::size_t bytes)
+    {
+        cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+        cudaError_t err = cudaThreadExchangeStreamCaptureMode(&mode);
+        if (err != cudaSuccess)
+            return err;
+        err = cudaMalloc(p, bytes);
+        cudaError_t const restore = cudaThreadExchangeStreamCaptureMode(&mode);
+        return err != cudaSuccess ? err : restore;
+    }
+
+    cudaError_t ensure_side_stream()
+    {
+        if (side != nullptr)
+            return cudaSuccess;
+        cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+        cudaError_t err = cudaThreadExchangeStreamCaptureMode(&mode);
+        if (err != cudaSuccess)
+            return err;
+        err = cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking);
+        cudaError_t const restore = cudaThreadExchangeStreamCaptureMode(&mode);
+        if (err != cudaSuccess)
+            side = nullptr;
+        return err != cudaSuccess ? err : restore;
+    }
+
+    char* carve_bytes(std::size_t need, cudaError_t& err)
+    {
+        err = cudaSuccess;
+        if (chunks.empty() || chunk_used + need > chunk_cap)
+        {
+            std::size_t const bytes = need > kChunkBytes ? need : kChunkBytes;
+            void* p = nullptr;
+            err = relaxed_malloc(&p, bytes);
+            if (err != cudaSuccess)
+                return nullptr;
+            chunks.push_back(static_cast<char*>(p));
+            chunk_cap = bytes;
+            chunk_used = 0;
+            reserved += bytes;
+        }
+        char* const out = chunks.back() + chunk_used;
+        chunk_used += need;
+        carved += need;
+        return out;
+    }
+
+    // The block for `key`; -1 with `err` set when memory ran out.
+    int bind(WeightKey const& key, bool capturing, bool& need_build, cudaError_t& err)
+    {
+        need_build = false;
+        err = cudaSuccess;
+        ++tick;
+        for (std::size_t i = 0; i < blocks.size(); ++i)
+        {
+            if (std::memcmp(&blocks[i].key, &key, sizeof(key)) == 0)
+            {
+                blocks[i].last_use = tick;
+                // First reference from a capture: pin it and rewrite it through
+                // the capture path (same bytes, host-waited) so that the write the
+                // eager call issued is known to have landed before the graph runs.
+                if (capturing && !blocks[i].pinned)
+                {
+                    blocks[i].pinned = true;
+                    need_build = true;
+                }
+                return static_cast<int>(i);
+            }
+        }
+        std::size_t const need = block_bytes(key.groups);
+        int victim = -1;
+        if (carved + need > soft_cap())
+        {
+            for (std::size_t i = 0; i < blocks.size(); ++i)
+            {
+                if (blocks[i].pinned || blocks[i].bytes != need)
+                    continue;
+                if (victim < 0 || blocks[i].last_use < blocks[static_cast<std::size_t>(victim)].last_use)
+                    victim = static_cast<int>(i);
+            }
+        }
+        bool fresh = false;
+        if (victim < 0)
+        {
+            char* const raw = carve_bytes(need, err);
+            if (raw == nullptr)
+                return -1;
+            WeightBlock b{};
+            carve(raw, key.groups, b.arrays);
+            b.bytes = need;
+            blocks.push_back(b);
+            victim = static_cast<int>(blocks.size()) - 1;
+            fresh = true;
+        }
+        WeightBlock& b = blocks[static_cast<std::size_t>(victim)];
+        std::memcpy(&b.key, &key, sizeof(key));
+        b.pinned = capturing;
+        b.last_use = tick;
+        need_build = true;
+        if (read_print_tile_info())
+        {
+            std::fprintf(stderr,
+                "[fso sm100 weight arena] %s block groups=%d N=%d K=%d bytes=%zu blocks=%zu carved=%zu "
+                "reserved=%zu capturing=%d\n",
+                fresh ? "new" : "rebound", key.groups, key.shape_n, key.shape_k, need, blocks.size(), carved,
+                reserved, capturing ? 1 : 0);
+        }
+        return victim;
+    }
+};
+
+inline WeightKey make_weight_key(void const* b, void const* sfb, int groups, int shape_n, int shape_k)
+{
+    WeightKey k;
+    std::memset(&k, 0, sizeof(k));
+    k.b = b;
+    k.sfb = sfb;
+    k.groups = groups;
+    k.shape_n = shape_n;
+    k.shape_k = shape_k;
+    k.sfa_rows = kCompactSfaRows;
+    return k;
+}
+
+// The weight block for one compact call, bound and, if needed, written. Eager:
+// the writer is a plain launch on the caller's stream, ahead of the GEMM.
+// Capturing: on the arena's own stream, host-waited, under the relaxed capture
+// mode, so the graph holds no writer of the block.
+inline ArgSlot const* acquire_weight_arrays(cudaStream_t stream, void const* b, void const* sfb, int groups,
+    int shape_n, int shape_k, cudaError_t& err)
+{
+    err = cudaSuccess;
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(stream, &cap);
+    bool const capturing = (cap == cudaStreamCaptureStatusActive);
+    WeightArena& arena = WeightArena::instance();
+    bool need_build = false;
+    WeightKey const key = make_weight_key(b, sfb, groups, shape_n, shape_k);
+    int const idx = arena.bind(key, capturing, need_build, err);
+    if (idx < 0)
+        return nullptr;
+    WeightBlock const& blk = arena.blocks[static_cast<std::size_t>(idx)];
+    if (need_build)
+    {
+        ArgSlot const& s = blk.arrays;
+        int const threads = 32;
+        int const grid = (groups + threads - 1) / threads;
+        int64_t const kp = shape_k / 128;
+        int64_t const b_bytes = static_cast<int64_t>(shape_n) * shape_k;
+        int64_t const sfb_bytes = static_cast<int64_t>(shape_n) * kp * static_cast<int64_t>(sizeof(int32_t));
+        char* const b_base = const_cast<char*>(static_cast<char const*>(b));
+        char* const sfb_base = const_cast<char*>(static_cast<char const*>(sfb));
+        if (!capturing)
+        {
+            sm100_grouped_weight_kernel<<<grid, threads, 0, stream>>>(s.ptr_b, s.ptr_sfb, s.stride_a, s.stride_b,
+                s.stride_d, s.layout_sfa, s.layout_sfb, groups, shape_n, shape_k, b_base, sfb_base, b_bytes,
+                sfb_bytes);
+            err = cudaGetLastError();
+        }
+        else
+        {
+            err = arena.ensure_side_stream();
+            if (err != cudaSuccess)
+                return nullptr;
+            cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+            err = cudaThreadExchangeStreamCaptureMode(&mode);
+            if (err != cudaSuccess)
+                return nullptr;
+            sm100_grouped_weight_kernel<<<grid, threads, 0, arena.side>>>(s.ptr_b, s.ptr_sfb, s.stride_a, s.stride_b,
+                s.stride_d, s.layout_sfa, s.layout_sfb, groups, shape_n, shape_k, b_base, sfb_base, b_bytes,
+                sfb_bytes);
+            err = cudaGetLastError();
+            if (err == cudaSuccess)
+                err = cudaStreamSynchronize(arena.side);
+            cudaError_t const restore = cudaThreadExchangeStreamCaptureMode(&mode);
+            if (err == cudaSuccess)
+                err = restore;
+        }
+        if (err != cudaSuccess)
+            return nullptr;
+    }
+    return &blk.arrays;
+}
+
+// Every argument array one grouped launch reads.
+struct GroupedArgView
+{
+    GProblemShape* problem = nullptr;
+    void const** ptr_a = nullptr;
+    void const** ptr_b = nullptr;
+    void const** ptr_sfa = nullptr;
+    void const** ptr_sfb = nullptr;
+    void** ptr_d = nullptr;
+    GStrideA* stride_a = nullptr;
+    GStrideB* stride_b = nullptr;
+    GStrideD* stride_d = nullptr;
+    GLayoutSFA* layout_sfa = nullptr;
+    GLayoutSFB* layout_sfb = nullptr;
+};
+
+// The arrays of one compact call. With the routing-supplied tensors
+// (`problem_shapes` int32 [G, 3] and `ptr_arrays` int64 [3, G], rows ptr_a,
+// ptr_sfa, ptr_d) the call launches nothing but the GEMM: the per-call arrays
+// are read where the routing op wrote them and the rest comes from the weight
+// block. Without them, the compact prep kernel writes all of them into a slot of
+// the prep path's two-slot pool (one extra launch, the masked op's prep path).
+// `d_row_bytes` is the byte pitch of D's rows (2N for bf16 D, I for the fused
+// FC1's fp8 output).
+inline cudaError_t compact_arg_view(GroupedArgView& v, cudaStream_t stream, bool pdl, __nv_fp8_e4m3* mat_a,
+    __nv_fp8_e4m3* mat_b, void* mat_d, int32_t* scales_a, int32_t* scales_b, int32_t const* masked_m,
+    int32_t const* blk0, int groups, int shape_n, int shape_k, int64_t d_row_bytes, int32_t const* problem_shapes,
+    int64_t const* ptr_arrays)
+{
+    if ((problem_shapes == nullptr) != (ptr_arrays == nullptr))
+        return cudaErrorInvalidValue; // the op refuses this before it gets here
+    if (problem_shapes != nullptr)
+    {
+        if (!problem_shape_is_three_plain_ints())
+        {
+            std::fprintf(stderr,
+                "[fish_scales_ops] sm_100 compact grouped MXFP8: cute::Shape<int,int,int> is not three plain ints "
+                "on this toolchain; refusing the routing-supplied problem shapes.\n");
+            return cudaErrorInvalidValue;
+        }
+        cudaError_t err = cudaSuccess;
+        ArgSlot const* w = acquire_weight_arrays(stream, mat_b, scales_b, groups, shape_n, shape_k, err);
+        if (w == nullptr)
+            return err != cudaSuccess ? err : cudaErrorMemoryAllocation;
+        v.problem = reinterpret_cast<GProblemShape*>(const_cast<int32_t*>(problem_shapes));
+        v.ptr_a = reinterpret_cast<void const**>(const_cast<int64_t*>(ptr_arrays));
+        v.ptr_sfa = reinterpret_cast<void const**>(const_cast<int64_t*>(ptr_arrays + groups));
+        v.ptr_d = reinterpret_cast<void**>(const_cast<int64_t*>(ptr_arrays + 2 * static_cast<int64_t>(groups)));
+        v.ptr_b = w->ptr_b;
+        v.ptr_sfb = w->ptr_sfb;
+        v.stride_a = w->stride_a;
+        v.stride_b = w->stride_b;
+        v.stride_d = w->stride_d;
+        v.layout_sfa = w->layout_sfa;
+        v.layout_sfb = w->layout_sfb;
+        return cudaSuccess;
+    }
+    auto& pool = ArgPool::instance();
+    int const slot_idx = pool.acquire(stream);
+    if (slot_idx < 0)
+        return cudaErrorMemoryAllocation;
+    ArgSlot const& slot = pool.slots[slot_idx];
+    int64_t const kp = shape_k / 128;
+    cudaLaunchConfig_t cfg{};
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = pdl ? 1 : 0;
+    int const threads = 32;
+    cfg.gridDim = dim3((groups + threads - 1) / threads);
+    cfg.blockDim = dim3(threads);
+    cfg.dynamicSmemBytes = 0;
+    cfg.stream = stream;
+    cfg.attrs = attrs;
+    cfg.numAttrs = 1;
+    cudaError_t const err = cudaLaunchKernelEx(&cfg, sm100_grouped_compact_prep_kernel, slot.problem, slot.ptr_a,
+        slot.ptr_b, slot.ptr_sfa, slot.ptr_sfb, slot.ptr_d, slot.stride_a, slot.stride_b, slot.stride_d,
+        slot.layout_sfa, slot.layout_sfb, masked_m, blk0, groups, shape_n, shape_k, reinterpret_cast<char*>(mat_a),
+        reinterpret_cast<char*>(mat_b), reinterpret_cast<char*>(scales_a), reinterpret_cast<char*>(scales_b),
+        static_cast<char*>(mat_d), static_cast<int64_t>(shape_k),
+        static_cast<int64_t>(shape_n) * shape_k, kp * 128 * static_cast<int64_t>(sizeof(int32_t)) * 1,
+        static_cast<int64_t>(shape_n) * kp * static_cast<int64_t>(sizeof(int32_t)), d_row_bytes, pdl);
+    if (err != cudaSuccess)
+        return err;
+    v.problem = slot.problem;
+    v.ptr_a = slot.ptr_a;
+    v.ptr_b = slot.ptr_b;
+    v.ptr_sfa = slot.ptr_sfa;
+    v.ptr_sfb = slot.ptr_sfb;
+    v.ptr_d = slot.ptr_d;
+    v.stride_a = slot.stride_a;
+    v.stride_b = slot.stride_b;
+    v.stride_d = slot.stride_d;
+    v.layout_sfa = slot.layout_sfa;
+    v.layout_sfb = slot.layout_sfb;
+    return cudaSuccess;
+}
+
+// The per-instantiation CUTLASS workspace of the compact launchers (per-SM
+// tensormap scratch; its size depends only on the SM count, so it is allocated
+// once). Unlike the masked launchers' pool this one may be filled inside a
+// capture: the allocation is made under the relaxed capture mode and its
+// initialisation on the weight arena's stream with a host wait, so a first
+// compact call inside a capture works instead of aborting.
+template <class GemmKernel, class Args>
+inline cudaError_t compact_workspace(Args const& args, cudaStream_t stream, void*& ws, std::size_t& ws_bytes)
+{
+    std::size_t const need = GemmKernel::get_workspace_size(args);
+    if (need <= ws_bytes)
+        return cudaSuccess;
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(stream, &cap);
+    bool const capturing = (cap == cudaStreamCaptureStatusActive);
+    // A buffer a captured graph may still read is never freed: growth keeps the
+    // old allocation (it only happens once per instantiation in practice).
+    void* p = nullptr;
+    cudaError_t err = WeightArena::relaxed_malloc(&p, need);
+    if (err != cudaSuccess)
+        return err;
+    cudaStream_t init_stream = stream;
+    cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+    if (capturing)
+    {
+        WeightArena& arena = WeightArena::instance();
+        err = arena.ensure_side_stream();
+        if (err != cudaSuccess)
+            return err;
+        init_stream = arena.side;
+        err = cudaThreadExchangeStreamCaptureMode(&mode);
+        if (err != cudaSuccess)
+            return err;
+    }
+    bool const ok = GemmKernel::initialize_workspace(args, p, init_stream) == cutlass::Status::kSuccess;
+    if (capturing)
+    {
+        cudaError_t const sync = cudaStreamSynchronize(init_stream);
+        cudaError_t const restore = cudaThreadExchangeStreamCaptureMode(&mode);
+        if (sync != cudaSuccess)
+            return sync;
+        if (restore != cudaSuccess)
+            return restore;
+    }
+    if (!ok)
+        return cudaErrorUnknown;
+    ws = p;
+    ws_bytes = need;
+    return cudaSuccess;
+}
+
+// cudaFuncSetAttribute for one kernel, once per process thread, made under the
+// relaxed capture mode so a first compact call inside a capture is legal.
+template <class GemmKernel>
+inline cudaError_t compact_configure_smem()
+{
+    static thread_local bool s_done = false;
+    if (s_done)
+        return cudaSuccess;
+    if (GemmKernel::SharedStorageSize >= (48 << 10))
+    {
+        cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+        cudaError_t err = cudaThreadExchangeStreamCaptureMode(&mode);
+        if (err != cudaSuccess)
+            return err;
+        err = cudaFuncSetAttribute(cutlass::device_kernel<GemmKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            GemmKernel::SharedStorageSize);
+        cudaError_t const restore = cudaThreadExchangeStreamCaptureMode(&mode);
+        if (err != cudaSuccess)
+            return err;
+        if (restore != cudaSuccess)
+            return restore;
+    }
+    s_done = true;
+    return cudaSuccess;
+}
+
+// ---------------------------------------------------------------------------
 // The second cascade entry: the slot-bound, swap-orientation decode kernel
 // ---------------------------------------------------------------------------
 // Defined in `csrc/gemm/ops/mxfp8_sm100_slot_kernel.cu`, which is the only
@@ -897,6 +1490,17 @@ bool slot_swiglu_kernel_instantiated(int shape_n, int shape_k);
 cudaError_t slot_swiglu_kernel_launch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_fp8_e4m3* out_h,
     int32_t* out_sfh, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int groups, int num_slots, int m_cap,
     int shape_n, int shape_k, int const* slot_to_expert, cudaStream_t stream);
+// The compact-layout forms of the two slot launches (fso 0.2.1): the weights keep
+// batch index `expert`, the tokens, their scales and the output take batch index
+// blk0[expert] over descriptors whose batch is one 128-row block of the R-row
+// compact buffer (`b_alloc` = R / 128 batches). Defined in the same translation
+// unit as the masked ones; see grouped_slot_dispatch.cuh.
+cudaError_t slot_kernel_launch_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bfloat16* mat_d,
+    int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int32_t const* blk0, int groups, int num_slots,
+    int m_cap, int b_alloc, int shape_n, int shape_k, int const* slot_to_expert, cudaStream_t stream);
+cudaError_t slot_swiglu_kernel_launch_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_fp8_e4m3* out_h,
+    int32_t* out_sfh, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int32_t const* blk0, int groups,
+    int num_slots, int m_cap, int b_alloc, int shape_n, int shape_k, int const* slot_to_expert, cudaStream_t stream);
 // The token-column chunk the fused epilogue walks (`kSlotChunk` in
 // fused_swiglu_slot_store.cuh: 32 columns, one warp width). `slot_route`
 // admits the fused slot kernel only while the whole row capacity fits ONE such
@@ -2196,6 +2800,357 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8_grouped_swiglu(__nv_fp8_e4m3* mat_a
     return DISPATCH_SM100_GROUPED_SWIGLU(128);
 
 #undef DISPATCH_SM100_GROUPED_SWIGLU
+}
+
+// ---------------------------------------------------------------------------
+// The compact-layout launchers (fso 0.2.1)
+// ---------------------------------------------------------------------------
+//
+// The same CUTLASS instantiations as the masked launchers above -- the Config
+// types are identical, so the compact op runs the very kernels the masked op
+// runs for the same tile -- handed different argument arrays: the per-call
+// activation arrays and problem shapes of `moe_build_routing_compact`, plus a
+// weight-keyed block (see `WeightArena`). The fused FC1 binds the compact twin of
+// its epilogue, which differs from the masked one in its two store addresses
+// only. `rows` is R = a.size(0), used for nothing but the host checks the op
+// already made.
+template <class Config, class FusedArgs>
+cudaError_t run_sm100_mxfp8_grouped_compact(grouped_detail::GroupedArgView const& v, int groups,
+    cudaStream_t stream, int swizzle, FusedArgs const* fused, char const* tag)
+{
+    using Gemm = typename Config::Gemm;
+    using GemmKernel = typename Config::GemmKernel;
+    using Args = typename Gemm::Arguments;
+    using Params = typename Gemm::Params;
+    namespace gd = grouped_detail;
+
+    static_assert(cute::is_same_v<typename Config::InternalStrideA, gd::GStrideA>, "stride type drift (A)");
+    static_assert(cute::is_same_v<typename Config::InternalStrideB, gd::GStrideB>, "stride type drift (B)");
+    static_assert(cute::is_same_v<typename Config::InternalStrideD, gd::GStrideD>, "stride type drift (D)");
+    static_assert(cute::is_same_v<typename Config::InternalLayoutSFA, gd::GLayoutSFA>, "SFA layout type drift");
+    static_assert(cute::is_same_v<typename Config::InternalLayoutSFB, gd::GLayoutSFB>, "SFB layout type drift");
+
+    if (gd::read_print_tile_info())
+    {
+        static bool s_info_printed = false;
+        if (!s_info_printed)
+        {
+            s_info_printed = true;
+            std::fprintf(stderr, "[fso sm100 grouped tile compact] %s stages=%d smem_bytes=%d epi_smem_bytes=%d\n",
+                tag, Config::kStages, Config::kSmemBytes, Config::kEpiSmemBytes);
+        }
+    }
+
+    cutlass::KernelHardwareInfo hw_info;
+    hw_info.device_id = 0;
+    hw_info.sm_count = gd::device_sm_count();
+
+    typename GemmKernel::TileSchedulerArguments scheduler{};
+    if (swizzle > 0)
+        scheduler.max_swizzle_size = swizzle;
+
+    using MainloopArgs = typename GemmKernel::MainloopArguments;
+    using EpilogueArgs = typename GemmKernel::EpilogueArguments;
+
+    MainloopArgs mainloop_args{};
+    mainloop_args.ptr_A = reinterpret_cast<decltype(mainloop_args.ptr_A)>(v.ptr_a);
+    mainloop_args.dA = v.stride_a;
+    mainloop_args.ptr_B = reinterpret_cast<decltype(mainloop_args.ptr_B)>(v.ptr_b);
+    mainloop_args.dB = v.stride_b;
+    mainloop_args.ptr_SFA = reinterpret_cast<decltype(mainloop_args.ptr_SFA)>(v.ptr_sfa);
+    mainloop_args.layout_SFA = v.layout_sfa;
+    mainloop_args.ptr_SFB = reinterpret_cast<decltype(mainloop_args.ptr_SFB)>(v.ptr_sfb);
+    mainloop_args.layout_SFB = v.layout_sfb;
+
+    EpilogueArgs epilogue_args{};
+    epilogue_args.thread.alpha = 1.0f;
+    epilogue_args.thread.beta = 0.0f;
+    epilogue_args.ptr_C = nullptr;
+    epilogue_args.dC = nullptr;
+    epilogue_args.ptr_D = reinterpret_cast<decltype(epilogue_args.ptr_D)>(v.ptr_d);
+    epilogue_args.dD = v.stride_d;
+    if constexpr (!cute::is_same_v<FusedArgs, void>)
+        epilogue_args.fused = *fused;
+
+    Args args{cutlass::gemm::GemmUniversalMode::kGrouped, typename Config::ProblemShape{groups, v.problem, nullptr},
+        mainloop_args, epilogue_args, hw_info, scheduler};
+
+    static thread_local void* s_ws = nullptr;
+    static thread_local std::size_t s_ws_bytes = 0;
+    cudaError_t const ws_err = gd::compact_workspace<GemmKernel>(args, stream, s_ws, s_ws_bytes);
+    if (ws_err != cudaSuccess)
+        return ws_err;
+
+    // Params cache. Params holds the addresses of every argument array (the
+    // per-call ones of the routing op, the weight block's, or the prep slot's),
+    // the problem-shape array, the workspace and, for the fused FC1, its fused
+    // destinations; never a value read from device memory. Keying on those
+    // addresses is therefore exact. A capture brings fresh per-call tensors and
+    // so a new key; past the cap the host recomputes Params, which costs host
+    // microseconds and no device memory.
+    struct CacheKey
+    {
+        void const* ptr_a;
+        void const* ptr_b;
+        void const* ptr_sfa;
+        void const* ptr_d;
+        void const* problem;
+        void const* f0;
+        void const* f1;
+        void const* f2;
+        int groups;
+        int swizzle;
+        bool operator==(CacheKey const& o) const { return std::memcmp(this, &o, sizeof(o)) == 0; }
+    };
+    struct CacheHash
+    {
+        std::size_t operator()(CacheKey const& k) const noexcept
+        {
+            std::size_t h = 1469598103934665603ULL;
+            auto const* p = reinterpret_cast<unsigned char const*>(&k);
+            for (std::size_t i = 0; i < sizeof(k); ++i)
+            {
+                h ^= p[i];
+                h *= 1099511628211ULL;
+            }
+            return h;
+        }
+    };
+    static thread_local std::unordered_map<CacheKey, Params, CacheHash> s_params_cache;
+    CacheKey key;
+    std::memset(&key, 0, sizeof(key));
+    key.ptr_a = v.ptr_a;
+    key.ptr_b = v.ptr_b;
+    key.ptr_sfa = v.ptr_sfa;
+    key.ptr_d = v.ptr_d;
+    key.problem = v.problem;
+    if constexpr (!cute::is_same_v<FusedArgs, void>)
+    {
+        key.f0 = fused->ptr_h;
+        key.f1 = fused->ptr_sfh;
+        key.f2 = fused->blk0;
+    }
+    key.groups = groups;
+    key.swizzle = swizzle;
+
+    Params kernel_params;
+    auto it = s_params_cache.find(key);
+    if (it != s_params_cache.end())
+    {
+        kernel_params = it->second;
+    }
+    else
+    {
+        if (Gemm::can_implement(args) != cutlass::Status::kSuccess)
+            return cudaErrorInvalidValue;
+        kernel_params = GemmKernel::to_underlying_arguments(args, s_ws); // host-only
+        if (s_params_cache.size() < 256u)
+            s_params_cache.emplace(key, kernel_params);
+    }
+
+    cudaError_t const smem_err = gd::compact_configure_smem<GemmKernel>();
+    if (smem_err != cudaSuccess)
+        return smem_err;
+
+    // PDL exactly as the masked launchers: the kernel's griddepcontrol.wait
+    // (sm100_gemm_array_tma_warpspecialized.hpp:839, ahead of every role that
+    // reads an argument array, the epilogue's ptr_D included) orders it behind
+    // the kernel before it, and every kernel of the layer chain waits on its own
+    // predecessor before it can retire, so the routing op's per-call arrays have
+    // landed by the time any of them is read.
+    bool const gemm_pdl = gd::kGroupedGdcCompiled && gd::grouped_pdl_enabled();
+    return Gemm::run(kernel_params, stream, nullptr, gemm_pdl) == cutlass::Status::kSuccess
+        ? cudaSuccess
+        : cudaErrorLaunchFailure;
+}
+
+template <int TileM, int TileN, int ClusterM, int ClusterN, int TileK = 128, bool NoSmemEpi = false,
+    bool EvtEpi = false>
+cudaError_t launch_sm100_mxfp8_grouped_gemm_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b,
+    __nv_bfloat16* mat_d, int32_t* scales_a, int32_t* scales_b, int32_t const* masked_m, int32_t const* blk0,
+    int groups, int shape_n, int shape_k, cudaStream_t stream, int32_t const* problem_shapes,
+    int64_t const* ptr_arrays, int swizzle = 0)
+{
+    using Config = Sm100MxFP8GroupedGemmConfig<TileM, TileN, ClusterM, ClusterN, TileK, NoSmemEpi, EvtEpi>;
+    namespace gd = grouped_detail;
+    if (groups < 1 || groups > gd::kMaxGroups)
+        return cudaErrorInvalidValue;
+    gd::GroupedArgView v;
+    cudaError_t const err = gd::compact_arg_view(v, stream, gd::grouped_pdl_enabled(), mat_a, mat_b, mat_d,
+        scales_a, scales_b, masked_m, blk0, groups, shape_n, shape_k,
+        static_cast<int64_t>(shape_n) * static_cast<int64_t>(sizeof(__nv_bfloat16)), problem_shapes, ptr_arrays);
+    if (err != cudaSuccess)
+        return err;
+    char tag[96];
+    std::snprintf(tag, sizeof(tag), "%dx%dx%d cluster=(%d,%d) nosmem=%d evt=%d", TileM, TileN, TileK, ClusterM,
+        ClusterN, static_cast<int>(NoSmemEpi), static_cast<int>(EvtEpi));
+    return run_sm100_mxfp8_grouped_compact<Config, void>(v, groups, stream, swizzle, nullptr, tag);
+}
+
+template <int TileM, int TileN, int TileK = 128>
+cudaError_t launch_sm100_mxfp8_grouped_swiglu_gemm_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b,
+    __nv_fp8_e4m3* out_h, int32_t* out_sfh, int32_t* scales_a, int32_t* scales_b, int32_t const* masked_m,
+    int32_t const* blk0, int groups, int shape_n, int shape_k, cudaStream_t stream, int32_t const* problem_shapes,
+    int64_t const* ptr_arrays)
+{
+    using Config = Sm100MxFP8GroupedSwiGluGemmConfig<TileM, TileN, TileK, /*Compact=*/true>;
+    namespace gd = grouped_detail;
+    if (groups < 1 || groups > gd::kMaxGroups)
+        return cudaErrorInvalidValue;
+    if (shape_n % TileN != 0 || (shape_n / 2) % 128 != 0)
+        return cudaErrorInvalidValue;
+    // D is declared and never stored through (generator edit 9); its arrays point
+    // at the fp8 output rows so the addresses the epilogue forms are inside it.
+    gd::GroupedArgView v;
+    cudaError_t const err = gd::compact_arg_view(v, stream, gd::grouped_pdl_enabled(), mat_a, mat_b, out_h,
+        scales_a, scales_b, masked_m, blk0, groups, shape_n, shape_k, static_cast<int64_t>(shape_n / 2),
+        problem_shapes, ptr_arrays);
+    if (err != cudaSuccess)
+        return err;
+    cutlass::epilogue::collective::fso_swiglu::FusedSwiGluCompactArgs fused{};
+    fused.ptr_h = out_h;
+    fused.ptr_sfh = out_sfh;
+    fused.blk0 = blk0;
+    char tag[96];
+    std::snprintf(tag, sizeof(tag), "%dx%dx%d cluster=(1,1) fused-swiglu", TileM, TileN, TileK);
+    return run_sm100_mxfp8_grouped_compact<Config, cutlass::epilogue::collective::fso_swiglu::FusedSwiGluCompactArgs>(
+        v, groups, stream, 0, &fused, tag);
+}
+
+// The compact-layout twin of `gemm_dispatch_sm100_mxfp8_grouped`: the SAME
+// route decision (`slot_route` on the host-static m_cap hint), the same
+// FSO_FORCE_TILE table and the same `cascade_pick`, so for one
+// (m_cap, N, K, G, expected_m, max_active_groups) the compact op lands on the
+// kernel instantiation the masked op lands on. `m_cap` here is align(M, 4), the
+// value the masked op's tensor shape carried; it is a hint, not a dimension.
+// `b_alloc` is R / 128, the token descriptor's batch extent on the slot route.
+inline cudaError_t gemm_dispatch_sm100_mxfp8_grouped_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b,
+    __nv_bfloat16* mat_d, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int32_t const* blk0, int groups,
+    int b_alloc, int m_cap, int shape_n, int shape_k, int expected_m, int max_active_groups,
+    int const* slot_to_expert, int32_t const* problem_shapes, int64_t const* ptr_arrays, cudaStream_t stream)
+{
+#define DISPATCH_SM100_GROUPED_C(TM_, TN_, CM_, CN_, TK_, NOSMEM_)                                                     \
+    launch_sm100_mxfp8_grouped_gemm_compact<TM_, TN_, CM_, CN_, TK_, NOSMEM_>(mat_a, mat_b, mat_d, scales_a,          \
+        scales_b, masked_m, blk0, groups, shape_n, shape_k, stream, problem_shapes, ptr_arrays)
+#define DISPATCH_SM100_GROUPED_C_EVT(TM_, TN_, CM_, CN_, TK_)                                                          \
+    launch_sm100_mxfp8_grouped_gemm_compact<TM_, TN_, CM_, CN_, TK_, true, true>(mat_a, mat_b, mat_d, scales_a,       \
+        scales_b, masked_m, blk0, groups, shape_n, shape_k, stream, problem_shapes, ptr_arrays)
+
+    auto forced = tensorrt_llm::kernels::blockscale_gemm::read_force_tile();
+    if (tensorrt_llm::kernels::blockscale_gemm::force_tile_applies(forced, static_cast<uint32_t>(shape_k))
+        && forced.tm > 0)
+    {
+        int const tm = forced.tm, tn = forced.tn, st = forced.st;
+        if (tm == 128 && tn == 64 && st == 1) return DISPATCH_SM100_GROUPED_C(128, 64, 1, 1, 128, false);
+        if (tm == 128 && tn == 128 && st == 1) return DISPATCH_SM100_GROUPED_C(128, 128, 1, 1, 128, false);
+        if (tm == 128 && tn == 192 && st == 1) return DISPATCH_SM100_GROUPED_C(128, 192, 1, 1, 128, false);
+        if (tm == 128 && tn == 256 && st == 1) return DISPATCH_SM100_GROUPED_C(128, 256, 1, 1, 128, false);
+        if (tm == 256 && tn == 128 && st == 2) return DISPATCH_SM100_GROUPED_C(256, 128, 2, 1, 128, false);
+        if (tm == 256 && tn == 256 && st == 2) return DISPATCH_SM100_GROUPED_C(256, 256, 2, 1, 128, false);
+        if (tm == 128 && tn == 128 && st == 3) return DISPATCH_SM100_GROUPED_C(128, 128, 1, 1, 256, false);
+        if (tm == 128 && tn == 256 && st == 3) return DISPATCH_SM100_GROUPED_C(128, 256, 1, 1, 256, false);
+        if (tm == 256 && tn == 128 && st == 4) return DISPATCH_SM100_GROUPED_C(256, 128, 2, 1, 256, false);
+        if (tm == 256 && tn == 256 && st == 4) return DISPATCH_SM100_GROUPED_C(256, 256, 2, 1, 256, false);
+        if (tm == 128 && tn == 64 && st == 5) return DISPATCH_SM100_GROUPED_C(128, 64, 1, 1, 128, true);
+        if (tm == 128 && tn == 128 && st == 5) return DISPATCH_SM100_GROUPED_C(128, 128, 1, 1, 128, true);
+        if (tm == 128 && tn == 192 && st == 5) return DISPATCH_SM100_GROUPED_C(128, 192, 1, 1, 128, true);
+        if (tm == 128 && tn == 256 && st == 5) return DISPATCH_SM100_GROUPED_C(128, 256, 1, 1, 128, true);
+        if (tm == 256 && tn == 128 && st == 6) return DISPATCH_SM100_GROUPED_C(256, 128, 2, 1, 128, true);
+        if (tm == 256 && tn == 256 && st == 6) return DISPATCH_SM100_GROUPED_C(256, 256, 2, 1, 128, true);
+        if (tm == 128 && tn == 128 && st == 7) return DISPATCH_SM100_GROUPED_C(128, 128, 1, 1, 256, true);
+        if (tm == 128 && tn == 256 && st == 7) return DISPATCH_SM100_GROUPED_C(128, 256, 1, 1, 256, true);
+        if (tm == 256 && tn == 128 && st == 8) return DISPATCH_SM100_GROUPED_C(256, 128, 2, 1, 256, true);
+        if (tm == 256 && tn == 256 && st == 8) return DISPATCH_SM100_GROUPED_C(256, 256, 2, 1, 256, true);
+        if (tm == 128 && tn == 128 && st == 9) return DISPATCH_SM100_GROUPED_C_EVT(128, 128, 1, 1, 128);
+        if (tm == 128 && tn == 192 && st == 9) return DISPATCH_SM100_GROUPED_C_EVT(128, 192, 1, 1, 128);
+        if (tm == 128 && tn == 256 && st == 9) return DISPATCH_SM100_GROUPED_C_EVT(128, 256, 1, 1, 128);
+        if (tm == 128 && tn == 192 && st == 11) return DISPATCH_SM100_GROUPED_C(128, 192, 2, 1, 128, false);
+        if (tm == 128 && tn == 256 && st == 11) return DISPATCH_SM100_GROUPED_C(128, 256, 2, 1, 128, false);
+        std::fprintf(stderr,
+            "[fso] FSO_FORCE_TILE=%d,%d,%d not wired on the sm_100 grouped path; falling through to cascade\n", tm, tn,
+            st);
+    }
+
+    switch (grouped_detail::slot_route(m_cap, shape_n, shape_k, groups, max_active_groups, /*fused_swiglu=*/false))
+    {
+    case grouped_detail::kSlotRouteSlot:
+        return grouped_detail::slot_kernel_launch_compact(mat_a, mat_b, mat_d, scales_a, scales_b, masked_m, blk0,
+            groups, max_active_groups < groups ? max_active_groups : groups, m_cap, b_alloc, shape_n, shape_k,
+            slot_to_expert, stream);
+    case grouped_detail::kSlotRouteCascade: break;
+    default: return cudaErrorInvalidValue;
+    }
+
+    grouped_detail::CascadePick const pick
+        = grouped_detail::cascade_pick(m_cap, shape_n, shape_k, groups, expected_m);
+    if (pick.nosmem && pick.evt)
+    {
+        if (pick.tile_n == 128) return DISPATCH_SM100_GROUPED_C_EVT(128, 128, 1, 1, 128);
+        if (pick.tile_n == 192) return DISPATCH_SM100_GROUPED_C_EVT(128, 192, 1, 1, 128);
+        return DISPATCH_SM100_GROUPED_C_EVT(128, 256, 1, 1, 128);
+    }
+    if (pick.nosmem)
+    {
+        if (pick.tile_n == 128) return DISPATCH_SM100_GROUPED_C(128, 128, 1, 1, 128, true);
+        if (pick.tile_n == 192) return DISPATCH_SM100_GROUPED_C(128, 192, 1, 1, 128, true);
+        return DISPATCH_SM100_GROUPED_C(128, 256, 1, 1, 128, true);
+    }
+    if (pick.tile_n == 128) return DISPATCH_SM100_GROUPED_C(128, 128, 1, 1, 128, false);
+    if (pick.tile_n == 192) return DISPATCH_SM100_GROUPED_C(128, 192, 1, 1, 128, false);
+    return DISPATCH_SM100_GROUPED_C(128, 256, 1, 1, 128, false);
+
+#undef DISPATCH_SM100_GROUPED_C
+#undef DISPATCH_SM100_GROUPED_C_EVT
+}
+
+// The compact-layout twin of `gemm_dispatch_sm100_mxfp8_grouped_swiglu`: the
+// same route and the same tile rule, line for line.
+inline cudaError_t gemm_dispatch_sm100_mxfp8_grouped_swiglu_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b,
+    __nv_fp8_e4m3* out_h, int32_t* out_sfh, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m,
+    int32_t const* blk0, int groups, int b_alloc, int m_cap, int shape_n, int shape_k, int expected_m,
+    int max_active_groups, int const* slot_to_expert, int32_t const* problem_shapes, int64_t const* ptr_arrays,
+    cudaStream_t stream)
+{
+#define DISPATCH_SM100_GROUPED_SWIGLU_C(TN_)                                                                          \
+    launch_sm100_mxfp8_grouped_swiglu_gemm_compact<128, TN_, 128>(mat_a, mat_b, out_h, out_sfh, scales_a, scales_b, \
+        masked_m, blk0, groups, shape_n, shape_k, stream, problem_shapes, ptr_arrays)
+
+    if (grouped_detail::slot_route(m_cap, shape_n, shape_k, groups, max_active_groups, /*fused_swiglu=*/true)
+            == grouped_detail::kSlotRouteSlot
+        && grouped_detail::slot_swiglu_kernel_instantiated(shape_n, shape_k))
+    {
+        return grouped_detail::slot_swiglu_kernel_launch_compact(mat_a, mat_b, out_h, out_sfh, scales_a, scales_b,
+            masked_m, blk0, groups, max_active_groups < groups ? max_active_groups : groups, m_cap, b_alloc, shape_n,
+            shape_k, slot_to_expert, stream);
+    }
+
+    auto forced = tensorrt_llm::kernels::blockscale_gemm::read_force_tile();
+    if (tensorrt_llm::kernels::blockscale_gemm::force_tile_applies(forced, static_cast<uint32_t>(shape_k))
+        && forced.tm == 128 && shape_n % forced.tn == 0)
+    {
+        if (forced.tn == 128) return DISPATCH_SM100_GROUPED_SWIGLU_C(128);
+        if (forced.tn == 192) return DISPATCH_SM100_GROUPED_SWIGLU_C(192);
+        if (forced.tn == 256) return DISPATCH_SM100_GROUPED_SWIGLU_C(256);
+        std::fprintf(stderr,
+            "[fso] FSO_FORCE_TILE TN=%d is not instantiated on the sm_100 fused-SwiGLU FC1 path; falling through "
+            "to the cascade\n",
+            forced.tn);
+    }
+
+    grouped_detail::CascadePick const pick
+        = grouped_detail::cascade_pick(m_cap, shape_n, shape_k, groups, expected_m);
+    int tile_n = pick.tile_n < 128 ? 128 : pick.tile_n;
+    if (tile_n == 256 && shape_n % 192 == 0
+        && grouped_detail::tail_fill_q10(shape_n, 192, groups)
+            > grouped_detail::tail_fill_q10(shape_n, 256, groups))
+        tile_n = 192;
+    if (shape_n % tile_n != 0)
+        tile_n = 128;
+    if (tile_n == 192) return DISPATCH_SM100_GROUPED_SWIGLU_C(192);
+    if (tile_n == 256) return DISPATCH_SM100_GROUPED_SWIGLU_C(256);
+    return DISPATCH_SM100_GROUPED_SWIGLU_C(128);
+
+#undef DISPATCH_SM100_GROUPED_SWIGLU_C
 }
 
 } // namespace sm100_blockscaled_gemm

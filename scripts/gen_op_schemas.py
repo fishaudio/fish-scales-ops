@@ -68,7 +68,8 @@ GEMM_MEMBERS = {
     },
     "moe_mxfp8": {
         "linear_mxfp8_grouped_masked", "linear_mxfp8_grouped_masked_swiglu",
-        "linear_mxfp8_grouped_masked_combine", "quantize_1x32_grouped_gather",
+        "linear_mxfp8_grouped_masked_combine", "linear_mxfp8_grouped_compact",
+        "linear_mxfp8_grouped_compact_swiglu", "quantize_1x32_grouped_gather",
         "silu_chunk_mul_quantize_1x32_grouped", "mxfp8_grouped_swiglu_available",
         "mxfp8_grouped_swiglu_fused_route", "mxfp8_grouped_slot_possible",
         "mxfp8_grouped_problem_shapes_consumed", "moe_build_routing", "moe_build_routing_compact",

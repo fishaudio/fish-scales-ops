@@ -103,7 +103,8 @@ at::Tensor linear_mxfp8_grouped_masked_combine(at::Tensor a_fp8, at::Tensor w2_f
     at::Tensor sw2_int32, at::Tensor masked_m, at::Tensor row_map, at::Tensor weight_of_slot, at::Tensor out,
     int64_t expected_m, int64_t max_active_groups);
 // The compact activation layout (0.2.1, charter D1/D4; ops/mxfp8_compact.cu): out-style ops, every buffer
-// allocated by the caller. The GEMMs serve sm_120/121 here (sm_100/103 pending); the two glue ops are arch-generic.
+// allocated by the caller. The GEMMs dispatch to the sm_120/121 kernels here and to the sm_100/103 kernels in
+// ops/mxfp8.cu; the two glue ops are arch-generic.
 void quantize_1x32_grouped_gather_out(at::Tensor x, at::Tensor slot_of_flat, int64_t topk, int64_t num_groups,
     int64_t m_cap, bool use_ue8m0, at::Tensor x_q, at::Tensor packed);
 void silu_chunk_mul_quantize_1x32_grouped_out(

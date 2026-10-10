@@ -96,6 +96,67 @@ cudaError_t launch_sm100_mxfp8_grouped_swiglu_dispatch(__nv_fp8_e4m3* A, __nv_fp
 #endif
 }
 
+// The compact-layout forms of the two grouped GEMMs (fso 0.2.1). A is the
+// one-group activation buffer [R, K] (R = 128 * b_alloc), SFA its one-group atom
+// slab, D [R, N] / H [R, I]; expert g's rows start at row blk0[g] * 128. The
+// route and tile decisions are the masked ones for the same m_cap hint.
+// `problem_shapes` (int32 [G, 3]) and `ptr_arrays` (int64 [3, G]) are
+// moe_build_routing_compact's per-call arrays for this GEMM, or both null.
+cudaError_t launch_sm100_mxfp8_grouped_compact_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D,
+    int32_t* SFA, int32_t* SFB, int32_t* masked_m, int32_t const* blk0, int num_groups, int b_alloc, int m_cap, int N,
+    int K, int expected_m, int max_active_groups, int const* slot_to_expert, int32_t const* problem_shapes,
+    int64_t const* ptr_arrays, cudaStream_t stream)
+{
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+    return sm100_blockscaled_gemm::gemm_dispatch_sm100_mxfp8_grouped_compact(A, B, D, SFA, SFB, masked_m, blk0,
+        num_groups, b_alloc, m_cap, N, K, expected_m, max_active_groups, slot_to_expert, problem_shapes, ptr_arrays,
+        stream);
+#else
+    (void) A; (void) B; (void) D; (void) SFA; (void) SFB; (void) masked_m; (void) blk0; (void) num_groups;
+    (void) b_alloc; (void) m_cap; (void) N; (void) K; (void) expected_m; (void) max_active_groups;
+    (void) slot_to_expert; (void) problem_shapes; (void) ptr_arrays; (void) stream;
+    return cudaErrorNotSupported;
+#endif
+}
+
+cudaError_t launch_sm100_mxfp8_grouped_swiglu_compact_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B,
+    __nv_fp8_e4m3* H, int32_t* SFH, int32_t* SFA, int32_t* SFB, int32_t* masked_m, int32_t const* blk0,
+    int num_groups, int b_alloc, int m_cap, int N, int K, int expected_m, int max_active_groups,
+    int const* slot_to_expert, int32_t const* problem_shapes, int64_t const* ptr_arrays, cudaStream_t stream)
+{
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+    return sm100_blockscaled_gemm::gemm_dispatch_sm100_mxfp8_grouped_swiglu_compact(A, B, H, SFH, SFA, SFB, masked_m,
+        blk0, num_groups, b_alloc, m_cap, N, K, expected_m, max_active_groups, slot_to_expert, problem_shapes,
+        ptr_arrays, stream);
+#else
+    (void) A; (void) B; (void) H; (void) SFH; (void) SFA; (void) SFB; (void) masked_m; (void) blk0;
+    (void) num_groups; (void) b_alloc; (void) m_cap; (void) N; (void) K; (void) expected_m;
+    (void) max_active_groups; (void) slot_to_expert; (void) problem_shapes; (void) ptr_arrays; (void) stream;
+    return cudaErrorNotSupported;
+#endif
+}
+
+// The constant row extent of the compact path's scale-factor layout, and
+// whether a call of R rows at this K fits it (see `kCompactSfaRows`).
+int sm100_mxfp8_grouped_compact_sfa_rows()
+{
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+    return sm100_blockscaled_gemm::grouped_detail::kCompactSfaRows;
+#else
+    return 0;
+#endif
+}
+
+int sm100_mxfp8_grouped_compact_fits(long long rows, int K)
+{
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+    return sm100_blockscaled_gemm::grouped_detail::compact_sfa_extent_fits(rows, K) ? 1 : 0;
+#else
+    (void) rows; (void) K;
+    return 0;
+#endif
+}
+
 // Whether a grouped call of this shape would READ a caller-supplied
 // `problem_shapes` tensor (run b300_round3_20260922/M-A4): 1 on the
 // pointer-array cascade, 0 on the slot route, which derives its grid from

@@ -168,7 +168,14 @@ using namespace cute;
 //     and does buy a little decode-1 latency, but it costs mainloop depth from
 //     M = 4 upward and much more above that, which is the opposite of what this
 //     kernel is for. The depth IS the mechanism.
-template <int TileM, int TileN, int TileK>
+//
+// `Compact` (fso 0.2.1) selects the compact-layout twin of the forked kernel,
+// `FsoSm100SlotGemmCompact`: the same mainloop, epilogue, tile and per-tile
+// skip, with the weights indexed by expert and the tokens, their scales and the
+// output by the expert's first 128-row block blk0[expert] (see the generator's
+// docstring). Everything else in the config is shared, so the compact route runs
+// the same tile shape with the same stage count as the masked one.
+template <int TileM, int TileN, int TileK, bool Compact = false>
 struct Sm100MxFP8SlotGemmConfig
 {
     static_assert(TileM == 128, "1SM only: cluster 1x1x1 / TileM 128 is the only configuration built and measured");
@@ -214,8 +221,11 @@ struct Sm100MxFP8SlotGemmConfig
     // Swapped: (M, N, K, L) = (N_w, m_cap, K, G).
     using ProblemShape = Shape<int, int, int, int>;
 
-    using GemmKernel = cutlass::gemm::kernel::FsoSm100SlotGemm<ProblemShape, CollectiveMainloop, CollectiveEpilogue,
-        cutlass::gemm::StaticPersistentScheduler>;
+    using GemmKernel = cute::conditional_t<Compact,
+        cutlass::gemm::kernel::FsoSm100SlotGemmCompact<ProblemShape, CollectiveMainloop, CollectiveEpilogue,
+            cutlass::gemm::StaticPersistentScheduler>,
+        cutlass::gemm::kernel::FsoSm100SlotGemm<ProblemShape, CollectiveMainloop, CollectiveEpilogue,
+            cutlass::gemm::StaticPersistentScheduler>>;
 
     using StrideA = typename GemmKernel::StrideA;
     using StrideB = typename GemmKernel::StrideB;
@@ -294,7 +304,7 @@ struct RebindFusedSwiGluSlot<cutlass::epilogue::collective::CollectiveEpilogue<
     using type = FusedSwiGluSlotEpilogueWS<ET, EC, SC, ED, SD, FC, CT, AC, AD>;
 };
 
-template <int TileM, int TileN, int TileK>
+template <int TileM, int TileN, int TileK, bool Compact = false>
 struct Sm100MxFP8SlotSwiGluGemmConfig
 {
     static_assert(TileM == 128, "1SM only: cluster 1x1x1 / TileM 128 is the only configuration built and measured");
@@ -352,8 +362,14 @@ struct Sm100MxFP8SlotSwiGluGemmConfig
     // Swapped: (M, N, K, L) = (N_w, m_cap, K, G).
     using ProblemShape = Shape<int, int, int, int>;
 
-    using GemmKernel = cutlass::gemm::kernel::FsoSm100SlotGemm<ProblemShape, CollectiveMainloop, CollectiveEpilogue,
-        cutlass::gemm::StaticPersistentScheduler>;
+    // The compact twin needs no epilogue change: its batch mode is blk0[expert],
+    // so the fused store's l_coord already names the expert's block, and the
+    // launcher hands it block strides (128 * I elements, I scale words).
+    using GemmKernel = cute::conditional_t<Compact,
+        cutlass::gemm::kernel::FsoSm100SlotGemmCompact<ProblemShape, CollectiveMainloop, CollectiveEpilogue,
+            cutlass::gemm::StaticPersistentScheduler>,
+        cutlass::gemm::kernel::FsoSm100SlotGemm<ProblemShape, CollectiveMainloop, CollectiveEpilogue,
+            cutlass::gemm::StaticPersistentScheduler>>;
 
     using StrideA = typename GemmKernel::StrideA;
     using StrideB = typename GemmKernel::StrideB;
@@ -962,6 +978,228 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8_slot_swiglu(__nv_fp8_e4m3* mat_a, _
     return launch_sm100_mxfp8_slot_swiglu_gemm<slot_detail::Sm100MxFP8SlotSwiGluGemmConfig<128, kSlotTileN, 128>>(
         mat_a, mat_b, out_h, out_sfh, scales_a, scales_b, masked_m, groups, num_slots, m_cap, shape_n, shape_k,
         slot_to_expert, stream);
+}
+
+// ---------------------------------------------------------------------------
+// The slot route on the compact activation layout (fso 0.2.1)
+// ---------------------------------------------------------------------------
+//
+// The tokens of expert e are rows blk0[e] * 128 + r, r < cnt[e] <= m_cap <= 64,
+// of the one-group compact buffer: inside the expert's FIRST 128-row block,
+// because an expert that holds a row owns at least one whole block. The token
+// operand is therefore described as (m_cap rows, K, L) with a batch stride of ONE
+// BLOCK (128 * K), its scale factors as one 128-row atom per batch (which is what
+// `tile_atom_to_shape_SFB` gives for an N extent <= 128: (K/128) atoms of 512
+// bytes, i.e. exactly one compact block of the one-group slab), and the output
+// as column-major (N_w, m_cap, L) with a batch stride of 128 * N_w. The forked
+// kernel's compact twin hands those three the batch index blk0[e] and the weights
+// (and their scales, batch stride as before) the expert id e.
+//
+// blk0[e] is not read: on this route it equals the slot index s of e. Every
+// active expert holds at most m_cap <= 64 rows and therefore exactly one block,
+// blk0 is the exclusive prefix of the per-expert block counts in ascending expert
+// order, and the packed slot list holds the active experts in ascending order, so
+// the expert in slot s starts at block s. The kernel keeps the scheduler's batch
+// coordinate (the slot) for the token side and loads only slot_to_expert[s] and
+// masked_m[e] per tile, exactly the loads of the masked route. (A first version
+// read blk0[e] in every warp role on every tile and measured up to 2 per cent
+// slower on Family C down at M = 16, the slot cell with the most and the shortest
+// tiles.) The op checks the identity on the host under FSO_CHECK_PROBLEM_SHAPES=1.
+//
+// L is max(G, b_alloc): the weight descriptors are indexed by e < G and the token
+// / output descriptors by blk0[e] < b_alloc, and one problem shape carries both.
+// A TMA descriptor's extent is a bound, not an allocation, so the larger extent
+// reads nothing that is not indexed.
+//
+// Every store stays where the masked route's did relative to the expert: at most
+// m_cap <= 64 token columns from the expert's first row, inside its first block.
+// The per-tile skip is the masked one (the N tile against masked_m[e]), so a slot
+// that holds no expert stores nothing -- which matters more here than on the
+// masked slab, because an empty expert's blk0 equals its successor's.
+template <class Config, bool Fused>
+cudaError_t launch_sm100_mxfp8_slot_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, void* out,
+    int32_t* out_sfh, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int32_t const* blk0, int groups,
+    int num_slots, int m_cap, int b_alloc, int shape_n, int shape_k, int const* slot_to_expert, cudaStream_t stream)
+{
+    using GemmKernel = typename Config::GemmKernel;
+    using Params = typename GemmKernel::Params;
+    using Args = typename GemmKernel::Arguments;
+    namespace sd = slot_detail;
+
+    (void) blk0; // equal to the slot index on this route; see the note above
+    if (groups < 1 || groups > sd::kMaxSlots || b_alloc < 1)
+        return cudaErrorInvalidValue;
+    if (num_slots < 1 || num_slots > groups)
+        num_slots = groups;
+    if constexpr (Fused)
+    {
+        if ((shape_n & 1) != 0 || ((shape_n / 2) % 128) != 0 || (m_cap % 4) != 0)
+            return cudaErrorInvalidValue;
+    }
+
+    bool const pdl = sd::slot_pdl_enabled();
+    int const* slots = slot_to_expert;
+    if (slots == nullptr)
+    {
+        int* const own = sd::SlotPool::instance().acquire(stream);
+        if (own == nullptr)
+            return cudaErrorMemoryAllocation;
+        slots = own;
+        cudaLaunchConfig_t cfg{};
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = pdl ? 1 : 0;
+        cfg.gridDim = dim3(1);
+        cfg.blockDim = dim3(256);
+        cfg.dynamicSmemBytes = 0;
+        cfg.stream = stream;
+        cfg.attrs = attrs;
+        cfg.numAttrs = 1;
+        cudaError_t const prep_err = cudaLaunchKernelEx(
+            &cfg, sd::sm100_slot_build_kernel, own, static_cast<int32_t const*>(masked_m), groups, num_slots, pdl);
+        if (prep_err != cudaSuccess)
+            return prep_err;
+    }
+
+    int const pm = shape_n; // expert weight rows, on the M axis
+    int const pn = m_cap;   // routed token rows, on the N axis
+    int const L = groups > b_alloc ? groups : b_alloc;
+    auto const stride_a = cutlass::make_cute_packed_stride(typename Config::StrideA{}, cute::make_shape(pm, shape_k, L));
+    auto stride_b = cutlass::make_cute_packed_stride(typename Config::StrideB{}, cute::make_shape(pn, shape_k, L));
+    auto stride_d = cutlass::make_cute_packed_stride(typename Config::StrideD{}, cute::make_shape(pm, pn, L));
+    // One compact block per batch on the token side and the output side.
+    cute::get<2>(stride_b) = static_cast<int64_t>(128) * shape_k;
+    if constexpr (!Fused)
+        cute::get<2>(stride_d) = static_cast<int64_t>(128) * pm;
+    auto const layout_sfa
+        = Config::Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(pm, pn, shape_k, L));
+    auto const layout_sfb
+        = Config::Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(pm, pn, shape_k, L));
+
+    cutlass::KernelHardwareInfo hw_info;
+    hw_info.device_id = 0;
+    hw_info.sm_count = sd::device_sm_count();
+
+    Args args{cutlass::gemm::GemmUniversalMode::kGemm, {pm, pn, shape_k, L},
+        {reinterpret_cast<typename Config::ElementA const*>(mat_b), stride_a,
+            reinterpret_cast<typename Config::ElementB const*>(mat_a), stride_b,
+            reinterpret_cast<typename Config::ElementSF const*>(scales_b), layout_sfa,
+            reinterpret_cast<typename Config::ElementSF const*>(scales_a), layout_sfb},
+        {{}, nullptr, stride_d, reinterpret_cast<typename Config::ElementD*>(out), stride_d}, hw_info, {}};
+    args.epilogue.thread.alpha = 1.0f;
+    args.epilogue.thread.beta = 0.0f;
+    if constexpr (Fused)
+    {
+        int64_t const inter = shape_n / 2;
+        // The fused store's l_coord is the batch mode, here blk0[e]: one compact
+        // block of fp8 rows (128 * I bytes) and one block of scale atoms
+        // (128 * I/128 = I words) per batch index.
+        args.epilogue.fused.ptr_h = out;
+        args.epilogue.fused.ptr_sfh = out_sfh;
+        args.epilogue.fused.h_group_elems = static_cast<long long>(128) * inter;
+        args.epilogue.fused.sf_group_words = static_cast<long long>(128) * (inter / 128);
+    }
+    else
+    {
+        (void) out_sfh;
+    }
+    args.fso_slot_to_expert = slots;
+    args.fso_masked_m = masked_m;
+    args.fso_num_slots = num_slots;
+    args.fso_num_groups = groups;
+
+    static thread_local void* s_ws = nullptr;
+    static thread_local std::size_t s_ws_bytes = 0;
+    std::size_t const need = GemmKernel::get_workspace_size(args);
+    if (need > s_ws_bytes)
+    {
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(stream, &cap);
+        if (cap == cudaStreamCaptureStatusActive)
+        {
+            std::fprintf(stderr,
+                "[fish_scales_ops] sm_100 slot-bound compact grouped MXFP8: needs %zu workspace bytes during stream "
+                "capture but the pool holds %zu. Warm the compact grouped op up eagerly before capturing.\n",
+                need, s_ws_bytes);
+            std::abort();
+        }
+        if (s_ws)
+            cudaFree(s_ws);
+        if (need > 0 && cudaMalloc(&s_ws, need) != cudaSuccess)
+            return cudaErrorMemoryAllocation;
+        s_ws_bytes = need;
+        if (GemmKernel::initialize_workspace(args, s_ws, stream) != cutlass::Status::kSuccess)
+            return cudaErrorUnknown;
+    }
+
+    if (!GemmKernel::can_implement(args))
+        return cudaErrorInvalidValue;
+    sd::slot_report_tile_info<Config>(Fused ? "fused compact" : "unfused compact",
+        static_cast<int>(cute::size<1>(typename Config::MmaTileShape{})));
+    Params const params = GemmKernel::to_underlying_arguments(args, s_ws); // host-only
+    dim3 const grid = GemmKernel::get_grid_shape(params);
+
+    static bool s_smem_configured = false;
+    if (!s_smem_configured)
+    {
+        if (GemmKernel::SharedStorageSize >= (48 << 10))
+        {
+            cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+            cudaError_t const ex = cudaThreadExchangeStreamCaptureMode(&mode);
+            if (ex != cudaSuccess)
+                return ex;
+            cudaError_t const result = cudaFuncSetAttribute(cutlass::device_kernel<GemmKernel>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, GemmKernel::SharedStorageSize);
+            cudaThreadExchangeStreamCaptureMode(&mode);
+            if (result != cudaSuccess)
+                return result;
+        }
+        s_smem_configured = true;
+    }
+
+    dim3 const block = GemmKernel::get_block_shape();
+    if (sd::kSlotGdcCompiled && pdl)
+    {
+        cudaLaunchConfig_t cfg{};
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = 1;
+        cfg.gridDim = grid;
+        cfg.blockDim = block;
+        cfg.dynamicSmemBytes = GemmKernel::SharedStorageSize;
+        cfg.stream = stream;
+        cfg.attrs = attrs;
+        cfg.numAttrs = 1;
+        cudaError_t const r = cudaLaunchKernelEx(&cfg, cutlass::device_kernel<GemmKernel>, params);
+        if (r != cudaSuccess)
+            return r;
+        return cudaGetLastError();
+    }
+    cutlass::device_kernel<GemmKernel><<<grid, block, GemmKernel::SharedStorageSize, stream>>>(params);
+    return cudaGetLastError();
+}
+
+inline cudaError_t gemm_dispatch_sm100_mxfp8_slot_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b,
+    __nv_bfloat16* mat_d, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int32_t const* blk0, int groups,
+    int num_slots, int m_cap, int b_alloc, int shape_n, int shape_k, int const* slot_to_expert, cudaStream_t stream)
+{
+    if (m_cap > kSlotTileN || num_slots < 1 || !sm100_mxfp8_slot_instantiated(shape_n, shape_k))
+        return cudaErrorInvalidValue;
+    return launch_sm100_mxfp8_slot_compact<slot_detail::Sm100MxFP8SlotGemmConfig<128, kSlotTileN, 128, true>, false>(
+        mat_a, mat_b, mat_d, nullptr, scales_a, scales_b, masked_m, blk0, groups, num_slots, m_cap, b_alloc, shape_n,
+        shape_k, slot_to_expert, stream);
+}
+
+inline cudaError_t gemm_dispatch_sm100_mxfp8_slot_swiglu_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b,
+    __nv_fp8_e4m3* out_h, int32_t* out_sfh, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m,
+    int32_t const* blk0, int groups, int num_slots, int m_cap, int b_alloc, int shape_n, int shape_k,
+    int const* slot_to_expert, cudaStream_t stream)
+{
+    if (m_cap > kSlotTileN || num_slots < 1 || !sm100_mxfp8_slot_swiglu_instantiated(shape_n, shape_k))
+        return cudaErrorInvalidValue;
+    return launch_sm100_mxfp8_slot_compact<slot_detail::Sm100MxFP8SlotSwiGluGemmConfig<128, kSlotTileN, 128, true>,
+        true>(mat_a, mat_b, out_h, out_sfh, scales_a, scales_b, masked_m, blk0, groups, num_slots, m_cap, b_alloc,
+        shape_n, shape_k, slot_to_expert, stream);
 }
 
 } // namespace sm100_blockscaled_gemm

@@ -258,6 +258,21 @@ public:
             AD>>::Sm100TmaWarpSpecializedAdapter;
 };
 
+// The compact-layout twin (0.2.1): the generated clone whose fused destinations
+// are `FusedSwiGluCompactArgs`, i.e. rows and scale atoms addressed through blk0
+// (see fused_swiglu_store.cuh). Same builder arguments, same fragment, same
+// shared storage; only the two store addresses differ.
+template <class ET, class EC, class SC, class ED, class SD, class FC, class CT, class AC, class AD>
+class FusedSwiGluCompactEpilogueWS
+    : public cutlass::epilogue::collective::detail::Sm100TmaWarpSpecializedAdapter<
+          cutlass::epilogue::collective::FsoFusedSwiGluPtrArrayNoSmemCompact<ET, EC, SC, ED, SD, FC, CT, AC, AD>>
+{
+public:
+    using cutlass::epilogue::collective::detail::Sm100TmaWarpSpecializedAdapter<
+        cutlass::epilogue::collective::FsoFusedSwiGluPtrArrayNoSmemCompact<ET, EC, SC, ED, SD, FC, CT, AC,
+            AD>>::Sm100TmaWarpSpecializedAdapter;
+};
+
 // Re-emit the builder's OWN nine epilogue template arguments against the
 // generated clone.
 //
@@ -269,14 +284,21 @@ public:
 // alignments are whatever the builder computed for this tile shape. If a
 // CUTLASS bump changes the builder's return type this fails to compile instead
 // of silently binding a differently-partitioned epilogue.
-template <class T>
+template <class T, bool Compact = false>
 struct RebindFusedSwiGlu;
 
 template <class ET, class EC, class SC, class ED, class SD, class FC, class CT, class AC, class AD>
 struct RebindFusedSwiGlu<cutlass::epilogue::collective::CollectiveEpilogue<
-    cutlass::epilogue::Sm100PtrArrayNoSmemWarpSpecialized, ET, EC, SC, ED, SD, FC, CT, AC, AD>>
+    cutlass::epilogue::Sm100PtrArrayNoSmemWarpSpecialized, ET, EC, SC, ED, SD, FC, CT, AC, AD>, false>
 {
     using type = FusedSwiGluEpilogueWS<ET, EC, SC, ED, SD, FC, CT, AC, AD>;
+};
+
+template <class ET, class EC, class SC, class ED, class SD, class FC, class CT, class AC, class AD>
+struct RebindFusedSwiGlu<cutlass::epilogue::collective::CollectiveEpilogue<
+    cutlass::epilogue::Sm100PtrArrayNoSmemWarpSpecialized, ET, EC, SC, ED, SD, FC, CT, AC, AD>, true>
+{
+    using type = FusedSwiGluCompactEpilogueWS<ET, EC, SC, ED, SD, FC, CT, AC, AD>;
 };
 
 // One kernel instantiation per (TileM, TileN, TileK) of the fused FC1. The
@@ -287,7 +309,13 @@ struct RebindFusedSwiGlu<cutlass::epilogue::collective::CollectiveEpilogue<
 // rejected). TileN 64 is excluded because the cascade never selects it and
 // because a 64-wide N tile is a single epilogue subtile, which leaves nothing
 // for the store loop to amortise.
-template <int TileM, int TileN, int TileK = 128>
+//
+// `Compact` (0.2.1) binds the compact-layout twin of the fused epilogue: the
+// same kernel with its two store addresses taken through blk0 (expert g's rows
+// start at row blk0[g] * 128 of a one-group slab) instead of g * m_cap. The
+// mainloop, the tile and the epilogue's fragment are unchanged, which is what
+// keeps the compact FC1's live rows byte-identical to the masked FC1's.
+template <int TileM, int TileN, int TileK = 128, bool Compact = false>
 struct Sm100MxFP8GroupedSwiGluGemmConfig
 {
     static_assert(TileM == 128, "the fused FC1 epilogue is written against the 1SM NoSmem epilogue (TileM = 128)");
@@ -326,7 +354,7 @@ struct Sm100MxFP8GroupedSwiGluGemmConfig
         ElementD, LayoutDTag, AlignmentD,
         EpilogueSchedule>::CollectiveOp;
 
-    using CollectiveEpilogue = typename RebindFusedSwiGlu<StockEpilogue>::type;
+    using CollectiveEpilogue = typename RebindFusedSwiGlu<StockEpilogue, Compact>::type;
 
     // The fused store writes through plain global stores and stages nothing, so
     // the epilogue's shared-memory footprint is unchanged and therefore

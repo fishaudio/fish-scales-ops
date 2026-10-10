@@ -130,6 +130,44 @@ Each edit asserts its exact match count, so a CUTLASS bump that moves any of
 these sites fails the build loudly instead of producing a silently different
 kernel.
 
+The compact-layout twin (fso 0.2.1)
+-----------------------------------
+The same generated header also carries `FsoSm100SlotGemmCompact`, the kernel the
+compact activation layout runs on the slot route. It is produced from the same
+CUTLASS source by the same edits plus five more (c1-c5), so the masked class
+above stays exactly what it was. On the compact layout the batch coordinate has
+to mean two things: the weights (A / SFA in the swap orientation) are indexed
+by EXPERT, while the tokens (B / SFB) and the output (D) are indexed by the
+expert's first 128-row block blk0[expert] of the one-group compact buffer.
+
+On this route blk0[expert] needs no load: it IS the slot index. The route runs
+only while the row capacity fits one token tile (m_cap <= 64), so every active
+expert holds at most 64 rows and owns exactly one 128-row block; blk0 is the
+exclusive prefix of the per-expert block counts in ascending expert order, and
+the slot list holds the active experts in ascending order, so the expert in
+slot s starts at block s. The twin therefore keeps the scheduler's batch
+coordinate (the slot) as the batch index of B, SFB, the epilogue's D slice and
+the fused epilogue's l_coord, and moves only the weight operands onto the
+expert id, by offsetting the two weight-side partitioned tensors of the
+mainloop's load parameters (`tAgA_mkl`, `tAgSFA_mkl`) along their batch mode by
+(expert - slot) at the two load call sites. That is the two-batch-coordinate
+design of run b300_mxfp8_20260917/M-X2 (whose rank-5 coordinate made the
+collective read the A / SFA batch from a fifth mode), expressed inside the
+already-forked kernel so the collective is not forked. A first version read
+blk0[expert] in every warp role on every tile and measured up to 2 per cent
+slower than the masked kernel on the cells with the most and shortest tiles
+(Family C down at M = 16); the identity removes that read.
+
+  c1  the class name;
+  c2  `fso_num_groups` in Arguments / Params and its transfer into Params (the
+      expert-id range check; the batch extent L is no longer the group count);
+  c3  every remap site calls `fso_slot_live_compact`, which leaves the batch
+      mode on the slot and returns the expert id beside the liveness verdict
+      (the per-tile skip on masked_m[expert] is unchanged);
+  c4  the declaration of the expert-id local next to `fso_live`;
+  c5  the two `collective_mainloop.load` calls receive the load parameters
+      with the weight-side tensors shifted by (expert - slot).
+
 Usage: make_sm100_slot_kernel.py <output-header>; CUTLASS_DIR (or
 BSGEMM_CUTLASS_DIR) names the CUTLASS checkout to read.
 """
@@ -385,6 +423,119 @@ fso_slot_remap_and_live(int const* slot_to_expert, int const* masked_m, int num_
     return s, report, src_path
 
 
+COMPACT_HELPERS = """
+// fso slot route, compact layout (0.2.1): the liveness test of the masked helper
+// above, without its remap. The batch mode stays on the SLOT, which on this route
+// equals the expert's first 128-row block blk0[e] of the one-group compact buffer
+// (every active expert owns exactly one block, and the packed slot list and blk0
+// both run over the active experts in ascending order), i.e. the batch index the
+// tokens, their scales and the output use. The expert id, which the weights use,
+// is returned in `a_batch`. Liveness is the masked helper's, unchanged: the N tile
+// against the expert's routed row count. Same totality rules: a coordinate whose
+// slot or expert is out of range is dead.
+template <class Coord>
+CUTLASS_DEVICE bool
+fso_slot_live_compact(int const* slot_to_expert, int const* masked_m, int num_slots, int num_groups,
+                      int tile_n_rows, Coord const& cta_coord_mnkl, int& a_batch) {
+  if (slot_to_expert == nullptr) { return false; }
+  int const fso_slot = cute::get<3>(cta_coord_mnkl);
+  if (fso_slot < 0 || fso_slot >= num_slots) { return false; }
+  int const fso_expert = slot_to_expert[fso_slot];
+  if (fso_expert < 0 || fso_expert >= num_groups) { return false; }
+  a_batch = fso_expert;
+  return int(cute::get<1>(cta_coord_mnkl)) * tile_n_rows < masked_m[fso_expert];
+}
+
+// fso slot route, compact layout: the second batch coordinate. The mainloop
+// slices all four global tensors with ONE batch index (the coordinate's mode 3,
+// here the slot = blk0[expert]); the weight-side tensors (A = expert weights and
+// SFA = their scales, in the swap orientation) are re-based along their batch mode
+// by `delta` = expert - slot, so that the same slice lands on the expert.
+// The tensors are TMA coordinate tensors, so the offset moves the batch
+// coordinate the TMA is issued with and nothing else. The structured binding
+// fails to compile if the collective's load parameters ever change shape.
+template <class LoadInputs>
+CUTLASS_DEVICE auto
+fso_shift_weight_batch(LoadInputs const& load_inputs, int delta) {
+  auto [k_tiles, tAgA_mkl, tBgB_nkl, tAsA, tBsB, tAgSFA_mkl, tBgSFB_nkl, tAsSFA, tBsSFB,
+        mcast_mask_a, mcast_mask_b, mcast_mask_sfa, mcast_mask_sfb] = load_inputs;
+  auto const off = cute::make_coord(cute::_0{}, cute::_0{}, cute::_0{}, delta);
+  return cute::make_tuple(k_tiles, cute::domain_offset(off, tAgA_mkl), tBgB_nkl, tAsA, tBsB,
+                          cute::domain_offset(off, tAgSFA_mkl), tBgSFB_nkl, tAsSFA, tBsSFB,
+                          mcast_mask_a, mcast_mask_b, mcast_mask_sfa, mcast_mask_sfb);
+}
+"""
+
+
+def _compact_class(masked_text: str, report: list[str]) -> str:
+    """Apply edits c1-c5 to the masked output and return the compact class."""
+    s = masked_text
+
+    def lit(anchor, rep, n, what):
+        nonlocal s
+        cnt = s.count(anchor)
+        assert cnt == n, f"[{what}] literal found {cnt} times, expected {n}: {anchor[:70]!r}"
+        s = s.replace(anchor, rep, n)
+        report.append(f"edit {what}: {cnt} site(s)")
+
+    lit("class FsoSm100SlotGemm {", "class FsoSm100SlotGemmCompact {", 1, "c1 class name")
+    lit("    int const* fso_slot_to_expert{nullptr};\n"
+        "    int const* fso_masked_m{nullptr};\n"
+        "    int fso_num_slots{0};",
+        "    int const* fso_slot_to_expert{nullptr};\n"
+        "    int const* fso_masked_m{nullptr};\n"
+        "    int fso_num_slots{0};\n"
+        "    // compact layout: the expert count (the batch extent L is max(G, B_alloc))\n"
+        "    int fso_num_groups{0};", 2, "c2 Arguments / Params fields")
+    lit("      ,args.fso_num_slots\n",
+        "      ,args.fso_num_slots\n      ,args.fso_num_groups\n", 1,
+        "c2b to_underlying_arguments")
+    remap_old = ("fso_live = fso_slot_remap_and_live(params.fso_slot_to_expert, params.fso_masked_m,")
+    remap_new = ("fso_live = fso_slot_live_compact(params.fso_slot_to_expert, params.fso_masked_m,")
+    lit(remap_old, remap_new, 5, "c3a liveness sites")
+    lit("params.fso_num_slots, int(L), cute::size<1>(CtaShape_MNK{}),\n",
+        "params.fso_num_slots, params.fso_num_groups, cute::size<1>(CtaShape_MNK{}),\n", 5,
+        "c3b expert-id range bound")
+    s2, cnt = re.subn(r"(fso_slot_live_compact\(.*?cta_coord_mnkl)\);", r"\1, fso_a_batch);", s,
+                      flags=re.S)
+    assert cnt == 5, f"[c3c expert out-parameter] applied {cnt} times, expected 5"
+    s = s2
+    report.append(f"edit c3c expert out-parameter: {cnt} site(s)")
+    lit("    bool fso_live = true;\n",
+        "    bool fso_live = true;\n    int fso_a_batch = 0;   // compact layout: the weights' batch index\n", 1,
+        "c4 expert-id local")
+    lit("          load_inputs,\n          cta_coord_mnkl,\n",
+        "          fso_shift_weight_batch(load_inputs, fso_a_batch - int(cute::get<3>(cta_coord_mnkl))),\n"
+        "          cta_coord_mnkl,\n", 2, "c5 weight-side batch offset at the load calls")
+
+    head = "class FsoSm100SlotGemmCompact {"
+    start = s.index(head)
+    # include the template header that precedes the class
+    tmpl = s.rindex("template <", 0, start)
+    i = start + len(head)
+    depth = 1
+    while depth:
+        c = s[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+        i += 1
+    assert s[i] == ";", "[c extract] class body does not end in '};'"
+    return s[tmpl:i + 1]
+
+
+def generate_with_compact(cutlass_dir: str) -> tuple[str, list[str], str]:
+    text, report, src_path = generate(cutlass_dir)
+    compact_report: list[str] = []
+    cls = _compact_class(text, compact_report)
+    close = "} // namespace cutlass::gemm::kernel"
+    assert text.count(close) == 1, "[c insert] namespace close not unique"
+    text = text.replace(close, COMPACT_HELPERS + "\n" + cls + "\n\n" + close)
+    report.extend(compact_report)
+    return text, report, src_path
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         print(__doc__.strip().splitlines()[-2], file=sys.stderr)
@@ -392,7 +543,7 @@ def main() -> int:
         return 2
     dst = sys.argv[1]
     cutlass_dir = _cutlass_dir()
-    text, report, src_path = generate(cutlass_dir)
+    text, report, src_path = generate_with_compact(cutlass_dir)
     # Only rewrite when the content actually changes, so an incremental build
     # does not recompile the translation unit on every invocation.
     old = None

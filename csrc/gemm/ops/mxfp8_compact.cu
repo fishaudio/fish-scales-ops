@@ -79,8 +79,8 @@ int64_t grouped_scale_words(bool sm1xx, int64_t groups, int64_t m_cap, int64_t k
     return groups * rows * kp;
 }
 
-// The three compact GEMMs: sm_120/121 is served here, sm_100/103 is pending (S5), and every other device has no
-// MXFP8 hardware.
+// The three compact GEMMs: sm_120/121 is served here, sm_100/103 by ops/mxfp8.cu (the combine is sm_120/121
+// only), and every other device has no MXFP8 hardware.
 void require_compact_gemm_arch(char const* op)
 {
     int const major = current_sm_major();
@@ -88,8 +88,6 @@ void require_compact_gemm_arch(char const* op)
     {
         return;
     }
-    TORCH_CHECK_NOT_IMPLEMENTED(major != 10, "sm_100 half pending: ", op,
-        " on sm_100/sm_103 (B200 / B300) is not implemented in this build yet");
     TORCH_CHECK_NOT_IMPLEMENTED(false, op,
         ": the grouped MXFP8 (MoE) path needs sm_100/sm_103 (B200/B300) or sm_120/121 (RTX 5090 / RTX PRO 6000); "
         "this device is sm_", major, "x. On sm_90 (Hopper) use the block-FP8 grouped surface "
@@ -282,6 +280,17 @@ void silu_chunk_mul_quantize_1x32_grouped_out(
 }
 
 
+// The sm_100/sm_103 halves of the two GEMM ops (ops/mxfp8.cu): the CUTLASS pointer-array and slot routes on the
+// compact layout, with their own argument checks. The entries below send sm_100/sm_103 calls there.
+void linear_mxfp8_grouped_compact_sm100(at::Tensor a, at::Tensor b, at::Tensor sa, at::Tensor sb,
+    at::Tensor masked_m, at::Tensor blk0, int64_t m_cap, int64_t expected_m, int64_t max_active_groups,
+    std::optional<at::Tensor> slot_to_expert, std::optional<at::Tensor> problem_shapes,
+    std::optional<at::Tensor> ptr_arrays, at::Tensor d);
+void linear_mxfp8_grouped_compact_swiglu_sm100(at::Tensor a, at::Tensor b, at::Tensor sa, at::Tensor sb,
+    at::Tensor masked_m, at::Tensor blk0, int64_t m_cap, int64_t expected_m, int64_t max_active_groups,
+    std::optional<at::Tensor> slot_to_expert, std::optional<at::Tensor> problem_shapes,
+    std::optional<at::Tensor> ptr_arrays, at::Tensor dq, at::Tensor sd);
+
 // linear_mxfp8_grouped_compact: the grouped MXFP8 GEMM on the compact layout. a fp8 [R, K] (expert g's rows from
 // blk0[g] * 128), b fp8 [G, N, K], sa the one-group scale words [1, K/128, R], sb [G, K/128, N], masked_m [G],
 // blk0 [G + 1]; writes d bf16 [R, N] at the live rows only. m_cap / expected_m / max_active_groups are the masked
@@ -293,6 +302,12 @@ void linear_mxfp8_grouped_compact(at::Tensor a, at::Tensor b, at::Tensor sa, at:
     std::optional<at::Tensor> ptr_arrays, at::Tensor d)
 {
     char const* const op = "linear_mxfp8_grouped_compact";
+    if (current_sm_major() == 10)
+    {
+        linear_mxfp8_grouped_compact_sm100(a, b, sa, sb, masked_m, blk0, m_cap, expected_m, max_active_groups,
+            slot_to_expert, problem_shapes, ptr_arrays, d);
+        return;
+    }
     require_compact_gemm_arch(op);
     CompactDims const s = check_compact_gemm(op, a, b, sa, sb, masked_m, blk0, m_cap, expected_m, max_active_groups);
     refuse_sm100_route_tensors(op, slot_to_expert, problem_shapes, ptr_arrays);
@@ -324,6 +339,12 @@ void linear_mxfp8_grouped_compact_swiglu(at::Tensor a, at::Tensor b, at::Tensor 
     std::optional<at::Tensor> ptr_arrays, at::Tensor dq, at::Tensor sd)
 {
     char const* const op = "linear_mxfp8_grouped_compact_swiglu";
+    if (current_sm_major() == 10)
+    {
+        linear_mxfp8_grouped_compact_swiglu_sm100(a, b, sa, sb, masked_m, blk0, m_cap, expected_m,
+            max_active_groups, slot_to_expert, problem_shapes, ptr_arrays, dq, sd);
+        return;
+    }
     require_compact_gemm_arch(op);
     CompactDims const s = check_compact_gemm(op, a, b, sa, sb, masked_m, blk0, m_cap, expected_m, max_active_groups);
     refuse_sm100_route_tensors(op, slot_to_expert, problem_shapes, ptr_arrays);

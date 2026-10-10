@@ -697,8 +697,7 @@ fused FC1. The cap exists because a wide BF16 direct store stops being cheap
 once the rows pile up; the fused store writes about a quarter of those bytes,
 so the wave arithmetic is allowed to decide at every `expected_m`.
 
-**sm_120/121 — compact activation layout (MXFP8, 0.2.1; the sm_100/103 half is
-pending and raises `NotImplementedError`).** The masked slab gives every expert
+**Compact activation layout (MXFP8, 0.2.1; sm_100/103 and sm_120/121).** The masked slab gives every expert
 `m_cap` rows of every activation-side tensor, so it grows with
 `num_experts * M`. The compact layout packs the routed rows into **one group of
 `R = 128 * B` rows made of 128-row blocks**: expert `g` owns the blocks from
@@ -719,7 +718,7 @@ A caller sizes `B` from the host-static bound
 `B_max = max(1, (M * topk + 127 * min(G, M * topk)) // 128)` plus one block of
 slack (`R = 128 * (B_max + 1)`).
 
-| step | function | in → out (sm_120/121 shapes) |
+| step | function | in → out (sm_120/121 scale shapes; on sm_100/103 each scale tensor is the one-group atom slab of `R` rows) |
 |---|---|---|
 | gather + quantize | `quantize_1x32_grouped_gather_out_fp8(x, slot_of_flat, topk, num_groups, m_cap, x_q, packed)` | bf16 `[M, K]` → the caller's fp8 `x_q` (`num_groups * m_cap * K` elements) and int32 `packed` (`[num_groups, K/128, m_cap]`; sm_100/103 the atom slab); the compact layout passes `num_groups=1, m_cap=R`. Writes exactly the bytes `quantize_1x32_grouped_gather_fp8` returns, at the routed rows only |
 | gate_up | `linear_mxfp8_grouped_compact(a_fp8, w_fp8, sa, sw, masked_m, blk0, m_cap, expected_m, max_active_groups, slot_to_expert=None, problem_shapes=None, ptr_arrays=None, *, d)` | fp8 `[R, K]` + int32 `[1, K/128, R]` × the FC1 weights → the caller's bf16 `d` `[R, 2*INTER]` at the live rows; the three optional tensors are the sm_100/103 routes' and are refused on sm_120/121 |
@@ -732,6 +731,27 @@ The torch ops behind these wrappers (`quantize_1x32_grouped_gather_out`,
 `silu_chunk_mul_quantize_1x32_grouped_out`, `linear_mxfp8_grouped_compact`,
 `linear_mxfp8_grouped_compact_swiglu`, `linear_mxfp8_grouped_compact_combine`)
 return nothing; their schemas are listed under *Lower-level interface* below.
+
+On sm_100/103 (the CUTLASS slot and pointer-array routes): `slot_to_expert` is the packed active-expert list (the slot route reads it).
+`problem_shapes` (int32 `[G, 3]`, `(masked_m[g], N, K)`) and `ptr_arrays` (int64
+`[3, G]`: the address of the expert's first activation row, of its first scale
+atom and of its first output row) are the routing op's per-call arrays for this
+GEMM; give both or neither. With them the pointer-array route launches nothing but
+the GEMM. The rest of its argument arrays (the weight pointers, the strides and
+both scale-factor layouts) are a function of the weights and `(G, N, K)` alone and
+are built once per weight set into a per-thread block, so a serving process holds
+two blocks per layer whatever the number of graph captures, and a capture never
+aborts for lack of space. The activation scale layout of those blocks carries a
+constant row extent of 2^20 rows, so `R` must be at most 2^20 and `K` below 65536;
+the op checks both.
+
+Stores stay inside each expert's rows: the pointer-array route writes the routed
+rows only; the slot route writes an active expert's first `m_cap <= 64` rows,
+which lie inside its first block. A 256-row tile (the 2-SM codes of
+`FSO_FORCE_TILE` and the two-CTA cluster code 11) reads the activation scale atoms
+of one 128-row block past the last expert's region, so the caller allocates the
+activation scale tensor with one block of slack: `B_alloc = B_max + 1` with
+`B_max = (M*topk + 127*min(G, M*topk)) // 128`.
 
 **sm_90 — expert-sorted contiguous layout (block-FP8).** The `M * topk` routed
 pairs are sorted by expert into one compact list, each expert's run padded to
@@ -756,7 +776,6 @@ The sm_90 masked-layout variant (`linear_fp8_grouped_masked`,
 `moe_combine`) is still public; the unified layer entry uses the contiguous
 layout. `moe_build_routing`, `moe_build_sorted`, `moe_combine` and
 `moe_combine_sorted` are arch-agnostic glue kernels.
-
 ## Constraints
 
 - `K % 128 == 0` for every op on every arch. The former `K % 512` requirement
@@ -1078,7 +1097,7 @@ set them on purpose.
 | `FSO_MOE_BLOCK_OVERLAP=0` | `moe_block_mxfp8_sm120` (sm_120/121) | on (also when empty) | once (Python, at the first block call) | `0` (any value starting with `0`) runs the block's shared expert on the current stream, sequentially with the routed path, instead of on a side stream; the per-call `overlap_shared=` argument overrides it either way. The output is bit-identical in both modes. With the overlap on, the first block call of the process creates the side stream and has to be eager: a first call inside a capture raises `RuntimeError` naming this variable |
 | `FSO_DISABLE_DECODE_DSL=1` | sm_100/103 `linear_mxfp8`, and `linear_fp8` and `fso.dense.linear`, which run on it there | the decode row serves M ≤ 64 wherever the vendored kernels import, `nvidia-cutlass-dsl` ≥ 4.5.0 is installed and `FSO_DISABLE_DSL` is unset | once (at the first call that reaches the row) | skip the M ≤ 64 decode row and leave those cells to the tiers behind it. The row's eager launch path rebuilds descriptors and marshals its arguments in Python on every call (*Constraints*), which a captured caller does once, at capture; a caller that runs the op eagerly one token at a time can set this to keep the previous tiers. Boolean rule above: `1` disables the row, `0` leaves it on |
 | `FSO_STREAMK_POOL_MB=<n>` | sm_120/121 dense `linear_fp8`, `linear_mxfp8` and `fso.dense.linear` wherever the cascade splits K (Stream-K) | 64 MB, or the first Stream-K call's need when that is larger | once, at the first Stream-K launch of the process | size of the process-wide BF16 partial-sum scratch, allocated once and never grown, because a re-allocation would invalidate captured graphs. A later Stream-K call that needs more prints `StreamKPool capacity exhausted … Bump FSO_STREAMK_POOL_MB` and **aborts the process** (`std::abort`). Size it for the largest Stream-K shape the process will run, or make that shape's call the first one. A value that does not parse to a positive integer keeps the default |
-| `FSO_GROUPED_ARG_POOL_MB=<n>` | sm_100/103 grouped GEMMs called with `problem_shapes` (`fso.moe.layer` passes them) | 128 MB per host thread (at least 1) | once per process; each host thread allocates its own arena on its first eager grouped call | capacity of the per-thread static-array arena. Every distinct (capture, GEMM) pair pins one block of it for the life of the process (*routing-supplied problem shapes* under *MoE per-step pieces* above). A capture that finds the arena full **aborts the process** with a message naming the variable, and so does a thread's first such call when it is made inside a capture; an eager call that finds the arena full falls back to the per-launch preparation kernel and warns once |
+| `FSO_GROUPED_ARG_POOL_MB=<n>` | sm_100/103 grouped GEMMs called with `problem_shapes` (`fso.moe.layer` passes them) | 128 MB per host thread (at least 1) | once per process; each host thread allocates its own arena on its first eager grouped call | capacity of the per-thread static-array arena. Every distinct (capture, GEMM) pair pins one block of it for the life of the process (*routing-supplied problem shapes* under *MoE per-step pieces* above). A capture that finds the arena full **aborts the process** with a message naming the variable, and so does a thread's first such call when it is made inside a capture; an eager call that finds the arena full falls back to the per-launch preparation kernel and warns once. This describes the masked ops. The compact ops (`linear_mxfp8_grouped_compact{,_swiglu}`) keep their weight-keyed blocks in a separate per-thread arena that grows in chunks as needed (also inside a capture) and never aborts; for it the value is only the point past which blocks that no capture uses may be reused |
 | `FSO_JIT_INCLUDE_DIRS=a:b:c` | sm_90 (the deep_gemm NVRTC JIT) | a wheel: `_jit_include/` next to the extension, one include root with the deep_gemm, CUTLASS and CUDA 13.0.3 headers. An in-place build: the directories baked in at build time, which are the CUTLASS headers, the repository's deep_gemm headers and the build host's CUDA headers | once, at the first JIT compile | colon-separated include directories for the JIT, used in place of the default. Needed when an in-place build's source tree has moved. With `FSO_JIT_DEBUG=1` the choice is logged as `sm_90 JIT include directories (<origin>): <list>` |
 | `FSO_JIT_NVRTC_LIB=<path>` | sm_90 (the deep_gemm NVRTC JIT) | the NVRTC 13.0.88 bundled with the package (the version torch 2.13.0+cu130 ships): `_nvrtc/libnvrtc.so.13` next to the extension, which `scripts/build.sh` unpacks for an sm_90 build (`scripts/vendor_nvrtc.py`) | once, at the first JIT compile or the first `jit_compiler_sm90` call | the `libnvrtc.so` file the JIT compiles with, in place of the bundled one; a relative path is taken from the working directory. The extension does not link NVRTC: it loads this one library privately (`RTLD_LOCAL`), so the `libnvrtc.so.13` that torch loads, whose version depends on the torch build, compiles no sm_90 kernel unless this variable names that very file. Nothing else is tried either: when the library cannot be loaded, the first sm_90 GEMM raises `RuntimeError` naming the path, the loader's message and the remedy (run `python scripts/vendor_nvrtc.py`, or set this variable to a CUDA 13.0 `libnvrtc.so.13`). A build made with `FSO_SKIP_NVRTC_VENDOR=1` has no bundled copy and needs this variable. A library whose version is not 13.0 is used as given and prints one line on stderr, because the sm_90 kernels are validated and measured with NVRTC 13.0 and other NVRTC versions emit different code. `torch.ops.fish_scales_ops.jit_compiler_sm90()` returns the compiler in use (`NVRTC 13.0 (<path>)`, or `nvcc <path>` under `FSO_JIT_USE_NVCC`), and on sm_90 the last line of `fso.dense.describe()` and `fso.moe.describe()` repeats it |
 
