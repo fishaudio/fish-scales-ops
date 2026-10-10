@@ -32,10 +32,10 @@ torch 2.13.0+cu130. One extension carries the kernels of all three architectures
   is the `tests/`, `bench/`, `scripts/` and `docs/` of the same commit; steps 3 and 4 run from it.
 - **Torch guard.** The wheel is tied to the torch it was built against. Importing it under another torch raises
   `ImportError`.
-- **Memory.** Each architecture pass of `csrc/gemm/ops/mxfp8_kernel.cu` peaks near 16 GB on its own, and four jobs
-  together peaked near 29 GB: give one job 16 GB and each further job about 12 GB. More than four jobs barely shortens
-  the build, because that one translation unit takes most of it. `--cpus N --memory SIZE` limit the container, for
-  example to reproduce a CI runner.
+- **Memory.** Each architecture pass of `csrc/gemm/ops/mxfp8_kernel.cu` and of `csrc/gemm/ops/mxfp8_compact_kernel.cu`
+  peaks near 16 GB on its own, and four jobs together peaked near 29 GB: give one job 16 GB and each further job
+  about 12 GB. More than four jobs barely shortens the build, because those two translation units take most of it.
+  `--cpus N --memory SIZE` limit the container, for example to reproduce a CI runner.
 - **Compiler cache.** `--ccache DIR --ccache-bin FILE` compiles the CUDA translation units through ccache, with the
   cache in `DIR` outside the repository. `FILE` must be a static ccache build, such as
   `ccache-4.14.1-linux-x86_64-musl-static` from the ccache releases, because it also runs inside the container. A
