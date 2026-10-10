@@ -582,7 +582,7 @@
     "version": "0.2.1"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T19:03:25Z",
+   "installed_utc": "2026-10-10T20:07:34Z",
    "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
    "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
    "machine": "h200",
@@ -622,8 +622,8 @@
      "the power cap held the clock in 3 of 59 busy samples (5 %); busy SM clock min 1845 MHz, mean 1975.2 MHz; busy power mean 136.7 W, max 257.49 W of the 700 W limit"
     ]
    },
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf_serving",
+   "run": "0.2.1-h200-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200-serving",
    "steps": [
     {
      "command": [
@@ -732,7 +732,7 @@
     "version": "0.2.1"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T19:03:22Z",
+   "installed_utc": "2026-10-10T20:07:34Z",
    "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
    "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
    "machine": "h200",
@@ -772,8 +772,8 @@
      "the power cap held the clock in 5 of 58 busy samples (9 %); busy SM clock min 1500 MHz, mean 1950.5 MHz; busy power mean 147.9 W, max 362.96 W of the 700 W limit"
     ]
    },
-   "run": "perf",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf",
+   "run": "0.2.1-h200",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200",
    "steps": [
     {
      "command": [
@@ -878,7 +878,7 @@
     "version": "0.2.1"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T19:03:25Z",
+   "installed_utc": "2026-10-10T20:07:34Z",
    "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
    "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
    "machine": "h200",
@@ -914,8 +914,8 @@
     }
    },
    "power_flags": {},
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf_serving",
+   "run": "0.2.1-h200-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200-serving",
    "steps": [
     {
      "command": [
@@ -1022,7 +1022,7 @@
     "version": "0.2.1"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T19:03:25Z",
+   "installed_utc": "2026-10-10T20:07:34Z",
    "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
    "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
    "machine": "h200",
@@ -1062,8 +1062,8 @@
      "the power cap held the clock in 7 of 59 busy samples (12 %); busy SM clock min 1575 MHz, mean 1961.7 MHz; busy power mean 147.8 W, max 357.36 W of the 700 W limit"
     ]
    },
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf_serving",
+   "run": "0.2.1-h200-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200-serving",
    "steps": [
     {
      "command": [
@@ -1170,7 +1170,7 @@
     "version": "0.2.1"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T19:03:25Z",
+   "installed_utc": "2026-10-10T20:07:34Z",
    "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
    "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
    "machine": "h200",
@@ -1210,8 +1210,8 @@
      "the power cap held the clock in 1 of 61 busy samples (2 %); busy SM clock min 1890 MHz, mean 1977.0 MHz; busy power mean 136.1 W, max 232.79 W of the 700 W limit"
     ]
    },
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf_serving",
+   "run": "0.2.1-h200-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200-serving",
    "steps": [
     {
      "command": [
@@ -1320,7 +1320,7 @@
     "version": "0.2.1"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T19:03:22Z",
+   "installed_utc": "2026-10-10T20:07:34Z",
    "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
    "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
    "machine": "h200",
@@ -1360,8 +1360,8 @@
      "the power cap held the clock in 3 of 72 busy samples (4 %); busy SM clock min 1605 MHz, mean 1970.4 MHz; busy power mean 141.9 W, max 299.52 W of the 700 W limit"
     ]
    },
-   "run": "perf",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf",
+   "run": "0.2.1-h200",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200",
    "steps": [
     {
      "command": [
@@ -1466,7 +1466,7 @@
     "version": "0.2.1"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T19:03:25Z",
+   "installed_utc": "2026-10-10T20:07:34Z",
    "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
    "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
    "machine": "h200",
@@ -1502,8 +1502,8 @@
     }
    },
    "power_flags": {},
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf_serving",
+   "run": "0.2.1-h200-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200-serving",
    "steps": [
     {
      "command": [
@@ -1610,7 +1610,7 @@
     "version": "0.2.1"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T19:03:22Z",
+   "installed_utc": "2026-10-10T20:07:34Z",
    "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
    "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
    "machine": "h200",
@@ -1650,8 +1650,8 @@
      "the power cap held the clock in 5 of 81 busy samples (6 %); busy SM clock min 1710 MHz, mean 1972.8 MHz; busy power mean 137.9 W, max 332.19 W of the 700 W limit"
     ]
    },
-   "run": "perf",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf",
+   "run": "0.2.1-h200",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200",
    "steps": [
     {
      "command": [
@@ -1756,7 +1756,7 @@
     "version": "0.2.1"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T19:03:25Z",
+   "installed_utc": "2026-10-10T20:07:34Z",
    "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
    "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
    "machine": "h200",
@@ -1796,8 +1796,8 @@
      "the power cap held the clock in 4 of 77 busy samples (5 %); busy SM clock min 1695 MHz, mean 1972.0 MHz; busy power mean 141.9 W, max 308.92 W of the 700 W limit"
     ]
    },
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf_serving",
+   "run": "0.2.1-h200-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200-serving",
    "steps": [
     {
      "command": [
@@ -2061,7 +2061,7 @@
     "version": "0.2.1"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T19:03:25Z",
+   "installed_utc": "2026-10-10T20:07:34Z",
    "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
    "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
    "machine": "h200",
@@ -2101,8 +2101,8 @@
      "the power cap held the clock in 1 of 155 busy samples (1 %); busy SM clock min 1785 MHz, mean 1978.6 MHz; busy power mean 235.3 W, max 445.12 W of the 700 W limit"
     ]
    },
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf_serving",
+   "run": "0.2.1-h200-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200-serving",
    "steps": [
     {
      "command": [
@@ -2337,7 +2337,7 @@
     "version": "0.2.1"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T19:03:25Z",
+   "installed_utc": "2026-10-10T20:07:34Z",
    "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
    "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
    "machine": "h200",
@@ -2373,8 +2373,8 @@
     }
    },
    "power_flags": {},
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf_serving",
+   "run": "0.2.1-h200-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200-serving",
    "steps": [
     {
      "command": [
@@ -2481,7 +2481,7 @@
     "version": "0.2.1"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T19:03:25Z",
+   "installed_utc": "2026-10-10T20:07:34Z",
    "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
    "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
    "machine": "h200",
@@ -2521,8 +2521,8 @@
      "the power cap held the clock in 5 of 232 busy samples (2 %); busy SM clock min 1785 MHz, mean 1977.7 MHz; busy power mean 286.6 W, max 465.27 W of the 700 W limit"
     ]
    },
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf_serving",
+   "run": "0.2.1-h200-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200-serving",
    "steps": [
     {
      "command": [
@@ -2629,7 +2629,7 @@
     "version": "0.2.1"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T19:03:25Z",
+   "installed_utc": "2026-10-10T20:07:34Z",
    "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
    "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
    "machine": "h200",
@@ -2665,8 +2665,8 @@
     }
    },
    "power_flags": {},
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf_serving",
+   "run": "0.2.1-h200-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200-serving",
    "steps": [
     {
      "command": [
@@ -2901,7 +2901,7 @@
     "version": "0.2.1"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T19:03:25Z",
+   "installed_utc": "2026-10-10T20:07:34Z",
    "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
    "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
    "machine": "h200",
@@ -2937,8 +2937,8 @@
     }
    },
    "power_flags": {},
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf_serving",
+   "run": "0.2.1-h200-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200-serving",
    "steps": [
     {
      "command": [
@@ -3045,7 +3045,7 @@
     "version": "0.2.1"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T19:03:25Z",
+   "installed_utc": "2026-10-10T20:07:34Z",
    "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
    "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
    "machine": "h200",
@@ -3085,8 +3085,8 @@
      "the power cap held the clock in 5 of 353 busy samples (1 %); busy SM clock min 1785 MHz, mean 1978.4 MHz; busy power mean 322.2 W, max 475.74 W of the 700 W limit"
     ]
    },
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf_serving",
+   "run": "0.2.1-h200-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200-serving",
    "steps": [
     {
      "command": [

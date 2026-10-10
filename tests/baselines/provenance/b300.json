@@ -597,7 +597,7 @@
     "version": "0.2.1"
    },
    "host": "fish-dev-5f7c8f8bbf-sgls4",
-   "installed_utc": "2026-10-10T19:48:23Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
@@ -637,8 +637,8 @@
      "the power cap held the clock in 1 of 210 busy samples (0 %); busy SM clock min 1260 MHz, mean 2027.7 MHz; busy power mean 276.7 W, max 401.7 W of the 1100 W limit"
     ]
    },
-   "run": "perf",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/b300/perf",
+   "run": "0.2.1-b300",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-b300",
    "steps": [
     {
      "command": [
@@ -746,7 +746,7 @@
     "version": "0.2.1"
    },
    "host": "fish-dev-5f7c8f8bbf-sgls4",
-   "installed_utc": "2026-10-10T19:48:23Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
@@ -786,8 +786,8 @@
      "the power cap held the clock in 1 of 79 busy samples (1 %); busy SM clock min 2032 MHz, mean 2032.0 MHz; busy power mean 267.4 W, max 327.77 W of the 1100 W limit"
     ]
    },
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/b300/perf_serving",
+   "run": "0.2.1-b300-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-b300-serving",
    "steps": [
     {
      "command": [
@@ -899,7 +899,7 @@
     "version": "0.2.1"
    },
    "host": "fish-dev-5f7c8f8bbf-sgls4",
-   "installed_utc": "2026-10-10T19:48:23Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
@@ -935,8 +935,8 @@
     }
    },
    "power_flags": {},
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/b300/perf_serving",
+   "run": "0.2.1-b300-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-b300-serving",
    "steps": [
     {
      "command": [
@@ -1046,7 +1046,7 @@
     "version": "0.2.1"
    },
    "host": "fish-dev-5f7c8f8bbf-sgls4",
-   "installed_utc": "2026-10-10T19:48:23Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
@@ -1086,8 +1086,8 @@
      "the power cap held the clock in 2 of 80 busy samples (2 %); busy SM clock min 1935 MHz, mean 2030.8 MHz; busy power mean 276.6 W, max 394.89 W of the 1100 W limit"
     ]
    },
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/b300/perf_serving",
+   "run": "0.2.1-b300-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-b300-serving",
    "steps": [
     {
      "command": [
@@ -1197,7 +1197,7 @@
     "version": "0.2.1"
    },
    "host": "fish-dev-5f7c8f8bbf-sgls4",
-   "installed_utc": "2026-10-10T19:48:23Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
@@ -1237,8 +1237,8 @@
      "the power cap held the clock in 3 of 212 busy samples (1 %); busy SM clock min 1807 MHz, mean 2030.2 MHz; busy power mean 277.2 W, max 380.35 W of the 1100 W limit"
     ]
    },
-   "run": "perf",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/b300/perf",
+   "run": "0.2.1-b300",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-b300",
    "steps": [
     {
      "command": [
@@ -1346,7 +1346,7 @@
     "version": "0.2.1"
    },
    "host": "fish-dev-5f7c8f8bbf-sgls4",
-   "installed_utc": "2026-10-10T19:48:23Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
@@ -1382,8 +1382,8 @@
     }
    },
    "power_flags": {},
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/b300/perf_serving",
+   "run": "0.2.1-b300-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-b300-serving",
    "steps": [
     {
      "command": [
@@ -1495,7 +1495,7 @@
     "version": "0.2.1"
    },
    "host": "fish-dev-5f7c8f8bbf-sgls4",
-   "installed_utc": "2026-10-10T19:48:23Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
@@ -1531,8 +1531,8 @@
     }
    },
    "power_flags": {},
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/b300/perf_serving",
+   "run": "0.2.1-b300-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-b300-serving",
    "steps": [
     {
      "command": [
@@ -1642,7 +1642,7 @@
     "version": "0.2.1"
    },
    "host": "fish-dev-5f7c8f8bbf-sgls4",
-   "installed_utc": "2026-10-10T19:48:23Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
@@ -1682,8 +1682,8 @@
      "the power cap held the clock in 2 of 80 busy samples (2 %); busy SM clock min 1822 MHz, mean 2029.4 MHz; busy power mean 275.6 W, max 396.6 W of the 1100 W limit"
     ]
    },
-   "run": "perf",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/b300/perf",
+   "run": "0.2.1-b300",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-b300",
    "steps": [
     {
      "command": [
@@ -1791,7 +1791,7 @@
     "version": "0.2.1"
    },
    "host": "fish-dev-5f7c8f8bbf-sgls4",
-   "installed_utc": "2026-10-10T19:48:23Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
@@ -1831,8 +1831,8 @@
      "the power cap held the clock in 1 of 92 busy samples (1 %); busy SM clock min 1980 MHz, mean 2030.9 MHz; busy power mean 274.7 W, max 382.55 W of the 1100 W limit"
     ]
    },
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/b300/perf_serving",
+   "run": "0.2.1-b300-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-b300-serving",
    "steps": [
     {
      "command": [
@@ -2071,7 +2071,7 @@
     "version": "0.2.1"
    },
    "host": "fish-dev-5f7c8f8bbf-sgls4",
-   "installed_utc": "2026-10-10T19:48:23Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
@@ -2170,8 +2170,8 @@
      "the power cap held the clock in 6 of 143 busy samples (4 %); busy SM clock min 1927 MHz, mean 2027.8 MHz; busy power mean 272.1 W, max 739.29 W of the 1100 W limit"
     ]
    },
-   "run": "perf",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/b300/perf",
+   "run": "0.2.1-b300",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-b300",
    "steps": [
     {
      "command": [
@@ -2315,7 +2315,7 @@
     "version": "0.2.1"
    },
    "host": "fish-dev-5f7c8f8bbf-sgls4",
-   "installed_utc": "2026-10-10T19:48:23Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
@@ -2351,8 +2351,8 @@
     }
    },
    "power_flags": {},
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/b300/perf_serving",
+   "run": "0.2.1-b300-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-b300-serving",
    "steps": [
     {
      "command": [
@@ -2464,7 +2464,7 @@
     "version": "0.2.1"
    },
    "host": "fish-dev-5f7c8f8bbf-sgls4",
-   "installed_utc": "2026-10-10T19:48:23Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
@@ -2500,8 +2500,8 @@
     }
    },
    "power_flags": {},
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/b300/perf_serving",
+   "run": "0.2.1-b300-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-b300-serving",
    "steps": [
     {
      "command": [
@@ -2611,7 +2611,7 @@
     "version": "0.2.1"
    },
    "host": "fish-dev-5f7c8f8bbf-sgls4",
-   "installed_utc": "2026-10-10T19:48:23Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
@@ -2647,8 +2647,8 @@
     }
    },
    "power_flags": {},
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/b300/perf_serving",
+   "run": "0.2.1-b300-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-b300-serving",
    "steps": [
     {
      "command": [
@@ -2758,7 +2758,7 @@
     "version": "0.2.1"
    },
    "host": "fish-dev-5f7c8f8bbf-sgls4",
-   "installed_utc": "2026-10-10T19:48:23Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
@@ -2857,8 +2857,8 @@
      "the power cap held the clock in 2 of 163 busy samples (1 %); busy SM clock min 1845 MHz, mean 2030.3 MHz; busy power mean 264.6 W, max 488.45 W of the 1100 W limit"
     ]
    },
-   "run": "perf",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/b300/perf",
+   "run": "0.2.1-b300",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-b300",
    "steps": [
     {
      "command": [
@@ -3002,7 +3002,7 @@
     "version": "0.2.1"
    },
    "host": "fish-dev-5f7c8f8bbf-sgls4",
-   "installed_utc": "2026-10-10T19:48:23Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
@@ -3038,8 +3038,8 @@
     }
    },
    "power_flags": {},
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/b300/perf_serving",
+   "run": "0.2.1-b300-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-b300-serving",
    "steps": [
     {
      "command": [
@@ -3151,7 +3151,7 @@
     "version": "0.2.1"
    },
    "host": "fish-dev-5f7c8f8bbf-sgls4",
-   "installed_utc": "2026-10-10T19:48:23Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
@@ -3187,8 +3187,8 @@
     }
    },
    "power_flags": {},
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/b300/perf_serving",
+   "run": "0.2.1-b300-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-b300-serving",
    "steps": [
     {
      "command": [
@@ -3298,7 +3298,7 @@
     "version": "0.2.1"
    },
    "host": "fish-dev-5f7c8f8bbf-sgls4",
-   "installed_utc": "2026-10-10T19:48:23Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
@@ -3338,8 +3338,8 @@
      "the power cap held the clock in 4 of 163 busy samples (2 %); busy SM clock min 1867 MHz, mean 2029.9 MHz; busy power mean 275.5 W, max 489.02 W of the 1100 W limit"
     ]
    },
-   "run": "perf",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/b300/perf",
+   "run": "0.2.1-b300",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-b300",
    "steps": [
     {
      "command": [
@@ -3447,7 +3447,7 @@
     "version": "0.2.1"
    },
    "host": "fish-dev-5f7c8f8bbf-sgls4",
-   "installed_utc": "2026-10-10T19:48:23Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "1cd1f9affb94ae203adbfc16443890059460a23a77109f950e8716ec7be17410",
    "machine": "b300",
@@ -3483,8 +3483,8 @@
     }
    },
    "power_flags": {},
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/b300/perf_serving",
+   "run": "0.2.1-b300-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-b300-serving",
    "steps": [
     {
      "command": [

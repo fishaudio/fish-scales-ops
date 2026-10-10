@@ -577,7 +577,7 @@
     "version": "0.2.1"
    },
    "host": "gpu5090-03",
-   "installed_utc": "2026-10-10T20:02:02Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "683cf6da12cedb0b751b466f843ac28098d75bb5092bec92dddc53c07a89aa12",
    "machine": "5090",
@@ -617,8 +617,8 @@
      "the power cap held the clock in 20 of 145 busy samples (14 %); busy SM clock min 2070 MHz, mean 2377.0 MHz; busy power mean 85.7 W, max 322.08 W of the 575 W limit"
     ]
    },
-   "run": "perf",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/5090/perf",
+   "run": "0.2.1-5090",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-5090",
    "steps": [
     {
      "command": [
@@ -722,7 +722,7 @@
     "version": "0.2.1"
    },
    "host": "gpu5090-03",
-   "installed_utc": "2026-10-10T20:02:02Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "683cf6da12cedb0b751b466f843ac28098d75bb5092bec92dddc53c07a89aa12",
    "machine": "5090",
@@ -762,8 +762,8 @@
      "the power cap held the clock in 3 of 47 busy samples (6 %); busy SM clock min 2392 MHz, mean 2392.0 MHz; busy power mean 69.2 W, max 88.29 W of the 575 W limit"
     ]
    },
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/5090/perf_serving",
+   "run": "0.2.1-5090-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-5090-serving",
    "steps": [
     {
      "command": [
@@ -871,7 +871,7 @@
     "version": "0.2.1"
    },
    "host": "gpu5090-03",
-   "installed_utc": "2026-10-10T20:02:02Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "683cf6da12cedb0b751b466f843ac28098d75bb5092bec92dddc53c07a89aa12",
    "machine": "5090",
@@ -907,8 +907,8 @@
     }
    },
    "power_flags": {},
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/5090/perf_serving",
+   "run": "0.2.1-5090-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-5090-serving",
    "steps": [
     {
      "command": [
@@ -1014,7 +1014,7 @@
     "version": "0.2.1"
    },
    "host": "gpu5090-03",
-   "installed_utc": "2026-10-10T20:02:02Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "683cf6da12cedb0b751b466f843ac28098d75bb5092bec92dddc53c07a89aa12",
    "machine": "5090",
@@ -1054,8 +1054,8 @@
      "the power cap held the clock in 7 of 64 busy samples (11 %); busy SM clock min 2310 MHz, mean 2388.2 MHz; busy power mean 85.5 W, max 284.79 W of the 575 W limit"
     ]
    },
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/5090/perf_serving",
+   "run": "0.2.1-5090-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-5090-serving",
    "steps": [
     {
      "command": [
@@ -1161,7 +1161,7 @@
     "version": "0.2.1"
    },
    "host": "gpu5090-03",
-   "installed_utc": "2026-10-10T20:02:02Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "683cf6da12cedb0b751b466f843ac28098d75bb5092bec92dddc53c07a89aa12",
    "machine": "5090",
@@ -1201,8 +1201,8 @@
      "the power cap held the clock in 14 of 153 busy samples (9 %); busy SM clock min 2287 MHz, mean 2389.6 MHz; busy power mean 76.8 W, max 270.25 W of the 575 W limit"
     ]
    },
-   "run": "perf",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/5090/perf",
+   "run": "0.2.1-5090",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-5090",
    "steps": [
     {
      "command": [
@@ -1306,7 +1306,7 @@
     "version": "0.2.1"
    },
    "host": "gpu5090-03",
-   "installed_utc": "2026-10-10T20:02:02Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "683cf6da12cedb0b751b466f843ac28098d75bb5092bec92dddc53c07a89aa12",
    "machine": "5090",
@@ -1346,8 +1346,8 @@
      "the power cap held the clock in 4 of 59 busy samples (7 %); busy SM clock min 2325 MHz, mean 2389.4 MHz; busy power mean 68.0 W, max 107.37 W of the 575 W limit"
     ]
    },
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/5090/perf_serving",
+   "run": "0.2.1-5090-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-5090-serving",
    "steps": [
     {
      "command": [
@@ -1455,7 +1455,7 @@
     "version": "0.2.1"
    },
    "host": "gpu5090-03",
-   "installed_utc": "2026-10-10T20:02:02Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "683cf6da12cedb0b751b466f843ac28098d75bb5092bec92dddc53c07a89aa12",
    "machine": "5090",
@@ -1495,8 +1495,8 @@
      "the power cap held the clock in 2 of 26 busy samples (8 %); busy SM clock min 2392 MHz, mean 2392.0 MHz; busy power mean 68.8 W, max 111.31 W of the 575 W limit"
     ]
    },
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/5090/perf_serving",
+   "run": "0.2.1-5090-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-5090-serving",
    "steps": [
     {
      "command": [
@@ -1602,7 +1602,7 @@
     "version": "0.2.1"
    },
    "host": "gpu5090-03",
-   "installed_utc": "2026-10-10T20:02:02Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "683cf6da12cedb0b751b466f843ac28098d75bb5092bec92dddc53c07a89aa12",
    "machine": "5090",
@@ -1642,8 +1642,8 @@
      "the power cap held the clock in 9 of 59 busy samples (15 %); busy SM clock min 2325 MHz, mean 2387.7 MHz; busy power mean 84.9 W, max 215.98 W of the 575 W limit"
     ]
    },
-   "run": "perf",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/5090/perf",
+   "run": "0.2.1-5090",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-5090",
    "steps": [
     {
      "command": [
@@ -1747,7 +1747,7 @@
     "version": "0.2.1"
    },
    "host": "gpu5090-03",
-   "installed_utc": "2026-10-10T20:02:02Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "683cf6da12cedb0b751b466f843ac28098d75bb5092bec92dddc53c07a89aa12",
    "machine": "5090",
@@ -1787,8 +1787,8 @@
      "the power cap held the clock in 11 of 70 busy samples (16 %); busy SM clock min 2325 MHz, mean 2390.1 MHz; busy power mean 84.7 W, max 262.47 W of the 575 W limit"
     ]
    },
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/5090/perf_serving",
+   "run": "0.2.1-5090-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-5090-serving",
    "steps": [
     {
      "command": [
@@ -2788,7 +2788,7 @@
     "version": "0.2.1"
    },
    "host": "gpu5090-03",
-   "installed_utc": "2026-10-10T20:02:02Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "683cf6da12cedb0b751b466f843ac28098d75bb5092bec92dddc53c07a89aa12",
    "machine": "5090",
@@ -2828,8 +2828,8 @@
      "the power cap held the clock in 4 of 67 busy samples (6 %); busy SM clock min 2340 MHz, mean 2389.1 MHz; busy power mean 67.9 W, max 154.52 W of the 575 W limit"
     ]
    },
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/5090/perf_serving",
+   "run": "0.2.1-5090-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-5090-serving",
    "steps": [
     {
      "command": [
@@ -2955,7 +2955,7 @@
     "version": "0.2.1"
    },
    "host": "gpu5090-03",
-   "installed_utc": "2026-10-10T20:02:02Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "683cf6da12cedb0b751b466f843ac28098d75bb5092bec92dddc53c07a89aa12",
    "machine": "5090",
@@ -3026,8 +3026,8 @@
      "the power cap held the clock in 17 of 65 busy samples (26 %); busy SM clock min 2370 MHz, mean 2389.6 MHz; busy power mean 93.4 W, max 349.21 W of the 575 W limit"
     ]
    },
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/5090/perf_serving",
+   "run": "0.2.1-5090-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-5090-serving",
    "steps": [
     {
      "command": [
@@ -3421,7 +3421,7 @@
     "version": "0.2.1"
    },
    "host": "gpu5090-03",
-   "installed_utc": "2026-10-10T20:02:02Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "683cf6da12cedb0b751b466f843ac28098d75bb5092bec92dddc53c07a89aa12",
    "machine": "5090",
@@ -3461,8 +3461,8 @@
      "the power cap held the clock in 4 of 65 busy samples (6 %); busy SM clock min 2340 MHz, mean 2387.6 MHz; busy power mean 72.0 W, max 164.84 W of the 575 W limit"
     ]
    },
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/5090/perf_serving",
+   "run": "0.2.1-5090-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-5090-serving",
    "steps": [
     {
      "command": [
@@ -3588,7 +3588,7 @@
     "version": "0.2.1"
    },
    "host": "gpu5090-03",
-   "installed_utc": "2026-10-10T20:02:02Z",
+   "installed_utc": "2026-10-10T20:07:35Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "683cf6da12cedb0b751b466f843ac28098d75bb5092bec92dddc53c07a89aa12",
    "machine": "5090",
@@ -3659,8 +3659,8 @@
      "the power cap held the clock in 11 of 88 busy samples (12 %); busy SM clock min 2377 MHz, mean 2390.9 MHz; busy power mean 77.0 W, max 200.81 W of the 575 W limit"
     ]
    },
-   "run": "perf_serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/5090/perf_serving",
+   "run": "0.2.1-5090-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-5090-serving",
    "steps": [
     {
      "command": [
