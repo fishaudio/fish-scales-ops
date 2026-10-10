@@ -777,6 +777,213 @@ def linear_mxfp8_grouped_masked_combine(
     )
 
 
+# ---------------------------------------------------------------------------
+# The compact activation layout (0.2.1).
+#
+# The masked slab gives every local expert ``m_cap = align(M, 4)`` rows of every
+# activation-side tensor, so it grows with ``num_experts * M``. The compact layout packs
+# the routed rows into ONE group of ``R = 128 * B`` rows made of 128-row blocks: expert
+# ``g`` owns the blocks from ``blk0[g]`` on, where ``blk0`` is the exclusive prefix of
+# ``ceil(masked_m[g] / 128)``, so its rows are ``[blk0[g] * 128, blk0[g] * 128 +
+# masked_m[g])``. A compact row index is exactly the slot of a masked slab with one group
+# of ``m_cap = R`` rows, so the glue ops run on it with ``num_groups = 1, m_cap = R`` and
+# a ``slot_of_flat`` that holds compact rows; only the GEMMs see two index spaces (the
+# weights by expert, the activations by compact row). Every op below writes into
+# buffers the caller allocated, and none writes a row that no routed pair owns.
+#
+# The GEMM ops take the masked layout's host-static hints unchanged (``m_cap =
+# align(M, 4)``, ``expected_m = ceil(M * topk / G)``, ``max_active_groups = min(M * topk,
+# G)``), so a compact call runs exactly the kernel instance the masked call of the same
+# shape runs, and its live rows are bit-identical to the masked call's.
+
+
+def quantize_1x32_grouped_gather_out_fp8(
+    x: torch.Tensor,
+    slot_of_flat: torch.Tensor,
+    topk: int,
+    num_groups: int,
+    m_cap: int,
+    x_q: torch.Tensor,
+    packed: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`quantize_1x32_grouped_gather_fp8` writing into the caller's buffers.
+
+    For the compact layout pass ``num_groups=1, m_cap=R`` and the compact
+    ``slot_of_flat``; ``x_q`` is then the compact activation (fp8, ``R * K``
+    elements, e.g. ``[R, K]``) and ``packed`` its one-group scale words (int32;
+    sm_120/121 ``[1, K/128, R]`` K-major, sm_100/103 ``R * K/128`` Sm1xx atoms).
+    With the masked layout's arguments it fills a masked slab instead. It writes
+    exactly the bytes the allocating op returns, at the rows routed pairs map to,
+    and nothing else.
+
+    Returns:
+        ``(x_q, packed)``.
+    """
+    _require_grouped_arch()
+    torch.ops.fish_scales_ops.quantize_1x32_grouped_gather_out(
+        x.contiguous(), slot_of_flat, int(topk), int(num_groups), int(m_cap), True, x_q, packed
+    )
+    return x_q, packed
+
+
+def silu_chunk_mul_quantize_1x32_grouped_out_fp8(
+    gu: torch.Tensor,
+    slot_of_flat: torch.Tensor,
+    dq: torch.Tensor,
+    sd: torch.Tensor,
+    pairwise: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`silu_chunk_mul_quantize_1x32_grouped_fp8` writing into the caller's buffers.
+
+    ``gu`` is the FC1 output: the masked slab bf16 ``[G, m_cap, 2*INTER]``, or the
+    compact one-group ``[R, 2*INTER]`` (read as ``G = 1, m_cap = R``). ``dq`` takes
+    ``G * m_cap * INTER`` fp8 and ``sd`` the arch's scale words for
+    ``(G, m_cap, INTER/128)`` (sm_120/121 K-major ``[G, INTER/128, m_cap]``). Writes
+    exactly the bytes the allocating op returns, at the rows routed pairs map to, and
+    nothing else; ``pairwise`` as in the allocating op.
+
+    Returns:
+        ``(dq, sd)``.
+    """
+    _require_grouped_arch()
+    if pairwise and sm_major() not in (10, 12):
+        raise NotImplementedError(
+            f"silu_chunk_mul_quantize_1x32_grouped_out_fp8(pairwise=True) targets the interleaved gate_up "
+            f"layout of the architectures that have a fused FC1 (sm_100/sm_103 and sm_120/121); this "
+            f"device is sm_{sm_major()}0."
+        )
+    torch.ops.fish_scales_ops.silu_chunk_mul_quantize_1x32_grouped_out(gu, slot_of_flat, True, pairwise, dq, sd)
+    return dq, sd
+
+
+def linear_mxfp8_grouped_compact(
+    a_fp8: torch.Tensor,
+    w_fp8: torch.Tensor,
+    sa: torch.Tensor,
+    sw: torch.Tensor,
+    masked_m: torch.Tensor,
+    blk0: torch.Tensor,
+    m_cap: int,
+    expected_m: int,
+    max_active_groups: int,
+    slot_to_expert: torch.Tensor | None = None,
+    problem_shapes: torch.Tensor | None = None,
+    ptr_arrays: torch.Tensor | None = None,
+    *,
+    d: torch.Tensor,
+) -> torch.Tensor:
+    """Grouped block-scaled MXFP8 GEMM on the compact activation layout.
+
+    Args:
+        a_fp8: float8_e4m3fn ``[R, K]``, ``R`` a multiple of 128; expert ``g``'s rows
+            are ``[blk0[g] * 128, blk0[g] * 128 + masked_m[g])``.
+        w_fp8: float8_e4m3fn ``[G, N, K]`` per-expert weights.
+        sa: the one-group scale words of ``a_fp8`` (sm_120/121 int32 ``[1, K/128, R]``),
+            as :func:`quantize_1x32_grouped_gather_out_fp8` writes them with
+            ``num_groups=1, m_cap=R``.
+        sw: the per-expert weight scales (sm_120/121 ``[G, K/128, N]``).
+        masked_m: int32 ``[G]`` on device, routed rows per expert.
+        blk0: int32 ``[G + 1]`` on device, the exclusive prefix of
+            ``ceil(masked_m / 128)``; ``128 * blk0[G] <= R`` is the caller's contract.
+        m_cap, expected_m, max_active_groups: the masked layout's host-static hints
+            (``align(M, 4)``, ``ceil(M * topk / G)``, ``min(M * topk, G)``); they pick
+            the tile and bound the grid exactly as for :func:`linear_mxfp8_grouped_masked`.
+        slot_to_expert, problem_shapes, ptr_arrays: the sm_100/103 routes' per-call
+            tensors; sm_120/121 refuses non-empty ones.
+        d: bf16 ``[R, N]``, written at the live rows only.
+
+    Returns:
+        ``d``.
+
+    Raises:
+        NotImplementedError: on sm_90 (no MXFP8 hardware) and, until its half lands,
+            on sm_100/sm_103.
+    """
+    _require_grouped_arch()
+    torch.ops.fish_scales_ops.linear_mxfp8_grouped_compact(
+        a_fp8, w_fp8, sa, sw, masked_m, blk0, int(m_cap), int(expected_m), int(max_active_groups),
+        slot_to_expert, problem_shapes, ptr_arrays, d
+    )
+    return d
+
+
+def linear_mxfp8_grouped_compact_swiglu(
+    a_fp8: torch.Tensor,
+    w13_fp8: torch.Tensor,
+    sa: torch.Tensor,
+    sw13: torch.Tensor,
+    masked_m: torch.Tensor,
+    blk0: torch.Tensor,
+    m_cap: int,
+    expected_m: int,
+    max_active_groups: int,
+    slot_to_expert: torch.Tensor | None = None,
+    problem_shapes: torch.Tensor | None = None,
+    ptr_arrays: torch.Tensor | None = None,
+    *,
+    dq: torch.Tensor,
+    sd: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The fused-SwiGLU FC1 on the compact activation layout.
+
+    The compact counterpart of :func:`linear_mxfp8_grouped_masked_swiglu`, with the
+    same precondition the op cannot detect: ``w13_fp8`` ``[G, 2*I, K]`` must carry
+    INTERLEAVED gate/up rows. Writes ``dq`` fp8 ``[R, I]`` and ``sd``, the one-group
+    scale words (sm_120/121 int32 ``[1, I/128, R]``), at the live rows only: the pair
+    :func:`silu_chunk_mul_quantize_1x32_grouped_out_fp8` (``pairwise=True``) writes
+    from the unfused FC1's output, ready for the compact FC2. The other arguments are
+    those of :func:`linear_mxfp8_grouped_compact`.
+
+    Returns:
+        ``(dq, sd)``.
+    """
+    _require_grouped_arch()
+    torch.ops.fish_scales_ops.linear_mxfp8_grouped_compact_swiglu(
+        a_fp8, w13_fp8, sa, sw13, masked_m, blk0, int(m_cap), int(expected_m), int(max_active_groups),
+        slot_to_expert, problem_shapes, ptr_arrays, dq, sd
+    )
+    return dq, sd
+
+
+def linear_mxfp8_grouped_compact_combine(
+    a_fp8: torch.Tensor,
+    w2_fp8: torch.Tensor,
+    sa: torch.Tensor,
+    sw2: torch.Tensor,
+    masked_m: torch.Tensor,
+    blk0: torch.Tensor,
+    row_map: torch.Tensor,
+    weight_of_slot: torch.Tensor,
+    m_cap: int,
+    expected_m: int,
+    max_active_groups: int,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """The fused-combine FC2 on the compact activation layout (sm_120/121, opt-in).
+
+    The compact counterpart of :func:`linear_mxfp8_grouped_masked_combine`: each live
+    row ``r`` is scaled by ``weight_of_slot[r]`` and **added into** ``out[row_map[r]]``
+    with atomic reductions, so ``out`` bf16 ``[M, N]`` must be pre-filled and the result
+    is not bit-reproducible run to run. ``row_map`` / ``weight_of_slot`` are indexed by
+    compact row and cover at least the routing's ``128 * B_max`` rows. The other
+    arguments are those of :func:`linear_mxfp8_grouped_compact`.
+
+    Returns:
+        ``out``.
+    """
+    _require_grouped_arch()
+    if sm_major() != 12:
+        raise NotImplementedError(
+            f"linear_mxfp8_grouped_compact_combine is the sm_120/121 fused-combine FC2; this device is "
+            f"sm_{sm_major()}0."
+        )
+    torch.ops.fish_scales_ops.linear_mxfp8_grouped_compact_combine(
+        a_fp8, w2_fp8, sa, sw2, masked_m, blk0, row_map, weight_of_slot, int(m_cap), int(expected_m),
+        int(max_active_groups), out
+    )
+    return out
+
+
 
 def moe_build_routing(
     topk_ids: torch.Tensor,

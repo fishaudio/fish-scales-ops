@@ -74,6 +74,10 @@ GEMM_MEMBERS = {
         "mxfp8_grouped_problem_shapes_consumed", "moe_build_routing", "moe_build_routing_compact",
         "moe_combine",
         "moe_topk_from_logits", "moe_build_sorted", "moe_combine_sorted",
+        # the compact activation layout (0.2.1, charter D4)
+        "linear_mxfp8_grouped_compact", "linear_mxfp8_grouped_compact_swiglu",
+        "linear_mxfp8_grouped_compact_combine", "quantize_1x32_grouped_gather_out",
+        "silu_chunk_mul_quantize_1x32_grouped_out",
     },
     "moe_sm90": {
         "linear_fp8_grouped_masked", "quantize_1x128_grouped_gather_sm90",

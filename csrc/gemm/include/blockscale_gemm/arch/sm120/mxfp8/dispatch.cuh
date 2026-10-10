@@ -32,16 +32,23 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels::blockscale_gemm
 {
 
+// CompactActs (with `blk0` and `act_rows`) launches the compact-activation-layout
+// instantiation of a grouped kernel: A, SFA and D are one group of `act_rows` rows in
+// which expert g's rows start at row blk0[g] * 128, while B / SFB / grouped_layout keep
+// the group index (see SM120BlockScaledKernel). shape_m stays the masked layout's
+// row capacity m_cap, which only the grid bound below reads (the cascade above the
+// launcher reads it as its tile hint), so a compact launch has the grid of the masked
+// launch it replaces.
 template <int TileM, int TileN, int NumStages, int MinBlocksPerSm = 1, int SchedGroup = 16,
     bool SeparateSmemD = false, bool GroupedLayoutSmem = false, bool FusedSwiGLU = false,
-    bool ScatterCombine = false, bool ScatterInStoreWarp = false>
+    bool ScatterCombine = false, bool ScatterInStoreWarp = false, bool CompactActs = false>
 void launch_sm120_mxfp8_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t stride_a, __nv_fp8_e4m3* mat_b,
     int64_t ld_b, int64_t stride_b, __nv_bfloat16* mat_d, int64_t ld_d, int64_t stride_d, int32_t* scales_a,
     int64_t /*stride_scales_a*/, int32_t* scales_b, int64_t /*stride_scales_b*/, uint32_t num_problems,
     uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, cudaStream_t stream, int num_device_sms = kNumDeviceSMs,
     int32_t* grouped_layout = nullptr, __nv_fp8_e4m3* out_fp8 = nullptr, int32_t* out_sf = nullptr,
     __nv_bfloat16* out_tokens = nullptr, int32_t const* row_map = nullptr, float const* weight_of_slot = nullptr,
-    uint32_t max_active_groups = 0)
+    uint32_t max_active_groups = 0, int32_t const* blk0 = nullptr, uint32_t act_rows = 0)
 {
     if (num_device_sms < 0)
         num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
@@ -50,8 +57,8 @@ void launch_sm120_mxfp8_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t 
     using ElementOutput = cute::bfloat16_t;
     using ElementBlockScale = int32_t;
     using KT = sm120_blockscaled_gemm::SM120MxFP8BlockScaledBuilder<TileM, TileN, NumStages, MinBlocksPerSm, SchedGroup, SeparateSmemD, GroupedLayoutSmem>;
-    using GemmKernel
-        = sm120_blockscaled_gemm::SM120BlockScaledKernel<KT, FusedSwiGLU, ScatterCombine, ScatterInStoreWarp>;
+    using GemmKernel = sm120_blockscaled_gemm::SM120BlockScaledKernel<KT, FusedSwiGLU, ScatterCombine,
+        ScatterInStoreWarp, CompactActs>;
     using Params = typename GemmKernel::Params;
     using Arguments = typename GemmKernel::Arguments;
     using ProblemShape = typename GemmKernel::ProblemShape;
@@ -65,7 +72,10 @@ void launch_sm120_mxfp8_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t 
 
     typename KT::StrideA dA = make_stride(ld_a, Int<1>{}, stride_a);
     typename KT::StrideB dB = make_stride(ld_b, Int<1>{}, stride_b);
-    typename KT::StrideSFA dSFA = KT::deduce_sfa_layout(problem_shape).stride();
+    // SFA follows the activation tensor: the problem shape, or with the compact layout
+    // one group of act_rows rows.
+    typename KT::StrideSFA dSFA
+        = KT::deduce_sfa_layout(GemmKernel::act_problem_shape(problem_shape, static_cast<int>(act_rows))).stride();
     typename KT::StrideSFB dSFB = KT::deduce_sfb_layout(problem_shape).stride();
     typename KT::StrideD dD = make_stride(ld_d, Int<1>{}, stride_d);
 
@@ -81,6 +91,13 @@ void launch_sm120_mxfp8_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t 
     Arguments args{ptr_A, dA, ptr_B, dB, ptr_SFA, dSFA, ptr_SFB, dSFB, ptr_D, dD, grouped_layout, out_fp8, out_sf,
         static_cast<int>(shape_m), static_cast<int>(shape_n) / 2, out_tokens, row_map, weight_of_slot, order.stride,
         order.block};
+    if constexpr (CompactActs)
+    {
+        // The fused epilogues address the one-group view: a slab of act_rows rows, group 0.
+        args.m_cap = static_cast<int>(act_rows);
+        args.blk0 = blk0;
+        args.act_rows = static_cast<int>(act_rows);
+    }
 
     // E9 (2026-05-10): cache Params (which holds 5 CUtensorMap descriptors) to
     // skip the 5x cuTensorMapEncodeTiled calls inside `to_underlying_arguments`.
@@ -96,8 +113,10 @@ void launch_sm120_mxfp8_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t 
     //
     // The cache is per-instantiation and thread-local; size capped at 64
     // entries (~45 KB) so a workload with many unique shapes doesn't blow up.
+    // dims[4] is the compact layout's act_rows (0 otherwise): it sizes the A / SFA / D
+    // descriptors, so two compact calls that differ only in it must not share Params.
     struct CacheKey {
-        void* p[5]; int dims[4]; int64_t ld[3]; int64_t st[3];
+        void* p[5]; int dims[5]; int64_t ld[3]; int64_t st[3];
         bool operator==(CacheKey const& o) const { return std::memcmp(this, &o, sizeof(o)) == 0; }
     };
     struct CacheHash {
@@ -113,6 +132,7 @@ void launch_sm120_mxfp8_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t 
     std::memset(&key, 0, sizeof(key));
     key.p[0] = ptr_A; key.p[1] = ptr_B; key.p[2] = ptr_SFA; key.p[3] = ptr_SFB; key.p[4] = ptr_D;
     key.dims[0] = (int) shape_m; key.dims[1] = (int) shape_n; key.dims[2] = (int) shape_k; key.dims[3] = (int) num_problems;
+    key.dims[4] = CompactActs ? (int) act_rows : 0;
     key.ld[0] = ld_a; key.ld[1] = ld_b; key.ld[2] = ld_d;
     key.st[0] = stride_a; key.st[1] = stride_b; key.st[2] = stride_d;
 
@@ -133,6 +153,11 @@ void launch_sm120_mxfp8_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t 
     // Params only carries the raw pointer — patch it after every cache
     // lookup so a cached Params never replays a stale grouped_layout.
     kernel_params.grouped_layout = grouped_layout;
+    if constexpr (CompactActs)
+    {
+        // Same reason: blk0 is a per-call routing output.
+        kernel_params.blk0 = blk0;
+    }
     // Not part of the cache key (it is a process-wide setting), but a cached
     // Params must not carry another launch's order.
     kernel_params.group_perm = order.stride;
@@ -980,13 +1005,21 @@ inline void gemm_dispatch_sm120_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b
 // receives from its caller. It bounds the decode route's tile count, which
 // `expected_m` cannot (at G = 128, top-8, expected_m is 1 for every M up to
 // 16). 0 means "not supplied" and keeps the m_cap-only decode gate.
-template <bool FusedSwiGLU = false, bool ScatterCombine = false>
+//
+// CompactActs (0.2.1, charter D1) runs the same cascade on the compact activation
+// layout: A [act_rows, K] fp8, SFA the one-group K-major words [1, K/128, act_rows],
+// D [act_rows, N] (or the fused epilogues' one-group FP8 rows and scale words), with
+// expert g's rows starting at row blk0[g] * 128. Every tile pick below reads only
+// (m_cap, N, K, expected_m, max_active_groups), which the caller passes exactly as
+// for the masked layout, so a compact call runs the instance the masked call of the
+// same shape runs -- forced instances included.
+template <bool FusedSwiGLU = false, bool ScatterCombine = false, bool CompactActs = false>
 inline void gemm_dispatch_sm120_mxfp8_grouped(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bfloat16* mat_d,
     int32_t* scales_a, int32_t* scales_b, int32_t* grouped_layout, uint32_t num_groups, uint32_t m_cap,
     uint32_t shape_n, uint32_t shape_k, uint32_t expected_m, cudaStream_t stream,
     int num_device_sms = kNumDeviceSMs, __nv_fp8_e4m3* out_fp8 = nullptr, int32_t* out_sf = nullptr,
     __nv_bfloat16* out_tokens = nullptr, int32_t const* row_map = nullptr, float const* weight_of_slot = nullptr,
-    uint32_t max_active_groups = 0)
+    uint32_t max_active_groups = 0, int32_t const* blk0 = nullptr, uint32_t act_rows = 0)
 {
     if (num_device_sms < 0)
         num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
@@ -994,9 +1027,13 @@ inline void gemm_dispatch_sm120_mxfp8_grouped(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m
     int64_t const ld_a = shape_k;
     int64_t const ld_b = shape_k;
     int64_t const ld_d = shape_n;
-    int64_t const stride_a = static_cast<int64_t>(m_cap) * shape_k;
+    // The activation tensors' batch stride: one group of act_rows rows (compact) or
+    // m_cap rows per group (masked). The compact descriptors have a batch extent of 1,
+    // so their stride is never stepped.
+    int64_t const act_group_rows = CompactActs ? static_cast<int64_t>(act_rows) : static_cast<int64_t>(m_cap);
+    int64_t const stride_a = act_group_rows * shape_k;
     int64_t const stride_b = static_cast<int64_t>(shape_n) * shape_k;
-    int64_t const stride_d = static_cast<int64_t>(m_cap) * shape_n;
+    int64_t const stride_d = act_group_rows * shape_n;
 
     // Where the fused combine's scatter runs. The default hands it to the store
     // warp and the otherwise-idle fourth TMA warp, so the weighted atomics overlap
@@ -1017,15 +1054,15 @@ inline void gemm_dispatch_sm120_mxfp8_grouped(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m
         if constexpr (ScatterCombine)                                                                                  \
         if (scatter_in_store_warp)                                                                                     \
         {                                                                                                              \
-            launch_sm120_mxfp8_gemm_kernel<TM, TN, ST, 1, 16, true, true, FusedSwiGLU, ScatterCombine, true>(           \
+            launch_sm120_mxfp8_gemm_kernel<TM, TN, ST, 1, 16, true, true, FusedSwiGLU, ScatterCombine, true, CompactActs>(           \
                 mat_a, ld_a, stride_a, mat_b, ld_b, stride_b, mat_d, ld_d, stride_d, scales_a, 0, scales_b, 0,         \
                 num_groups, m_cap, shape_n, shape_k, stream, num_device_sms, grouped_layout, out_fp8, out_sf,          \
-                out_tokens, row_map, weight_of_slot, max_active_groups);                                               \
+                out_tokens, row_map, weight_of_slot, max_active_groups, blk0, act_rows);                                               \
             return;                                                                                                    \
         }                                                                                                              \
-        launch_sm120_mxfp8_gemm_kernel<TM, TN, ST, 1, 16, true, true, FusedSwiGLU, ScatterCombine>(mat_a, ld_a, stride_a, mat_b,    \
+        launch_sm120_mxfp8_gemm_kernel<TM, TN, ST, 1, 16, true, true, FusedSwiGLU, ScatterCombine, false, CompactActs>(mat_a, ld_a, stride_a, mat_b,    \
             ld_b, stride_b, mat_d, ld_d, stride_d, scales_a, 0, scales_b, 0, num_groups, m_cap, shape_n, shape_k,      \
-            stream, num_device_sms, grouped_layout, out_fp8, out_sf, out_tokens, row_map, weight_of_slot, max_active_groups); \
+            stream, num_device_sms, grouped_layout, out_fp8, out_sf, out_tokens, row_map, weight_of_slot, max_active_groups, blk0, act_rows); \
         return;                                                                                                        \
     } while (0)
 
@@ -1042,42 +1079,42 @@ inline void gemm_dispatch_sm120_mxfp8_grouped(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m
         {
             if (forced.tm == 16 && forced.tn == 64 && forced.st == 4)
             {
-                launch_sm120_mxfp8_gemm_kernel<16, 64, 4, 2, 16, true, true, FusedSwiGLU, ScatterCombine>(mat_a, ld_a, stride_a,
+                launch_sm120_mxfp8_gemm_kernel<16, 64, 4, 2, 16, true, true, FusedSwiGLU, ScatterCombine, false, CompactActs>(mat_a, ld_a, stride_a,
                     mat_b, ld_b, stride_b, mat_d, ld_d, stride_d, scales_a, 0, scales_b, 0, num_groups, m_cap,
                     shape_n, shape_k, stream, num_device_sms, grouped_layout, out_fp8, out_sf, out_tokens,
-                    row_map, weight_of_slot, max_active_groups);
+                    row_map, weight_of_slot, max_active_groups, blk0, act_rows);
                 return;
             }
             if (forced.tm == 16 && forced.tn == 64 && forced.st == 2)
             {
-                launch_sm120_mxfp8_gemm_kernel<16, 64, 2, 2, 16, true, true, FusedSwiGLU, ScatterCombine>(mat_a, ld_a, stride_a,
+                launch_sm120_mxfp8_gemm_kernel<16, 64, 2, 2, 16, true, true, FusedSwiGLU, ScatterCombine, false, CompactActs>(mat_a, ld_a, stride_a,
                     mat_b, ld_b, stride_b, mat_d, ld_d, stride_d, scales_a, 0, scales_b, 0, num_groups, m_cap,
                     shape_n, shape_k, stream, num_device_sms, grouped_layout, out_fp8, out_sf, out_tokens,
-                    row_map, weight_of_slot, max_active_groups);
+                    row_map, weight_of_slot, max_active_groups, blk0, act_rows);
                 return;
             }
             if (forced.tm == 16 && forced.tn == 128 && forced.st == 2)
             {
-                launch_sm120_mxfp8_gemm_kernel<16, 128, 2, 2, 16, true, true, FusedSwiGLU, ScatterCombine>(mat_a, ld_a, stride_a,
+                launch_sm120_mxfp8_gemm_kernel<16, 128, 2, 2, 16, true, true, FusedSwiGLU, ScatterCombine, false, CompactActs>(mat_a, ld_a, stride_a,
                     mat_b, ld_b, stride_b, mat_d, ld_d, stride_d, scales_a, 0, scales_b, 0, num_groups, m_cap,
                     shape_n, shape_k, stream, num_device_sms, grouped_layout, out_fp8, out_sf, out_tokens,
-                    row_map, weight_of_slot, max_active_groups);
+                    row_map, weight_of_slot, max_active_groups, blk0, act_rows);
                 return;
             }
             if (forced.tm == 32 && forced.tn == 64 && forced.st == 2)
             {
-                launch_sm120_mxfp8_gemm_kernel<32, 64, 2, 2, 16, true, true, FusedSwiGLU, ScatterCombine>(mat_a, ld_a, stride_a,
+                launch_sm120_mxfp8_gemm_kernel<32, 64, 2, 2, 16, true, true, FusedSwiGLU, ScatterCombine, false, CompactActs>(mat_a, ld_a, stride_a,
                     mat_b, ld_b, stride_b, mat_d, ld_d, stride_d, scales_a, 0, scales_b, 0, num_groups, m_cap,
                     shape_n, shape_k, stream, num_device_sms, grouped_layout, out_fp8, out_sf, out_tokens,
-                    row_map, weight_of_slot, max_active_groups);
+                    row_map, weight_of_slot, max_active_groups, blk0, act_rows);
                 return;
             }
             if (forced.tm == 64 && forced.tn == 64 && forced.st == 2)
             {
-                launch_sm120_mxfp8_gemm_kernel<64, 64, 2, 2, 16, true, true, FusedSwiGLU, ScatterCombine>(mat_a, ld_a, stride_a,
+                launch_sm120_mxfp8_gemm_kernel<64, 64, 2, 2, 16, true, true, FusedSwiGLU, ScatterCombine, false, CompactActs>(mat_a, ld_a, stride_a,
                     mat_b, ld_b, stride_b, mat_d, ld_d, stride_d, scales_a, 0, scales_b, 0, num_groups, m_cap,
                     shape_n, shape_k, stream, num_device_sms, grouped_layout, out_fp8, out_sf, out_tokens,
-                    row_map, weight_of_slot, max_active_groups);
+                    row_map, weight_of_slot, max_active_groups, blk0, act_rows);
                 return;
             }
             std::fprintf(stderr,
@@ -1107,9 +1144,9 @@ inline void gemm_dispatch_sm120_mxfp8_grouped(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m
 #define DISPATCH_GROUPED_TILE_MX_MB2(TM, TN, ST)                                                                       \
     do                                                                                                                 \
     {                                                                                                                  \
-        launch_sm120_mxfp8_gemm_kernel<TM, TN, ST, 2, 16, true, true, FusedSwiGLU, ScatterCombine>(mat_a, ld_a, stride_a, mat_b,    \
+        launch_sm120_mxfp8_gemm_kernel<TM, TN, ST, 2, 16, true, true, FusedSwiGLU, ScatterCombine, false, CompactActs>(mat_a, ld_a, stride_a, mat_b,    \
             ld_b, stride_b, mat_d, ld_d, stride_d, scales_a, 0, scales_b, 0, num_groups, m_cap, shape_n, shape_k,      \
-            stream, num_device_sms, grouped_layout, out_fp8, out_sf, out_tokens, row_map, weight_of_slot, max_active_groups); \
+            stream, num_device_sms, grouped_layout, out_fp8, out_sf, out_tokens, row_map, weight_of_slot, max_active_groups, blk0, act_rows); \
         return;                                                                                                        \
     } while (0)
 
@@ -1174,9 +1211,9 @@ inline void gemm_dispatch_sm120_mxfp8_grouped(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m
         // em <= 32 decode/mid band: v3 partial-span route, then v2 rules.
         if (partial_span)
         {
-            launch_sm120_mxfp8_gemm_kernel<16, 128, 2, 2, 16, true, true, FusedSwiGLU, ScatterCombine>(mat_a, ld_a, stride_a, mat_b,
+            launch_sm120_mxfp8_gemm_kernel<16, 128, 2, 2, 16, true, true, FusedSwiGLU, ScatterCombine, false, CompactActs>(mat_a, ld_a, stride_a, mat_b,
                 ld_b, stride_b, mat_d, ld_d, stride_d, scales_a, 0, scales_b, 0, num_groups, m_cap, shape_n, shape_k,
-                stream, num_device_sms, grouped_layout, out_fp8, out_sf, out_tokens, row_map, weight_of_slot, max_active_groups);
+                stream, num_device_sms, grouped_layout, out_fp8, out_sf, out_tokens, row_map, weight_of_slot, max_active_groups, blk0, act_rows);
             return;
         }
         if (em >= 16 && shape_k <= 1024)

@@ -1,7 +1,8 @@
 # `fish_scales_ops.compat` — the explicit ops and the MoE per-step pieces
 
 `fso.compat` keeps, under the names existing callers use, the eleven explicit
-dense ops and the thirty-four MoE per-step pieces. New code uses the two stable
+dense ops and the thirty-nine MoE per-step pieces (thirty-four since 0.2.0, five
+since 0.2.1 for the compact activation layout). New code uses the two stable
 entries instead. Each runs the architecture dispatch inside one torch custom op
 and never hands the caller a scale layout: `fso.dense` for a dense linear
 ([`dense.md`](dense.md)) and `fso.moe` for an MoE layer ([`moe.md`](moe.md)).
@@ -19,9 +20,10 @@ What this namespace promises:
 Before fish-scales-ops 0.2.0 these names were exported from `fso.gemm`.
 `fso.gemm.<name>` still resolves to the same object as `fso.compat.<name>` and
 raises one `DeprecationWarning` per name per process, naming the new home;
-fish-scales-ops 0.3.0 removes `fso.gemm`. The implementation modules stay where
-they were (`python/fish_scales_ops/gemm/{fp8,mxfp8,bf16}.py`), and importing them
-by their module path raises no warning.
+fish-scales-ops 0.3.0 removes `fso.gemm`. The five names added in 0.2.1 never
+lived there and are reachable through `fso.compat` only. The implementation modules
+stay where they were (`python/fish_scales_ops/gemm/{fp8,mxfp8,bf16}.py`), and
+importing them by their module path raises no warning.
 
 This file also holds the reference sections that every GEMM and MoE op shares,
 `fso.dense` and `fso.moe` included: the constraints, the generated `torch.ops`
@@ -695,6 +697,42 @@ fused FC1. The cap exists because a wide BF16 direct store stops being cheap
 once the rows pile up; the fused store writes about a quarter of those bytes,
 so the wave arithmetic is allowed to decide at every `expected_m`.
 
+**sm_120/121 — compact activation layout (MXFP8, 0.2.1; the sm_100/103 half is
+pending and raises `NotImplementedError`).** The masked slab gives every expert
+`m_cap` rows of every activation-side tensor, so it grows with
+`num_experts * M`. The compact layout packs the routed rows into **one group of
+`R = 128 * B` rows made of 128-row blocks**: expert `g` owns the blocks from
+`blk0[g]` on (`blk0` int32 `[G + 1]`, the exclusive prefix of
+`ceil(masked_m[g] / 128)`), so its rows are `[blk0[g] * 128, blk0[g] * 128 +
+masked_m[g])`. A compact row index is exactly the slot of a masked slab with one
+group of `m_cap = R` rows, so the gather-quantize, the SwiGLU requantize and
+`moe_combine` run on it unchanged with `num_groups = 1`, `m_cap = R` and a
+`slot_of_flat` that holds compact rows (`moe_combine` reads the down output as
+`dn.view(1, R, HIDDEN)`). Only the GEMMs see two index spaces: the weights by
+expert, the activations by compact row. Every op of this layout writes into
+buffers the caller allocated, and none writes a row no routed pair owns (every
+store of the GEMMs is bounded by `masked_m[g]`). The GEMMs take the masked
+layout's host-static hints unchanged (`m_cap = align(M, 4)`, `expected_m`,
+`max_active_groups`), so a compact call runs the kernel instance the masked call
+of the same shape runs and its live rows are bit-identical to the masked call's.
+A caller sizes `B` from the host-static bound
+`B_max = max(1, (M * topk + 127 * min(G, M * topk)) // 128)` plus one block of
+slack (`R = 128 * (B_max + 1)`).
+
+| step | function | in → out (sm_120/121 shapes) |
+|---|---|---|
+| gather + quantize | `quantize_1x32_grouped_gather_out_fp8(x, slot_of_flat, topk, num_groups, m_cap, x_q, packed)` | bf16 `[M, K]` → the caller's fp8 `x_q` (`num_groups * m_cap * K` elements) and int32 `packed` (`[num_groups, K/128, m_cap]`; sm_100/103 the atom slab); the compact layout passes `num_groups=1, m_cap=R`. Writes exactly the bytes `quantize_1x32_grouped_gather_fp8` returns, at the routed rows only |
+| gate_up | `linear_mxfp8_grouped_compact(a_fp8, w_fp8, sa, sw, masked_m, blk0, m_cap, expected_m, max_active_groups, slot_to_expert=None, problem_shapes=None, ptr_arrays=None, *, d)` | fp8 `[R, K]` + int32 `[1, K/128, R]` × the FC1 weights → the caller's bf16 `d` `[R, 2*INTER]` at the live rows; the three optional tensors are the sm_100/103 routes' and are refused on sm_120/121 |
+| SwiGLU + quantize | `silu_chunk_mul_quantize_1x32_grouped_out_fp8(gu, slot_of_flat, dq, sd, pairwise=False)` | bf16 `[R, 2*INTER]` (or a masked `[G, m_cap, 2*INTER]`) → the caller's fp8 `dq` `[R, INTER]` and int32 `sd` `[1, INTER/128, R]`; writes exactly the bytes `silu_chunk_mul_quantize_1x32_grouped_fp8` returns |
+| gate_up + SwiGLU + quantize | `linear_mxfp8_grouped_compact_swiglu(a_fp8, w13_fp8, sa, sw13, masked_m, blk0, m_cap, expected_m, max_active_groups, slot_to_expert=None, problem_shapes=None, ptr_arrays=None, *, dq, sd)` | → the caller's fp8 `dq` `[R, INTER]` and int32 `sd` `[1, INTER/128, R]`; INTERLEAVED FC1 weight rows, as for `linear_mxfp8_grouped_masked_swiglu` |
+| down | `linear_mxfp8_grouped_compact(...)` with `dq, sd` and the FC2 weights | → the caller's bf16 `d` `[R, HIDDEN]`, which `moe_combine(d.view(1, R, HIDDEN), slot_of_flat, topk_w, ...)` reads |
+| down + combine, fused (sm_120/121) | `linear_mxfp8_grouped_compact_combine(a_fp8, w2_fp8, sa, sw2, masked_m, blk0, row_map, weight_of_slot, m_cap, expected_m, max_active_groups, out)` | adds each live row, scaled by `weight_of_slot[row]`, into `out[row_map[row]]` (both indexed by compact row, at least `R - 128` entries); `out` is pre-filled, and the result is not bit-reproducible run to run, as for `linear_mxfp8_grouped_masked_combine` |
+
+The torch ops behind these wrappers (`quantize_1x32_grouped_gather_out`,
+`silu_chunk_mul_quantize_1x32_grouped_out`, `linear_mxfp8_grouped_compact`,
+`linear_mxfp8_grouped_compact_swiglu`, `linear_mxfp8_grouped_compact_combine`)
+return nothing; their schemas are listed under *Lower-level interface* below.
+
 **sm_90 — expert-sorted contiguous layout (block-FP8).** The `M * topk` routed
 pairs are sorted by expert into one compact list, each expert's run padded to
 the GEMM block size, so the scheduler enumerates active padded blocks rather
@@ -851,6 +889,11 @@ moe_build_routing(Tensor topk_ids, int num_groups, int m_cap, bool with_slots=Fa
 moe_build_routing_compact(Tensor topk_ids, int num_groups, int num_blocks, bool with_slots=False, bool with_row_map=False, Tensor? topk_w=None, int[] problem_shapes_nk=[], Tensor[]? ptr_bases=None, int[] ptr_strides=[]) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)
 linear_mxfp8_grouped_masked_combine(Tensor a_fp8, Tensor w2_fp8, Tensor sa_int32, Tensor sw2_int32, Tensor masked_m, Tensor row_map, Tensor weight_of_slot, Tensor(a!) out, int expected_m, int max_active_groups=0) -> Tensor(a!)
 moe_combine(Tensor dn, Tensor slot_of_flat, Tensor topk_w, Tensor? bias=None, Tensor? bias_scale=None, Tensor? out=None) -> Tensor
+quantize_1x32_grouped_gather_out(Tensor x, Tensor slot_of_flat, int topk, int num_groups, int m_cap, bool use_ue8m0, Tensor(a!) x_q, Tensor(b!) packed) -> ()
+linear_mxfp8_grouped_compact(Tensor a, Tensor b, Tensor sa, Tensor sb, Tensor masked_m, Tensor blk0, int m_cap, int expected_m, int max_active_groups, Tensor? slot_to_expert, Tensor? problem_shapes, Tensor? ptr_arrays, Tensor(a!) d) -> ()
+linear_mxfp8_grouped_compact_swiglu(Tensor a, Tensor b, Tensor sa, Tensor sb, Tensor masked_m, Tensor blk0, int m_cap, int expected_m, int max_active_groups, Tensor? slot_to_expert, Tensor? problem_shapes, Tensor? ptr_arrays, Tensor(a!) dq, Tensor(b!) sd) -> ()
+linear_mxfp8_grouped_compact_combine(Tensor a, Tensor b, Tensor sa, Tensor sb, Tensor masked_m, Tensor blk0, Tensor row_map, Tensor weight_of_slot, int m_cap, int expected_m, int max_active_groups, Tensor(a!) out) -> ()
+silu_chunk_mul_quantize_1x32_grouped_out(Tensor gu, Tensor slot_of_flat, bool use_ue8m0, bool pairwise, Tensor(a!) dq, Tensor(b!) sd) -> ()
 moe_topk_from_logits(Tensor logits, int topk, bool renormalize=True, bool with_shared_gate=False, Tensor? num_token_non_padded=None, Tensor? expert_map=None) -> (Tensor, Tensor, Tensor)
 moe_build_sorted(Tensor topk_ids, int num_groups, int block_m) -> (Tensor, Tensor, Tensor)
 moe_combine_sorted(Tensor dn, Tensor flat_to_sorted, Tensor topk_w) -> Tensor

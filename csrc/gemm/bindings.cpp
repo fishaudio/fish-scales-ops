@@ -102,6 +102,23 @@ bool mxfp8_grouped_problem_shapes_consumed(
 at::Tensor linear_mxfp8_grouped_masked_combine(at::Tensor a_fp8, at::Tensor w2_fp8, at::Tensor sa_int32,
     at::Tensor sw2_int32, at::Tensor masked_m, at::Tensor row_map, at::Tensor weight_of_slot, at::Tensor out,
     int64_t expected_m, int64_t max_active_groups);
+// The compact activation layout (0.2.1, charter D1/D4; ops/mxfp8_compact.cu): out-style ops, every buffer
+// allocated by the caller. The GEMMs serve sm_120/121 here (sm_100/103 pending); the two glue ops are arch-generic.
+void quantize_1x32_grouped_gather_out(at::Tensor x, at::Tensor slot_of_flat, int64_t topk, int64_t num_groups,
+    int64_t m_cap, bool use_ue8m0, at::Tensor x_q, at::Tensor packed);
+void silu_chunk_mul_quantize_1x32_grouped_out(
+    at::Tensor gu, at::Tensor slot_of_flat, bool use_ue8m0, bool pairwise, at::Tensor dq, at::Tensor sd);
+void linear_mxfp8_grouped_compact(at::Tensor a, at::Tensor b, at::Tensor sa, at::Tensor sb, at::Tensor masked_m,
+    at::Tensor blk0, int64_t m_cap, int64_t expected_m, int64_t max_active_groups,
+    std::optional<at::Tensor> slot_to_expert, std::optional<at::Tensor> problem_shapes,
+    std::optional<at::Tensor> ptr_arrays, at::Tensor d);
+void linear_mxfp8_grouped_compact_swiglu(at::Tensor a, at::Tensor b, at::Tensor sa, at::Tensor sb,
+    at::Tensor masked_m, at::Tensor blk0, int64_t m_cap, int64_t expected_m, int64_t max_active_groups,
+    std::optional<at::Tensor> slot_to_expert, std::optional<at::Tensor> problem_shapes,
+    std::optional<at::Tensor> ptr_arrays, at::Tensor dq, at::Tensor sd);
+void linear_mxfp8_grouped_compact_combine(at::Tensor a, at::Tensor b, at::Tensor sa, at::Tensor sb,
+    at::Tensor masked_m, at::Tensor blk0, at::Tensor row_map, at::Tensor weight_of_slot, int64_t m_cap,
+    int64_t expected_m, int64_t max_active_groups, at::Tensor out);
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_build_routing(
     at::Tensor topk_ids, int64_t num_groups, int64_t m_cap, bool with_slots,
     std::vector<int64_t> problem_shapes_nk, std::optional<at::Tensor> topk_w);
@@ -200,6 +217,20 @@ TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
                                               "int max_active_groups=0) -> Tensor(a!)");
     m.def("moe_combine(Tensor dn, Tensor slot_of_flat, Tensor topk_w, Tensor? bias=None, "
                        "Tensor? bias_scale=None, Tensor? out=None) -> Tensor");
+    // The compact activation layout (0.2.1): the schemas of charter decision D4, verbatim.
+    m.def("quantize_1x32_grouped_gather_out(Tensor x, Tensor slot_of_flat, int topk, int num_groups, int m_cap, "
+          "bool use_ue8m0, Tensor(a!) x_q, Tensor(b!) packed) -> ()");
+    m.def("linear_mxfp8_grouped_compact(Tensor a, Tensor b, Tensor sa, Tensor sb, Tensor masked_m, Tensor blk0, "
+          "int m_cap, int expected_m, int max_active_groups, Tensor? slot_to_expert, Tensor? problem_shapes, "
+          "Tensor? ptr_arrays, Tensor(a!) d) -> ()");
+    m.def("linear_mxfp8_grouped_compact_swiglu(Tensor a, Tensor b, Tensor sa, Tensor sb, Tensor masked_m, "
+          "Tensor blk0, int m_cap, int expected_m, int max_active_groups, Tensor? slot_to_expert, "
+          "Tensor? problem_shapes, Tensor? ptr_arrays, Tensor(a!) dq, Tensor(b!) sd) -> ()");
+    m.def("linear_mxfp8_grouped_compact_combine(Tensor a, Tensor b, Tensor sa, Tensor sb, Tensor masked_m, "
+          "Tensor blk0, Tensor row_map, Tensor weight_of_slot, int m_cap, int expected_m, int max_active_groups, "
+          "Tensor(a!) out) -> ()");
+    m.def("silu_chunk_mul_quantize_1x32_grouped_out(Tensor gu, Tensor slot_of_flat, bool use_ue8m0, "
+          "bool pairwise, Tensor(a!) dq, Tensor(b!) sd) -> ()");
     m.def("moe_topk_from_logits(Tensor logits, int topk, bool renormalize=True, "
                                 "bool with_shared_gate=False, Tensor? num_token_non_padded=None, "
                                 "Tensor? expert_map=None) -> (Tensor, Tensor, Tensor)");
@@ -242,6 +273,11 @@ TORCH_LIBRARY_IMPL(fish_scales_ops, CUDA, m)
     m.impl("moe_build_routing_compact", &blockscale_gemm::moe_build_routing_compact);
     m.impl("linear_mxfp8_grouped_masked_combine", &blockscale_gemm::linear_mxfp8_grouped_masked_combine);
     m.impl("moe_combine", &blockscale_gemm::moe_combine);
+    m.impl("quantize_1x32_grouped_gather_out", &blockscale_gemm::quantize_1x32_grouped_gather_out);
+    m.impl("linear_mxfp8_grouped_compact", &blockscale_gemm::linear_mxfp8_grouped_compact);
+    m.impl("linear_mxfp8_grouped_compact_swiglu", &blockscale_gemm::linear_mxfp8_grouped_compact_swiglu);
+    m.impl("linear_mxfp8_grouped_compact_combine", &blockscale_gemm::linear_mxfp8_grouped_compact_combine);
+    m.impl("silu_chunk_mul_quantize_1x32_grouped_out", &blockscale_gemm::silu_chunk_mul_quantize_1x32_grouped_out);
     m.impl("moe_topk_from_logits", &blockscale_gemm::moe_topk_from_logits);
     m.impl("moe_build_sorted", &blockscale_gemm::moe_build_sorted);
     m.impl("moe_combine_sorted", &blockscale_gemm::moe_combine_sorted);
