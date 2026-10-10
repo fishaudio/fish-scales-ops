@@ -332,7 +332,15 @@ def _ue8m0_scale(scale: torch.Tensor, n: int, k: int, device, major: int, ctx: s
         raise ValueError(f"{ctx}: scale is on {scale.device} and the weight on {device}; both must be "
                          f"on the serving device")
     packed = _ue8m0_scale_handle(scale.detach().unsqueeze(0))[0]
-    return packed.t() if major == 12 else packed
+    if major != 12:
+        return packed
+    # sm_120/sm_121: allocate exactly the [N, K/128] tensor with strides (1, N) that
+    # quantize_1x32_fp8 allocates. Taking the transpose of the packed words instead gives
+    # the same bytes, but at K/128 == 1 torch treats the stride of the size-1 dimension as
+    # free and the result would not carry the quantizer's strides.
+    out = torch.empty_strided((n, k // 128), (1, n), dtype=torch.int32, device=packed.device)
+    out.copy_(packed.t())
+    return out
 
 
 def _dequantize_block_fp8(wq: torch.Tensor, scale: torch.Tensor, r0: int, r1: int) -> torch.Tensor:
