@@ -1512,6 +1512,12 @@ constexpr int kCompactMaxCluster = 8;    // portable cluster size: no cudaFuncSe
 // The sm_100/103 compact slot route's work-stealing counter (tile draws, finished CTAs), emitted zeroed next to
 // the slot list (run fso_0.2.1_20261010/S10b-1; grouped_slot_dispatch.cuh / slot_work_stealing.cuh).
 constexpr int kCompactSlotSchedWords = 2;
+// The sm_100/103 compact slot route's packed list of live 64-row token tiles (run fso_0.2.1_20261010/S10b-3b):
+// entry = q | e << 14 | (r - 1) << 24 with q = 2 * block + half, e the expert, r in 1..64 its rows in the tile
+// (`pack_token_tile` in grouped_slot_dispatch.cuh, which this translation unit cannot include, and the
+// generated kernel's `fso_slot_live_compact` decode the same packing). A block index must stay below 2^13.
+constexpr int kCompactTileRows = 64;
+constexpr int kCompactTileMaxBlocks = 1 << 13;
 
 struct CompactRoutingArgs
 {
@@ -1532,6 +1538,9 @@ struct CompactRoutingArgs
     int num_pairs;
     int topk;
     int num_groups;
+    // Appended last, so the kernels that do not write it keep the parameter layout they had.
+    int tiles_cap;           // with slot_tiles: its entry count (the count word sits at slot_tiles[tiles_cap])
+    int32_t* slot_tiles;     // [tiles_cap + 1] or nullptr: the live 64-row token tiles, -1, then their count
 };
 
 // The decode kernel's arguments: everything but the per-call pointer arrays, whose bases and steps make
@@ -1681,6 +1690,53 @@ __device__ __forceinline__ void compact_block_scan(
     active_total = ta;
 }
 
+// Block-wide exclusive prefix of one int per thread (same two-level shuffle scan as compact_block_scan), for the
+// token-tile counts of the slot route's tile list. Block-uniform: every thread must call it.
+__device__ __forceinline__ void compact_block_scan1(int v, int* s_wsum, int& excl, int& total)
+{
+    int const lane = static_cast<int>(threadIdx.x) & 31;
+    int const warp = static_cast<int>(threadIdx.x) >> 5;
+    int const num_warps = static_cast<int>(blockDim.x) >> 5;
+    int iv = v;
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1)
+    {
+        int const u = __shfl_up_sync(0xffffffffu, iv, off);
+        if (lane >= off)
+            iv += u;
+    }
+    if (lane == 31)
+        s_wsum[warp] = iv;
+    __syncthreads();
+    int const t = lane < num_warps ? s_wsum[lane] : 0;
+    int w = t;
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1)
+    {
+        int const u = __shfl_up_sync(0xffffffffu, w, off);
+        if (lane >= off)
+            w += u;
+    }
+    int const pw = __shfl_sync(0xffffffffu, w - t, warp);
+    total = __shfl_sync(0xffffffffu, w, 31);
+    excl = pw + iv - v;
+}
+
+// Expert g's entries of the slot route's token-tile list: its k-th 64-row token tile (rows 64k .. 64k + 63 of the
+// expert) is half k % 2 of block b0 + k / 2, i.e. q = 2 * b0 + k, holding min(64, cnt - 64k) rows.
+__device__ __forceinline__ void compact_emit_tiles(CompactRoutingArgs const& a, int g, int cnt, int b0, int t0)
+{
+    int const nt = (cnt + kCompactTileRows - 1) / kCompactTileRows;
+    for (int k = 0; k < nt; ++k)
+    {
+        int const t = t0 + k;
+        int const left = cnt - k * kCompactTileRows;
+        int const r = left < kCompactTileRows ? left : kCompactTileRows;
+        if (t < a.tiles_cap)
+            a.slot_tiles[t] = (2 * b0 + k) | (g << 14) | ((r - 1) << 24);
+    }
+}
+
 __device__ __forceinline__ void compact_cluster_arrive()
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
@@ -1807,7 +1863,12 @@ __global__ void __launch_bounds__(1024) moe_routing_compact_small_kernel(Compact
 // the loop for pairs past the registers (more than 8 * blockDim * CTAs of them).
 // Inside an expert the rows go CTA by CTA, and inside a CTA in the order of the
 // shared atomics.
-template <int kRegPairs, bool kCluster>
+//
+// kTiles (with_tiles, run fso_0.2.1_20261010/S10b-3b): also the sm_100/103 compact slot route's packed list of live
+// 64-row token tiles (compact_emit_tiles), from a second prefix over the experts' token-tile counts; every entry
+// past the live tiles is -1 and entry tiles_cap holds the count. Its own instantiation, so the kernels without it
+// are what they were.
+template <int kRegPairs, bool kCluster, bool kTiles>
 __global__ void __launch_bounds__(1024) moe_routing_compact_cta_kernel(CompactRoutingArgs a, bool pdl)
 {
     if (pdl)
@@ -1820,6 +1881,7 @@ __global__ void __launch_bounds__(1024) moe_routing_compact_cta_kernel(CompactRo
     __shared__ int32_t s_base[kCluster ? kMaxGroups : 1]; // cluster: pairs of each expert in lower-ranked CTAs
     __shared__ int32_t s_blk0[kMaxGroups];
     __shared__ int2 s_wsum[32];
+    __shared__ int s_tsum[kTiles ? 32 : 1];
 
     int const tid = static_cast<int>(threadIdx.x);
     int const nthr = static_cast<int>(blockDim.x);
@@ -1913,6 +1975,10 @@ __global__ void __launch_bounds__(1024) moe_routing_compact_cta_kernel(CompactRo
     }
     int b0, a0, blocks_total, active_total;
     compact_block_scan(cnt, s_wsum, b0, a0, blocks_total, active_total);
+    int t0 = 0;
+    int tiles_total = 0;
+    if constexpr (kTiles)
+        compact_block_scan1((cnt + kCompactTileRows - 1) / kCompactTileRows, s_tsum, t0, tiles_total);
     if (tid < G)
     {
         s_blk0[tid] = b0;
@@ -1920,7 +1986,16 @@ __global__ void __launch_bounds__(1024) moe_routing_compact_cta_kernel(CompactRo
         {
             compact_emit_expert(a, tid, cnt, b0);
             compact_emit_slot(a, tid, cnt, a0, active_total);
+            if constexpr (kTiles)
+                compact_emit_tiles(a, tid, cnt, b0, t0);
         }
+    }
+    if constexpr (kTiles)
+    {
+        for (int t = tiles_total + crank * nthr + tid; t < a.tiles_cap; t += ncta * nthr)
+            a.slot_tiles[t] = -1;
+        if (crank == 0 && tid == 0)
+            a.slot_tiles[a.tiles_cap] = tiles_total < a.tiles_cap ? tiles_total : a.tiles_cap;
     }
     if (crank == 0 && tid == 0)
     {
@@ -2446,7 +2521,9 @@ static int compact_round32(int x)
     return (x + 31) / 32 * 32;
 }
 
-static CompactPlan compact_plan(int P, int G, bool want_ptrs)
+// `want_ptrs` / `want_tiles`: a call that asks for pointer arrays or for the token-tile list never takes the decode
+// kernel (neither is in CompactRoutingSmallArgs; no layer plan asks for either at a decode pair count).
+static CompactPlan compact_plan(int P, int G, bool want_ptrs, bool want_tiles)
 {
     static std::string const forced = []
     {
@@ -2475,7 +2552,7 @@ static CompactPlan compact_plan(int P, int G, bool want_ptrs)
     int const small_threads = std::max(32, std::max(compact_round32(G), compact_round32(P)));
     if (!forced.empty())
     {
-        if (forced == "small" && P <= kCompactSmallMaxPairs && !want_ptrs)
+        if (forced == "small" && P <= kCompactSmallMaxPairs && !want_ptrs && !want_tiles)
             return {CompactPath::kSmall, small_threads, 1, 1};
         if (forced == "cta")
             return cta_plan(CompactPath::kCta, 1);
@@ -2487,7 +2564,7 @@ static CompactPlan compact_plan(int P, int G, bool want_ptrs)
         }
         // A forced shape that cannot take this pair count falls through to the default.
     }
-    if (P <= kCompactSmallMaxPairs && !want_ptrs)
+    if (P <= kCompactSmallMaxPairs && !want_ptrs && !want_tiles)
         return {CompactPath::kSmall, small_threads, 1, 1};
     if (P <= kCompactCtaMaxPairs)
         return cta_plan(CompactPath::kCta, 1);
@@ -2524,10 +2601,11 @@ static cudaError_t compact_launch(KernelT kernel, int ctas, int threads, std::si
 }
 
 // See docs/api and the Python wrapper (fish_scales_ops.gemm.mxfp8.moe_build_routing_compact) for the contract.
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+    at::Tensor>
 moe_build_routing_compact(at::Tensor topk_ids, int64_t num_groups, int64_t num_blocks, bool with_slots,
     bool with_row_map, std::optional<at::Tensor> topk_w, std::vector<int64_t> problem_shapes_nk,
-    std::optional<std::vector<at::Tensor>> ptr_bases, std::vector<int64_t> ptr_strides)
+    std::optional<std::vector<at::Tensor>> ptr_bases, std::vector<int64_t> ptr_strides, bool with_tiles)
 {
     TORCH_CHECK(topk_ids.is_cuda() && topk_ids.dtype() == at::kInt, "topk_ids must be CUDA int32");
     TORCH_CHECK(topk_ids.dim() == 2, "topk_ids must be [M, topk]");
@@ -2544,6 +2622,16 @@ moe_build_routing_compact(at::Tensor topk_ids, int64_t num_groups, int64_t num_b
         bound, " for M * topk = ", pairs, " and num_groups = ", num_groups,
         "; pass max(1, (M*topk + 127*min(G, M*topk)) // 128)");
     TORCH_CHECK(num_blocks * kCompactRows <= INT32_MAX, "num_blocks * 128 must fit int32 rows");
+    // The token-tile list: at most sum over the active experts of ceil(cnt / 64) <= (pairs + 63 * active) / 64
+    // live tiles, for ANY ids, so this many entries can never be overrun.
+    int64_t const tiles_cap = std::max<int64_t>(1, (pairs + 63 * std::min<int64_t>(num_groups, pairs)) / kCompactTileRows);
+    if (with_tiles)
+    {
+        TORCH_CHECK(with_slots, "moe_build_routing_compact: with_tiles needs with_slots (the tile list's slot GEMMs "
+            "also take the work-stealing counter `slot_sched`)");
+        TORCH_CHECK(num_blocks <= kCompactTileMaxBlocks, "moe_build_routing_compact: with_tiles packs a 128-row block "
+            "index into 13 bits, so num_blocks must be at most ", kCompactTileMaxBlocks, ", got ", num_blocks);
+    }
     TORCH_CHECK(problem_shapes_nk.size() % 2 == 0,
         "problem_shapes_nk must be a flat list of (N, K) pairs, got ", problem_shapes_nk.size(), " ints");
     int const num_ps = static_cast<int>(problem_shapes_nk.size() / 2);
@@ -2614,6 +2702,9 @@ moe_build_routing_compact(at::Tensor topk_ids, int64_t num_groups, int64_t num_b
     // With the slot list, the slot route's work-stealing counter, zeroed by the kernel: a per-call tensor, so two
     // calls in flight never share one, and the slot GEMMs of this call leave it zero for each other.
     auto slot_sched = at::empty({with_slots ? kCompactSlotSchedWords : 0}, opts);
+    // With the token-tile list: the live 64-row token tiles of the slot route past a row capacity of 64, then -1,
+    // then their count (int32 [tiles_cap + 1]).
+    auto slot_tiles = at::empty({with_tiles ? tiles_cap + 1 : 0}, opts);
 
     args.topk_ids = reinterpret_cast<int32_t const*>(topk_ids.data_ptr());
     args.masked_m = reinterpret_cast<int32_t*>(masked_m.data_ptr());
@@ -2621,6 +2712,8 @@ moe_build_routing_compact(at::Tensor topk_ids, int64_t num_groups, int64_t num_b
     args.slot_of_flat = reinterpret_cast<int32_t*>(slot_of_flat.data_ptr());
     args.slot_to_expert = with_slots ? reinterpret_cast<int32_t*>(slot_to_expert.data_ptr()) : nullptr;
     args.slot_sched = with_slots ? reinterpret_cast<int32_t*>(slot_sched.data_ptr()) : nullptr;
+    args.slot_tiles = with_tiles ? reinterpret_cast<int32_t*>(slot_tiles.data_ptr()) : nullptr;
+    args.tiles_cap = with_tiles ? static_cast<int>(tiles_cap) : 0;
     args.problem_shapes = num_ps > 0 ? reinterpret_cast<int32_t*>(problem_shapes.data_ptr()) : nullptr;
     args.ptr_arrays = want_ptrs ? reinterpret_cast<int64_t*>(ptr_arrays.data_ptr()) : nullptr;
     args.row_map = with_row_map ? reinterpret_cast<int32_t*>(row_map.data_ptr()) : nullptr;
@@ -2631,7 +2724,7 @@ moe_build_routing_compact(at::Tensor topk_ids, int64_t num_groups, int64_t num_b
 
     auto stream = at::cuda::getCurrentCUDAStream();
     bool const pdl = fso_pdl_enabled();
-    CompactPlan const plan = compact_plan(static_cast<int>(pairs), static_cast<int>(G), want_ptrs);
+    CompactPlan const plan = compact_plan(static_cast<int>(pairs), static_cast<int>(G), want_ptrs, with_tiles);
     cudaError_t err = cudaSuccess;
     switch (plan.path)
     {
@@ -2647,9 +2740,18 @@ moe_build_routing_compact(at::Tensor topk_ids, int64_t num_groups, int64_t num_b
     case CompactPath::kCluster:
     {
         bool const cl = plan.path == CompactPath::kCluster;
+#define FSO_COMPACT_CTA_T(K, TL)                                                                                     \
+    err = cl ? compact_launch(moe_routing_compact_cta_kernel<K, true, TL>, plan.ctas, plan.threads, 0, stream, pdl,   \
+                   args)                                                                                            \
+             : compact_launch(moe_routing_compact_cta_kernel<K, false, TL>, 1, plan.threads, 0, stream, pdl, args)
 #define FSO_COMPACT_CTA(K)                                                                                          \
-    err = cl ? compact_launch(moe_routing_compact_cta_kernel<K, true>, plan.ctas, plan.threads, 0, stream, pdl, args) \
-             : compact_launch(moe_routing_compact_cta_kernel<K, false>, 1, plan.threads, 0, stream, pdl, args)
+    do                                                                                                              \
+    {                                                                                                               \
+        if (with_tiles)                                                                                             \
+            FSO_COMPACT_CTA_T(K, true);                                                                             \
+        else                                                                                                        \
+            FSO_COMPACT_CTA_T(K, false);                                                                            \
+    } while (0)
         switch (plan.reg_pairs)
         {
         case 1: FSO_COMPACT_CTA(1); break;
@@ -2658,12 +2760,13 @@ moe_build_routing_compact(at::Tensor topk_ids, int64_t num_groups, int64_t num_b
         default: FSO_COMPACT_CTA(kCompactRegPairs); break;
         }
 #undef FSO_COMPACT_CTA
+#undef FSO_COMPACT_CTA_T
         break;
     }
     }
     TORCH_CHECK(err == cudaSuccess, "moe_build_routing_compact: kernel launch failed: ", cudaGetErrorString(err));
     return {masked_m, blk0, slot_of_flat, slot_to_expert, problem_shapes, ptr_arrays, row_map, weight_of_slot,
-        slot_sched};
+        slot_sched, slot_tiles};
 }
 
 

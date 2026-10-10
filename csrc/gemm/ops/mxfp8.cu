@@ -14,6 +14,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/torch.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <optional>
@@ -62,7 +63,7 @@ cudaError_t launch_sm100_mxfp8_grouped_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3*
     int expected_m, int max_active_groups, int const* slot_to_expert, int32_t const* problem_shapes,
     cudaStream_t stream);
 bool sm100_mxfp8_grouped_compiled();
-int sm100_mxfp8_grouped_slot_refusal(int m_cap, int N, int K, int groups, int max_active_groups);
+int sm100_mxfp8_grouped_slot_refusal(int m_cap, int N, int K, int groups, int max_active_groups, int compact);
 int sm100_mxfp8_grouped_slot_taken(
     int m_cap, int N, int K, int groups, int max_active_groups, int fused_swiglu, int compact);
 int sm100_mxfp8_grouped_slot_tile_n();
@@ -82,12 +83,12 @@ int sm100_mxfp8_grouped_fused_fc1_route(int m_cap, int N, int K, int groups, int
 cudaError_t launch_sm100_mxfp8_grouped_compact_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D,
     int32_t* SFA, int32_t* SFB, int32_t* masked_m, int32_t const* blk0, int num_groups, int b_alloc, int m_cap, int N,
     int K, int expected_m, int max_active_groups, int const* slot_to_expert, int32_t const* problem_shapes,
-    int64_t const* ptr_arrays, int* slot_sched, cudaStream_t stream);
+    int64_t const* ptr_arrays, int* slot_sched, int* slot_tiles, int tiles_cap, bool build_tiles, cudaStream_t stream);
 cudaError_t launch_sm100_mxfp8_grouped_swiglu_compact_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B,
     __nv_fp8_e4m3* H, int32_t* SFH, int32_t* SFA, int32_t* SFB, int32_t* masked_m, int32_t const* blk0,
     int num_groups, int b_alloc, int m_cap, int N, int K, int expected_m, int max_active_groups,
     int const* slot_to_expert, int32_t const* problem_shapes, int64_t const* ptr_arrays, int* slot_sched,
-    cudaStream_t stream);
+    int* slot_tiles, int tiles_cap, bool build_tiles, cudaStream_t stream);
 int sm100_mxfp8_grouped_compact_sfa_rows();
 int sm100_mxfp8_grouped_compact_fits(long long rows, int K);
 int sm100_mxfp8_grouped_fused_fc1_available(int N, int K);
@@ -524,7 +525,7 @@ at::Tensor linear_mxfp8_grouped_masked(at::Tensor a_fp8, at::Tensor w_fp8, at::T
         // to be refused here, before any kernel is launched. The rule itself
         // lives in the dispatcher; this reads its verdict.
         int const slot_refusal = detail::sm100_mxfp8_grouped_slot_refusal(
-            m_cap, N, K, G, static_cast<int>(max_active_groups));
+            m_cap, N, K, G, static_cast<int>(max_active_groups), /*compact=*/0);
         TORCH_CHECK(slot_refusal != 2,
             "FSO_GROUPED_SLOT=force: the sm_100 slot-bound grouped MXFP8 route needs the whole row capacity to "
             "fit one token tile, but m_cap=", m_cap, " exceeds TileN=", detail::sm100_mxfp8_grouped_slot_tile_n(),
@@ -806,7 +807,7 @@ CompactDims check_compact_operands(char const* op, at::Tensor const& a, at::Tens
 // The route refusals the masked op makes, made on the compact op's m_cap hint.
 void check_compact_slot_refusal(char const* op, CompactDims const& d, int m_cap, int max_active_groups)
 {
-    int const r = detail::sm100_mxfp8_grouped_slot_refusal(m_cap, d.N, d.K, d.G, max_active_groups);
+    int const r = detail::sm100_mxfp8_grouped_slot_refusal(m_cap, d.N, d.K, d.G, max_active_groups, /*compact=*/1);
     TORCH_CHECK(r != 2, op, ": FSO_GROUPED_SLOT=force: the sm_100 slot-bound route needs the whole row capacity to fit "
         "one token tile, but m_cap=", m_cap, " exceeds TileN=", detail::sm100_mxfp8_grouped_slot_tile_n(),
         ". Outside that bound the kernel silently scales its output by 2^-127. Unset FSO_GROUPED_SLOT or call with "
@@ -937,6 +938,75 @@ int* compact_slot_sched(char const* op, std::optional<at::Tensor> const& slot_sc
     return reinterpret_cast<int*>(owned.data_ptr());
 }
 
+// The compact slot route's packed list of live 64-row token tiles (run
+// fso_0.2.1_20261010/S10b-3b), int32 [T + 1]: entries [0, count) the live tiles,
+// entries [count, T) -1, entry T the count (moe_build_routing_compact(...,
+// with_tiles=True)'s `slot_tiles`; packing in grouped_slot_dispatch.cuh,
+// `pack_token_tile`). The slot route reads it past a row capacity of one token tile
+// (m_cap > 64), where an expert spans several token tiles and blocks; at m_cap <= 64
+// it keeps its slot mode and ignores the list. A call that needs the list and was
+// handed none gets one from the caching allocator, of 2 * B_alloc entries (every
+// 128-row block holds at most two token tiles), which the launch fills from
+// masked_m and blk0 first (one small kernel). Returns the device pointer, or nullptr
+// when the route reads no list; `cap` gets T and `build` whether the launch must
+// fill it.
+int* compact_slot_tiles(char const* op, std::optional<at::Tensor> const& slot_tiles, at::Tensor const& masked_m,
+    at::Tensor const& blk0, CompactDims const& d, bool list_mode, at::Tensor& owned, int& cap, bool& build)
+{
+    cap = 0;
+    build = false;
+    bool const given = slot_tiles.has_value() && slot_tiles->defined();
+    if (given)
+    {
+        at::Tensor const& t = *slot_tiles;
+        TORCH_CHECK(t.is_cuda() && t.dtype() == at::kInt && t.is_contiguous() && t.dim() == 1 && t.numel() >= 2,
+            op, ": slot_tiles must be a contiguous 1-D CUDA int32 tensor of T + 1 >= 2 entries "
+            "(moe_build_routing_compact's `slot_tiles` output), got ", t.sizes(), " ", t.dtype());
+        TORCH_CHECK(t.device() == masked_m.device(), op, ": slot_tiles must be on masked_m's device");
+        TORCH_CHECK(t.numel() - 1 <= int64_t{2} * d.b_alloc, op, ": slot_tiles holds ", t.numel() - 1,
+            " entries, more than the 2 * B_alloc = ", int64_t{2} * d.b_alloc, " token tiles the compact buffer has");
+    }
+    if (!list_mode)
+        return nullptr;
+    TORCH_CHECK(d.b_alloc <= 8192, op, ": the slot route past a row capacity of one token tile packs a 128-row "
+        "block index into 13 bits, so it needs R <= 8192 * 128 rows; got B_alloc = ", d.b_alloc,
+        ". Unset FSO_GROUPED_SLOT.");
+    if (given)
+    {
+        cap = static_cast<int>(slot_tiles->numel() - 1);
+        char const* check = std::getenv("FSO_CHECK_PROBLEM_SHAPES");
+        if (check && check[0] == '1')
+        {
+            // The list against masked_m and blk0: every expert's token tiles, in order, then -1, then the count.
+            at::Tensor const ht = slot_tiles->to(at::kCPU);
+            at::Tensor const hm = masked_m.to(at::kCPU);
+            at::Tensor const hb = blk0.to(at::kCPU);
+            auto const at_ = ht.accessor<int32_t, 1>();
+            auto const am = hm.accessor<int32_t, 1>();
+            auto const ab = hb.accessor<int32_t, 1>();
+            int t = 0;
+            for (int g = 0; g < d.G; ++g)
+                for (int k = 0; k * 64 < am[g]; ++k, ++t)
+                {
+                    int const r = std::min(64, am[g] - 64 * k);
+                    int const want = (2 * ab[g] + k) | (g << 14) | ((r - 1) << 24);
+                    TORCH_CHECK(t < cap && at_[t] == want, "FSO_CHECK_PROBLEM_SHAPES: ", op, ": slot_tiles[", t,
+                        "] does not hold token tile ", k, " of expert ", g, " (blk0=", ab[g], ", rows=", am[g], ")");
+                }
+            TORCH_CHECK(at_[cap] == t, "FSO_CHECK_PROBLEM_SHAPES: ", op, ": slot_tiles[T] = ", at_[cap],
+                " but the routing has ", t, " live token tiles");
+            for (int u = t; u < cap; ++u)
+                TORCH_CHECK(at_[u] == -1, "FSO_CHECK_PROBLEM_SHAPES: ", op, ": slot_tiles[", u,
+                    "] past the live tiles is not -1");
+        }
+        return reinterpret_cast<int*>(slot_tiles->data_ptr());
+    }
+    cap = 2 * d.b_alloc;
+    owned = at::empty({cap + 1}, masked_m.options());
+    build = true;
+    return reinterpret_cast<int*>(owned.data_ptr());
+}
+
 // The op entries (ops/mxfp8_compact.cu) send sm_100/sm_103 here and serve sm_120/121 themselves, so this only
 // guards the build.
 void compact_arch_gate(char const* op)
@@ -953,7 +1023,8 @@ void compact_arch_gate(char const* op)
 void linear_mxfp8_grouped_compact_sm100(at::Tensor a, at::Tensor b, at::Tensor sa, at::Tensor sb,
     at::Tensor masked_m, at::Tensor blk0, int64_t m_cap, int64_t expected_m, int64_t max_active_groups,
     std::optional<at::Tensor> slot_to_expert, std::optional<at::Tensor> problem_shapes,
-    std::optional<at::Tensor> ptr_arrays, at::Tensor d, std::optional<at::Tensor> slot_sched)
+    std::optional<at::Tensor> ptr_arrays, at::Tensor d, std::optional<at::Tensor> slot_sched,
+    std::optional<at::Tensor> slot_tiles)
 {
     char const* const op = "linear_mxfp8_grouped_compact";
     compact_arch_gate(op);
@@ -966,10 +1037,16 @@ void linear_mxfp8_grouped_compact_sm100(at::Tensor a, at::Tensor b, at::Tensor s
     int const* const slot_ptr = check_slot_to_expert(slot_to_expert, dims.G, masked_m);
     bool const slot_taken = detail::sm100_mxfp8_grouped_slot_taken(static_cast<int>(m_cap), dims.N, dims.K, dims.G,
         static_cast<int>(max_active_groups), /*fused_swiglu=*/0, /*compact=*/1);
-    if (slot_taken)
+    bool const list_mode = slot_taken && m_cap > detail::sm100_mxfp8_grouped_slot_tile_n();
+    if (slot_taken && !list_mode)
         check_compact_slot_identity(op, dims, masked_m, blk0, slot_to_expert, static_cast<int>(m_cap));
     at::Tensor sched_owned;
     int* const sched_ptr = compact_slot_sched(op, slot_sched, masked_m, slot_taken, sched_owned);
+    at::Tensor tiles_owned;
+    int tiles_cap = 0;
+    bool build_tiles = false;
+    int* const tiles_ptr
+        = compact_slot_tiles(op, slot_tiles, masked_m, blk0, dims, list_mode, tiles_owned, tiles_cap, build_tiles);
     auto const arrays = check_compact_arrays(op, dims, problem_shapes, ptr_arrays, masked_m, blk0, a.data_ptr(),
         sa.data_ptr(), d.data_ptr(), static_cast<int64_t>(dims.N) * 2);
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -979,14 +1056,15 @@ void linear_mxfp8_grouped_compact_sm100(at::Tensor a, at::Tensor b, at::Tensor s
         reinterpret_cast<int32_t*>(sb.data_ptr()), reinterpret_cast<int32_t*>(masked_m.data_ptr()),
         reinterpret_cast<int32_t const*>(blk0.data_ptr()), dims.G, dims.b_alloc, static_cast<int>(m_cap), dims.N,
         dims.K, static_cast<int>(expected_m), static_cast<int>(max_active_groups), slot_ptr, arrays.first,
-        arrays.second, sched_ptr, stream);
+        arrays.second, sched_ptr, tiles_ptr, tiles_cap, build_tiles, stream);
     TORCH_CHECK(err == cudaSuccess, "sm100 compact mxfp8 grouped kernel error: ", cudaGetErrorString(err));
 }
 
 void linear_mxfp8_grouped_compact_swiglu_sm100(at::Tensor a, at::Tensor b, at::Tensor sa, at::Tensor sb,
     at::Tensor masked_m, at::Tensor blk0, int64_t m_cap, int64_t expected_m, int64_t max_active_groups,
     std::optional<at::Tensor> slot_to_expert, std::optional<at::Tensor> problem_shapes,
-    std::optional<at::Tensor> ptr_arrays, at::Tensor dq, at::Tensor sd, std::optional<at::Tensor> slot_sched)
+    std::optional<at::Tensor> ptr_arrays, at::Tensor dq, at::Tensor sd, std::optional<at::Tensor> slot_sched,
+    std::optional<at::Tensor> slot_tiles)
 {
     char const* const op = "linear_mxfp8_grouped_compact_swiglu";
     compact_arch_gate(op);
@@ -1008,10 +1086,16 @@ void linear_mxfp8_grouped_compact_swiglu_sm100(at::Tensor a, at::Tensor b, at::T
     int const* const slot_ptr = check_slot_to_expert(slot_to_expert, dims.G, masked_m);
     bool const slot_taken = detail::sm100_mxfp8_grouped_slot_taken(static_cast<int>(m_cap), dims.N, dims.K, dims.G,
         static_cast<int>(max_active_groups), /*fused_swiglu=*/1, /*compact=*/1);
-    if (slot_taken)
+    bool const list_mode = slot_taken && m_cap > detail::sm100_mxfp8_grouped_slot_tile_n();
+    if (slot_taken && !list_mode)
         check_compact_slot_identity(op, dims, masked_m, blk0, slot_to_expert, static_cast<int>(m_cap));
     at::Tensor sched_owned;
     int* const sched_ptr = compact_slot_sched(op, slot_sched, masked_m, slot_taken, sched_owned);
+    at::Tensor tiles_owned;
+    int tiles_cap = 0;
+    bool build_tiles = false;
+    int* const tiles_ptr
+        = compact_slot_tiles(op, slot_tiles, masked_m, blk0, dims, list_mode, tiles_owned, tiles_cap, build_tiles);
     // The fused FC1 is a GEMM of N = 2*I weight rows, so its triples carry that
     // N; its D rows are the fp8 output's (I bytes each).
     auto const arrays = check_compact_arrays(op, dims, problem_shapes, ptr_arrays, masked_m, blk0, a.data_ptr(),
@@ -1023,7 +1107,8 @@ void linear_mxfp8_grouped_compact_swiglu_sm100(at::Tensor a, at::Tensor b, at::T
         reinterpret_cast<int32_t*>(sa.data_ptr()), reinterpret_cast<int32_t*>(sb.data_ptr()),
         reinterpret_cast<int32_t*>(masked_m.data_ptr()), reinterpret_cast<int32_t const*>(blk0.data_ptr()), dims.G,
         dims.b_alloc, static_cast<int>(m_cap), dims.N, dims.K, static_cast<int>(expected_m),
-        static_cast<int>(max_active_groups), slot_ptr, arrays.first, arrays.second, sched_ptr, stream);
+        static_cast<int>(max_active_groups), slot_ptr, arrays.first, arrays.second, sched_ptr, tiles_ptr, tiles_cap,
+        build_tiles, stream);
     TORCH_CHECK(err == cudaSuccess, "sm100 compact fused-SwiGLU mxfp8 grouped kernel error: ",
         cudaGetErrorString(err));
 }

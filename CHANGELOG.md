@@ -16,7 +16,10 @@ Performance figures are in `docs/perf/`, not here.
   decode-band GEMMs have their own route rule between the slot-bound kernel and the pointer-array kernel; the
   `fso.compat` route queries (`mxfp8_grouped_slot_possible`, `mxfp8_grouped_problem_shapes_consumed`,
   `mxfp8_grouped_swiglu_fused_route`) take a new keyword `compact=False`, and a caller composing the compact ops asks
-  them with `compact=True`. Without it they answer for the masked ops, as in 0.2.0.
+  them with `compact=True`. Without it they answer for the masked ops, as in 0.2.0. The compact layout's slot-bound
+  kernel also runs past 64 tokens per call (the layer takes it up to 512): there it walks a list of the live 64-row
+  token tiles, which `moe_build_routing_compact(..., with_tiles=True)` emits as a tenth output, `slot_tiles`, and the
+  compact GEMM ops take as `slot_tiles=`; a compact GEMM that lands there without one builds the list itself.
 - **No routing scratch, no argument-arena abort (#7).** The compact layout's routing op keeps no device state between
   calls, so the 0.2.0 routing builder's limit of 16 graph captures per host thread (after which it fell back to the
   single-CTA builder) no longer applies to `fso.moe.layer`. On sm_100/sm_103 the grouped GEMMs take their per-call

@@ -193,6 +193,33 @@ slower than the masked kernel on the cells with the most and shortest tiles
   c9  the load warp releases one extra scheduler query at its start, so a
       dynamic scheduler draws two tiles ahead of the mainloop.
 
+The tile-list twin (fso 0.2.1, run fso_0.2.1_20261010/S10b-3b)
+---------------------------------------------------------------
+Past a row capacity of one token tile (m_cap > 64) an expert spans several 64-row
+token tiles and several 128-row blocks, so the slot is no longer its block. The
+header therefore carries a third class, `FsoSm100SlotGemmCompactList`, made from
+the compact class by four more edits (l1-l4), so the compact class stays exactly
+what it was: a first version that switched modes at run time inside the compact
+class measured 0.4 to 1.9 per cent slower than f6ad71a at every M from 1 to 64 of
+Family C (one layer pass; the most at M = 1, where its tiles are shortest). Its scheduler's batch coordinate
+indexes the routing op's packed list of LIVE token tiles (one N tile per entry),
+each entry names its block b, its half h and its expert e, and
+`fso_slot_live_compact_list` rewrites the coordinate to (m, h, k, b) and returns e
+for the weights and 64h plus the entry's rows as the store bound. The launcher gives
+the problem a token extent of one whole block (128 rows) per batch, so the half is
+an ordinary second N tile, and CUTLASS's own TileN-64 scale handling in the
+collective -- N tile n reads scale atom n / 2, and the MMA shifts the TMEM scale
+address by n % 2 -- gives the half-block tile the second half of its block's
+128-row scale atom. On the compact layout, where one block is exactly one atom, the
+forced slot route is bit-identical to the pointer-array route at every m_cap from
+65 to 512 and under every routing tested (test_mxfp8_compact_sm100.py, case
+`slotx`); the masked class keeps its m_cap <= 64 guard.
+
+  l1  the class name;
+  l2  `fso_tile_list` in Arguments / Params and its transfer into Params;
+  l3  every liveness site calls `fso_slot_live_compact_list` instead;
+  l4  a check that no slot-mode liveness call is left.
+
 The compact twin is instantiated with the work-stealing tile scheduler of
 `slot_work_stealing.cuh` (a per-call counter over the live tiles) rather than
 the static persistent one; that needs no edit here beyond 8i, because the
@@ -498,6 +525,44 @@ fso_slot_live_compact(int const* slot_to_expert, int const* masked_m, int num_sl
   return int(cute::get<1>(cta_coord_mnkl)) * tile_n_rows < rows;
 }
 
+// fso slot route, compact layout, TILE-LIST mode (FsoSm100SlotGemmCompactList; run
+// fso_0.2.1_20261010/S10b-3b): the twin past a row capacity of one token tile. The
+// scheduler's batch coordinate is an index i into the routing op's packed list of
+// LIVE 64-row token tiles and its N coordinate is 0 (the launcher gives the
+// scheduler one N tile per list entry). Entry i packs the tile as
+// q | e << 14 | (r - 1) << 24, with q = 2 * b + h (b the 128-row block of the
+// compact buffer, h the 64-row half of it), e the expert that owns the block and r
+// in 1..64 the expert's rows inside the tile; -1 marks an entry past the live
+// tiles. The coordinate is rewritten to the block and the half, (m, h, k, b): the
+// token operand, its scale factors and the output take the block as their batch
+// index (the problem's token extent per batch is one block, 128 rows, so the half is
+// an ordinary second N tile, whose scale factors are the second half of the block's
+// 128-row atom: the collective's TileN-64 handling maps N tile n to atom n / 2 on
+// load and shifts the TMEM scale address by n % 2 in the MMA), the weights take the
+// expert (`a_batch`), and the store bound `rows` is the half's first row plus r, so
+// the epilogue writes exactly the expert's rows inside the tile. Same totality rules
+// as the slot-mode helper: an index out of range, a -1 entry or an expert out of
+// range is dead.
+template <class Coord>
+CUTLASS_DEVICE bool
+fso_slot_live_compact_list(int const* tile_list, int num_slots, int num_groups, int tile_n_rows,
+                           Coord& cta_coord_mnkl, int& a_batch, int& rows) {
+  if (tile_list == nullptr) { return false; }
+  int const fso_i = cute::get<3>(cta_coord_mnkl);
+  if (fso_i < 0 || fso_i >= num_slots) { return false; }
+  int const fso_v = tile_list[fso_i];
+  if (fso_v < 0) { return false; }
+  int const fso_e = (fso_v >> 14) & 0x3ff;
+  if (fso_e >= num_groups) { return false; }
+  int const fso_q = fso_v & 0x3fff;
+  int const fso_h = fso_q & 1;
+  a_batch = fso_e;
+  rows = fso_h * tile_n_rows + ((fso_v >> 24) & 0x3f) + 1;
+  cta_coord_mnkl = cute::make_coord(cute::get<0>(cta_coord_mnkl), fso_h, cute::get<2>(cta_coord_mnkl),
+                                    fso_q >> 1);
+  return true;
+}
+
 // fso slot route, compact layout: the problem shape the EPILOGUE is handed, with
 // the token extent N cut to the expert's routed rows. Both compact slot
 // epilogues bound their stores by the N they are given (the direct store of the
@@ -673,13 +738,39 @@ def _compact_class(masked_text: str, report: list[str]) -> str:
     return s[tmpl:i + 1]
 
 
+def _compact_list_class(compact_cls: str, report: list[str]) -> str:
+    """Apply edits l1-l4 to the compact class and return its tile-list twin."""
+    s = compact_cls
+
+    def lit(anchor, rep, n, what):
+        nonlocal s
+        cnt = s.count(anchor)
+        assert cnt == n, f"[{what}] literal found {cnt} times, expected {n}: {anchor[:70]!r}"
+        s = s.replace(anchor, rep, n)
+        report.append(f"edit {what}: {cnt} site(s)")
+
+    lit("class FsoSm100SlotGemmCompact {", "class FsoSm100SlotGemmCompactList {", 1, "l1 class name")
+    lit("    int fso_num_groups{0};",
+        "    int fso_num_groups{0};\n"
+        "    // tile-list mode: the routing op's packed list of live 64-row token tiles\n"
+        "    int const* fso_tile_list{nullptr};", 2, "l2 Arguments / Params tile-list field")
+    lit("      ,args.fso_num_groups\n", "      ,args.fso_num_groups\n      ,args.fso_tile_list\n", 1,
+        "l2b to_underlying_arguments")
+    lit("fso_live = fso_slot_live_compact(params.fso_slot_to_expert, params.fso_masked_m,",
+        "fso_live = fso_slot_live_compact_list(params.fso_tile_list,", 5, "l3 tile-list liveness sites")
+    assert "fso_slot_live_compact(" not in s, "[l4] a slot-mode liveness call survived in the tile-list class"
+    report.append("edit l4 no slot-mode liveness call left: checked")
+    return s
+
+
 def generate_with_compact(cutlass_dir: str) -> tuple[str, list[str], str]:
     text, report, src_path = generate(cutlass_dir)
     compact_report: list[str] = []
     cls = _compact_class(text, compact_report)
+    cls_list = _compact_list_class(cls, compact_report)
     close = "} // namespace cutlass::gemm::kernel"
     assert text.count(close) == 1, "[c insert] namespace close not unique"
-    text = text.replace(close, COMPACT_HELPERS + "\n" + cls + "\n\n" + close)
+    text = text.replace(close, COMPACT_HELPERS + "\n" + cls + "\n\n" + cls_list + "\n\n" + close)
     report.extend(compact_report)
     return text, report, src_path
 

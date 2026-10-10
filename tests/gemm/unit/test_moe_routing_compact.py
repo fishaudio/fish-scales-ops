@@ -63,12 +63,13 @@ ROUTINGS = ("uniform", "hot", "pad-1", "padG", "ep")
 PS_PAIRS = [(1024, 2048), (2048, 512)]          # two GEMMs, as a layer's FC1 / FC2
 PTR_STRIDES = [2048, 128 * 2048 // 32, 1024,      # FC1: A bytes / row, SFA bytes / block, D bytes / row
                512, 128 * 512 // 32, 2 * 2048]    # FC2
-PATHS = {  # forced shape -> (largest pair count it takes, kernel-name fragments)
+PATHS = {  # forced shape -> (largest pair count it takes, kernel-name fragments: the template's kCluster argument,
+           # followed by its kTiles argument)
     "small": (128, ("moe_routing_compact_small_kernel",)),
-    "cta": (None, (", false>", ", 0>")),
-    "cluster2": (None, (", true>", ", 1>")),
-    "cluster4": (None, (", true>", ", 1>")),
-    "cluster8": (None, (", true>", ", 1>")),
+    "cta": (None, (", false, ", ", 0, ")),
+    "cluster2": (None, (", true, ", ", 1, ")),
+    "cluster4": (None, (", true, ", ", 1, ")),
+    "cluster8": (None, (", true, ", ", 1, ")),
 }
 
 
@@ -96,7 +97,7 @@ def draw(m, g, topk, routing, seed, device):
 
 def check_contract(ids, g, nb_max, out, want_all, topk_w, bases):
     """The list of contract violations of one call's outputs (empty when it holds)."""
-    masked_m, blk0, sof, slots, ps, ptrs, row_map, wslot, sched = out
+    masked_m, blk0, sof, slots, ps, ptrs, row_map, wslot, sched, tiles = out
     errs = []
     m, topk = ids.shape
     flat = ids.reshape(-1).long()
@@ -135,6 +136,22 @@ def check_contract(ids, g, nb_max, out, want_all, topk_w, bases):
         # the slot route's work-stealing counter: two int32 words, zero (S10b-1)
         if sched.dtype != torch.int32 or sched.numel() != 2 or bool((sched != 0).any()):
             errs.append("slot_sched")
+        # the slot route's token-tile list (S10b-3b), asked for together with the pointer arrays (a request the
+        # decode shape does not take either): every expert's 64-row token tiles in order, then -1, then the count
+        if bases is not None:
+            pairs = m * topk
+            cap = max(1, (pairs + 63 * min(g, pairs)) // 64)
+            ent = []
+            for x, c in enumerate(cnt.tolist()):
+                for k in range((c + 63) // 64):
+                    ent.append((2 * int(blk0_ref[x]) + k) | (x << 14) | ((min(64, c - 64 * k) - 1) << 24))
+            ref = torch.full((cap + 1,), -1, dtype=torch.int32)
+            ref[: len(ent)] = torch.tensor(ent, dtype=torch.int32)
+            ref[cap] = len(ent)
+            if tiles.dtype != torch.int32 or not torch.equal(tiles.cpu(), ref):
+                errs.append("slot_tiles")
+        elif tiles.numel():
+            errs.append("slot_tiles not asked for but not empty")
         ps_ref = torch.stack([torch.stack([cnt, torch.full_like(cnt, n), torch.full_like(cnt, k)], dim=1)
                               for n, k in PS_PAIRS])
         if tuple(ps.shape) != (len(PS_PAIRS), g, 3) or not torch.equal(ps.long(), ps_ref):
@@ -151,7 +168,8 @@ def check_contract(ids, g, nb_max, out, want_all, topk_w, bases):
         elif tuple(ptrs.shape) != (len(PS_PAIRS), 3, g) or not torch.equal(ptrs, torch.stack(ptr_ref)):
             errs.append("ptr_arrays")
     else:
-        if slots.numel() or ps.numel() or ptrs.numel() or row_map.numel() or wslot.numel() or sched.numel():
+        if (slots.numel() or ps.numel() or ptrs.numel() or row_map.numel() or wslot.numel() or sched.numel()
+                or tiles.numel()):
             errs.append("an output that was not asked for is not empty")
     return errs
 
@@ -163,7 +181,8 @@ def call(ids, g, want_all, topk_w, bases, num_blocks=None):
     if want_all:
         out = fso.compat.moe_build_routing_compact(
             ids, g, nb_max, with_slots=True, with_row_map=True, topk_w=topk_w, problem_shapes_for=PS_PAIRS,
-            ptr_bases=bases, ptr_strides=PTR_STRIDES if bases is not None else None)
+            ptr_bases=bases, ptr_strides=PTR_STRIDES if bases is not None else None,
+            with_tiles=bases is not None and nb_max <= 8192)
     else:
         out = fso.compat.moe_build_routing_compact(ids, g, nb_max)
     return nb_max, out

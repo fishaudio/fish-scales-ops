@@ -78,6 +78,12 @@
 // host from m_cap alone. `grouped_dispatch.cuh` enforces it as a hard check and
 // the op refuses a forced illegal call rather than running it.
 //
+// The guard binds the masked slot kernel only. The compact layout's twin (see
+// `launch_sm100_mxfp8_slot_compact` below) runs past one token tile in its
+// tile-list mode, where every batch is one 128-row block, i.e. exactly one scale
+// atom, and an expert's later token tiles are the halves of its later blocks; it is
+// bit-identical to the pointer-array route there (run fso_0.2.1_20261010/S10b-3b).
+//
 // Dead tiles: skipped per tile, and only per tile
 // -----------------------------------------------
 // CUTLASS's static persistent scheduler truncates the grid to the SM count, so
@@ -216,9 +222,14 @@ struct RebindPlainSlotBounded<cutlass::epilogue::collective::CollectiveEpilogue<
     using type = PlainSlotEpilogueWSBounded<ET, EC, SC, ED, SD, FC, CT, AC, AD>;
 };
 
-template <int TileM, int TileN, int TileK, bool Compact = false>
+// `TileList` (compact only; run fso_0.2.1_20261010/S10b-3b) selects the compact twin's tile-list form,
+// `FsoSm100SlotGemmCompactList`, which walks the routing op's packed list of live 64-row token tiles past a row
+// capacity of one token tile. A separate class rather than a runtime mode, so the compact class is unchanged.
+template <int TileM, int TileN, int TileK, bool Compact = false, bool TileList = false>
 struct Sm100MxFP8SlotGemmConfig
 {
+    static_assert(Compact || !TileList, "the tile-list form exists for the compact twin only");
+    static constexpr bool kTileList = TileList;
     static_assert(TileM == 128, "1SM only: cluster 1x1x1 / TileM 128 is the only configuration built and measured");
     static_assert(TileN == 64 || TileN == 128 || TileN == 192 || TileN == 256,
         "block-scaled UMMA: TileN must be 64, 128, 192 or 256 (the SF block is padded up on the N axis)");
@@ -277,8 +288,11 @@ struct Sm100MxFP8SlotGemmConfig
     using ProblemShape = Shape<int, int, int, int>;
 
     using GemmKernel = cute::conditional_t<Compact,
-        cutlass::gemm::kernel::FsoSm100SlotGemmCompact<ProblemShape, CollectiveMainloop, CollectiveEpilogue,
-            cutlass::gemm::FsoSlotWorkStealingScheduler>,
+        cute::conditional_t<TileList,
+            cutlass::gemm::kernel::FsoSm100SlotGemmCompactList<ProblemShape, CollectiveMainloop, CollectiveEpilogue,
+                cutlass::gemm::FsoSlotWorkStealingScheduler>,
+            cutlass::gemm::kernel::FsoSm100SlotGemmCompact<ProblemShape, CollectiveMainloop, CollectiveEpilogue,
+                cutlass::gemm::FsoSlotWorkStealingScheduler>>,
         cutlass::gemm::kernel::FsoSm100SlotGemm<ProblemShape, CollectiveMainloop, CollectiveEpilogue,
             cutlass::gemm::StaticPersistentScheduler>>;
 
@@ -384,9 +398,11 @@ struct RebindFusedSwiGluSlotBounded<cutlass::epilogue::collective::CollectiveEpi
     using type = FusedSwiGluSlotEpilogueWSBounded<ET, EC, SC, ED, SD, FC, CT, AC, AD>;
 };
 
-template <int TileM, int TileN, int TileK, bool Compact = false>
+template <int TileM, int TileN, int TileK, bool Compact = false, bool TileList = false>
 struct Sm100MxFP8SlotSwiGluGemmConfig
 {
+    static_assert(Compact || !TileList, "the tile-list form exists for the compact twin only");
+    static constexpr bool kTileList = TileList;
     static_assert(TileM == 128, "1SM only: cluster 1x1x1 / TileM 128 is the only configuration built and measured");
     static_assert(TileN == 64,
         "the fused slot store is written against a 64-column token tile held whole by one thread (one epilogue "
@@ -448,8 +464,11 @@ struct Sm100MxFP8SlotSwiGluGemmConfig
     // (128 * I elements, I scale words). Its epilogue is the exact-N clone and its
     // scheduler the work-stealing one (see the plain config above).
     using GemmKernel = cute::conditional_t<Compact,
-        cutlass::gemm::kernel::FsoSm100SlotGemmCompact<ProblemShape, CollectiveMainloop, CollectiveEpilogue,
-            cutlass::gemm::FsoSlotWorkStealingScheduler>,
+        cute::conditional_t<TileList,
+            cutlass::gemm::kernel::FsoSm100SlotGemmCompactList<ProblemShape, CollectiveMainloop, CollectiveEpilogue,
+                cutlass::gemm::FsoSlotWorkStealingScheduler>,
+            cutlass::gemm::kernel::FsoSm100SlotGemmCompact<ProblemShape, CollectiveMainloop, CollectiveEpilogue,
+                cutlass::gemm::FsoSlotWorkStealingScheduler>>,
         cutlass::gemm::kernel::FsoSm100SlotGemm<ProblemShape, CollectiveMainloop, CollectiveEpilogue,
             cutlass::gemm::StaticPersistentScheduler>>;
 
@@ -463,6 +482,8 @@ struct Sm100MxFP8SlotSwiGluGemmConfig
 // moe_glue.cu's kMaxGroups, so the slot-list pool is sized once and never
 // reallocated.
 constexpr int kMaxSlots = 1024;
+// The token tile of the slot kernels (TileN): rows per entry of the compact tile list.
+constexpr int kSlotTokenTileRows = 64;
 
 // FSO_PRINT_TILE_INFO=1: print, once per instantiation, what
 // StageCountAutoCarveout gave the mainloop and what the epilogue cost it. The
@@ -681,6 +702,83 @@ struct SlotPool
         return p;
     }
 };
+
+// The compact slot route's packed list of live 64-row token tiles (run
+// fso_0.2.1_20261010/S10b-3b): int32 [cap + 1], entries [0, count) the live tiles
+// in ascending expert order (and ascending row inside an expert), entries
+// [count, cap) -1, entry cap the count. A live tile packs as
+//     q | e << 14 | (r - 1) << 24,
+// q = 2 * b + h (b the 128-row block of the compact buffer, h the 64-row half of
+// it), e the expert that owns the block, r in 1..64 its rows inside the tile. The
+// k-th tile of expert e is rows 64k .. 64k + 63 of the expert, i.e. q = 2 * blk0[e]
+// + k and r = min(64, masked_m[e] - 64k). The same packing is written by
+// moe_build_routing_compact(..., with_tiles=True) (ops/moe_glue.cu, which cannot
+// include this header) and decoded by the generated kernel's
+// `fso_slot_live_compact`; a block index needs b < 8192 and an expert e < 1024.
+constexpr int kTileListMaxBlocks = 1 << 13;
+constexpr int kTileListMaxGroups = 1 << 10;
+
+__host__ __device__ constexpr int pack_token_tile(int q, int e, int r)
+{
+    return q | (e << 14) | ((r - 1) << 24);
+}
+
+// The list from masked_m and blk0, for a compact slot call at a row capacity past
+// one token tile whose caller passed no list (the layer passes the routing op's).
+// One CTA, one thread per expert (blockDim = G rounded up to a warp, G <= 1024):
+// a block-wide exclusive scan of each expert's token-tile count gives its first
+// entry. Like `sm100_slot_build_kernel`, it never releases its dependents early.
+__global__ __launch_bounds__(1024) void sm100_slot_tiles_build_kernel(int* __restrict__ tiles,
+    int32_t const* __restrict__ masked_m, int32_t const* __restrict__ blk0, int groups, int cap, bool pdl)
+{
+    __shared__ int s_warp_sum[32];
+    int const tid = threadIdx.x;
+    int const lane = tid & 31;
+    int const warp = tid >> 5;
+    int const num_warps = static_cast<int>(blockDim.x) >> 5;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    if (pdl)
+        cudaGridDependencySynchronize();
+#endif
+    int cnt = 0;
+    int b0 = 0;
+    if (tid < groups)
+    {
+        cnt = masked_m[tid];
+        b0 = blk0[tid];
+    }
+    int const nt = cnt > 0 ? (cnt + kSlotTokenTileRows - 1) / kSlotTokenTileRows : 0;
+    int x = nt;
+    for (int off = 1; off < 32; off <<= 1)
+    {
+        int const y = __shfl_up_sync(0xffffffffu, x, off);
+        if (lane >= off)
+            x += y;
+    }
+    if (lane == 31)
+        s_warp_sum[warp] = x;
+    __syncthreads();
+    int before = 0;
+    int total = 0;
+    for (int w = 0; w < num_warps; ++w)
+    {
+        int const v = s_warp_sum[w];
+        before += w < warp ? v : 0;
+        total += v;
+    }
+    int const t0 = before + x - nt;
+    for (int k = 0; k < nt; ++k)
+    {
+        int const t = t0 + k;
+        int const left = cnt - k * kSlotTokenTileRows;
+        if (t < cap)
+            tiles[t] = pack_token_tile(2 * b0 + k, tid, left < kSlotTokenTileRows ? left : kSlotTokenTileRows);
+    }
+    for (int t = total + tid; t < cap; t += static_cast<int>(blockDim.x))
+        tiles[t] = -1;
+    if (tid == 0)
+        tiles[cap] = total < cap ? total : cap;
+}
 
 } // namespace slot_detail
 
@@ -1125,21 +1223,54 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8_slot_swiglu(__nv_fp8_e4m3* mat_a, _
 // (the N tile against masked_m[e]), so a slot that holds no expert stores nothing
 // -- which matters more here than on the masked slab, because an empty expert's
 // blk0 equals its successor's.
+//
+// Tile-list mode (`slot_tiles` given; run fso_0.2.1_20261010/S10b-3b). Past a row
+// capacity of one token tile an expert spans several 64-row token tiles and several
+// 128-row blocks, so the slot is no longer its block. The kernel then walks the
+// routing op's packed list of LIVE token tiles instead (`pack_token_tile` above;
+// moe_build_routing_compact(..., with_tiles=True), or `sm100_slot_tiles_build_kernel`
+// when the op was handed none and `build_tiles` asks for it): the scheduler's slot
+// is a list entry with one N tile, the token extent per batch is one whole block
+// (pn = 128), and the kernel rewrites each tile's coordinate to (weight tile, half,
+// block) and takes the expert for the weights from the entry. The half is an
+// ordinary second N tile of its block, so the collective's TileN-64 scale handling
+// (scale atom n / 2 on load, TMEM scale address shifted by n % 2 in the MMA) reads
+// the second half of the block's 128-row scale atom; the store bound is the half's
+// first row plus the entry's row count. The live count is the list's count word,
+// written after its `tiles_cap` entries, which bound the grid as the slot bound does
+// in slot mode. Slot mode (m_cap <= 64, `slot_tiles` null) is unchanged.
 template <class Config, bool Fused>
 cudaError_t launch_sm100_mxfp8_slot_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, void* out,
     int32_t* out_sfh, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int32_t const* blk0, int groups,
     int num_slots, int m_cap, int b_alloc, int shape_n, int shape_k, int const* slot_to_expert, int* slot_sched,
-    cudaStream_t stream)
+    int* slot_tiles, int tiles_cap, bool build_tiles, cudaStream_t stream)
 {
     using GemmKernel = typename Config::GemmKernel;
     using Params = typename GemmKernel::Params;
     using Args = typename GemmKernel::Arguments;
     namespace sd = slot_detail;
+    static_assert(cute::size<1>(typename Config::MmaTileShape{}) == sd::kSlotTokenTileRows,
+        "the compact slot route's token-tile list is packed for 64-row token tiles");
 
+    // Tile-list form (FsoSm100SlotGemmCompactList): past one token tile of row capacity.
+    constexpr bool list_mode = Config::kTileList;
     if (groups < 1 || groups > sd::kMaxSlots || b_alloc < 1 || blk0 == nullptr || slot_sched == nullptr)
         return cudaErrorInvalidValue;
-    if (num_slots < 1 || num_slots > groups)
-        num_slots = groups;
+    if constexpr (list_mode)
+    {
+        if (slot_tiles == nullptr)
+            return cudaErrorInvalidValue;
+        if (tiles_cap < 1 || groups > sd::kTileListMaxGroups || b_alloc > sd::kTileListMaxBlocks)
+            return cudaErrorInvalidValue;
+        num_slots = tiles_cap;
+    }
+    else
+    {
+        if (m_cap > sd::kSlotTokenTileRows)
+            return cudaErrorInvalidValue;
+        if (num_slots < 1 || num_slots > groups)
+            num_slots = groups;
+    }
     if constexpr (Fused)
     {
         if ((shape_n & 1) != 0 || ((shape_n / 2) % 128) != 0 || (m_cap % 4) != 0)
@@ -1147,8 +1278,25 @@ cudaError_t launch_sm100_mxfp8_slot_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3*
     }
 
     bool const pdl = sd::slot_pdl_enabled();
+    if (list_mode && build_tiles)
+    {
+        cudaLaunchConfig_t cfg{};
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = pdl ? 1 : 0;
+        cfg.gridDim = dim3(1);
+        cfg.blockDim = dim3(static_cast<unsigned>((groups + 31) / 32 * 32));
+        cfg.dynamicSmemBytes = 0;
+        cfg.stream = stream;
+        cfg.attrs = attrs;
+        cfg.numAttrs = 1;
+        cudaError_t const prep_err = cudaLaunchKernelEx(&cfg, sd::sm100_slot_tiles_build_kernel, slot_tiles,
+            static_cast<int32_t const*>(masked_m), blk0, groups, tiles_cap, pdl);
+        if (prep_err != cudaSuccess)
+            return prep_err;
+    }
     int const* slots = slot_to_expert;
-    if (slots == nullptr)
+    if (slots == nullptr && !list_mode)
     {
         int* const own = sd::SlotPool::instance().acquire(stream);
         if (own == nullptr)
@@ -1171,7 +1319,9 @@ cudaError_t launch_sm100_mxfp8_slot_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3*
     }
 
     int const pm = shape_n; // expert weight rows, on the M axis
-    int const pn = m_cap;   // routed token rows, on the N axis
+    // Routed token rows, on the N axis, per batch: in slot mode the row capacity (one token tile), in tile-list
+    // mode one whole 128-row block, so that the half h of block b is N tile h of batch b.
+    int const pn = list_mode ? 128 : m_cap;
     int const L = groups > b_alloc ? groups : b_alloc;
     auto const stride_a = cutlass::make_cute_packed_stride(typename Config::StrideA{}, cute::make_shape(pm, shape_k, L));
     auto stride_b = cutlass::make_cute_packed_stride(typename Config::StrideB{}, cute::make_shape(pn, shape_k, L));
@@ -1217,16 +1367,21 @@ cudaError_t launch_sm100_mxfp8_slot_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3*
         args.epilogue.plain.col_elems = static_cast<long long>(pm);
         args.epilogue.plain.batch_elems = static_cast<long long>(128) * pm;
     }
-    args.fso_slot_to_expert = slots;
+    args.fso_slot_to_expert = list_mode ? nullptr : slots;
     args.fso_masked_m = masked_m;
     args.fso_num_slots = num_slots;
     args.fso_num_groups = groups;
-    // The work-stealing scheduler: its counter, the live slot count blk0[G], and how many waves of the grid it
-    // hands out statically before it draws (sd::slot_static_waves).
+    if constexpr (list_mode)
+        args.fso_tile_list = slot_tiles;
+    // The work-stealing scheduler: its counter, the live slot count (blk0[G] in slot mode, the list's count word in
+    // tile-list mode, where each list entry is one token tile), and how many waves of the grid it hands out
+    // statically before it draws (sd::slot_static_waves).
     args.scheduler.counter = slot_sched;
-    args.scheduler.live_slots = blk0 + groups;
+    args.scheduler.live_slots = list_mode ? slot_tiles + tiles_cap : blk0 + groups;
+    args.scheduler.tiles_n = list_mode ? 1 : 0;
     {
-        long long const bound_tiles = static_cast<long long>((pm + 127) / 128) * ((pn + 63) / 64) * num_slots;
+        long long const tiles_n = list_mode ? 1 : (pn + 63) / 64;
+        long long const bound_tiles = static_cast<long long>((pm + 127) / 128) * tiles_n * num_slots;
         long long const sms = hw_info.sm_count > 0 ? hw_info.sm_count : 1;
         long long const grid = bound_tiles < sms ? bound_tiles : sms;
         args.scheduler.static_waves = sd::slot_static_waves(bound_tiles, grid);
@@ -1306,25 +1461,39 @@ cudaError_t launch_sm100_mxfp8_slot_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3*
 inline cudaError_t gemm_dispatch_sm100_mxfp8_slot_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b,
     __nv_bfloat16* mat_d, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int32_t const* blk0, int groups,
     int num_slots, int m_cap, int b_alloc, int shape_n, int shape_k, int const* slot_to_expert, int* slot_sched,
-    cudaStream_t stream)
+    int* slot_tiles, int tiles_cap, bool build_tiles, cudaStream_t stream)
 {
-    if (m_cap > kSlotTileN || num_slots < 1 || !sm100_mxfp8_slot_instantiated(shape_n, shape_k))
+    if ((m_cap > kSlotTileN && slot_tiles == nullptr) || num_slots < 1
+        || !sm100_mxfp8_slot_instantiated(shape_n, shape_k))
         return cudaErrorInvalidValue;
+    // Past one token tile of row capacity the tile-list form; up to it the slot form, unchanged.
+    if (m_cap > kSlotTileN)
+        return launch_sm100_mxfp8_slot_compact<
+            slot_detail::Sm100MxFP8SlotGemmConfig<128, kSlotTileN, 128, true, true>, false>(mat_a, mat_b, mat_d,
+            nullptr, scales_a, scales_b, masked_m, blk0, groups, num_slots, m_cap, b_alloc, shape_n, shape_k,
+            slot_to_expert, slot_sched, slot_tiles, tiles_cap, build_tiles, stream);
     return launch_sm100_mxfp8_slot_compact<slot_detail::Sm100MxFP8SlotGemmConfig<128, kSlotTileN, 128, true>, false>(
         mat_a, mat_b, mat_d, nullptr, scales_a, scales_b, masked_m, blk0, groups, num_slots, m_cap, b_alloc, shape_n,
-        shape_k, slot_to_expert, slot_sched, stream);
+        shape_k, slot_to_expert, slot_sched, nullptr, 0, false, stream);
 }
 
 inline cudaError_t gemm_dispatch_sm100_mxfp8_slot_swiglu_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b,
     __nv_fp8_e4m3* out_h, int32_t* out_sfh, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m,
     int32_t const* blk0, int groups, int num_slots, int m_cap, int b_alloc, int shape_n, int shape_k,
-    int const* slot_to_expert, int* slot_sched, cudaStream_t stream)
+    int const* slot_to_expert, int* slot_sched, int* slot_tiles, int tiles_cap, bool build_tiles,
+    cudaStream_t stream)
 {
-    if (m_cap > kSlotTileN || num_slots < 1 || !sm100_mxfp8_slot_swiglu_instantiated(shape_n, shape_k))
+    if ((m_cap > kSlotTileN && slot_tiles == nullptr) || num_slots < 1
+        || !sm100_mxfp8_slot_swiglu_instantiated(shape_n, shape_k))
         return cudaErrorInvalidValue;
+    if (m_cap > kSlotTileN)
+        return launch_sm100_mxfp8_slot_compact<
+            slot_detail::Sm100MxFP8SlotSwiGluGemmConfig<128, kSlotTileN, 128, true, true>, true>(mat_a, mat_b, out_h,
+            out_sfh, scales_a, scales_b, masked_m, blk0, groups, num_slots, m_cap, b_alloc, shape_n, shape_k,
+            slot_to_expert, slot_sched, slot_tiles, tiles_cap, build_tiles, stream);
     return launch_sm100_mxfp8_slot_compact<slot_detail::Sm100MxFP8SlotSwiGluGemmConfig<128, kSlotTileN, 128, true>,
         true>(mat_a, mat_b, out_h, out_sfh, scales_a, scales_b, masked_m, blk0, groups, num_slots, m_cap, b_alloc,
-        shape_n, shape_k, slot_to_expert, slot_sched, stream);
+        shape_n, shape_k, slot_to_expert, slot_sched, nullptr, 0, false, stream);
 }
 
 } // namespace sm100_blockscaled_gemm

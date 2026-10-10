@@ -38,6 +38,20 @@ Cases (each runs in its own process, so the process-static knobs
                 weight arena binds 2 blocks per layer and nothing per capture;
 * ``slack``     the end-of-buffer 2-SM tile with and without the one block of
                 allocation slack, for ``compute-sanitizer --tool memcheck``;
+* ``slotx``     the slot route past one token tile of row capacity (m_cap 65 to
+                512, run fso_0.2.1_20261010/S10b-3b), where an expert spans several
+                64-row token tiles and several 128-row blocks and the kernel walks
+                the packed list of live token tiles: a ``FSO_GROUPED_SLOT=0`` child
+                records a digest of every live row the pointer-array route writes,
+                and a ``FSO_GROUPED_SLOT=force`` child requires the slot route's
+                bytes to equal them, for the plain FC1, the fused FC1 (fp8 rows and
+                scale words) and the FC2, under uniform routing, one hot expert in
+                every token (more than 64, 128 and 256 rows), a graded skew, every
+                pair on one expert (top-1), padded buckets (ids -1 and E) and the
+                expert-parallel form, at E = 128 and 256; the list comes from the
+                routing op (``with_tiles=True``, checked against the contract),
+                from the host, or from the op itself (none passed), by turns; and
+                nothing outside the live rows is written;
 * ``sched``     ``FSO_GROUPED_SLOT=force``: the slot route's work-stealing
                 counter (``slot_sched``): the routing op returns it zero, every
                 slot GEMM leaves it zero, and one counter serves consecutive
@@ -64,6 +78,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 
 FAMILIES = {
@@ -447,9 +462,128 @@ def child_sched():
     return results
 
 
+# ---- slotx -----------------------------------------------------------------
+
+SLOTX_M = [65, 80, 96, 128, 160, 192, 256, 384, 512]
+SLOTX_ROUTINGS = ["uniform", "hot", "skew", "one", "padded", "ep"]
+
+
+def slotx_ids(M, E, topk, kind, seed):
+    """Routing forms of the slotx case: make_topk's, plus a graded skew (six hot experts of falling popularity, the
+    rest uniform) and every pair on one expert (top-1)."""
+    if kind == "one":
+        return torch.full((M, 1), 3, device="cuda", dtype=torch.int32)
+    if kind == "skew":
+        g = torch.Generator(device="cuda").manual_seed(seed)
+        r = torch.rand(M, E, generator=g, device="cuda")
+        r[:, :6] += torch.tensor([3.0, 1.0, 0.6, 0.45, 0.3, 0.2], device="cuda")
+        return r.topk(topk, dim=1).indices.int().contiguous()
+    return make_topk(M, E, topk, kind, seed)
+
+
+def tile_list_ref(rt):
+    """The packed live token-tile list of moe_build_routing_compact(with_tiles=True), from the routing's counts:
+    expert g's k-th 64-row token tile is (2*blk0[g] + k) | g << 14 | (rows - 1) << 24, then -1, then the count."""
+    cnt = rt.cnt.cpu().tolist()
+    b0 = rt.blk0.cpu().tolist()
+    ent = [(2 * b0[g] + k) | (g << 14) | ((min(64, c - 64 * k) - 1) << 24)
+           for g, c in enumerate(cnt) for k in range((c + 63) // 64)]
+    cap = max(1, (rt.P + 63 * min(rt.G, rt.P)) // 64)
+    t = torch.full((cap + 1,), -1, dtype=torch.int32)
+    if ent:
+        t[: len(ent)] = torch.tensor(ent, dtype=torch.int32)
+    t[cap] = len(ent)
+    return t
+
+
+def child_slotx(ref_path, write_ref, quick):
+    """See the module docstring (``slotx``). `write_ref`: the FSO_GROUPED_SLOT=0 child, which writes the digests."""
+    import hashlib
+    results = []
+    digests = {} if write_ref else torch.load(ref_path)
+    m_list = [80, 256] if quick else SLOTX_M
+    n = 0
+    for fam in ("B", "C"):
+        f = FAMILIES[fam]
+        E, H, I = f["E"], f["H"], f["I"]
+        w13q, sw13, w2q, sw2, inter = weights(fam)
+        for M in m_list:
+            for kind in SLOTX_ROUTINGS:
+                topk = 1 if kind == "one" else f["topk"]
+                ids = slotx_ids(M, E, topk, kind, seed=M * 1009 + E * 17)
+                rt = Routing(ids, E)
+                lv = rt.slot_c[rt.valid].long()
+                allowed = allowed_rows(rt, True)
+                tiles_ok = True
+                for gemm in ("fc1", "fc1_fused", "fc2"):
+                    key = f"{fam}/M{M}/{kind}/{gemm}"
+                    fused = gemm == "fc1_fused"
+                    if fused and not inter:
+                        continue
+                    if gemm == "fc2":
+                        N, K, w, sw = H, I, w2q, sw2
+                    else:
+                        N, K, w, sw = 2 * I, H, w13q, sw13
+                    slot = slot_taken(rt, N, K, fused, compact=True)
+                    src = ("routing", "host", "own")[n % 3]
+                    n += 1
+                    tiles = None
+                    if slot and src == "routing":
+                        out = fso.compat.moe_build_routing_compact(ids, E, rt.b_max, with_slots=True, with_tiles=True)
+                        tiles = out[9]
+                        tiles_ok = tiles_ok and torch.equal(tiles.cpu(), tile_list_ref(rt))
+                    elif slot and src == "host":
+                        tiles = tile_list_ref(rt).cuda()
+                    torch.manual_seed(M * 7 + E)
+                    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * (0.1 if gemm != "fc2" else 1.0)
+                    _, _, hq, sh = gather_both(x, rt, K)
+                    slots = rt.slots if slot else None
+                    if not fused:
+                        d = torch.empty(rt.R, N, device="cuda", dtype=torch.bfloat16)
+                        d.view(torch.int16).fill_(-1)
+                        ops.linear_mxfp8_grouped_compact(hq, w, sh, sw, rt.cnt, rt.blk0, rt.m_cap, rt.expected_m,
+                                                         rt.max_active, slots, None, None, d, None, tiles)
+                        torch.cuda.synchronize()
+                        live = d[lv].view(torch.int16).cpu().numpy().tobytes()
+                        bounded = bool((d[~allowed].view(torch.int16) == -1).all())
+                    else:
+                        dq = torch.empty(rt.R, I, device="cuda", dtype=torch.float8_e4m3fn)
+                        dq.view(torch.uint8).fill_(0xFF)
+                        sd = torch.full((rt.R * (I // 128),), -1, device="cuda", dtype=torch.int32)
+                        ops.linear_mxfp8_grouped_compact_swiglu(hq, w, sh, sw, rt.cnt, rt.blk0, rt.m_cap,
+                                                                rt.expected_m, rt.max_active, slots, None, None, dq,
+                                                                sd, None, tiles)
+                        torch.cuda.synchronize()
+                        num_kp = I // 128
+                        live = (dq.view(torch.uint8)[lv].cpu().numpy().tobytes()
+                                + sd[atom_words(lv, num_kp).flatten()].cpu().numpy().tobytes())
+                        un = torch.nonzero(~allowed).flatten()
+                        bounded = bool((dq.view(torch.uint8)[un] == 0xFF).all()) and (
+                            bool((sd[atom_words(un, num_kp).flatten()] == -1).all()) if un.numel() else True)
+                    dg = hashlib.sha256(live).hexdigest()
+                    rec = dict(case="slotx", fam=fam, M=M, routing=kind, gemm=gemm, route="slot" if slot else "ptr",
+                               tiles=src if slot else "-", cnt_max=int(rt.cnt.max()), bounded=bounded)
+                    if write_ref:
+                        digests[key] = dg
+                        rec["ok"] = bounded and not slot
+                    else:
+                        rec["equal"] = digests.get(key) == dg
+                        rec["tiles_contract"] = tiles_ok
+                        rec["ok"] = rec["equal"] and bounded and slot and tiles_ok
+                    results.append(rec)
+            torch.cuda.empty_cache()
+        _W_CACHE.pop(fam, None)
+        torch.cuda.empty_cache()
+    if write_ref:
+        torch.save(digests, ref_path)
+    return results
+
+
 # ---- chain -----------------------------------------------------------------
 
-CHAIN_M = [1, 7, 64, 513, 4096]
+# M = 200 runs the compact slot route past one token tile (the chain hands the GEMMs no token-tile list, so the ops
+# build their own, captured with the rest; fso.moe.layer passes the routing op's)
+CHAIN_M = [1, 7, 64, 200, 513, 4096]
 
 
 def chain_inputs(fam, M, seed):
@@ -872,6 +1006,8 @@ def child_main(args):
         res = child_slack_guarded(int(slack), tile, which)
     elif case == "sched":
         res = child_sched()
+    elif case in ("slotx", "slotx_ref"):
+        res = child_slotx(os.environ["FSO_TEST_SLOTX_REF"], case == "slotx_ref", quick)
     else:
         raise SystemExit(f"unknown case {case}")
     print("@@RESULTS@@" + json.dumps(res))
@@ -886,8 +1022,10 @@ def case_env(case):
     env = {}
     if case == "ptrarray":
         env["FSO_GROUPED_SLOT"] = "0"
-    elif case in ("slot", "sched"):
+    elif case in ("slot", "sched", "slotx"):
         env["FSO_GROUPED_SLOT"] = "force"
+    elif case == "slotx_ref":
+        env["FSO_GROUPED_SLOT"] = "0"
     elif case.startswith("tile:"):
         env["FSO_GROUPED_SLOT"] = "0"
         env["FSO_FORCE_TILE"] = case.split(":")[-1]
@@ -938,7 +1076,7 @@ def run_child(case, args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--child", default=None)
-    ap.add_argument("--cases", default="rule,ptrarray,slot,sched,tiles,ref020,chain,arena")
+    ap.add_argument("--cases", default="rule,ptrarray,slot,slotx,sched,tiles,ref020,chain,arena")
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--ref", default=None, help="path of the 0.2.0 layer reference file (ref020 writes, chain reads)")
     ap.add_argument("--out", default=None, help="write the per-case JSON here")
@@ -950,6 +1088,11 @@ def main():
     for c in args.cases.split(","):
         if c == "tiles":
             cases += [f"tile:{t}" for t in UNFUSED_TILES] + [f"tile:fused:{t}" for t in FUSED_TILES]
+        elif c == "slotx":
+            # the pointer-array digests first, then the forced slot route against them (one temporary file)
+            os.environ.setdefault("FSO_TEST_SLOTX_REF",
+                                  os.path.join(tempfile.mkdtemp(prefix="fso_slotx_"), "slotx_ref.pt"))
+            cases += ["slotx_ref", "slotx"]
         else:
             cases.append(c)
     failures = 0

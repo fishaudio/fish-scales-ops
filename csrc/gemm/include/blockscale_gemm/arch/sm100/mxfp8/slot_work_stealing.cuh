@@ -64,7 +64,11 @@
 //     (blk0[G] = 128-row blocks in use = active experts on this route, where every
 //     active expert owns exactly one block), read once per CTA after the
 //     scheduler warp's griddepcontrol.wait, in flight together with the first
-//     draw. Whether a launch draws at all is the host's verdict for the whole grid
+//     draw. In the compact kernel's tile-list mode (row capacities past one token
+//     tile, run fso_0.2.1_20261010/S10b-3b) a slot is one entry of the routing
+//     op's packed list of live 64-row token tiles (`tiles_n` = 1), and the live
+//     count is the list's own count word, which the routing op writes after the
+//     last entry. Whether a launch draws at all is the host's verdict for the whole grid
 //     (static tiles below the bound tiles), so either every CTA draws -- and the
 //     finished-CTA count sees all of them -- or none does. When none does, no warp
 //     uses the response pipeline: each role computes its next tile itself and the
@@ -164,6 +168,10 @@ public:
         // Waves of the grid handed out statically (CTA b: tiles b, b + grid, ...) before the draws begin; at
         // least 1. A value that covers every bound tile makes the kernel the static persistent one.
         int static_waves = 1;
+        // N tiles per slot when > 0, instead of ceil(N / TileN). The compact kernel's tile-list mode (any row
+        // capacity) gives each entry of its live token-tile list one N tile: the slot IS a 64-row token tile, and
+        // the kernel rewrites the coordinate to that tile's block and half itself.
+        int tiles_n = 0;
     };
 
     struct Params
@@ -193,8 +201,9 @@ public:
         p.live_slots = args.live_slots;
         p.tiles_m = static_cast<int32_t>(
             (cute::get<0>(problem_shape_mnkl) + cute::size<0>(tile_shape_mnk) - 1) / cute::size<0>(tile_shape_mnk));
-        p.tiles_n = static_cast<int32_t>(
-            (cute::get<1>(problem_shape_mnkl) + cute::size<1>(tile_shape_mnk) - 1) / cute::size<1>(tile_shape_mnk));
+        p.tiles_n = args.tiles_n > 0 ? static_cast<int32_t>(args.tiles_n)
+                                     : static_cast<int32_t>((cute::get<1>(problem_shape_mnkl)
+                                           + cute::size<1>(tile_shape_mnk) - 1) / cute::size<1>(tile_shape_mnk));
         p.tiles_l = static_cast<int32_t>(cute::get<3>(problem_shape_mnkl));
         long long const total = static_cast<long long>(p.tiles_m) * p.tiles_n * p.tiles_l;
         long long const sms = hw_info.sm_count > 0 ? hw_info.sm_count : 1;

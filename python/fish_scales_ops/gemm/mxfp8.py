@@ -900,6 +900,7 @@ def linear_mxfp8_grouped_compact(
     *,
     d: torch.Tensor,
     slot_sched: torch.Tensor | None = None,
+    slot_tiles: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Grouped block-scaled MXFP8 GEMM on the compact activation layout.
 
@@ -927,6 +928,13 @@ def linear_mxfp8_grouped_compact(
             Read only when the call lands on the slot route; without it such a call takes
             a zeroed counter from the caching allocator (one fill kernel). sm_120/121
             refuses a non-empty one.
+        slot_tiles: the sm_100/103 slot route's packed list of live 64-row token
+            tiles, int32 ``[T + 1]``: :func:`moe_build_routing_compact`'s ``slot_tiles``
+            output (``with_tiles=True``). Read only when the call lands on the slot route
+            with ``m_cap > 64``, where an expert spans several token tiles; without it
+            such a call builds the list itself from ``masked_m`` and ``blk0`` (a
+            ``2 * R / 128 + 1``-entry tensor from the caching allocator and one small
+            kernel). sm_120/121 refuses a non-empty one.
 
     Returns:
         ``d``.
@@ -938,7 +946,7 @@ def linear_mxfp8_grouped_compact(
     _require_grouped_arch()
     torch.ops.fish_scales_ops.linear_mxfp8_grouped_compact(
         a_fp8, w_fp8, sa, sw, masked_m, blk0, int(m_cap), int(expected_m), int(max_active_groups),
-        slot_to_expert, problem_shapes, ptr_arrays, d, slot_sched
+        slot_to_expert, problem_shapes, ptr_arrays, d, slot_sched, slot_tiles
     )
     return d
 
@@ -960,6 +968,7 @@ def linear_mxfp8_grouped_compact_swiglu(
     dq: torch.Tensor,
     sd: torch.Tensor,
     slot_sched: torch.Tensor | None = None,
+    slot_tiles: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The fused-SwiGLU FC1 on the compact activation layout.
 
@@ -977,7 +986,7 @@ def linear_mxfp8_grouped_compact_swiglu(
     _require_grouped_arch()
     torch.ops.fish_scales_ops.linear_mxfp8_grouped_compact_swiglu(
         a_fp8, w13_fp8, sa, sw13, masked_m, blk0, int(m_cap), int(expected_m), int(max_active_groups),
-        slot_to_expert, problem_shapes, ptr_arrays, dq, sd, slot_sched
+        slot_to_expert, problem_shapes, ptr_arrays, dq, sd, slot_sched, slot_tiles
     )
     return dq, sd
 
@@ -1130,6 +1139,7 @@ def moe_build_routing_compact(
     problem_shapes_for: list[tuple[int, int]] | None = None,
     ptr_bases: list | None = None,
     ptr_strides: list | None = None,
+    with_tiles: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """topk routing -> the compact 128-row-block layout, one kernel launch, no scratch.
 
@@ -1177,12 +1187,21 @@ def moe_build_routing_compact(
             block and is never read).
         ptr_strides: three byte strides per pair, flat or as triples, in the same
             order: A bytes per row, A-scale bytes per 128-row block, D bytes per row.
+        with_tiles: also emit ``slot_tiles``, the sm_100/103 compact slot route's packed
+            list of live 64-row token tiles, int32 ``[T + 1]`` with ``T = max(1,
+            (M*topk + 63*min(G, M*topk)) // 64)``: entries ``[0, count)`` the token tiles
+            in ascending expert order, the k-th tile of expert ``g`` (its rows ``64k`` to
+            ``64k + 63``) packed as ``(2*blk0[g] + k) | g << 14 | (r - 1) << 24`` with
+            ``r = min(64, cnt[g] - 64k)``; entries ``[count, T)`` -1; entry ``T`` the
+            count. The compact slot GEMMs read it past a row capacity of 64
+            (``slot_tiles=``). Needs ``with_slots`` and ``num_blocks <= 8192``; a call
+            that asks for it never takes the decode launch shape.
 
     Returns:
         ``(masked_m [G], blk0 [G + 1], slot_of_flat [M*topk], slot_to_expert [G or
         0], problem_shapes [P, G, 3], ptr_arrays [P or 0, 3, G], row_map
         [num_blocks*128 or 0], weight_of_slot [num_blocks*128 or 0], slot_sched [2
-        or 0])``.
+        or 0], slot_tiles [T + 1 or 0])``.
         ``blk0[G]`` is the number of blocks in use. Rows past ``cnt[g]`` in an
         expert's last block, and every row of an unused block, are never written.
         The order of the rows inside an expert is unspecified.
@@ -1209,7 +1228,7 @@ def moe_build_routing_compact(
     # arch-agnostic glue (plain int32 / int64 + PDL), the same kernels on every architecture
     return tuple(torch.ops.fish_scales_ops.moe_build_routing_compact(
         topk_ids, int(num_groups), int(num_blocks), bool(with_slots), bool(with_row_map), topk_w, nk,
-        bases if bases else None, strides))
+        bases if bases else None, strides, bool(with_tiles)))
 
 
 def moe_topk_from_logits(
@@ -1463,6 +1482,19 @@ class _Mxfp8LayerPlan:
     compact: bool = False
     num_blocks: int = 0
     rows: int = 0
+    # sm_100/103 compact layout: a GEMM lands on the slot route past a row capacity of one
+    # token tile, so the routing op also emits the packed live token-tile list it walks.
+    want_tiles: bool = False
+
+
+# The token tile of the sm_100/103 slot kernels: past a row capacity of this many rows the
+# compact slot ops walk the routing op's packed list of live token tiles (`slot_tiles`).
+_SLOT_TOKEN_TILE = 64
+
+
+def _compact_tiles_cap(pairs: int, num_experts: int) -> int:
+    """Entries of `moe_build_routing_compact`'s token-tile list (one more holds the count)."""
+    return max(1, (pairs + 63 * min(num_experts, pairs)) // 64)
 
 
 # Whether the MXFP8 layer runs on the compact layout (the default) or on the masked slab
@@ -1536,8 +1568,11 @@ def _mxfp8_layer_plan(m: int, topk: int, num_experts: int, n_w: int, hidden_size
     # scale-factor descriptor has a constant extent), and the slack keeps such a tile's
     # reads inside the allocation.
     rows = 128 * (num_blocks + 1) if compact else 0
+    # The compact slot ops past one token tile of row capacity walk the routing op's live
+    # token-tile list (run fso_0.2.1_20261010/S10b-3b); asked for exactly where one runs.
+    want_tiles = bool(compact and want_slots and m_cap > _SLOT_TOKEN_TILE)
     return _Mxfp8LayerPlan(m_cap, expected_m, max_active_groups, fused_fc1, want_slots,
-                           want_ps_fc1, want_ps_fc2, scatter, compact, num_blocks, rows)
+                           want_ps_fc1, want_ps_fc2, scatter, compact, num_blocks, rows, want_tiles)
 
 
 def _alloc_bytes(nbytes: int) -> int:
@@ -1597,6 +1632,8 @@ def _mxfp8_plan_bytes_compact(plan: _Mxfp8LayerPlan, m: int, topk: int, num_expe
     if plan.want_slots:
         total += a(4 * g)                                     # packed active-expert list
         total += a(4 * 2)                                     # the slot route's work-stealing counter
+    if plan.want_tiles:
+        total += a(4 * (_compact_tiles_cap(m * topk, g) + 1))  # the slot route's live token-tile list
     if n_ps:
         total += a(4 * 3 * g * n_ps)                          # per-group (rows, N, K) triples
         total += a(8 * 3 * g * n_ps)                          # per-call A / A-scale / D pointers
@@ -1878,14 +1915,16 @@ def _moe_layer_mxfp8_compact(
         nk += [hsz, inter]
         bases += [dq, sd, dn]
         strides += [inter, 4 * inter, 2 * hsz]
-    masked_m, blk0, slot_of_flat, slots, shapes, ptrs, row_map, weight_of_slot, slot_sched = (
+    masked_m, blk0, slot_of_flat, slots, shapes, ptrs, row_map, weight_of_slot, slot_sched, slot_tiles = (
         ops.moe_build_routing_compact(
             topk_ids, num_experts, plan.num_blocks, plan.want_slots, plan.scatter,
-            topk_w if plan.scatter else None, nk, bases if bases else None, strides))
+            topk_w if plan.scatter else None, nk, bases if bases else None, strides, plan.want_tiles))
     slot_to_expert = slots if plan.want_slots else None
     # The sm_100/103 slot route's work-stealing counter: zero from the routing op, and
     # left zero by each slot GEMM, so FC1 and FC2 of this call share it.
     sched = slot_sched if plan.want_slots else None
+    # Past one token tile of row capacity, the live token tiles the slot GEMMs walk.
+    tiles = slot_tiles if plan.want_tiles else None
     ps_fc1 = shapes[0] if plan.want_ps_fc1 else None
     ptr_fc1 = ptrs[0] if plan.want_ps_fc1 else None
     i2 = 1 if plan.want_ps_fc1 else 0
@@ -1897,11 +1936,11 @@ def _moe_layer_mxfp8_compact(
     if plan.fused_fc1:
         ops.linear_mxfp8_grouped_compact_swiglu(
             a1, w13_fp8, sh, sw13, masked_m, blk0, plan.m_cap, plan.expected_m, plan.max_active_groups,
-            slot_to_expert, ps_fc1, ptr_fc1, dq.view(r, inter), sd, sched)
+            slot_to_expert, ps_fc1, ptr_fc1, dq.view(r, inter), sd, sched, tiles)
     else:
         ops.linear_mxfp8_grouped_compact(
             a1, w13_fp8, sh, sw13, masked_m, blk0, plan.m_cap, plan.expected_m, plan.max_active_groups,
-            slot_to_expert, ps_fc1, ptr_fc1, gu.view(r, n_w), sched)
+            slot_to_expert, ps_fc1, ptr_fc1, gu.view(r, n_w), sched, tiles)
         # Interleaved weights without the fused FC1 put gate_j and up_j in adjacent
         # columns, which is what the SwiGLU kernel's pairwise form reads.
         ops.silu_chunk_mul_quantize_1x32_grouped_out(gu, slot_of_flat, True, w13_interleaved, dq, sd)
@@ -1924,7 +1963,7 @@ def _moe_layer_mxfp8_compact(
         return dst
     ops.linear_mxfp8_grouped_compact(
         a2, w2_fp8, sd, sw2, masked_m, blk0, plan.m_cap, plan.expected_m, plan.max_active_groups,
-        slot_to_expert, ps_fc2, ptr_fc2, dn.view(r, hsz), sched)
+        slot_to_expert, ps_fc2, ptr_fc2, dn.view(r, hsz), sched, tiles)
     if join is not None:
         join()
     return ops.moe_combine(dn, slot_of_flat, topk_w, bias, bias_scale, out)
