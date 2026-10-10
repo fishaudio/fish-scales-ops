@@ -2,6 +2,19 @@
 
 Performance figures are in `docs/perf/`, not here.
 
+## 0.2.1 — unreleased
+
+### New
+
+- **MXFP8 weights load as stored (#9).** `fso.moe.prepare_experts(w13, w2, format="mxfp8", sw13=..., sw2=...)`
+  and `fso.dense.prepare_weight(w, format="mxfp8", scale=...)` take an MXFP8 checkpoint as it is written:
+  float8_e4m3fn weights with uint8 UE8M0 scales, one byte per 32 elements along K (`sw13 [E, 2I, H/32]`,
+  `sw2 [E, H, I/32]`, `scale [N, K/32]`), row-major, byte `b` meaning 2^(b − 127). The bytes are the same on
+  sm_100/sm_103 and sm_120/sm_121. The library only packs the scale bytes into the device's layout and
+  re-orders the FC1 rows for the fused FC1; it requantizes nothing, so calibrated checkpoints are served as
+  written and loading needs no bf16 copy of the layer. The bf16 forms and the int32 dense scale stay as
+  they were; sm_90 still refuses `format="mxfp8"`.
+
 ## 0.2.0 — 2026-10-06
 
 First stable release. The supported interface is `fso.dense`, `fso.moe` and `fso.attention`. The same

@@ -34,8 +34,10 @@ import torch, fish_scales_ops as fso
 # Once per layer at load time, on the serving device: the rank's local experts as
 # the checkpoint stores them, w13 [E, 2I, H] with the gate rows first and
 # w2 [E, H, I]. "bsfp8" = fp8 weights with fp32 128x128 block scales, "mxfp8" =
-# bf16 weights (quantized here). The arch dispatch is inside the op.
+# bf16 weights (quantized here) or fp8 weights with uint8 UE8M0 scales as an MXFP8
+# checkpoint stores them (kept as stored). The arch dispatch is inside the op.
 experts = fso.moe.prepare_experts(w13, w2, format="bsfp8", sw13=sw13, sw2=sw2)
+experts = fso.moe.prepare_experts(w13_fp8, w2_fp8, format="mxfp8", sw13=sw13_u8, sw2=sw2_u8)
 # Per call. topk_ids (int32 or int64) may carry ids outside [0, E) for padded
 # graph rows and for experts another expert-parallel rank owns; they are skipped.
 out = fso.moe.layer(hidden, experts, topk_ids, topk_w)
@@ -78,7 +80,7 @@ with it.
 | `format` | what the caller holds | sm_90 (H200) | sm_100 / sm_103 (B200, B300) | sm_120 / sm_121 (RTX 5090) |
 |---|---|---|---|---|
 | `"bsfp8"` | float8_e4m3fn weights with fp32 128×128 block scales `sw13 [E, 2I/128, H/128]` and `sw2 [E, H/128, I/128]`, weight = fp8 value × block scale (the `bsgemm-moe` dialect) | kept as they are (validated, made contiguous if they are not); kind `"bsfp8"` | each expert dequantized block by block to bf16 and requantized to MXFP8 1×32 with the FC1 rows interleaved; kind `"mxfp8"` | same as sm_100 |
-| `"mxfp8"` | bf16 weights (the `mxfp8` dialect keeps its experts bf16 in the checkpoint) | `NotImplementedError`: sm_90 has no MXFP8 hardware | quantized to MXFP8 1×32 with the FC1 rows interleaved; kind `"mxfp8"` | same as sm_100 |
+| `"mxfp8"` | bf16 weights and no scales (the `mxfp8` dialect keeps its experts bf16 in the checkpoint); or an MXFP8 checkpoint as it is stored: float8_e4m3fn weights with uint8 UE8M0 scales `sw13 [E, 2I, H/32]` and `sw2 [E, H, I/32]`, one byte per 32 elements along K, row-major, byte `b` meaning the scale 2^(b − 127), weight = fp8 value × scale | `NotImplementedError`: sm_90 has no MXFP8 hardware, whatever the dtypes | bf16 weights are quantized to MXFP8 1×32; an MXFP8 checkpoint keeps its weight bytes and its scale bytes are packed into this architecture's int32 layout, nothing requantized. The FC1 rows are interleaved either way; kind `"mxfp8"` | same as sm_100 |
 | anything else (bf16 experts, int8, fp4, …) | — | `NotImplementedError` for a known dialect, `ValueError` for an unknown string; no fallback | same | same |
 
 It returns an `fso.moe.MoeExperts`, a frozen handle with the fields `kind`,
@@ -109,7 +111,33 @@ the shape, which it does unless `FSO_FC1_FUSED=0`; the handle's
 runs a few experts at a time under a fixed scratch budget, so preparing a layer
 never holds a second full copy of its weights. On sm_90 the handle keeps the
 caller's own block-FP8 tensors, so freeing the source parameters afterwards
-releases no memory there; on the MXFP8 architectures it does.
+releases no memory there; on the MXFP8 architectures it does, except for an
+MXFP8 checkpoint (below).
+
+**MXFP8 checkpoints as stored.** An MXFP8 checkpoint holds the 1×32 encoding
+itself: float8_e4m3fn weights and one UE8M0 scale byte per 32 elements along K,
+as uint8 `sw13 [E, 2I, H/32]` and `sw2 [E, H, I/32]` in the same row-major order
+as the weights, byte `b` meaning the scale 2^(b − 127). These are the same bytes
+on every MXFP8 architecture, so one checkpoint serves sm_100/103 and sm_120/121.
+`prepare_experts(w13_fp8, w2_fp8, format="mxfp8", sw13=sw13_u8, sw2=sw2_u8)`
+takes them as they are: it packs each row's scale bytes four to an int32 word
+(the lowest K block in the lowest byte) and writes the words in the order this
+architecture's kernels read, and it re-orders the FC1 weight rows and their scale
+rows together when the handle is interleaved. It computes nothing from the
+values, so codes and scales that no load-time rule would produce (a calibrated
+checkpoint's, for instance) are served exactly as written, and there is no bf16
+transient. The handle keeps the caller's `w2` tensor, and its `w13` too when the
+FC1 rows are not interleaved; the interleaved `w13` and the scale handles are
+new tensors. A scale in another form is refused with a `ValueError` that names
+the expected dtype and shape: the int32 scale handle of
+`quantize_moe_weights_1x32_fp8` (it is architecture-specific), fp32 scales, a
+`float8_e8m0fnu` tensor (pass `.view(torch.uint8)`, the same bytes), a wrong
+shape, a scale on another device, scales with bf16 weights, fp8 weights without
+scales, and one weight of each dtype.
+`tests/gemm/unit/test_prequant_mxfp8.py` checks that a handle prepared this way
+from the bytes of a bf16-prepared handle equals that handle tensor for tensor,
+that random codes and scale bytes reach the handle unchanged, and that the
+layer outputs are bit-identical.
 
 **The layer.** `layer(hidden, experts, topk_ids, topk_w, *, bias=None, bias_scale=None)`
 computes, for every token `t`,

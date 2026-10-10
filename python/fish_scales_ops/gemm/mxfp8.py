@@ -579,6 +579,59 @@ def interleave_w13_fp8(
     return w_out, s_out.reshape(sw13.shape)
 
 
+def _ue8m0_scale_handle(sf: torch.Tensor, row_perm: torch.Tensor | None = None) -> torch.Tensor:
+    """Pack checkpoint UE8M0 scale bytes into this device's grouped int32 scale handle.
+
+    This is the one place that turns the scales of an MXFP8 checkpoint into the layout
+    the GEMMs read; ``fso.moe.prepare_experts`` and ``fso.dense.prepare_weight`` both
+    call it. It moves bytes and computes nothing, so no weight is requantized.
+
+    The input is the portable form an MXFP8 checkpoint stores: uint8 ``[G, N, K/32]``,
+    one UE8M0 byte per 32 elements along K, row-major, byte ``b`` meaning the scale
+    ``2^(b - 127)``. The 1x32 quantizer packs the four bytes of one 128-wide K block of a
+    row into one int32 word with the lowest K block in the lowest byte
+    (``b0 | b1 << 8 | b2 << 16 | b3 << 24``, ``csrc/gemm/ops/quant_kernels.cu``), and
+    device memory is little-endian, so the contiguous bytes reinterpreted as int32 are
+    already the words ``[G, N, K/128]``. What remains is the order of the words:
+
+    * sm_120/121: ``[G, K/128, N]``, the words of one K block adjacent across rows (the
+      grouped handle of :func:`quantize_moe_weights_1x32_fp8`).
+    * sm_100/103: ``[G, pad(N, 128) * K/128]``, one CUTLASS Sm1xx atom slab per group with
+      every word at :func:`_sm100_atom_word_index`; the words of padding rows are zero
+      bytes, as the quantizer writes them.
+
+    Args:
+        sf: uint8 ``[G, N, K/32]`` with ``K % 128 == 0``, any strides.
+        row_perm: optional permutation of the N rows, applied before the layout is
+            written: output row ``r`` takes the words of input row ``row_perm[r]``. The
+            FC1 interleave passes :func:`_w13_interleave_perm`.
+
+    Returns:
+        A new int32 tensor in the grouped layout above. A dense weight is the ``G = 1``
+        case: element ``[0]`` of the result, transposed on sm_120/121 to the ``[N, K/128]``
+        tensor with strides ``(1, N)`` that ``quantize_1x32_fp8`` returns, and as it is
+        (1-D) on sm_100/103.
+    """
+    _require_grouped_arch()
+    if sf.dtype != torch.uint8 or sf.dim() != 3 or int(sf.shape[2]) % 4 != 0:
+        raise ValueError(f"_ue8m0_scale_handle: sf must be uint8 [G, N, K/32] with K % 128 == 0, got "
+                         f"{sf.dtype} {list(sf.shape)}")
+    g, n, kb = int(sf.shape[0]), int(sf.shape[1]), int(sf.shape[2]) // 4
+    s = sf.contiguous()
+    if s.storage_offset() % 4 != 0:
+        s = s.clone()  # a view into a byte buffer at an odd offset cannot be reinterpreted in place
+    words = s.view(torch.int32)  # [G, N, K/128], the same bytes
+    if row_perm is not None:
+        words = words.index_select(1, row_perm.to(device=words.device, dtype=torch.long))
+    if sm_major() == 12:
+        return words.transpose(1, 2).contiguous()
+    n_pad = (n + 127) // 128 * 128
+    out = torch.zeros(g, n_pad * kb, dtype=torch.int32, device=sf.device)
+    dst = _sm100_atom_word_index(torch.arange(n, dtype=torch.long, device=sf.device), kb).reshape(-1)
+    out[:, dst] = words.reshape(g, n * kb)
+    return out
+
+
 def quantize_1x32_grouped_gather_fp8(
     x: torch.Tensor,
     slot_of_flat: torch.Tensor,
