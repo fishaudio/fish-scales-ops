@@ -196,6 +196,9 @@ struct CompactActsParams<true>
     int32_t const* blk0 = nullptr;
     // R, the row count of those tensors (128 * the blocks the caller allocated).
     int act_rows = 0;
+    // Rv = min(m_cap, 128), the row extent of the block view of A (kBlockView instances only; see
+    // SM120BlockScaledKernel::kBlockView).
+    int view_rows = 0;
 };
 
 // FusedSwiGLUEpi turns the epilogue into the MoE layer's FC1 tail: instead of
@@ -285,6 +288,46 @@ struct SM120BlockScaledKernel
         }
     }
 
+    // The block view of the activation operand A (compact instances whose TileM divides 128).
+    //
+    // The one-group view reads A as one tensor of R rows, so a tile that runs past its expert's live rows READS
+    // those rows: they are in bounds. The masked slab's (m_cap, K, G) tensor ends each group at m_cap, so the
+    // same rows are out of bounds there and TMA zero-fills them without touching memory. At decode that
+    // difference was nearly the whole extra cost of the compact FC1 (run fso_0.2.1_20261010/S4b): a 16-row tile
+    // over an expert with one to a few live rows fetched 16 rows of A per k-tile instead of m_cap = 4, and the
+    // masked kernel run on a slab padded to 16 rows reproduced the compact gap almost exactly (+0.32 against
+    // +0.38 us at Family C M = 4 for the fused FC1, +0.59 against +0.64 at M = 8), while staging blk0 in shared
+    // memory did not move it. FC2 (K = 512) over-reads a quarter as many bytes per tile, which is why it barely
+    // showed the gap.
+    //
+    // So these instances read A as the rank-3 tensor [blocks, Rv rows, K] (row stride K, block stride 128 * K)
+    // with Rv = min(m_cap, 128): rows Rv..127 of every block are out of bounds and zero-filled, exactly as rows
+    // past m_cap are in the masked slab. A tile of expert g at m-block m is block blk0[g] + m * TileM / 128, rows
+    // (m * TileM) % 128 + [0, TileM): since TileM divides 128 and an expert starts on a block boundary, no tile
+    // crosses a block. Correct at every M: below 128 tokens an expert holds at most m_cap rows, all in its one
+    // block; from 128 on Rv = 128 and every row of every block is visible (the over-read is then a sliver of a
+    // compute-bound tile). Precondition, the masked GEMM's own: masked_m[g] <= m_cap.
+    //
+    // The scale words (SFA) keep the one-group view. Giving them the same block view was measured too (run
+    // S4c): it reads a quarter of A's over-read bytes away but splits every scale box into four 16-byte pieces,
+    // and was slower than this A-only form at nearly every decode cell. The 96- and 160-row instances keep the
+    // one-group view for A as well (their tiles cross blocks), and stores keep it everywhere (they are bounded by
+    // masked_m already). The compact buffer itself (charter D1) does not change; only A's read addressing does.
+    static constexpr bool kBlockView = CompactActs && (128 % KT::kTileM == 0);
+
+    CUTE_HOST_DEVICE static int block_view_rows(int m_cap)
+    {
+        return m_cap < 128 ? m_cap : 128;
+    }
+
+    // The block view's (m-tile, block) of the tile whose expert starts at row act_row0 (a multiple of 128).
+    CUTE_DEVICE static void block_view_coord(int act_row0, int m_block, int& m_tile, int& block)
+    {
+        int const row = act_row0 + m_block * KT::kTileM;
+        m_tile = (row & 127) / KT::kTileM;
+        block = row >> 7;
+    }
+
     struct Params : CompactActsParams<CompactActs>
     {
         typename KT::TMA_A tma_load_a;
@@ -361,7 +404,20 @@ struct SM120BlockScaledKernel
         auto const act_shape = act_problem_shape(problem_shape, args.act_rows);
         auto M_a = cute::get<0>(act_shape);
         auto L_a = cute::get<3>(act_shape);
-        auto tensor_A = make_tensor(make_gmem_ptr(args.ptr_A), make_layout(make_shape(M_a, K, L_a), args.dA));
+        auto tensor_A = [&]
+        {
+            if constexpr (kBlockView)
+            {
+                int64_t const ld = cute::get<0>(args.dA);
+                return make_tensor(make_gmem_ptr(args.ptr_A),
+                    make_layout(make_shape(block_view_rows(cute::get<0>(problem_shape)), K, args.act_rows / 128),
+                        make_stride(ld, Int<1>{}, ld * 128)));
+            }
+            else
+            {
+                return make_tensor(make_gmem_ptr(args.ptr_A), make_layout(make_shape(M_a, K, L_a), args.dA));
+            }
+        }();
         typename KT::TMA_A tma_load_a
             = make_tma_copy(SM90_TMA_LOAD{}, tensor_A, typename KT::SmemLayoutA{}(_, _, Int<0>{}),
                 make_shape(shape<0>(typename KT::TileShape{}), shape<2>(typename KT::TileShape{})), _1{});
@@ -398,6 +454,7 @@ struct SM120BlockScaledKernel
         {
             params.blk0 = args.blk0;
             params.act_rows = args.act_rows;
+            params.view_rows = block_view_rows(cute::get<0>(problem_shape));
         }
         return params;
     }
@@ -620,7 +677,11 @@ struct SM120BlockScaledKernel
 
         auto mA_mkl = [&]
         {
-            if constexpr (CompactActs)
+            if constexpr (kBlockView)
+            {
+                return params.tma_load_a.get_tma_tensor(make_shape(params.view_rows, K, params.act_rows / 128));
+            }
+            else if constexpr (CompactActs)
             {
                 return act_coord_tensor(params.tma_load_a.get_tma_tensor(make_shape(params.act_rows, K, 1)), act_row0);
             }
@@ -644,8 +705,22 @@ struct SM120BlockScaledKernel
         auto n_coord = cute::get<1>(blk_coord);
         auto l_coord = cute::get<2>(blk_coord);
 
-        // The compact layout's activations are one group: batch index 0.
-        auto gA = gA_mkl(_, _, m_coord, _, CompactActs ? 0 : l_coord);
+        // The compact layout's activations are one group (batch index 0), or in the block view the tile's
+        // (m-tile, block) inside it.
+        auto gA = [&]
+        {
+            if constexpr (kBlockView)
+            {
+                int m_sel;
+                int l_sel;
+                block_view_coord(act_row0, m_coord, m_sel, l_sel);
+                return gA_mkl(_, _, m_sel, _, l_sel);
+            }
+            else
+            {
+                return gA_mkl(_, _, m_coord, _, CompactActs ? 0 : l_coord);
+            }
+        }();
         auto gB = gB_nkl(_, _, n_coord, _, l_coord);
 
         auto tAgA = block_tma_a.partition_S(gA); // (TMA,TMA_M,TMA_K,k)
