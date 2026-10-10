@@ -14,8 +14,8 @@ engine starts with the integration guide, [`docs/guide.md`](docs/guide.md).
 
 | feature | H200 (sm_90) | B200 / B300 (sm_100 / sm_103) | RTX 5090 (sm_120) |
 |---|---|---|---|
-| dense linear, `fso.dense` | block-FP8 1×128 | MXFP8 1×32; block-FP8 checkpoints are requantized to MXFP8 at load | MXFP8 1×32; block-FP8 checkpoints are requantized to MXFP8 at load |
-| MoE layer, `fso.moe` | block-FP8 experts | MXFP8 (block-FP8 or bf16 experts) | MXFP8 (block-FP8 or bf16 experts) |
+| dense linear, `fso.dense` | block-FP8 1×128 | MXFP8 1×32; MXFP8 checkpoints load as stored, block-FP8 checkpoints are requantized to MXFP8 at load | MXFP8 1×32; MXFP8 checkpoints load as stored, block-FP8 checkpoints are requantized to MXFP8 at load |
+| MoE layer, `fso.moe` | block-FP8 experts | MXFP8 (MXFP8, block-FP8 or bf16 experts) | MXFP8 (MXFP8, block-FP8 or bf16 experts) |
 | attention, `fso.attention` | torch SDPA | torch SDPA | MXFP8 prefill, paged prefill and paged decode; torch SDPA |
 
 `fso.dense.linear` and `fso.moe.layer` take and return bf16 and quantize the
@@ -56,11 +56,14 @@ import fish_scales_ops as fso
 
 # Dense linear, every architecture: prepare once per weight at load time, then one call per batch.
 weight = fso.dense.prepare_weight(w_fp8, format="bsfp8", scale=w_scale)  # a block-FP8 checkpoint
+# weight = fso.dense.prepare_weight(w_fp8, format="mxfp8", scale=w_ue8m0)  # an MXFP8 checkpoint, as stored (Blackwell)
 # weight = fso.dense.prepare_weight(w_bf16, format="mxfp8")             # a bf16 weight, as MXFP8 (Blackwell)
 y = fso.dense.linear(x, weight)              # bf16 [..., K] -> bf16 [..., N]
 
 # MoE layer, every architecture: prepare once per layer at load time, then one call per batch.
-experts = fso.moe.prepare_experts(w13, w2, format="bsfp8", sw13=sw13, sw2=sw2)  # or format="mxfp8" (bf16 experts)
+experts = fso.moe.prepare_experts(w13, w2, format="bsfp8", sw13=sw13, sw2=sw2)  # a block-FP8 checkpoint
+# experts = fso.moe.prepare_experts(w13, w2, format="mxfp8", sw13=sw13, sw2=sw2)  # an MXFP8 checkpoint (Blackwell)
+# experts = fso.moe.prepare_experts(w13, w2, format="mxfp8")                      # bf16 experts, as MXFP8 (Blackwell)
 out = fso.moe.layer(hidden, experts, topk_ids, topk_w)
 reserve = fso.moe.transient_bytes(experts, max_tokens, topk)   # bytes one call allocates
 
