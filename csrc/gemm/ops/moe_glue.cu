@@ -293,73 +293,20 @@ __global__ void moe_build_routing_ps_kernel(
 // sigmoid gate, which every other layout pays a separate elementwise pass for.
 // With kBias false the body is what it was, instruction for instruction, so the
 // layers that have no shared expert keep the kernel they had on every arch.
+// One (token t, 8 columns from h) item of the combine: out[t, h..h+7] = sum_j topk_w[t, j] * dn[slot_j, h..h+7] (+ the
+// bias row), j ascending. `slots` / `ws` hold the token's routing when `fast` (topk <= kMaxTopk); the slow path reads
+// it here.
+constexpr int kCombineVec = 8;     // 8 bf16 = 16 bytes per thread
+constexpr int kCombineMaxTopk = 8; // the unrolled fast path
+
 template <bool kBias>
-__global__ void moe_combine_kernel(
-    __nv_bfloat16 const* __restrict__ dn, // [G * m_cap, H]
-    int32_t const* __restrict__ slot_of_flat, // [M * topk]
-    float const* __restrict__ topk_w,     // [M, topk]
-    __nv_bfloat16* __restrict__ out,      // [M, H]
-    __nv_bfloat16 const* __restrict__ bias,   // [M, H] or nullptr (read iff kBias)
-    float const* __restrict__ bias_scale,     // [M] or nullptr: per-token factor on bias
-    int M, int topk, int H, bool pdl)
+__device__ __forceinline__ void moe_combine_item(__nv_bfloat16 const* __restrict__ dn,
+    int32_t const* __restrict__ slot_of_flat, float const* __restrict__ topk_w, __nv_bfloat16* __restrict__ out,
+    __nv_bfloat16 const* __restrict__ bias, float const* __restrict__ bias_scale, int t, int h, int topk, int H,
+    bool fast, int const (&slots)[kCombineMaxTopk], float (&ws)[kCombineMaxTopk])
 {
-    constexpr int kVec = 8; // 8 bf16 = 16 bytes per thread
-    int const tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int const num_hvec = H / kVec;
-    // A thread past the end has nothing to load and nothing to wait for. Thread 0
-    // of every CTA is in range (the grid is ceil(total / blockDim)), so every CTA
-    // still reaches the PDL trigger below.
-    if (tid >= M * num_hvec)
-        return;
-    int const t = tid / num_hvec;
-    int const h = (tid % num_hvec) * kVec;
-
-    // Prefetch all topk routed rows before reducing so the scattered LDG.128
-    // latencies overlap. At M=1 this kernel is a single latency-bound CTA and
-    // the old load->use-per-iteration chain serialised topk dependent loads.
-    // Fast path unrolls a fixed bound (covers the common MoE topk); larger topk
-    // falls back to the sequential loop.
-    constexpr int kMaxTopk = 8;
-    bool const fast = topk <= kMaxTopk;
-    float ws[kMaxTopk];
-    int slots[kMaxTopk];
-    if (fast)
-    {
-        // Three unrolled phases so the topk slot / weight loads, then the topk LDG.128 row loads, issue
-        // back-to-back (two memory round trips per thread, as before masked entries were supported: a
-        // branch or select inside a single loop cost +1.4-1.7 us at M = 8). A masked padded-row entry
-        // (sorted layout, flat_to_sorted = -1) reads row 0, always allocated, and is zeroed afterwards.
-        //
-        // The first phase runs BEFORE the PDL wait below. slot_of_flat and topk_w are routing outputs,
-        // written four launches upstream of this kernel in every MoE chain of this library, so they are
-        // grandparent-or-older data like everything a kernel of the chain reads before its wait; only
-        // the dn rows come from the parent (the FC2). A CTA that is resident before the FC2 ends, which
-        // the 128-thread launch in moe_combine() makes the common case at decode, has its first round
-        // trip done when the wait returns. Direct callers inherit the chain's precondition: neither
-        // input may be written by the kernel launched immediately before this one. Measured in run
-        // sm120_r2_p1_20260929 (REPORT.md, part 2).
-#pragma unroll
-        for (int j = 0; j < kMaxTopk; ++j)
-        {
-            if (j < topk)
-            {
-                slots[j] = slot_of_flat[t * topk + j];
-                ws[j] = topk_w[t * topk + j];
-            }
-        }
-    }
-
-    // PDL entry (see moe_build_routing_kernel): the wait orders every dn read behind the parent,
-    // and the trigger follows the wait as in every kernel of the chain.
-    if (pdl)
-    {
-        cudaGridDependencySynchronize();
-        if (threadIdx.x == 0)
-        {
-            cudaTriggerProgrammaticLaunchCompletion();
-        }
-    }
-
+    constexpr int kVec = kCombineVec;
+    constexpr int kMaxTopk = kCombineMaxTopk;
     float acc[kVec];
 #pragma unroll
     for (int v = 0; v < kVec; ++v)
@@ -445,8 +392,248 @@ __global__ void moe_combine_kernel(
 #pragma unroll
     for (int p = 0; p < kVec / 2; ++p)
         packed[p] = __floats2bfloat162_rn(acc[2 * p], acc[2 * p + 1]);
-    *reinterpret_cast<float4*>(&out[static_cast<int64_t>(t) * H + h])
-        = *reinterpret_cast<float4 const*>(&packed[0]);
+    *reinterpret_cast<float4*>(&out[static_cast<int64_t>(t) * H + h]) = *reinterpret_cast<float4 const*>(&packed[0]);
+}
+
+// The token's routing for the fast path: the topk slot / weight loads issue back to back, then (in
+// moe_combine_item) the topk LDG.128 row loads, two memory round trips per thread (a branch or select inside a single
+// loop cost +1.4-1.7 us at M = 8). A masked padded-row entry (sorted layout, flat_to_sorted = -1) reads row 0, always
+// allocated, and is zeroed afterwards.
+__device__ __forceinline__ void moe_combine_routing(int32_t const* __restrict__ slot_of_flat,
+    float const* __restrict__ topk_w, int t, int topk, int (&slots)[kCombineMaxTopk], float (&ws)[kCombineMaxTopk])
+{
+#pragma unroll
+    for (int j = 0; j < kCombineMaxTopk; ++j)
+    {
+        if (j < topk)
+        {
+            slots[j] = slot_of_flat[t * topk + j];
+            ws[j] = topk_w[t * topk + j];
+        }
+    }
+}
+
+// kStride = false: one (token, 8-column) item per thread, the straight-line kernel this file always had; moe_combine()
+// launches it whenever its grid fits in kFsoGlueFlatWaves waves. kStride = true: the same items, grid-stride, on a grid
+// of one wave when the items exceed that, every item reduced exactly as a thread of a larger grid would. Two
+// instantiations rather than one loop because the loop needs about 16 registers more than the straight-line body
+// (80-84 against 64): in one kernel the decode launches would pay them too, and at 64 registers a 128-thread CTA fits
+// beside the sm_120 decode FC2's two resident CTAs (see moe_combine), at 80 or more it does not; bounding the loop to
+// 64 registers spills instead.
+template <bool kBias, bool kStride>
+__global__ void moe_combine_kernel(
+    __nv_bfloat16 const* __restrict__ dn, // [G * m_cap, H]
+    int32_t const* __restrict__ slot_of_flat, // [M * topk]
+    float const* __restrict__ topk_w,     // [M, topk]
+    __nv_bfloat16* __restrict__ out,      // [M, H]
+    __nv_bfloat16 const* __restrict__ bias,   // [M, H] or nullptr (read iff kBias)
+    float const* __restrict__ bias_scale,     // [M] or nullptr: per-token factor on bias
+    int M, int topk, int H, bool pdl)
+{
+    if constexpr (!kStride)
+    {
+        // The one-item-per-thread kernel, exactly as it always was (its machine code is unchanged).
+        constexpr int kVec = 8; // 8 bf16 = 16 bytes per thread
+        int const tid = blockIdx.x * blockDim.x + threadIdx.x;
+        int const num_hvec = H / kVec;
+        // A thread past the end has nothing to load and nothing to wait for. Thread 0
+        // of every CTA is in range (the grid is ceil(total / blockDim)), so every CTA
+        // still reaches the PDL trigger below.
+        if (tid >= M * num_hvec)
+            return;
+        int const t = tid / num_hvec;
+        int const h = (tid % num_hvec) * kVec;
+
+        // Prefetch all topk routed rows before reducing so the scattered LDG.128
+        // latencies overlap. At M=1 this kernel is a single latency-bound CTA and
+        // the old load->use-per-iteration chain serialised topk dependent loads.
+        // Fast path unrolls a fixed bound (covers the common MoE topk); larger topk
+        // falls back to the sequential loop.
+        constexpr int kMaxTopk = 8;
+        bool const fast = topk <= kMaxTopk;
+        float ws[kMaxTopk];
+        int slots[kMaxTopk];
+        if (fast)
+        {
+            // Three unrolled phases so the topk slot / weight loads, then the topk LDG.128 row loads, issue
+            // back-to-back (two memory round trips per thread, as before masked entries were supported: a
+            // branch or select inside a single loop cost +1.4-1.7 us at M = 8). A masked padded-row entry
+            // (sorted layout, flat_to_sorted = -1) reads row 0, always allocated, and is zeroed afterwards.
+            //
+            // The first phase runs BEFORE the PDL wait below. slot_of_flat and topk_w are routing outputs,
+            // written four launches upstream of this kernel in every MoE chain of this library, so they are
+            // grandparent-or-older data like everything a kernel of the chain reads before its wait; only
+            // the dn rows come from the parent (the FC2). A CTA that is resident before the FC2 ends, which
+            // the 128-thread launch in moe_combine() makes the common case at decode, has its first round
+            // trip done when the wait returns. Direct callers inherit the chain's precondition: neither
+            // input may be written by the kernel launched immediately before this one. Measured in run
+            // sm120_r2_p1_20260929 (REPORT.md, part 2).
+#pragma unroll
+            for (int j = 0; j < kMaxTopk; ++j)
+            {
+                if (j < topk)
+                {
+                    slots[j] = slot_of_flat[t * topk + j];
+                    ws[j] = topk_w[t * topk + j];
+                }
+            }
+        }
+
+        // PDL entry (see moe_build_routing_kernel): the wait orders every dn read behind the parent,
+        // and the trigger follows the wait as in every kernel of the chain.
+        if (pdl)
+        {
+            cudaGridDependencySynchronize();
+            if (threadIdx.x == 0)
+            {
+                cudaTriggerProgrammaticLaunchCompletion();
+            }
+        }
+
+        float acc[kVec];
+#pragma unroll
+        for (int v = 0; v < kVec; ++v)
+            acc[v] = 0.f;
+
+        if (fast)
+        {
+            float4 raws[kMaxTopk];
+#pragma unroll
+            for (int j = 0; j < kMaxTopk; ++j)
+            {
+                if (j < topk)
+                {
+                    int const src = slots[j] < 0 ? 0 : slots[j];
+                    raws[j] = *reinterpret_cast<float4 const*>(&dn[static_cast<int64_t>(src) * H + h]);
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < kMaxTopk; ++j)
+            {
+                if (j < topk && slots[j] < 0)
+                {
+                    ws[j] = 0.f;
+                    raws[j].x = 0.f;
+                    raws[j].y = 0.f;
+                    raws[j].z = 0.f;
+                    raws[j].w = 0.f;
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < kMaxTopk; ++j)
+            {
+                if (j < topk)
+                {
+                    __nv_bfloat162 const* v2 = reinterpret_cast<__nv_bfloat162 const*>(&raws[j]);
+#pragma unroll
+                    for (int p = 0; p < kVec / 2; ++p)
+                    {
+                        float2 const f = __bfloat1622float2(v2[p]);
+                        acc[2 * p] += ws[j] * f.x;
+                        acc[2 * p + 1] += ws[j] * f.y;
+                    }
+                }
+            }
+        }
+        else
+        {
+            for (int j = 0; j < topk; ++j)
+            {
+                int const slot = slot_of_flat[t * topk + j];
+                bool const valid = slot >= 0; // masked padded-row entry (sorted layout): no routed row
+                float const wl = topk_w[t * topk + j];
+                float const w = valid ? wl : 0.f;
+                float4 const rawl = *reinterpret_cast<float4 const*>(
+                    &dn[static_cast<int64_t>(valid ? slot : 0) * H + h]);
+                float4 const raw = valid ? rawl : make_float4(0.f, 0.f, 0.f, 0.f);
+                __nv_bfloat162 const* v2 = reinterpret_cast<__nv_bfloat162 const*>(&raw);
+#pragma unroll
+                for (int p = 0; p < kVec / 2; ++p)
+                {
+                    float2 const f = __bfloat1622float2(v2[p]);
+                    acc[2 * p] += w * f.x;
+                    acc[2 * p + 1] += w * f.y;
+                }
+            }
+        }
+
+        if constexpr (kBias)
+        {
+            float const bs = (bias_scale != nullptr) ? bias_scale[t] : 1.f;
+            float4 const raw = *reinterpret_cast<float4 const*>(&bias[static_cast<int64_t>(t) * H + h]);
+            __nv_bfloat162 const* v2 = reinterpret_cast<__nv_bfloat162 const*>(&raw);
+#pragma unroll
+            for (int p = 0; p < kVec / 2; ++p)
+            {
+                float2 const f = __bfloat1622float2(v2[p]);
+                acc[2 * p] += bs * f.x;
+                acc[2 * p + 1] += bs * f.y;
+            }
+        }
+
+        __nv_bfloat162 packed[kVec / 2];
+#pragma unroll
+        for (int p = 0; p < kVec / 2; ++p)
+            packed[p] = __floats2bfloat162_rn(acc[2 * p], acc[2 * p + 1]);
+        *reinterpret_cast<float4*>(&out[static_cast<int64_t>(t) * H + h])
+            = *reinterpret_cast<float4 const*>(&packed[0]);
+    }
+    else
+    {
+        int const num_hvec = H / kCombineVec;
+        int tid = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+        // A thread past the end has nothing to load and nothing to wait for. Thread 0
+        // of every CTA is in range (the grid is at most ceil(total / blockDim)), so every CTA
+        // still reaches the PDL trigger below.
+        if (tid >= M * num_hvec)
+            return;
+
+        // Prefetch all topk routed rows before reducing so the scattered LDG.128
+        // latencies overlap. At M=1 this kernel is a single latency-bound CTA and
+        // the old load->use-per-iteration chain serialised topk dependent loads.
+        // Fast path unrolls a fixed bound (covers the common MoE topk); larger topk
+        // falls back to the sequential loop.
+        bool const fast = topk <= kCombineMaxTopk;
+        float ws[kCombineMaxTopk];
+        int slots[kCombineMaxTopk];
+        // The first item's routing is read BEFORE the PDL wait below. slot_of_flat and topk_w are routing outputs,
+        // written four launches upstream of this kernel in every MoE chain of this library, so they are
+        // grandparent-or-older data like everything a kernel of the chain reads before its wait; only
+        // the dn rows come from the parent (the FC2). A CTA that is resident before the FC2 ends, which
+        // the 128-thread launch in moe_combine() makes the common case at decode, has its first round
+        // trip done when the wait returns. Direct callers inherit the chain's precondition: neither
+        // input may be written by the kernel launched immediately before this one. Measured in run
+        // sm120_r2_p1_20260929 (REPORT.md, part 2). The items beyond the first read theirs after the wait.
+        if (fast)
+            moe_combine_routing(slot_of_flat, topk_w, tid / num_hvec, topk, slots, ws);
+
+        // PDL entry (see moe_build_routing_kernel): the wait orders every dn read behind the parent,
+        // and the trigger follows the wait as in every kernel of the chain.
+        if (pdl)
+        {
+            cudaGridDependencySynchronize();
+            if (threadIdx.x == 0)
+            {
+                cudaTriggerProgrammaticLaunchCompletion();
+            }
+        }
+
+        moe_combine_item<kBias>(dn, slot_of_flat, topk_w, out, bias, bias_scale, tid / num_hvec,
+            (tid % num_hvec) * kCombineVec, topk, H, fast, slots, ws);
+        if constexpr (kStride)
+        {
+            for (tid += static_cast<int>(gridDim.x * blockDim.x); tid < M * num_hvec;
+                 tid += static_cast<int>(gridDim.x * blockDim.x))
+            {
+                float ws_i[kCombineMaxTopk];
+                int slots_i[kCombineMaxTopk];
+                if (fast)
+                    moe_combine_routing(slot_of_flat, topk_w, tid / num_hvec, topk, slots_i, ws_i);
+                moe_combine_item<kBias>(dn, slot_of_flat, topk_w, out, bias, bias_scale, tid / num_hvec,
+                    (tid % num_hvec) * kCombineVec, topk, H, fast, slots_i, ws_i);
+            }
+        }
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -1176,7 +1363,9 @@ __device__ __forceinline__ float router_full_denom(float const (&v)[kSlots], int
     return acc;
 }
 
-template <typename TLogit, int kSlots>
+// kStride: one warp per token on a grid of up to kFsoGlueFlatWaves waves (the one-item form), or grid-stride over
+// the tokens on kFsoGlueWaves waves beyond that (moe_topk_from_logits, fso_glue_launch).
+template <typename TLogit, int kSlots, bool kStride>
 __global__ void moe_topk_from_logits_kernel(TLogit const* __restrict__ logits, // [M, ld]
     int32_t const* __restrict__ n_valid,                                       // [1] or nullptr
     int32_t const* __restrict__ expert_map,                                    // [E + 1] or nullptr
@@ -1185,44 +1374,92 @@ __global__ void moe_topk_from_logits_kernel(TLogit const* __restrict__ logits, /
     float* __restrict__ shared_gate,                                           // [M] or nullptr
     int M, int E, int ld, int topk, int sentinel, bool renormalize, bool pdl)
 {
-    if (pdl)
+    if constexpr (!kStride)
     {
-        cudaGridDependencySynchronize();
-        if (threadIdx.x == 0)
+        // One warp per token, the kernel as it always was (its machine code is unchanged).
+        if (pdl)
         {
-            cudaTriggerProgrammaticLaunchCompletion();
+            cudaGridDependencySynchronize();
+            if (threadIdx.x == 0)
+            {
+                cudaTriggerProgrammaticLaunchCompletion();
+            }
         }
-    }
-    int const lane = threadIdx.x & 31;
-    int const token = static_cast<int>(blockIdx.x) * (kRouterThreads >> 5) + static_cast<int>(threadIdx.x >> 5);
-    if (token >= M)
-        return;
-    int64_t const row = static_cast<int64_t>(token) * ld;
-    // The shared expert's gate is logit column E, when the caller concatenated
-    // that weight row onto the router's. A padded row still gets a value (the
-    // block multiplies it by a zero-valued shared output), so it is written
-    // before the mask check.
-    if (shared_gate != nullptr && lane == 0)
-    {
-        float const l = router_to_float(logits[row + E]);
-        shared_gate[token] = 1.f / (1.f + expf(-l));
-    }
-    bool const masked = (n_valid != nullptr) && (token >= *n_valid);
-    float v[kSlots];
-    float full_denom = 0.f;
-    if (!masked)
-    {
+        int const lane = threadIdx.x & 31;
+        int const token = static_cast<int>(blockIdx.x) * (kRouterThreads >> 5) + static_cast<int>(threadIdx.x >> 5);
+        if (token >= M)
+            return;
+        int64_t const row = static_cast<int64_t>(token) * ld;
+        // The shared expert's gate is logit column E, when the caller concatenated
+        // that weight row onto the router's. A padded row still gets a value (the
+        // block multiplies it by a zero-valued shared output), so it is written
+        // before the mask check.
+        if (shared_gate != nullptr && lane == 0)
+        {
+            float const l = router_to_float(logits[row + E]);
+            shared_gate[token] = 1.f / (1.f + expf(-l));
+        }
+        bool const masked = (n_valid != nullptr) && (token >= *n_valid);
+        float v[kSlots];
+        float full_denom = 0.f;
+        if (!masked)
+        {
 #pragma unroll
-        for (int s = 0; s < kSlots; ++s)
-        {
-            int const e = lane + 32 * s;
-            v[s] = (e < E) ? router_to_float(logits[row + e]) : -INFINITY;
+            for (int s = 0; s < kSlots; ++s)
+            {
+                int const e = lane + 32 * s;
+                v[s] = (e < E) ? router_to_float(logits[row + e]) : -INFINITY;
+            }
+            if (!renormalize)
+                full_denom = router_full_denom<kSlots>(v, E, lane);
         }
-        if (!renormalize)
-            full_denom = router_full_denom<kSlots>(v, E, lane);
+        router_select_topk<kSlots>(v, E, topk, renormalize, full_denom, lane, expert_map, masked, sentinel,
+            topk_ids + static_cast<int64_t>(token) * topk, topk_w + static_cast<int64_t>(token) * topk);
     }
-    router_select_topk<kSlots>(v, E, topk, renormalize, full_denom, lane, expert_map, masked, sentinel,
-        topk_ids + static_cast<int64_t>(token) * topk, topk_w + static_cast<int64_t>(token) * topk);
+    else
+    {
+        if (pdl)
+        {
+            cudaGridDependencySynchronize();
+            if (threadIdx.x == 0)
+            {
+                cudaTriggerProgrammaticLaunchCompletion();
+            }
+        }
+        int const lane = threadIdx.x & 31;
+        // One warp per token, grid-stride over the tokens (moe_topk_from_logits caps the grid at kFsoGlueWaves waves).
+        int const token_stride = static_cast<int>(gridDim.x) * (kRouterThreads >> 5);
+        for (int token = static_cast<int>(blockIdx.x) * (kRouterThreads >> 5) + static_cast<int>(threadIdx.x >> 5);
+             token < M; token += token_stride)
+        {
+            int64_t const row = static_cast<int64_t>(token) * ld;
+            // The shared expert's gate is logit column E, when the caller concatenated
+            // that weight row onto the router's. A padded row still gets a value (the
+            // block multiplies it by a zero-valued shared output), so it is written
+            // before the mask check.
+            if (shared_gate != nullptr && lane == 0)
+            {
+                float const l = router_to_float(logits[row + E]);
+                shared_gate[token] = 1.f / (1.f + expf(-l));
+            }
+            bool const masked = (n_valid != nullptr) && (token >= *n_valid);
+            float v[kSlots];
+            float full_denom = 0.f;
+            if (!masked)
+            {
+#pragma unroll
+                for (int s = 0; s < kSlots; ++s)
+                {
+                    int const e = lane + 32 * s;
+                    v[s] = (e < E) ? router_to_float(logits[row + e]) : -INFINITY;
+                }
+                if (!renormalize)
+                    full_denom = router_full_denom<kSlots>(v, E, lane);
+            }
+            router_select_topk<kSlots>(v, E, topk, renormalize, full_denom, lane, expert_map, masked, sentinel,
+                topk_ids + static_cast<int64_t>(token) * topk, topk_w + static_cast<int64_t>(token) * topk);
+        }
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -1759,10 +1996,6 @@ static inline bool fso_pdl_enabled()
     return v;
 }
 
-// See quant_kernels.cu: huge programmatic dependents flood the SMs and
-// throttle the parent's tail, so large grids launch plain.
-constexpr unsigned kFsoPdlMaxGridCtas = 4096;
-
 template <typename KernelT, typename... Args>
 static inline void fso_pdl_launch(KernelT kernel, dim3 grid, dim3 block, cudaStream_t stream, bool pdl, Args... args)
 {
@@ -1779,6 +2012,67 @@ static inline void fso_pdl_launch(KernelT kernel, dim3 grid, dim3 block, cudaStr
     cudaLaunchKernelEx(&cfg, kernel, args..., pdl);
 }
 
+// One wave of a glue kernel instantiation: the current device's SM count times the instantiation's occupancy at
+// `kThreads` threads and no dynamic shared memory (queried once per instantiation), i.e. the CTAs resident at once.
+template <auto kKernel, int kThreads>
+static int64_t fso_glue_wave()
+{
+    static int const per_sm = []
+    {
+        int n = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, kKernel, kThreads, 0) != cudaSuccess || n < 1)
+        {
+            (void) cudaGetLastError();
+            n = 1;
+        }
+        return n;
+    }();
+    return static_cast<int64_t>(at::cuda::getCurrentDeviceProperties()->multiProcessorCount) * per_sm;
+}
+
+// The bound that lets every glue launch carry PDL at every size (as in quant_kernels.cu): the one-item form (the code
+// each kernel always had) runs whenever its grid fits in kFsoGlueFlatWaves of its waves, and a grid-stride form of the
+// same per-item work beyond that, on kFsoGlueWaves waves (the combine's on one, see moe_combine_launch).
+constexpr int64_t kFsoGlueFlatWaves = 16;
+constexpr int64_t kFsoGlueWaves = 4;
+
+// Launch `kFlat` on `ctas` CTAs if they fit in kFsoGlueFlatWaves of its waves, else `kStride` on kFsoGlueWaves of its
+// waves; both with PDL when `pdl` is set (the global switch). `args` exclude the trailing pdl flag.
+template <auto kFlat, auto kStride, int kThreads, typename... Args>
+static void fso_glue_launch(int64_t ctas, cudaStream_t stream, bool pdl, Args... args)
+{
+    if (ctas < 1)
+        ctas = 1;
+    if (ctas <= fso_glue_wave<kFlat, kThreads>() * kFsoGlueFlatWaves)
+    {
+        fso_pdl_launch(kFlat, dim3(static_cast<unsigned>(ctas)), dim3(kThreads), stream, pdl, args...);
+        return;
+    }
+    int64_t const cap = fso_glue_wave<kStride, kThreads>() * kFsoGlueWaves;
+    fso_pdl_launch(kStride, dim3(static_cast<unsigned>(ctas < cap ? ctas : cap)), dim3(kThreads), stream, pdl, args...);
+}
+
+// Launch the combine on `ctas` CTAs' worth of items (one item per thread) with PDL unless FSO_DISABLE_PDL=1: the
+// one-item kernel up to kFsoGlueFlatWaves of its waves, else the grid-stride kernel on ONE wave of its own. Its loop
+// needs 80 registers on sm_90 and 95-102 on sm_100/sm_120 against 64 for the one-item body (3 or 2 resident 256-thread
+// CTAs per SM instead of 4), and every extra wave of it only adds a tail: on the H200 one wave measured 1.031x the
+// unbounded one-item grid at M = 8192, four waves 1.049x (run fso_0.2.1_20261010/S8b). Either way the bytes are the
+// same (each item is reduced by the same arithmetic).
+template <bool kBias, int kThreads, typename... Args>
+static void moe_combine_launch(int64_t ctas, cudaStream_t stream, bool pdl, Args... args)
+{
+    if (ctas < 1)
+        ctas = 1;
+    if (ctas <= fso_glue_wave<moe_combine_kernel<kBias, false>, kThreads>() * kFsoGlueFlatWaves)
+    {
+        fso_pdl_launch(moe_combine_kernel<kBias, false>, dim3(static_cast<unsigned>(ctas)), dim3(kThreads), stream, pdl,
+            args...);
+        return;
+    }
+    int64_t const wave = fso_glue_wave<moe_combine_kernel<kBias, true>, kThreads>();
+    fso_pdl_launch(moe_combine_kernel<kBias, true>, dim3(static_cast<unsigned>(wave < ctas ? wave : ctas)),
+        dim3(kThreads), stream, pdl, args...);
+}
 
 // Current device's SM major version (10 = sm_100 B200 / sm_103 B300), cached.
 // Mirrors the helper in mxfp8.cu; the multi-CTA routing builder is selected on
@@ -2522,24 +2816,34 @@ at::Tensor moe_combine(at::Tensor dn, at::Tensor slot_of_flat, at::Tensor topk_w
     bool const small_grid = at::cuda::getCurrentDeviceProperties()->major == 12
         && total <= kSmallGridMaxCtas * kSmallGridThreads;
     int const threads = small_grid ? kSmallGridThreads : 256;
-    int const grid = static_cast<int>((total + threads - 1) / threads);
+    int64_t const ctas = (total + threads - 1) / threads;
     auto stream = at::cuda::getCurrentCUDAStream();
-    bool const pdl = fso_pdl_enabled() && static_cast<unsigned>(grid) <= kFsoPdlMaxGridCtas;
+    // PDL at every size (FSO_DISABLE_PDL=1 turns it off with the rest of the chain) on a bounded grid (see
+    // moe_combine_launch). Its bound is far above the 128-thread launch's 256 CTAs on every device, so that launch is
+    // the kernel it was.
+    bool const pdl = fso_pdl_enabled();
+    auto const* dn_p = reinterpret_cast<__nv_bfloat16 const*>(dn.data_ptr());
+    auto const* slot_p = reinterpret_cast<int32_t const*>(slot_of_flat.data_ptr());
+    auto const* w_p = reinterpret_cast<float const*>(topk_w.data_ptr());
+    auto* out_p = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
     if (bias_ptr != nullptr)
     {
-        fso_pdl_launch(moe_combine_kernel<true>, dim3(grid), dim3(threads), stream, pdl,
-            reinterpret_cast<__nv_bfloat16 const*>(dn.data_ptr()),
-            reinterpret_cast<int32_t const*>(slot_of_flat.data_ptr()),
-            reinterpret_cast<float const*>(topk_w.data_ptr()),
-            reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), bias_ptr, bias_scale_ptr, M, topk, H);
+        if (threads == kSmallGridThreads)
+            moe_combine_launch<true, kSmallGridThreads>(ctas, stream, pdl, dn_p, slot_p, w_p, out_p, bias_ptr,
+                bias_scale_ptr, M, topk, H);
+        else
+            moe_combine_launch<true, 256>(ctas, stream, pdl, dn_p, slot_p, w_p, out_p, bias_ptr, bias_scale_ptr, M,
+                topk, H);
     }
     else
     {
-        fso_pdl_launch(moe_combine_kernel<false>, dim3(grid), dim3(threads), stream, pdl,
-            reinterpret_cast<__nv_bfloat16 const*>(dn.data_ptr()),
-            reinterpret_cast<int32_t const*>(slot_of_flat.data_ptr()),
-            reinterpret_cast<float const*>(topk_w.data_ptr()),
-            reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), nullptr, nullptr, M, topk, H);
+        __nv_bfloat16 const* no_bias = nullptr;
+        float const* no_scale = nullptr;
+        if (threads == kSmallGridThreads)
+            moe_combine_launch<false, kSmallGridThreads>(ctas, stream, pdl, dn_p, slot_p, w_p, out_p, no_bias, no_scale,
+                M, topk, H);
+        else
+            moe_combine_launch<false, 256>(ctas, stream, pdl, dn_p, slot_p, w_p, out_p, no_bias, no_scale, M, topk, H);
     }
     return out;
 }
@@ -2566,16 +2870,16 @@ at::Tensor moe_combine_sorted(at::Tensor dn, at::Tensor flat_to_sorted, at::Tens
         "flat_to_sorted must have M*topk entries");
 
     auto out = at::empty({M, H}, dn.options());
-    int const threads = 256;
+    constexpr int threads = 256;
     int64_t const total = static_cast<int64_t>(M) * (H / 8);
-    int const grid = static_cast<int>((total + threads - 1) / threads);
     auto stream = at::cuda::getCurrentCUDAStream();
-    bool const pdl = fso_pdl_enabled() && static_cast<unsigned>(grid) <= kFsoPdlMaxGridCtas;
-    fso_pdl_launch(moe_combine_kernel<false>, dim3(grid), dim3(threads), stream, pdl,
+    // PDL at every size on a bounded grid (see moe_combine_launch).
+    __nv_bfloat16 const* no_bias = nullptr;
+    float const* no_scale = nullptr;
+    moe_combine_launch<false, threads>((total + threads - 1) / threads, stream, fso_pdl_enabled(),
         reinterpret_cast<__nv_bfloat16 const*>(dn.data_ptr()),
-        reinterpret_cast<int32_t const*>(flat_to_sorted.data_ptr()),
-        reinterpret_cast<float const*>(topk_w.data_ptr()),
-        reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), nullptr, nullptr, M, topk, H);
+        reinterpret_cast<int32_t const*>(flat_to_sorted.data_ptr()), reinterpret_cast<float const*>(topk_w.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), no_bias, no_scale, M, topk, H);
     return out;
 }
 
@@ -2637,14 +2941,16 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_topk_from_logits(at::Tensor l
     float* gate_ptr = with_shared_gate ? reinterpret_cast<float*>(shared_gate.data_ptr()) : nullptr;
     int const ld = static_cast<int>(logits.stride(0));
     int const tokens_per_cta = kRouterThreads / 32;
-    int const grid = (M + tokens_per_cta - 1) / tokens_per_cta;
+    int64_t const ctas = (static_cast<int64_t>(M) + tokens_per_cta - 1) / tokens_per_cta;
     auto stream = at::cuda::getCurrentCUDAStream();
-    bool const pdl = fso_pdl_enabled() && static_cast<unsigned>(grid) <= kFsoPdlMaxGridCtas;
+    // PDL at every size on a bounded grid (fso_glue_launch).
+    bool const pdl = fso_pdl_enabled();
 
-#define FSO_ROUTER_LAUNCH(TLOGIT, SLOTS, PTR)                                                                          \
-    fso_pdl_launch(moe_topk_from_logits_kernel<TLOGIT, SLOTS>, dim3(grid), dim3(kRouterThreads), stream, pdl, PTR,      \
-        n_valid, map_ptr, reinterpret_cast<int32_t*>(ids.data_ptr()), reinterpret_cast<float*>(weights.data_ptr()),     \
-        gate_ptr, M, E, ld, static_cast<int>(topk), E, renormalize)
+#define FSO_ROUTER_LAUNCH(TLOGIT, SLOTS, PTR)                                                                        \
+    fso_glue_launch<moe_topk_from_logits_kernel<TLOGIT, SLOTS, false>,                                               \
+        moe_topk_from_logits_kernel<TLOGIT, SLOTS, true>, kRouterThreads>(ctas, stream, pdl, PTR, n_valid, map_ptr,    \
+        reinterpret_cast<int32_t*>(ids.data_ptr()), reinterpret_cast<float*>(weights.data_ptr()), gate_ptr, M, E, ld,  \
+        static_cast<int>(topk), E, renormalize)
 
     if (logits.dtype() == at::kBFloat16)
     {
