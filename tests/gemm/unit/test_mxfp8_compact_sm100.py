@@ -838,7 +838,9 @@ def child_slack_guarded(slack_blocks, tile, which):
 def child_main(args):
     _child_imports()
     if torch.cuda.get_device_capability()[0] != 10:
-        print(json.dumps([dict(case=args.case, skipped="not sm_100/103", ok=True)]))
+        # With the results marker, so that the parent counts the case as skipped rather than as a child
+        # that printed no results (which failed every case on sm_90 and sm_120).
+        print("@@RESULTS@@" + json.dumps([dict(case=args.case, skipped="not sm_100/103", ok=True)]))
         return 0
     case = args.case
     quick = args.quick
