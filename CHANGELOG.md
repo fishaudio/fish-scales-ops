@@ -4,6 +4,21 @@ Performance figures are in `docs/perf/`, not here.
 
 ## 0.2.1 — unreleased
 
+### Changed (no action needed; reservations get smaller)
+
+- **The Blackwell MoE layer's intermediates are sized by the routed rows (#7, #10).** On sm_100/sm_103 and
+  sm_120/sm_121 `fso.moe.layer` no longer gives every local expert `align(tokens, 4)` rows of every intermediate (the
+  masked slab). Each expert now holds its routed rows in whole 128-row blocks of one compact buffer, so a call needs
+  memory for `tokens * topk` rows plus at most 127 rows per expert that holds one. `fso.moe.transient_bytes` returns
+  the new, much smaller figure (Family C at 8192 tokens: about 0.65 GiB per call on a B300 instead of 13.2 GiB, and
+  about 0.54 GiB per RTX 5090 rank with 128 local experts instead of 6.6 GiB). The layer's outputs are bit-identical
+  to 0.2.0's, it runs the same kernels per bucket, and `FSO_MOE_COMPACT=0` restores the masked slab as an A/B arm.
+- **No routing scratch, no argument-arena abort (#7).** The compact layout's routing op keeps no device state between
+  calls, so the 0.2.0 routing builder's limit of 16 graph captures per host thread (after which it fell back to the
+  single-CTA builder) no longer applies to `fso.moe.layer`. On sm_100/sm_103 the grouped GEMMs take their per-call
+  activation pointers from that routing op and keep only weight-side arguments in their arena, two blocks per layer
+  whatever the number of captures; the arena grows on demand and no longer aborts a capture.
+
 ### New
 
 - **MXFP8 weights load as stored (#9).** `fso.moe.prepare_experts(w13, w2, format="mxfp8", sw13=..., sw2=...)`

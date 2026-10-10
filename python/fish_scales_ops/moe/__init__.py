@@ -201,19 +201,19 @@ def describe() -> str:
             9: "served: the checkpoint's block-FP8 tensors are kept as they are and run "
                "through the expert-sorted block-FP8 layer (moe_layer_fp8_sm90)",
             10: "served: dequantized block by block at load time, requantized to MXFP8 1x32 "
-                "with the FC1 rows interleaved, run through the masked-slab MXFP8 layer",
+                "with the FC1 rows interleaved, run through the compact MXFP8 layer",
             12: "served: dequantized block by block at load time, requantized to MXFP8 1x32 "
-                "with the FC1 rows interleaved, run through the masked-slab MXFP8 layer",
+                "with the FC1 rows interleaved, run through the compact MXFP8 layer",
         },
         "mxfp8": {
             9: "not served: sm_90 has no MXFP8 hardware; serve block-FP8 experts with "
                "format 'bsfp8' instead",
             10: "served: bf16 experts are quantized to MXFP8 1x32 at load time, an MXFP8 "
                 "checkpoint keeps its bytes and has its scales repacked; the FC1 rows are "
-                "interleaved, run through the masked-slab MXFP8 layer",
+                "interleaved, run through the compact MXFP8 layer",
             12: "served: bf16 experts are quantized to MXFP8 1x32 at load time, an MXFP8 "
                 "checkpoint keeps its bytes and has its scales repacked; the FC1 rows are "
-                "interleaved, run through the masked-slab MXFP8 layer",
+                "interleaved, run through the compact MXFP8 layer",
         },
     }
     heads = {
@@ -775,14 +775,15 @@ def transient_bytes(experts, tokens, topk) -> int:
     * sm_90, kind ``"bsfp8"``: the expert-sorted layout, sized by the routed rows
       (``tokens * topk`` plus per-expert padding), see
       :func:`fish_scales_ops.compat.moe_layer_transient_bytes_sm90`;
-    * sm_100/103 and sm_120/121, kind ``"mxfp8"``: the masked slab, sized by
-      ``num_experts * align(tokens, 4)`` rows, with the fused FC1 when the handle's
+    * sm_100/103 and sm_120/121, kind ``"mxfp8"``: the compact layout, sized by the
+      routed rows (``tokens * topk`` plus at most 127 rows for every expert that holds
+      one, in whole 128-row blocks), with the fused FC1 when the handle's
       ``w13_interleaved`` and the route query allow it and, on sm_120/121, the fused
       combine where ``FSO_MOE_FUSED_COMBINE=1`` allows it and its engagement rule
       takes it, see :func:`fish_scales_ops.compat.moe_layer_transient_bytes_mxfp8`.
 
-    Inputs, weights, a ``bias`` and the library's persistent pools (routing scratch,
-    the sm_100/103 argument arena) are not counted.
+    Inputs, weights, a ``bias`` and the library's persistent pool (the sm_100/103
+    argument arena, two blocks per layer) are not counted.
 
     Args:
         experts: the :class:`MoeExperts` handle from :func:`prepare_experts`.

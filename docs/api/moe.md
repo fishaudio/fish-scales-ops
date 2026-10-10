@@ -44,7 +44,7 @@ out = fso.moe.layer(hidden, experts, topk_ids, topk_w)
 ```
 
 `fso.moe.layer` runs the architecture's chain: `moe_layer_fp8_sm90` on sm_90, and
-the masked-slab MXFP8 chain behind `moe_layer_mxfp8_sm120` on sm_120/121 and
+the compact-layout MXFP8 chain behind `moe_layer_mxfp8_sm120` on sm_120/121 and
 sm_100/103. Both are in `fso.compat` with the per-step ops they compose
 ([`compat.md`](compat.md), *MoE per-step pieces*).
 `bench/gemm/python/bench_moe_qwen3_30a3.py` (`fso_mxfp8_layer`) drives the steps
@@ -57,7 +57,7 @@ its fused FC1 and its slot-bound decode route, was developed.
 each layer's local experts once, on the device that will serve them, and then
 makes one call per batch; the architecture dispatch happens inside a torch
 custom op, so the caller never names an architecture and nothing falls back.
-The per-arch entries — `moe_layer_fp8_sm90` and the masked-slab MXFP8 chain
+The per-arch entries — `moe_layer_fp8_sm90` and the compact-layout MXFP8 chain
 behind `moe_layer_mxfp8_sm120` — are the implementation behind it and live in
 `fso.compat` ([`compat.md`](compat.md), *MoE per-step pieces*), where their names
 keep working and their arguments follow the kernels.
@@ -180,11 +180,14 @@ to 1 MiB more for a tensor above 1 MiB that a cached block serves without splitt
 — so the figure is an upper bound, tight to about 1 MiB per large tensor. It does not count the inputs,
 the weights, a `bias` or the library's persistent pools. The intermediates are
 freed when the call returns, so one reservation for the largest bucket a forward
-can carry covers every MoE layer of a model. The two layouts scale differently:
-sm_90's expert-sorted layout grows with `tokens · topk` plus per-expert padding,
-while the masked slab of sm_100/103 and sm_120/121 grows with `E_local · tokens`,
-which is the larger of the two whenever `E_local` exceeds `topk`. A bucket whose
-tensors do not fit raises the allocator's out-of-memory error.
+can carry covers every MoE layer of a model. Both layouts grow with the routed rows:
+sm_90's expert-sorted layout with `tokens · topk` plus per-expert padding to its
+tile, and the compact layout of sm_100/103 and sm_120/121 with `tokens · topk` plus
+at most 127 rows for every local expert that holds one, because each expert's rows
+sit in whole 128-row blocks. With `FSO_MOE_COMPACT=0` the Blackwell layer runs
+0.2.0's masked slab instead, which gives every local expert `align(tokens, 4)` rows
+and grows with `E_local · tokens`. A bucket whose tensors do not fit raises the
+allocator's out-of-memory error.
 
 **The op and its dispatch.** `layer` validates the arguments against the handle
 and calls `torch.ops.fish_scales_ops.moe_layer(hidden, w13, sw13, w2, sw2,
@@ -195,21 +198,20 @@ device's architecture:
 | kind | architecture | what runs |
 |---|---|---|
 | `"bsfp8"` | sm_90 | `moe_layer_fp8_sm90` (the expert-sorted contiguous layout, swap-AB or non-swap picked from `M`), then the bias fold above |
-| `"mxfp8"` | sm_120 / sm_121 | the masked-slab chain of `moe_layer_mxfp8_sm120`, unchanged, with `w13_interleaved` from the handle and the fused combine allowed (see below); one call per bucket |
-| `"mxfp8"` | sm_100 / sm_103 | the same chain, with the routing kernel asked for exactly the tensors this architecture's grouped routes read: per GEMM, `mxfp8_grouped_slot_possible` and `mxfp8_grouped_problem_shapes_consumed` (the FC1 asked under the kernel it will run) choose between the packed active-expert list for the slot-bound decode route and the per-group problem shapes for the pointer-array cascade, which is the composition `bench/gemm/python/bench_moe_qwen3_30a3.py` (`fso_mxfp8_layer`) drives. The fused FC1 is taken where `mxfp8_grouped_swiglu_fused_route` says so and there is no fused combine; one call per bucket |
+| `"mxfp8"` | sm_120 / sm_121 | the compact-layout chain of `moe_layer_mxfp8_sm120` (`moe_build_routing_compact`, the out-style gather, the compact grouped GEMMs, `moe_combine`), with `w13_interleaved` from the handle and the fused combine allowed (see below); one call per bucket |
+| `"mxfp8"` | sm_100 / sm_103 | the same chain, with the routing kernel asked for exactly the tensors this architecture's grouped routes read (and, for the pointer-array cascade, the per-call activation pointer arrays): per GEMM, `mxfp8_grouped_slot_possible` and `mxfp8_grouped_problem_shapes_consumed` (the FC1 asked under the kernel it will run) choose between the packed active-expert list for the slot-bound decode route and the per-group problem shapes for the pointer-array cascade, which is the composition `bench/gemm/python/bench_moe_qwen3_30a3.py` (`fso_mxfp8_layer`) drives. The fused FC1 is taken where `mxfp8_grouped_swiglu_fused_route` says so and there is no fused combine; one call per bucket |
 | anything else | any | `NotImplementedError` naming the architecture and the format to use instead, or `ValueError` for an unknown kind |
 
 *The fused combine.* On sm_120/121 the fused-combine FC2 adds each routed row
 into its token's output row with atomic reductions instead of storing the
-down-projection slab for a separate combine kernel. Where
-`moe_layer_fused_combine_engages_sm120` takes it (the buckets whose slab would
-dominate the layer's transient memory) the slab is never allocated, but the
+down-projection rows for a separate combine kernel. Where
+`moe_layer_fused_combine_engages_sm120` takes it those rows are never allocated, but the
 order of the adds follows the order in which the CTAs finish, so those buckets
 are stable in aggregate and not bit-reproducible run to run.
 `fso.moe.layer` therefore keeps it opt-in, the same default as
 `moe_layer_mxfp8_sm120`: `FSO_MOE_FUSED_COMBINE=1` allows it and the engagement
-rule then decides per bucket; unset, every bucket keeps the slab and the combine
-kernel and is reproducible. `fso.moe.transient_bytes` follows the setting, so a
+rule then decides per bucket; unset, every bucket keeps the down-projection rows
+and the combine kernel and is reproducible. `fso.moe.transient_bytes` follows the setting, so a
 caller that allows the fused combine reserves less for the buckets that take it.
 
 *Capture and compile.* The op can be captured into a CUDA graph after one eager
@@ -249,7 +251,7 @@ The per-architecture entries behind `fso.moe.layer` (`moe_layer_fp8_sm90`,
 `moe_layer_mxfp8_sm120` and the whole-block `moe_block_mxfp8_sm120`), the grouped
 GEMMs of both layouts, the routing builders and combines, the router, the memory
 planners and the route queries are `fso.compat.<name>`. Their contracts — the
-masked slab and expert-sorted layouts, the fused FC1 and the fused combine, the
+compact, masked-slab and expert-sorted layouts, the fused FC1 and the fused combine, the
 slot-bound decode route and the routing-supplied problem shapes of sm_100/103,
 the multi-CTA routing builder — are in [`compat.md`](compat.md), *MoE per-step
 pieces*.
