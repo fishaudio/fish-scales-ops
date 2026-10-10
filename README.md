@@ -131,14 +131,14 @@ in [`docs/perf/`](docs/perf/README.md).
 | A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | MXFP8 1×32      |  35.66 |      3 |
 | A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | MXFP8 1×32      | 663.23 |    615 |
 | A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 648.54 |    629 |
-| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | MXFP8 1×32      |   32.4 |    2.3 |
-| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | MXFP8 1×32      |  564.5 |  273.9 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | MXFP8 1×32      |   38.6 |    1.5 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | MXFP8 1×32      |  711.9 |  162.9 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | MXFP8 1×32      |   32.6 |    2.3 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | MXFP8 1×32      |  560.2 |  276.0 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | MXFP8 1×32      |   39.3 |    1.4 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | MXFP8 1×32      |  712.9 |  162.7 |
 
 ## TODO
 
-Open items after 0.2.0: the known issues of [`CHANGELOG.md`](CHANGELOG.md),
+Open items after 0.2.1: the known issues of [`CHANGELOG.md`](CHANGELOG.md),
 whose measured gaps are in the summaries of [`docs/perf/`](docs/perf/README.md),
 and two build items.
 
@@ -146,15 +146,15 @@ and two build items.
   ([`docs/perf/layer/sm90.md`](docs/perf/layer/sm90.md), Families B and C).
 - **H200 dense MLP block at M = 64–256 and from M = 1024 up**, against sglang's block-FP8 linear (DeepGEMM)
   ([`docs/perf/layer/sm90.md`](docs/perf/layer/sm90.md), Family A).
-- **B300 MoE layer at middle batch sizes**, against TensorRT-LLM's trtllm-gen MoE
-  ([`docs/perf/layer/sm100.md`](docs/perf/layer/sm100.md), Families B and C).
-- **RTX 5090 Family C MoE layer at M = 1024**, against the Triton FP8 MoE layers of vLLM and sglang
+- **RTX 5090 Family C MoE layer at M = 64, 512 and 1024**, against the Triton FP8 MoE layers of vLLM and sglang
   ([`docs/perf/layer/sm120.md`](docs/perf/layer/sm120.md), Family C).
+- **RTX 5090 Family C MoE block at M = 1** with the shared expert added after the routed layer, against 0.2.0
+  ([`CHANGELOG.md`](CHANGELOG.md), 0.2.1 known issues).
 - **Blackwell dense MLP block at some batch sizes**, against sglang's DeepGEMM linear on the B300 and vLLM's on the
   RTX 5090 ([`docs/perf/layer/sm100.md`](docs/perf/layer/sm100.md),
   [`docs/perf/layer/sm120.md`](docs/perf/layer/sm120.md), Family A).
 - **Pin the PTX at build time.** Compile the kernels to PTX once with a pinned front end and turn that PTX into SASS
-  with one pinned `ptxas`, so that a toolkit update changes only that last step. 0.2.0 compiles everything with the
+  with one pinned `ptxas`, so that a toolkit update changes only that last step. 0.2.1 compiles everything with the
   CUDA 13.0 that torch 2.13.0+cu130 uses.
 - **Byte-identical rebuilds.** nvcc puts temporary file names into the extension's local symbol names, so two builds
   of one commit hold the same code but are different files ([`docs/harness.md`](docs/harness.md) §1).

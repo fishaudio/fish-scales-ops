@@ -44,12 +44,35 @@ Performance figures are in `docs/perf/`, not here.
 
 ### Faster
 
-- **B300 (sm_100/sm_103) MoE layer in the decode band.** The compact layer's grouped GEMMs take the slot-bound route
-  up to 512 tokens per call. That route hands its tiles out dynamically over the experts that hold rows and writes
-  only the routed rows, so Families B and C are faster from 8 to 512 tokens per call, under uniform, skewed and
-  padded routing alike, and the layer no longer runs into the card's power cap at 128–256 tokens.
-- **H200 (sm_90) MoE layer at decode.** The grouped GEMMs and the expert-sorted gather-quantize now launch with PDL,
-  so each starts while its predecessor finishes.
+- **B300 (sm_100/sm_103) MoE layer and block.** The compact layer's grouped GEMMs take the slot-bound route up to
+  512 tokens per call, which hands its tiles out dynamically over the experts that hold rows and writes only the
+  routed rows. Both families are faster from 16 to 512 tokens per call, under uniform, skewed and padded routing
+  alike, and the layer no longer runs into the card's power cap there. fso is now level with or faster than
+  TensorRT-LLM's trtllm-gen block-FP8 MoE at every batch size of the tables.
+- **H200 (sm_90) MoE layer and block.** The grouped GEMMs and the expert-sorted gather-quantize now launch with PDL,
+  so each starts while its predecessor finishes; the layer is faster at decode and in prefill.
+
+### Known issues
+
+The gaps below are measured against the serving libraries on the same card; the summary under each table of
+`docs/perf/layer/` gives the batch sizes and the size of every gap.
+
+- **H200, MoE layer.** sglang 0.5.20's Triton FP8 MoE layer, run with apex's tuned configs, is faster than fso on
+  Family C at M = 16, 32 and 64.
+- **H200, dense MLP block.** sglang 0.5.20's block-FP8 linear layer (DeepGEMM `sm90_fp8_gemm_1d2d`, with the
+  programmatic dependent launch sglang serves it with) is faster than fso's block on the Family A MLP block from
+  M = 64 to M = 256 and from M = 1024 up.
+- **RTX 5090, Family C MoE layer.** vLLM 0.29.0's Triton FP8 MoE layer is faster than fso at M = 64 and 1024, and
+  sglang 0.5.20's at M = 512 and 1024.
+- **RTX 5090, Family C MoE block at M = 1.** With the shared expert computed after the routed layer and added to its
+  output, the block at M = 1 is 1.9 % slower than in 0.2.0: the shared expert's first GEMM, whose machine code is
+  unchanged, runs slower right after the compact routed chain, and the routing kernel's start is no longer hidden
+  behind the preceding add. Passing the shared expert's output to `fso.moe.layer` as `bias` instead of adding it
+  afterwards brings the block within 1 % of 0.2.0 in the same form, and is faster than the add form in either
+  release.
+- **Blackwell, dense MLP block.** On the B300, sglang's block-FP8 linear (DeepGEMM) is faster than fso's MXFP8 block
+  from M = 32 to M = 256 and at M = 1024 and 2048; on the RTX 5090, vLLM's block-FP8 linear (DeepGEMM, run as eager
+  ops) is faster at M = 512 and 1024.
 
 ## 0.2.0 — 2026-10-06
 

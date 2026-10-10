@@ -503,13 +503,13 @@
    "bench_env": {},
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
-    "fingerprint": "c801228f6cf29df78df911843545f7f68da38400e33b242a6aadf6ff6825d406",
+    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
     "source": "kit"
    },
    "card": {
     "clocks_max_sm_mhz": 3090,
-    "compute_mode": "Exclusive_Process",
+    "compute_mode": "Default",
     "driver": "595.58.03",
     "index": "1",
     "memory_total_mib": 32607,
@@ -549,8 +549,8 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T23:52:55Z",
-     "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+     "built_at": "2026-10-10T15:55:17Z",
+     "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
      "cuda_toolkit": "13.0.3",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
@@ -569,72 +569,531 @@
      },
      "python": "CPython 3.12.15",
      "torch": "2.13.0+cu130",
-     "version": "0.2.0"
+     "version": "0.2.1"
     },
-    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
-    "extension_sha256": "0f7a715cc7c135f6877db36f5d9760e8b8575ea82ad862f5811546eff8777b84",
+    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+    "extension_sha256": "dfae2d579c6d36cd9c5819f19664bdd7dd0f1f25e3900090e13f9225c082f903",
     "source_build": false,
-    "version": "0.2.0"
+    "version": "0.2.1"
    },
    "host": "gpu5090-03",
-   "installed_utc": "2026-10-06T00:52:18Z",
+   "installed_utc": "2026-10-10T20:02:02Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "683cf6da12cedb0b751b466f843ac28098d75bb5092bec92dddc53c07a89aa12",
    "machine": "5090",
-   "manifest_sha256": "51f4e831cb0a22a915f42d24869563a3fd1e2d406e8040cae90dcefbb556360f",
+   "manifest_sha256": "71eafe06b633bf0f5f0577e161fa01b476be9e6764de529a4d23355adab71d08",
    "observed_clocks": {
     "fso_30a3": {
-     "busy_samples": 143,
+     "busy_samples": 145,
      "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 23,
-     "power_capped_share_of_busy": 0.1608,
-     "power_w_max": 366.15,
-     "samples": 544,
+     "power_cap_busy_samples": 20,
+     "power_capped_busy_samples": 20,
+     "power_capped_share_of_busy": 0.1379,
+     "power_limit_w": 575,
+     "power_throttle_share_of_busy": 0.1379,
+     "power_w_max": 338.07,
+     "power_w_max_busy": 322.08,
+     "power_w_mean_busy": 85.7,
+     "samples": 618,
      "sm_mhz_max_busy": 2392,
+     "sm_mhz_mean_busy": 2377.0,
      "sm_mhz_median_busy": 2392,
-     "sm_mhz_min_busy": 2235,
-     "temperature_c_max": 54,
-     "thermal_busy_samples": 0
+     "sm_mhz_min_busy": 2070,
+     "temperature_c_max": 52,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 20,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.1379
     }
    },
-   "run": "cu130-5090",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_cu130_20261005/runs/cu130-5090",
+   "power_flags": {
+    "fso_30a3": [
+     "the power cap held the clock in 20 of 145 busy samples (14 %); busy SM clock min 2070 MHz, mean 2377.0 MHz; busy power mean 85.7 W, max 322.08 W of the 575 W limit"
+    ]
+   },
+   "run": "perf",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/5090/perf",
    "steps": [
     {
      "command": [
       "/home/stone/workspace/standalone/.venv-sgl/bin/python",
-      "/mnt/share/stone-bench-runs/fso_release_0.2.0_cu130_20261005/suite/kit/fish_scales_ops-0.2.0-testkit-7162cce/bench/gemm/python/bench_moe_qwen3_30a3.py",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_30a3.py",
       "--run",
       "--impls",
       "fso_mxfp8_grouped,fso_mxfp8_layer",
       "--out",
-      "/mnt/share/stone-bench-runs/fso_release_0.2.0_cu130_20261005/perf/perf_moe_qwen3_30a3_5090.jsonl"
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/perf/perf_moe_qwen3_30a3_5090.jsonl"
      ],
-     "end_utc": "2026-10-06T00:36:04.078Z",
+     "end_utc": "2026-10-10T16:40:26.753Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "fso_30a3",
      "rows": 45,
-     "start_utc": "2026-10-06T00:34:15.037Z"
+     "start_utc": "2026-10-10T16:38:22.934Z"
     }
    ],
    "window_utc": [
-    "2026-10-06T00:34:15.037Z",
-    "2026-10-06T00:36:04.078Z"
+    "2026-10-10T16:38:22.934Z",
+    "2026-10-10T16:40:26.753Z"
+   ]
+  },
+  "perf_moe_qwen3_30a3_ep2_5090.jsonl": {
+   "bench_env": {},
+   "bench_tree": {
+    "bench_dirty": null,
+    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
+    "source": "kit"
+   },
+   "card": {
+    "clocks_max_sm_mhz": 3090,
+    "compute_mode": "Default",
+    "driver": "595.58.03",
+    "index": "1",
+    "memory_total_mib": 32607,
+    "name": "NVIDIA GeForce RTX 5090",
+    "pci": "00000000:21:00.0",
+    "power_limit_w": 575,
+    "uuid": "GPU-bdc88aea-7478-c763-79e4-5c8a28bce484"
+   },
+   "clock_flags": {},
+   "clock_policy": {
+    "applied": "sudo -n nvidia-smi -i 00000000:21:00.0 -lgc 2407",
+    "max_sm_mhz": 3090,
+    "mhz": 2407,
+    "mode": "locked"
+   },
+   "drift_accepted": [],
+   "driver": "595.58.03",
+   "environments": {
+    "main": {
+     "packages": {
+      "expecttest": "0.3.0",
+      "flashinfer-python": "0.6.18",
+      "numpy": "2.3.5",
+      "nvidia-cublas": "13.1.1.3",
+      "nvidia-cuda-nvrtc": "13.0.88",
+      "nvidia-cudnn-cu13": "9.20.0.48",
+      "nvidia-cudnn-frontend": "1.30.0",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "torch": "2.13.0+cu130",
+      "triton": "3.7.1",
+      "vllm": "0.29.0"
+     },
+     "python": "/home/stone/workspace/standalone/.venv-sgl/bin/python",
+     "python_version": "3.12.3"
+    }
+   },
+   "fso": {
+    "build_info": {
+     "arch_list": "9.0a;10.0f;12.0a",
+     "built_at": "2026-10-10T15:55:17Z",
+     "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+     "cuda_toolkit": "13.0.3",
+     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+     "dirty": false,
+     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
+     "glibc_required": "GLIBC_2.34",
+     "image": {
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
+     },
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
+     "nvrtc": {
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+     },
+     "python": "CPython 3.12.15",
+     "torch": "2.13.0+cu130",
+     "version": "0.2.1"
+    },
+    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+    "extension_sha256": "dfae2d579c6d36cd9c5819f19664bdd7dd0f1f25e3900090e13f9225c082f903",
+    "source_build": false,
+    "version": "0.2.1"
+   },
+   "host": "gpu5090-03",
+   "installed_utc": "2026-10-10T20:02:02Z",
+   "jit_compiler_sm90": null,
+   "lock_sha256": "683cf6da12cedb0b751b466f843ac28098d75bb5092bec92dddc53c07a89aa12",
+   "machine": "5090",
+   "manifest_sha256": "bf477333159c524c417e140dd08124e73837fc4b560b4c8950280da50285a9db",
+   "observed_clocks": {
+    "srv_ep2_30a3": {
+     "busy_samples": 47,
+     "hw_slowdown_busy_samples": 0,
+     "power_cap_busy_samples": 3,
+     "power_capped_busy_samples": 3,
+     "power_capped_share_of_busy": 0.0638,
+     "power_limit_w": 575,
+     "power_throttle_share_of_busy": 0.0638,
+     "power_w_max": 208.34,
+     "power_w_max_busy": 88.29,
+     "power_w_mean_busy": 69.2,
+     "samples": 283,
+     "sm_mhz_max_busy": 2392,
+     "sm_mhz_mean_busy": 2392.0,
+     "sm_mhz_median_busy": 2392,
+     "sm_mhz_min_busy": 2392,
+     "temperature_c_max": 37,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 3,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.0638
+    }
+   },
+   "power_flags": {
+    "srv_ep2_30a3": [
+     "the power cap held the clock in 3 of 47 busy samples (6 %); busy SM clock min 2392 MHz, mean 2392.0 MHz; busy power mean 69.2 W, max 88.29 W of the 575 W limit"
+    ]
+   },
+   "run": "perf_serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/5090/perf_serving",
+   "steps": [
+    {
+     "command": [
+      "/home/stone/workspace/standalone/.venv-sgl/bin/python",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_30a3.py",
+      "--run",
+      "--routing",
+      "ep",
+      "--ep-size",
+      "2",
+      "--impls",
+      "fso_mxfp8_layer",
+      "--out",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/perf_serving/perf_moe_qwen3_30a3_ep2_5090.jsonl"
+     ],
+     "end_utc": "2026-10-10T17:10:52.768Z",
+     "env": "main",
+     "error_rows": 0,
+     "exit_code": 0,
+     "name": "srv_ep2_30a3",
+     "rows": 15,
+     "start_utc": "2026-10-10T17:09:56.316Z"
+    }
+   ],
+   "window_utc": [
+    "2026-10-10T17:09:56.316Z",
+    "2026-10-10T17:10:52.768Z"
+   ]
+  },
+  "perf_moe_qwen3_30a3_padded_5090.jsonl": {
+   "bench_env": {},
+   "bench_tree": {
+    "bench_dirty": null,
+    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
+    "source": "kit"
+   },
+   "card": {
+    "clocks_max_sm_mhz": 3090,
+    "compute_mode": "Default",
+    "driver": "595.58.03",
+    "index": "1",
+    "memory_total_mib": 32607,
+    "name": "NVIDIA GeForce RTX 5090",
+    "pci": "00000000:21:00.0",
+    "power_limit_w": 575,
+    "uuid": "GPU-bdc88aea-7478-c763-79e4-5c8a28bce484"
+   },
+   "clock_flags": {},
+   "clock_policy": {
+    "applied": "sudo -n nvidia-smi -i 00000000:21:00.0 -lgc 2407",
+    "max_sm_mhz": 3090,
+    "mhz": 2407,
+    "mode": "locked"
+   },
+   "drift_accepted": [],
+   "driver": "595.58.03",
+   "environments": {
+    "main": {
+     "packages": {
+      "expecttest": "0.3.0",
+      "flashinfer-python": "0.6.18",
+      "numpy": "2.3.5",
+      "nvidia-cublas": "13.1.1.3",
+      "nvidia-cuda-nvrtc": "13.0.88",
+      "nvidia-cudnn-cu13": "9.20.0.48",
+      "nvidia-cudnn-frontend": "1.30.0",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "torch": "2.13.0+cu130",
+      "triton": "3.7.1",
+      "vllm": "0.29.0"
+     },
+     "python": "/home/stone/workspace/standalone/.venv-sgl/bin/python",
+     "python_version": "3.12.3"
+    }
+   },
+   "fso": {
+    "build_info": {
+     "arch_list": "9.0a;10.0f;12.0a",
+     "built_at": "2026-10-10T15:55:17Z",
+     "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+     "cuda_toolkit": "13.0.3",
+     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+     "dirty": false,
+     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
+     "glibc_required": "GLIBC_2.34",
+     "image": {
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
+     },
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
+     "nvrtc": {
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+     },
+     "python": "CPython 3.12.15",
+     "torch": "2.13.0+cu130",
+     "version": "0.2.1"
+    },
+    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+    "extension_sha256": "dfae2d579c6d36cd9c5819f19664bdd7dd0f1f25e3900090e13f9225c082f903",
+    "source_build": false,
+    "version": "0.2.1"
+   },
+   "host": "gpu5090-03",
+   "installed_utc": "2026-10-10T20:02:02Z",
+   "jit_compiler_sm90": null,
+   "lock_sha256": "683cf6da12cedb0b751b466f843ac28098d75bb5092bec92dddc53c07a89aa12",
+   "machine": "5090",
+   "manifest_sha256": "bf477333159c524c417e140dd08124e73837fc4b560b4c8950280da50285a9db",
+   "observed_clocks": {
+    "srv_padded_30a3": {
+     "busy_samples": 30,
+     "hw_slowdown_busy_samples": 0,
+     "power_cap_busy_samples": 0,
+     "power_capped_busy_samples": 0,
+     "power_capped_share_of_busy": 0.0,
+     "power_limit_w": 575,
+     "power_throttle_share_of_busy": 0.0,
+     "power_w_max": 101.1,
+     "power_w_max_busy": 78.23,
+     "power_w_mean_busy": 65.8,
+     "samples": 188,
+     "sm_mhz_max_busy": 2392,
+     "sm_mhz_mean_busy": 2392.0,
+     "sm_mhz_median_busy": 2392.0,
+     "sm_mhz_min_busy": 2392,
+     "temperature_c_max": 32,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 0,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.0
+    }
+   },
+   "power_flags": {},
+   "run": "perf_serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/5090/perf_serving",
+   "steps": [
+    {
+     "command": [
+      "/home/stone/workspace/standalone/.venv-sgl/bin/python",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_30a3.py",
+      "--run",
+      "--routing",
+      "padded",
+      "--impls",
+      "fso_mxfp8_layer",
+      "--out",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/perf_serving/perf_moe_qwen3_30a3_padded_5090.jsonl"
+     ],
+     "end_utc": "2026-10-10T17:09:18.677Z",
+     "env": "main",
+     "error_rows": 0,
+     "exit_code": 0,
+     "name": "srv_padded_30a3",
+     "rows": 10,
+     "start_utc": "2026-10-10T17:08:40.994Z"
+    }
+   ],
+   "window_utc": [
+    "2026-10-10T17:08:40.994Z",
+    "2026-10-10T17:09:18.677Z"
+   ]
+  },
+  "perf_moe_qwen3_30a3_skew_5090.jsonl": {
+   "bench_env": {},
+   "bench_tree": {
+    "bench_dirty": null,
+    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
+    "source": "kit"
+   },
+   "card": {
+    "clocks_max_sm_mhz": 3090,
+    "compute_mode": "Default",
+    "driver": "595.58.03",
+    "index": "1",
+    "memory_total_mib": 32607,
+    "name": "NVIDIA GeForce RTX 5090",
+    "pci": "00000000:21:00.0",
+    "power_limit_w": 575,
+    "uuid": "GPU-bdc88aea-7478-c763-79e4-5c8a28bce484"
+   },
+   "clock_flags": {},
+   "clock_policy": {
+    "applied": "sudo -n nvidia-smi -i 00000000:21:00.0 -lgc 2407",
+    "max_sm_mhz": 3090,
+    "mhz": 2407,
+    "mode": "locked"
+   },
+   "drift_accepted": [],
+   "driver": "595.58.03",
+   "environments": {
+    "main": {
+     "packages": {
+      "expecttest": "0.3.0",
+      "flashinfer-python": "0.6.18",
+      "numpy": "2.3.5",
+      "nvidia-cublas": "13.1.1.3",
+      "nvidia-cuda-nvrtc": "13.0.88",
+      "nvidia-cudnn-cu13": "9.20.0.48",
+      "nvidia-cudnn-frontend": "1.30.0",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "torch": "2.13.0+cu130",
+      "triton": "3.7.1",
+      "vllm": "0.29.0"
+     },
+     "python": "/home/stone/workspace/standalone/.venv-sgl/bin/python",
+     "python_version": "3.12.3"
+    }
+   },
+   "fso": {
+    "build_info": {
+     "arch_list": "9.0a;10.0f;12.0a",
+     "built_at": "2026-10-10T15:55:17Z",
+     "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+     "cuda_toolkit": "13.0.3",
+     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+     "dirty": false,
+     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
+     "glibc_required": "GLIBC_2.34",
+     "image": {
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
+     },
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
+     "nvrtc": {
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+     },
+     "python": "CPython 3.12.15",
+     "torch": "2.13.0+cu130",
+     "version": "0.2.1"
+    },
+    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+    "extension_sha256": "dfae2d579c6d36cd9c5819f19664bdd7dd0f1f25e3900090e13f9225c082f903",
+    "source_build": false,
+    "version": "0.2.1"
+   },
+   "host": "gpu5090-03",
+   "installed_utc": "2026-10-10T20:02:02Z",
+   "jit_compiler_sm90": null,
+   "lock_sha256": "683cf6da12cedb0b751b466f843ac28098d75bb5092bec92dddc53c07a89aa12",
+   "machine": "5090",
+   "manifest_sha256": "bf477333159c524c417e140dd08124e73837fc4b560b4c8950280da50285a9db",
+   "observed_clocks": {
+    "srv_skew_30a3": {
+     "busy_samples": 64,
+     "hw_slowdown_busy_samples": 0,
+     "power_cap_busy_samples": 7,
+     "power_capped_busy_samples": 7,
+     "power_capped_share_of_busy": 0.1094,
+     "power_limit_w": 575,
+     "power_throttle_share_of_busy": 0.1094,
+     "power_w_max": 362.17,
+     "power_w_max_busy": 284.79,
+     "power_w_mean_busy": 85.5,
+     "samples": 293,
+     "sm_mhz_max_busy": 2392,
+     "sm_mhz_mean_busy": 2388.2,
+     "sm_mhz_median_busy": 2392.0,
+     "sm_mhz_min_busy": 2310,
+     "temperature_c_max": 52,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 7,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.1094
+    }
+   },
+   "power_flags": {
+    "srv_skew_30a3": [
+     "the power cap held the clock in 7 of 64 busy samples (11 %); busy SM clock min 2310 MHz, mean 2388.2 MHz; busy power mean 85.5 W, max 284.79 W of the 575 W limit"
+    ]
+   },
+   "run": "perf_serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/5090/perf_serving",
+   "steps": [
+    {
+     "command": [
+      "/home/stone/workspace/standalone/.venv-sgl/bin/python",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_30a3.py",
+      "--run",
+      "--routing",
+      "skew",
+      "--impls",
+      "fso_mxfp8_layer",
+      "--out",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/perf_serving/perf_moe_qwen3_30a3_skew_5090.jsonl"
+     ],
+     "end_utc": "2026-10-10T16:58:09.325Z",
+     "env": "main",
+     "error_rows": 0,
+     "exit_code": 0,
+     "name": "srv_skew_30a3",
+     "rows": 15,
+     "start_utc": "2026-10-10T16:57:10.588Z"
+    }
+   ],
+   "window_utc": [
+    "2026-10-10T16:57:10.588Z",
+    "2026-10-10T16:58:09.325Z"
    ]
   },
   "perf_moe_qwen3_35a3_5090.jsonl": {
    "bench_env": {},
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
-    "fingerprint": "c801228f6cf29df78df911843545f7f68da38400e33b242a6aadf6ff6825d406",
+    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
     "source": "kit"
    },
    "card": {
     "clocks_max_sm_mhz": 3090,
-    "compute_mode": "Exclusive_Process",
+    "compute_mode": "Default",
     "driver": "595.58.03",
     "index": "1",
     "memory_total_mib": 32607,
@@ -674,8 +1133,8 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T23:52:55Z",
-     "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+     "built_at": "2026-10-10T15:55:17Z",
+     "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
      "cuda_toolkit": "13.0.3",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
@@ -694,72 +1153,388 @@
      },
      "python": "CPython 3.12.15",
      "torch": "2.13.0+cu130",
-     "version": "0.2.0"
+     "version": "0.2.1"
     },
-    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
-    "extension_sha256": "0f7a715cc7c135f6877db36f5d9760e8b8575ea82ad862f5811546eff8777b84",
+    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+    "extension_sha256": "dfae2d579c6d36cd9c5819f19664bdd7dd0f1f25e3900090e13f9225c082f903",
     "source_build": false,
-    "version": "0.2.0"
+    "version": "0.2.1"
    },
    "host": "gpu5090-03",
-   "installed_utc": "2026-10-06T00:52:18Z",
+   "installed_utc": "2026-10-10T20:02:02Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "683cf6da12cedb0b751b466f843ac28098d75bb5092bec92dddc53c07a89aa12",
    "machine": "5090",
-   "manifest_sha256": "51f4e831cb0a22a915f42d24869563a3fd1e2d406e8040cae90dcefbb556360f",
+   "manifest_sha256": "71eafe06b633bf0f5f0577e161fa01b476be9e6764de529a4d23355adab71d08",
    "observed_clocks": {
     "fso_35a3": {
-     "busy_samples": 136,
+     "busy_samples": 153,
      "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 20,
-     "power_capped_share_of_busy": 0.1471,
-     "power_w_max": 306.25,
-     "samples": 558,
+     "power_cap_busy_samples": 14,
+     "power_capped_busy_samples": 14,
+     "power_capped_share_of_busy": 0.0915,
+     "power_limit_w": 575,
+     "power_throttle_share_of_busy": 0.0915,
+     "power_w_max": 299.63,
+     "power_w_max_busy": 270.25,
+     "power_w_mean_busy": 76.8,
+     "samples": 641,
      "sm_mhz_max_busy": 2392,
-     "sm_mhz_median_busy": 2392.0,
-     "sm_mhz_min_busy": 2347,
-     "temperature_c_max": 53,
-     "thermal_busy_samples": 0
+     "sm_mhz_mean_busy": 2389.6,
+     "sm_mhz_median_busy": 2392,
+     "sm_mhz_min_busy": 2287,
+     "temperature_c_max": 52,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 14,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.0915
     }
    },
-   "run": "cu130-5090",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_cu130_20261005/runs/cu130-5090",
+   "power_flags": {
+    "fso_35a3": [
+     "the power cap held the clock in 14 of 153 busy samples (9 %); busy SM clock min 2287 MHz, mean 2389.6 MHz; busy power mean 76.8 W, max 270.25 W of the 575 W limit"
+    ]
+   },
+   "run": "perf",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/5090/perf",
    "steps": [
     {
      "command": [
       "/home/stone/workspace/standalone/.venv-sgl/bin/python",
-      "/mnt/share/stone-bench-runs/fso_release_0.2.0_cu130_20261005/suite/kit/fish_scales_ops-0.2.0-testkit-7162cce/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_35a3.py",
       "--run",
       "--impls",
       "fso_mxfp8_grouped,fso_mxfp8_layer",
       "--out",
-      "/mnt/share/stone-bench-runs/fso_release_0.2.0_cu130_20261005/perf/perf_moe_qwen3_35a3_5090.jsonl"
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/perf/perf_moe_qwen3_35a3_5090.jsonl"
      ],
-     "end_utc": "2026-10-06T00:51:27.068Z",
+     "end_utc": "2026-10-10T16:56:04.041Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "fso_35a3",
      "rows": 45,
-     "start_utc": "2026-10-06T00:49:35.494Z"
+     "start_utc": "2026-10-10T16:53:55.691Z"
     }
    ],
    "window_utc": [
-    "2026-10-06T00:49:35.494Z",
-    "2026-10-06T00:51:27.068Z"
+    "2026-10-10T16:53:55.691Z",
+    "2026-10-10T16:56:04.041Z"
+   ]
+  },
+  "perf_moe_qwen3_35a3_ep2_5090.jsonl": {
+   "bench_env": {},
+   "bench_tree": {
+    "bench_dirty": null,
+    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
+    "source": "kit"
+   },
+   "card": {
+    "clocks_max_sm_mhz": 3090,
+    "compute_mode": "Default",
+    "driver": "595.58.03",
+    "index": "1",
+    "memory_total_mib": 32607,
+    "name": "NVIDIA GeForce RTX 5090",
+    "pci": "00000000:21:00.0",
+    "power_limit_w": 575,
+    "uuid": "GPU-bdc88aea-7478-c763-79e4-5c8a28bce484"
+   },
+   "clock_flags": {},
+   "clock_policy": {
+    "applied": "sudo -n nvidia-smi -i 00000000:21:00.0 -lgc 2407",
+    "max_sm_mhz": 3090,
+    "mhz": 2407,
+    "mode": "locked"
+   },
+   "drift_accepted": [],
+   "driver": "595.58.03",
+   "environments": {
+    "main": {
+     "packages": {
+      "expecttest": "0.3.0",
+      "flashinfer-python": "0.6.18",
+      "numpy": "2.3.5",
+      "nvidia-cublas": "13.1.1.3",
+      "nvidia-cuda-nvrtc": "13.0.88",
+      "nvidia-cudnn-cu13": "9.20.0.48",
+      "nvidia-cudnn-frontend": "1.30.0",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "torch": "2.13.0+cu130",
+      "triton": "3.7.1",
+      "vllm": "0.29.0"
+     },
+     "python": "/home/stone/workspace/standalone/.venv-sgl/bin/python",
+     "python_version": "3.12.3"
+    }
+   },
+   "fso": {
+    "build_info": {
+     "arch_list": "9.0a;10.0f;12.0a",
+     "built_at": "2026-10-10T15:55:17Z",
+     "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+     "cuda_toolkit": "13.0.3",
+     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+     "dirty": false,
+     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
+     "glibc_required": "GLIBC_2.34",
+     "image": {
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
+     },
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
+     "nvrtc": {
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+     },
+     "python": "CPython 3.12.15",
+     "torch": "2.13.0+cu130",
+     "version": "0.2.1"
+    },
+    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+    "extension_sha256": "dfae2d579c6d36cd9c5819f19664bdd7dd0f1f25e3900090e13f9225c082f903",
+    "source_build": false,
+    "version": "0.2.1"
+   },
+   "host": "gpu5090-03",
+   "installed_utc": "2026-10-10T20:02:02Z",
+   "jit_compiler_sm90": null,
+   "lock_sha256": "683cf6da12cedb0b751b466f843ac28098d75bb5092bec92dddc53c07a89aa12",
+   "machine": "5090",
+   "manifest_sha256": "bf477333159c524c417e140dd08124e73837fc4b560b4c8950280da50285a9db",
+   "observed_clocks": {
+    "srv_ep2_35a3": {
+     "busy_samples": 59,
+     "hw_slowdown_busy_samples": 0,
+     "power_cap_busy_samples": 4,
+     "power_capped_busy_samples": 4,
+     "power_capped_share_of_busy": 0.0678,
+     "power_limit_w": 575,
+     "power_throttle_share_of_busy": 0.0678,
+     "power_w_max": 175.19,
+     "power_w_max_busy": 107.37,
+     "power_w_mean_busy": 68.0,
+     "samples": 284,
+     "sm_mhz_max_busy": 2392,
+     "sm_mhz_mean_busy": 2389.4,
+     "sm_mhz_median_busy": 2392,
+     "sm_mhz_min_busy": 2325,
+     "temperature_c_max": 38,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 4,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.0678
+    }
+   },
+   "power_flags": {
+    "srv_ep2_35a3": [
+     "the power cap held the clock in 4 of 59 busy samples (7 %); busy SM clock min 2325 MHz, mean 2389.4 MHz; busy power mean 68.0 W, max 107.37 W of the 575 W limit"
+    ]
+   },
+   "run": "perf_serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/5090/perf_serving",
+   "steps": [
+    {
+     "command": [
+      "/home/stone/workspace/standalone/.venv-sgl/bin/python",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "--run",
+      "--routing",
+      "ep",
+      "--ep-size",
+      "2",
+      "--impls",
+      "fso_mxfp8_layer",
+      "--out",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/perf_serving/perf_moe_qwen3_35a3_ep2_5090.jsonl"
+     ],
+     "end_utc": "2026-10-10T17:14:17.728Z",
+     "env": "main",
+     "error_rows": 0,
+     "exit_code": 0,
+     "name": "srv_ep2_35a3",
+     "rows": 15,
+     "start_utc": "2026-10-10T17:13:21.001Z"
+    }
+   ],
+   "window_utc": [
+    "2026-10-10T17:13:21.001Z",
+    "2026-10-10T17:14:17.728Z"
+   ]
+  },
+  "perf_moe_qwen3_35a3_padded_5090.jsonl": {
+   "bench_env": {},
+   "bench_tree": {
+    "bench_dirty": null,
+    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
+    "source": "kit"
+   },
+   "card": {
+    "clocks_max_sm_mhz": 3090,
+    "compute_mode": "Default",
+    "driver": "595.58.03",
+    "index": "1",
+    "memory_total_mib": 32607,
+    "name": "NVIDIA GeForce RTX 5090",
+    "pci": "00000000:21:00.0",
+    "power_limit_w": 575,
+    "uuid": "GPU-bdc88aea-7478-c763-79e4-5c8a28bce484"
+   },
+   "clock_flags": {},
+   "clock_policy": {
+    "applied": "sudo -n nvidia-smi -i 00000000:21:00.0 -lgc 2407",
+    "max_sm_mhz": 3090,
+    "mhz": 2407,
+    "mode": "locked"
+   },
+   "drift_accepted": [],
+   "driver": "595.58.03",
+   "environments": {
+    "main": {
+     "packages": {
+      "expecttest": "0.3.0",
+      "flashinfer-python": "0.6.18",
+      "numpy": "2.3.5",
+      "nvidia-cublas": "13.1.1.3",
+      "nvidia-cuda-nvrtc": "13.0.88",
+      "nvidia-cudnn-cu13": "9.20.0.48",
+      "nvidia-cudnn-frontend": "1.30.0",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "torch": "2.13.0+cu130",
+      "triton": "3.7.1",
+      "vllm": "0.29.0"
+     },
+     "python": "/home/stone/workspace/standalone/.venv-sgl/bin/python",
+     "python_version": "3.12.3"
+    }
+   },
+   "fso": {
+    "build_info": {
+     "arch_list": "9.0a;10.0f;12.0a",
+     "built_at": "2026-10-10T15:55:17Z",
+     "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+     "cuda_toolkit": "13.0.3",
+     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+     "dirty": false,
+     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
+     "glibc_required": "GLIBC_2.34",
+     "image": {
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
+     },
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
+     "nvrtc": {
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+     },
+     "python": "CPython 3.12.15",
+     "torch": "2.13.0+cu130",
+     "version": "0.2.1"
+    },
+    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+    "extension_sha256": "dfae2d579c6d36cd9c5819f19664bdd7dd0f1f25e3900090e13f9225c082f903",
+    "source_build": false,
+    "version": "0.2.1"
+   },
+   "host": "gpu5090-03",
+   "installed_utc": "2026-10-10T20:02:02Z",
+   "jit_compiler_sm90": null,
+   "lock_sha256": "683cf6da12cedb0b751b466f843ac28098d75bb5092bec92dddc53c07a89aa12",
+   "machine": "5090",
+   "manifest_sha256": "bf477333159c524c417e140dd08124e73837fc4b560b4c8950280da50285a9db",
+   "observed_clocks": {
+    "srv_padded_35a3": {
+     "busy_samples": 26,
+     "hw_slowdown_busy_samples": 0,
+     "power_cap_busy_samples": 2,
+     "power_capped_busy_samples": 2,
+     "power_capped_share_of_busy": 0.0769,
+     "power_limit_w": 575,
+     "power_throttle_share_of_busy": 0.0769,
+     "power_w_max": 112.88,
+     "power_w_max_busy": 111.31,
+     "power_w_mean_busy": 68.8,
+     "samples": 187,
+     "sm_mhz_max_busy": 2392,
+     "sm_mhz_mean_busy": 2392.0,
+     "sm_mhz_median_busy": 2392.0,
+     "sm_mhz_min_busy": 2392,
+     "temperature_c_max": 34,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 2,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.0769
+    }
+   },
+   "power_flags": {
+    "srv_padded_35a3": [
+     "the power cap held the clock in 2 of 26 busy samples (8 %); busy SM clock min 2392 MHz, mean 2392.0 MHz; busy power mean 68.8 W, max 111.31 W of the 575 W limit"
+    ]
+   },
+   "run": "perf_serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/5090/perf_serving",
+   "steps": [
+    {
+     "command": [
+      "/home/stone/workspace/standalone/.venv-sgl/bin/python",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "--run",
+      "--routing",
+      "padded",
+      "--impls",
+      "fso_mxfp8_layer",
+      "--out",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/perf_serving/perf_moe_qwen3_35a3_padded_5090.jsonl"
+     ],
+     "end_utc": "2026-10-10T17:09:56.216Z",
+     "env": "main",
+     "error_rows": 0,
+     "exit_code": 0,
+     "name": "srv_padded_35a3",
+     "rows": 10,
+     "start_utc": "2026-10-10T17:09:18.779Z"
+    }
+   ],
+   "window_utc": [
+    "2026-10-10T17:09:18.779Z",
+    "2026-10-10T17:09:56.216Z"
    ]
   },
   "perf_moe_qwen3_35a3_shared_5090.jsonl": {
    "bench_env": {},
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
-    "fingerprint": "c801228f6cf29df78df911843545f7f68da38400e33b242a6aadf6ff6825d406",
+    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
     "source": "kit"
    },
    "card": {
     "clocks_max_sm_mhz": 3090,
-    "compute_mode": "Exclusive_Process",
+    "compute_mode": "Default",
     "driver": "595.58.03",
     "index": "1",
     "memory_total_mib": 32607,
@@ -799,8 +1574,8 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T23:52:55Z",
-     "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
+     "built_at": "2026-10-10T15:55:17Z",
+     "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
      "cuda_toolkit": "13.0.3",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
@@ -819,59 +1594,226 @@
      },
      "python": "CPython 3.12.15",
      "torch": "2.13.0+cu130",
-     "version": "0.2.0"
+     "version": "0.2.1"
     },
-    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
-    "extension_sha256": "0f7a715cc7c135f6877db36f5d9760e8b8575ea82ad862f5811546eff8777b84",
+    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+    "extension_sha256": "dfae2d579c6d36cd9c5819f19664bdd7dd0f1f25e3900090e13f9225c082f903",
     "source_build": false,
-    "version": "0.2.0"
+    "version": "0.2.1"
    },
    "host": "gpu5090-03",
-   "installed_utc": "2026-10-06T00:52:18Z",
+   "installed_utc": "2026-10-10T20:02:02Z",
    "jit_compiler_sm90": null,
    "lock_sha256": "683cf6da12cedb0b751b466f843ac28098d75bb5092bec92dddc53c07a89aa12",
    "machine": "5090",
-   "manifest_sha256": "51f4e831cb0a22a915f42d24869563a3fd1e2d406e8040cae90dcefbb556360f",
+   "manifest_sha256": "71eafe06b633bf0f5f0577e161fa01b476be9e6764de529a4d23355adab71d08",
    "observed_clocks": {
     "shared_35a3": {
-     "busy_samples": 63,
+     "busy_samples": 59,
      "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 15,
-     "power_capped_share_of_busy": 0.2381,
-     "power_w_max": 312.61,
-     "samples": 207,
+     "power_cap_busy_samples": 9,
+     "power_capped_busy_samples": 9,
+     "power_capped_share_of_busy": 0.1525,
+     "power_limit_w": 575,
+     "power_throttle_share_of_busy": 0.1525,
+     "power_w_max": 327.51,
+     "power_w_max_busy": 215.98,
+     "power_w_mean_busy": 84.9,
+     "samples": 293,
      "sm_mhz_max_busy": 2392,
+     "sm_mhz_mean_busy": 2387.7,
      "sm_mhz_median_busy": 2392,
-     "sm_mhz_min_busy": 2355,
-     "temperature_c_max": 53,
-     "thermal_busy_samples": 0
+     "sm_mhz_min_busy": 2325,
+     "temperature_c_max": 49,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 9,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.1525
     }
    },
-   "run": "cu130-5090",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_cu130_20261005/runs/cu130-5090",
+   "power_flags": {
+    "shared_35a3": [
+     "the power cap held the clock in 9 of 59 busy samples (15 %); busy SM clock min 2325 MHz, mean 2387.7 MHz; busy power mean 84.9 W, max 215.98 W of the 575 W limit"
+    ]
+   },
+   "run": "perf",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/5090/perf",
    "steps": [
     {
      "command": [
       "/home/stone/workspace/standalone/.venv-sgl/bin/python",
-      "/mnt/share/stone-bench-runs/fso_release_0.2.0_cu130_20261005/suite/kit/fish_scales_ops-0.2.0-testkit-7162cce/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_35a3.py",
       "--run",
       "--impls",
       "fso_mxfp8_layer_shared",
       "--out",
-      "/mnt/share/stone-bench-runs/fso_release_0.2.0_cu130_20261005/perf/perf_moe_qwen3_35a3_shared_5090.jsonl"
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/perf/perf_moe_qwen3_35a3_shared_5090.jsonl"
      ],
-     "end_utc": "2026-10-06T00:52:08.624Z",
+     "end_utc": "2026-10-10T16:57:02.803Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "shared_35a3",
      "rows": 15,
-     "start_utc": "2026-10-06T00:51:27.199Z"
+     "start_utc": "2026-10-10T16:56:04.145Z"
     }
    ],
    "window_utc": [
-    "2026-10-06T00:51:27.199Z",
-    "2026-10-06T00:52:08.624Z"
+    "2026-10-10T16:56:04.145Z",
+    "2026-10-10T16:57:02.803Z"
+   ]
+  },
+  "perf_moe_qwen3_35a3_skew_5090.jsonl": {
+   "bench_env": {},
+   "bench_tree": {
+    "bench_dirty": null,
+    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
+    "source": "kit"
+   },
+   "card": {
+    "clocks_max_sm_mhz": 3090,
+    "compute_mode": "Default",
+    "driver": "595.58.03",
+    "index": "1",
+    "memory_total_mib": 32607,
+    "name": "NVIDIA GeForce RTX 5090",
+    "pci": "00000000:21:00.0",
+    "power_limit_w": 575,
+    "uuid": "GPU-bdc88aea-7478-c763-79e4-5c8a28bce484"
+   },
+   "clock_flags": {},
+   "clock_policy": {
+    "applied": "sudo -n nvidia-smi -i 00000000:21:00.0 -lgc 2407",
+    "max_sm_mhz": 3090,
+    "mhz": 2407,
+    "mode": "locked"
+   },
+   "drift_accepted": [],
+   "driver": "595.58.03",
+   "environments": {
+    "main": {
+     "packages": {
+      "expecttest": "0.3.0",
+      "flashinfer-python": "0.6.18",
+      "numpy": "2.3.5",
+      "nvidia-cublas": "13.1.1.3",
+      "nvidia-cuda-nvrtc": "13.0.88",
+      "nvidia-cudnn-cu13": "9.20.0.48",
+      "nvidia-cudnn-frontend": "1.30.0",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "torch": "2.13.0+cu130",
+      "triton": "3.7.1",
+      "vllm": "0.29.0"
+     },
+     "python": "/home/stone/workspace/standalone/.venv-sgl/bin/python",
+     "python_version": "3.12.3"
+    }
+   },
+   "fso": {
+    "build_info": {
+     "arch_list": "9.0a;10.0f;12.0a",
+     "built_at": "2026-10-10T15:55:17Z",
+     "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+     "cuda_toolkit": "13.0.3",
+     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+     "dirty": false,
+     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
+     "glibc_required": "GLIBC_2.34",
+     "image": {
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
+     },
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
+     "nvrtc": {
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+     },
+     "python": "CPython 3.12.15",
+     "torch": "2.13.0+cu130",
+     "version": "0.2.1"
+    },
+    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+    "extension_sha256": "dfae2d579c6d36cd9c5819f19664bdd7dd0f1f25e3900090e13f9225c082f903",
+    "source_build": false,
+    "version": "0.2.1"
+   },
+   "host": "gpu5090-03",
+   "installed_utc": "2026-10-10T20:02:02Z",
+   "jit_compiler_sm90": null,
+   "lock_sha256": "683cf6da12cedb0b751b466f843ac28098d75bb5092bec92dddc53c07a89aa12",
+   "machine": "5090",
+   "manifest_sha256": "bf477333159c524c417e140dd08124e73837fc4b560b4c8950280da50285a9db",
+   "observed_clocks": {
+    "srv_skew_35a3": {
+     "busy_samples": 70,
+     "hw_slowdown_busy_samples": 0,
+     "power_cap_busy_samples": 11,
+     "power_capped_busy_samples": 11,
+     "power_capped_share_of_busy": 0.1571,
+     "power_limit_w": 575,
+     "power_throttle_share_of_busy": 0.1571,
+     "power_w_max": 282.86,
+     "power_w_max_busy": 262.47,
+     "power_w_mean_busy": 84.7,
+     "samples": 293,
+     "sm_mhz_max_busy": 2392,
+     "sm_mhz_mean_busy": 2390.1,
+     "sm_mhz_median_busy": 2392.0,
+     "sm_mhz_min_busy": 2325,
+     "temperature_c_max": 50,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 11,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.1571
+    }
+   },
+   "power_flags": {
+    "srv_skew_35a3": [
+     "the power cap held the clock in 11 of 70 busy samples (16 %); busy SM clock min 2325 MHz, mean 2390.1 MHz; busy power mean 84.7 W, max 262.47 W of the 575 W limit"
+    ]
+   },
+   "run": "perf_serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/5090/perf_serving",
+   "steps": [
+    {
+     "command": [
+      "/home/stone/workspace/standalone/.venv-sgl/bin/python",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "--run",
+      "--routing",
+      "skew",
+      "--impls",
+      "fso_mxfp8_layer",
+      "--out",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/perf_serving/perf_moe_qwen3_35a3_skew_5090.jsonl"
+     ],
+     "end_utc": "2026-10-10T17:03:52.831Z",
+     "env": "main",
+     "error_rows": 0,
+     "exit_code": 0,
+     "name": "srv_skew_35a3",
+     "rows": 15,
+     "start_utc": "2026-10-10T17:02:54.028Z"
+    }
+   ],
+   "window_utc": [
+    "2026-10-10T17:02:54.028Z",
+    "2026-10-10T17:03:52.831Z"
    ]
   },
   "ref_kern_moe_qwen3_30a3_5090.jsonl": {
@@ -1767,6 +2709,372 @@
     "2026-10-05T06:45:28.689Z"
    ]
   },
+  "ref_moe_qwen3_30a3_ep2_5090.jsonl": {
+   "bench_env": {},
+   "bench_tree": {
+    "bench_dirty": null,
+    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
+    "source": "kit"
+   },
+   "card": {
+    "clocks_max_sm_mhz": 3090,
+    "compute_mode": "Default",
+    "driver": "595.58.03",
+    "index": "1",
+    "memory_total_mib": 32607,
+    "name": "NVIDIA GeForce RTX 5090",
+    "pci": "00000000:21:00.0",
+    "power_limit_w": 575,
+    "uuid": "GPU-bdc88aea-7478-c763-79e4-5c8a28bce484"
+   },
+   "clock_flags": {},
+   "clock_policy": {
+    "applied": "sudo -n nvidia-smi -i 00000000:21:00.0 -lgc 2407",
+    "max_sm_mhz": 3090,
+    "mhz": 2407,
+    "mode": "locked"
+   },
+   "drift_accepted": [],
+   "driver": "595.58.03",
+   "environments": {
+    "sglang": {
+     "packages": {
+      "flashinfer-python": "0.6.18",
+      "numpy": "2.3.5",
+      "nvidia-cublas": "13.1.1.3",
+      "nvidia-cuda-nvrtc": "13.0.88",
+      "nvidia-cudnn-cu13": "9.20.0.48",
+      "nvidia-cudnn-frontend": "1.30.0",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "sgl-deep-gemm": "0.2.0",
+      "sglang": "0.5.20",
+      "sglang-kernel": "0.4.7",
+      "torch": "2.13.0+cu130",
+      "triton": "3.7.1"
+     },
+     "python": "/home/stone/workspace/standalone/.venv-sglang/bin/python",
+     "python_version": "3.12.3"
+    }
+   },
+   "fso": {
+    "build_info": {
+     "arch_list": "9.0a;10.0f;12.0a",
+     "built_at": "2026-10-10T15:55:17Z",
+     "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+     "cuda_toolkit": "13.0.3",
+     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+     "dirty": false,
+     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
+     "glibc_required": "GLIBC_2.34",
+     "image": {
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
+     },
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
+     "nvrtc": {
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+     },
+     "python": "CPython 3.12.15",
+     "torch": "2.13.0+cu130",
+     "version": "0.2.1"
+    },
+    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+    "extension_sha256": "dfae2d579c6d36cd9c5819f19664bdd7dd0f1f25e3900090e13f9225c082f903",
+    "source_build": false,
+    "version": "0.2.1"
+   },
+   "host": "gpu5090-03",
+   "installed_utc": "2026-10-10T20:02:02Z",
+   "jit_compiler_sm90": null,
+   "lock_sha256": "683cf6da12cedb0b751b466f843ac28098d75bb5092bec92dddc53c07a89aa12",
+   "machine": "5090",
+   "manifest_sha256": "bf477333159c524c417e140dd08124e73837fc4b560b4c8950280da50285a9db",
+   "observed_clocks": {
+    "srv_ep2_ref_sgl_30a3": {
+     "busy_samples": 67,
+     "hw_slowdown_busy_samples": 0,
+     "power_cap_busy_samples": 4,
+     "power_capped_busy_samples": 4,
+     "power_capped_share_of_busy": 0.0597,
+     "power_limit_w": 575,
+     "power_throttle_share_of_busy": 0.0597,
+     "power_w_max": 261.83,
+     "power_w_max_busy": 154.52,
+     "power_w_mean_busy": 67.9,
+     "samples": 740,
+     "sm_mhz_max_busy": 2392,
+     "sm_mhz_mean_busy": 2389.1,
+     "sm_mhz_median_busy": 2392,
+     "sm_mhz_min_busy": 2340,
+     "temperature_c_max": 40,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 4,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.0597
+    }
+   },
+   "power_flags": {
+    "srv_ep2_ref_sgl_30a3": [
+     "the power cap held the clock in 4 of 67 busy samples (6 %); busy SM clock min 2340 MHz, mean 2389.1 MHz; busy power mean 67.9 W, max 154.52 W of the 575 W limit"
+    ]
+   },
+   "run": "perf_serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/5090/perf_serving",
+   "steps": [
+    {
+     "command": [
+      "/home/stone/workspace/standalone/.venv-sglang/bin/python",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_30a3.py",
+      "--run",
+      "--routing",
+      "ep",
+      "--ep-size",
+      "2",
+      "--impls",
+      "triton_fp8b",
+      "--out",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/perf_serving/ref_sgl020_ep2_30a3_5090.jsonl"
+     ],
+     "end_utc": "2026-10-10T17:13:20.901Z",
+     "env": "sglang",
+     "error_rows": 0,
+     "exit_code": 0,
+     "name": "srv_ep2_ref_sgl_30a3",
+     "rows": 14,
+     "start_utc": "2026-10-10T17:10:52.869Z"
+    }
+   ],
+   "window_utc": [
+    "2026-10-10T17:10:52.869Z",
+    "2026-10-10T17:13:20.901Z"
+   ]
+  },
+  "ref_moe_qwen3_30a3_skew_5090.jsonl": {
+   "bench_env": {},
+   "bench_tree": {
+    "bench_dirty": null,
+    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
+    "source": "kit"
+   },
+   "card": {
+    "clocks_max_sm_mhz": 3090,
+    "compute_mode": "Default",
+    "driver": "595.58.03",
+    "index": "1",
+    "memory_total_mib": 32607,
+    "name": "NVIDIA GeForce RTX 5090",
+    "pci": "00000000:21:00.0",
+    "power_limit_w": 575,
+    "uuid": "GPU-bdc88aea-7478-c763-79e4-5c8a28bce484"
+   },
+   "clock_flags": {},
+   "clock_policy": {
+    "applied": "sudo -n nvidia-smi -i 00000000:21:00.0 -lgc 2407",
+    "max_sm_mhz": 3090,
+    "mhz": 2407,
+    "mode": "locked"
+   },
+   "drift_accepted": [],
+   "driver": "595.58.03",
+   "environments": {
+    "main": {
+     "packages": {
+      "expecttest": "0.3.0",
+      "flashinfer-python": "0.6.18",
+      "numpy": "2.3.5",
+      "nvidia-cublas": "13.1.1.3",
+      "nvidia-cuda-nvrtc": "13.0.88",
+      "nvidia-cudnn-cu13": "9.20.0.48",
+      "nvidia-cudnn-frontend": "1.30.0",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "torch": "2.13.0+cu130",
+      "triton": "3.7.1",
+      "vllm": "0.29.0"
+     },
+     "python": "/home/stone/workspace/standalone/.venv-sgl/bin/python",
+     "python_version": "3.12.3"
+    },
+    "sglang": {
+     "packages": {
+      "flashinfer-python": "0.6.18",
+      "numpy": "2.3.5",
+      "nvidia-cublas": "13.1.1.3",
+      "nvidia-cuda-nvrtc": "13.0.88",
+      "nvidia-cudnn-cu13": "9.20.0.48",
+      "nvidia-cudnn-frontend": "1.30.0",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "sgl-deep-gemm": "0.2.0",
+      "sglang": "0.5.20",
+      "sglang-kernel": "0.4.7",
+      "torch": "2.13.0+cu130",
+      "triton": "3.7.1"
+     },
+     "python": "/home/stone/workspace/standalone/.venv-sglang/bin/python",
+     "python_version": "3.12.3"
+    }
+   },
+   "fso": {
+    "build_info": {
+     "arch_list": "9.0a;10.0f;12.0a",
+     "built_at": "2026-10-10T15:55:17Z",
+     "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+     "cuda_toolkit": "13.0.3",
+     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+     "dirty": false,
+     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
+     "glibc_required": "GLIBC_2.34",
+     "image": {
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
+     },
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
+     "nvrtc": {
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+     },
+     "python": "CPython 3.12.15",
+     "torch": "2.13.0+cu130",
+     "version": "0.2.1"
+    },
+    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+    "extension_sha256": "dfae2d579c6d36cd9c5819f19664bdd7dd0f1f25e3900090e13f9225c082f903",
+    "source_build": false,
+    "version": "0.2.1"
+   },
+   "host": "gpu5090-03",
+   "installed_utc": "2026-10-10T20:02:02Z",
+   "jit_compiler_sm90": null,
+   "lock_sha256": "683cf6da12cedb0b751b466f843ac28098d75bb5092bec92dddc53c07a89aa12",
+   "machine": "5090",
+   "manifest_sha256": "bf477333159c524c417e140dd08124e73837fc4b560b4c8950280da50285a9db",
+   "observed_clocks": {
+    "srv_skew_ref_30a3": {
+     "busy_samples": 78,
+     "hw_slowdown_busy_samples": 0,
+     "power_cap_busy_samples": 8,
+     "power_capped_busy_samples": 8,
+     "power_capped_share_of_busy": 0.1026,
+     "power_limit_w": 575,
+     "power_throttle_share_of_busy": 0.1026,
+     "power_w_max": 446.04,
+     "power_w_max_busy": 253.91,
+     "power_w_mean_busy": 75.5,
+     "samples": 668,
+     "sm_mhz_max_busy": 2392,
+     "sm_mhz_mean_busy": 2390.9,
+     "sm_mhz_median_busy": 2392.0,
+     "sm_mhz_min_busy": 2370,
+     "temperature_c_max": 49,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 8,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.1026
+    },
+    "srv_skew_ref_sgl_30a3": {
+     "busy_samples": 65,
+     "hw_slowdown_busy_samples": 0,
+     "power_cap_busy_samples": 17,
+     "power_capped_busy_samples": 17,
+     "power_capped_share_of_busy": 0.2615,
+     "power_limit_w": 575,
+     "power_throttle_share_of_busy": 0.2615,
+     "power_w_max": 349.21,
+     "power_w_max_busy": 349.21,
+     "power_w_mean_busy": 93.4,
+     "samples": 752,
+     "sm_mhz_max_busy": 2392,
+     "sm_mhz_mean_busy": 2389.6,
+     "sm_mhz_median_busy": 2392,
+     "sm_mhz_min_busy": 2370,
+     "temperature_c_max": 51,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 17,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.2615
+    }
+   },
+   "power_flags": {
+    "srv_skew_ref_30a3": [
+     "the power cap held the clock in 8 of 78 busy samples (10 %); busy SM clock min 2370 MHz, mean 2390.9 MHz; busy power mean 75.5 W, max 253.91 W of the 575 W limit"
+    ],
+    "srv_skew_ref_sgl_30a3": [
+     "the power cap held the clock in 17 of 65 busy samples (26 %); busy SM clock min 2370 MHz, mean 2389.6 MHz; busy power mean 93.4 W, max 349.21 W of the 575 W limit"
+    ]
+   },
+   "run": "perf_serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/5090/perf_serving",
+   "steps": [
+    {
+     "command": [
+      "/home/stone/workspace/standalone/.venv-sglang/bin/python",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_30a3.py",
+      "--run",
+      "--routing",
+      "skew",
+      "--impls",
+      "triton_fp8b",
+      "--out",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/perf_serving/ref_sgl020_skew_30a3_5090.jsonl"
+     ],
+     "end_utc": "2026-10-10T17:00:40.108Z",
+     "env": "sglang",
+     "error_rows": 0,
+     "exit_code": 0,
+     "name": "srv_skew_ref_sgl_30a3",
+     "rows": 14,
+     "start_utc": "2026-10-10T16:58:09.428Z"
+    },
+    {
+     "command": [
+      "/home/stone/workspace/standalone/.venv-sgl/bin/python",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_30a3.py",
+      "--run",
+      "--routing",
+      "skew",
+      "--impls",
+      "vllm_fp8b",
+      "--out",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/perf_serving/ref_skew_30a3_5090.jsonl"
+     ],
+     "end_utc": "2026-10-10T17:02:53.929Z",
+     "env": "main",
+     "error_rows": 0,
+     "exit_code": 0,
+     "name": "srv_skew_ref_30a3",
+     "rows": 14,
+     "start_utc": "2026-10-10T17:00:40.210Z"
+    }
+   ],
+   "window_utc": [
+    "2026-10-10T16:58:09.428Z",
+    "2026-10-10T17:02:53.929Z"
+   ]
+  },
   "ref_moe_qwen3_35a3_5090.jsonl": {
    "bench_env": {},
    "bench_tree": {
@@ -2032,6 +3340,372 @@
    "window_utc": [
     "2026-10-05T06:02:59.309Z",
     "2026-10-05T06:49:34.689Z"
+   ]
+  },
+  "ref_moe_qwen3_35a3_ep2_5090.jsonl": {
+   "bench_env": {},
+   "bench_tree": {
+    "bench_dirty": null,
+    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
+    "source": "kit"
+   },
+   "card": {
+    "clocks_max_sm_mhz": 3090,
+    "compute_mode": "Default",
+    "driver": "595.58.03",
+    "index": "1",
+    "memory_total_mib": 32607,
+    "name": "NVIDIA GeForce RTX 5090",
+    "pci": "00000000:21:00.0",
+    "power_limit_w": 575,
+    "uuid": "GPU-bdc88aea-7478-c763-79e4-5c8a28bce484"
+   },
+   "clock_flags": {},
+   "clock_policy": {
+    "applied": "sudo -n nvidia-smi -i 00000000:21:00.0 -lgc 2407",
+    "max_sm_mhz": 3090,
+    "mhz": 2407,
+    "mode": "locked"
+   },
+   "drift_accepted": [],
+   "driver": "595.58.03",
+   "environments": {
+    "sglang": {
+     "packages": {
+      "flashinfer-python": "0.6.18",
+      "numpy": "2.3.5",
+      "nvidia-cublas": "13.1.1.3",
+      "nvidia-cuda-nvrtc": "13.0.88",
+      "nvidia-cudnn-cu13": "9.20.0.48",
+      "nvidia-cudnn-frontend": "1.30.0",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "sgl-deep-gemm": "0.2.0",
+      "sglang": "0.5.20",
+      "sglang-kernel": "0.4.7",
+      "torch": "2.13.0+cu130",
+      "triton": "3.7.1"
+     },
+     "python": "/home/stone/workspace/standalone/.venv-sglang/bin/python",
+     "python_version": "3.12.3"
+    }
+   },
+   "fso": {
+    "build_info": {
+     "arch_list": "9.0a;10.0f;12.0a",
+     "built_at": "2026-10-10T15:55:17Z",
+     "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+     "cuda_toolkit": "13.0.3",
+     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+     "dirty": false,
+     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
+     "glibc_required": "GLIBC_2.34",
+     "image": {
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
+     },
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
+     "nvrtc": {
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+     },
+     "python": "CPython 3.12.15",
+     "torch": "2.13.0+cu130",
+     "version": "0.2.1"
+    },
+    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+    "extension_sha256": "dfae2d579c6d36cd9c5819f19664bdd7dd0f1f25e3900090e13f9225c082f903",
+    "source_build": false,
+    "version": "0.2.1"
+   },
+   "host": "gpu5090-03",
+   "installed_utc": "2026-10-10T20:02:02Z",
+   "jit_compiler_sm90": null,
+   "lock_sha256": "683cf6da12cedb0b751b466f843ac28098d75bb5092bec92dddc53c07a89aa12",
+   "machine": "5090",
+   "manifest_sha256": "bf477333159c524c417e140dd08124e73837fc4b560b4c8950280da50285a9db",
+   "observed_clocks": {
+    "srv_ep2_ref_sgl_35a3": {
+     "busy_samples": 65,
+     "hw_slowdown_busy_samples": 0,
+     "power_cap_busy_samples": 4,
+     "power_capped_busy_samples": 4,
+     "power_capped_share_of_busy": 0.0615,
+     "power_limit_w": 575,
+     "power_throttle_share_of_busy": 0.0615,
+     "power_w_max": 200.54,
+     "power_w_max_busy": 164.84,
+     "power_w_mean_busy": 72.0,
+     "samples": 737,
+     "sm_mhz_max_busy": 2392,
+     "sm_mhz_mean_busy": 2387.6,
+     "sm_mhz_median_busy": 2392,
+     "sm_mhz_min_busy": 2340,
+     "temperature_c_max": 40,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 4,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.0615
+    }
+   },
+   "power_flags": {
+    "srv_ep2_ref_sgl_35a3": [
+     "the power cap held the clock in 4 of 65 busy samples (6 %); busy SM clock min 2340 MHz, mean 2387.6 MHz; busy power mean 72.0 W, max 164.84 W of the 575 W limit"
+    ]
+   },
+   "run": "perf_serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/5090/perf_serving",
+   "steps": [
+    {
+     "command": [
+      "/home/stone/workspace/standalone/.venv-sglang/bin/python",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "--run",
+      "--routing",
+      "ep",
+      "--ep-size",
+      "2",
+      "--impls",
+      "triton_fp8b",
+      "--out",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/perf_serving/ref_sgl020_ep2_35a3_5090.jsonl"
+     ],
+     "end_utc": "2026-10-10T17:16:45.293Z",
+     "env": "sglang",
+     "error_rows": 0,
+     "exit_code": 0,
+     "name": "srv_ep2_ref_sgl_35a3",
+     "rows": 14,
+     "start_utc": "2026-10-10T17:14:17.830Z"
+    }
+   ],
+   "window_utc": [
+    "2026-10-10T17:14:17.830Z",
+    "2026-10-10T17:16:45.293Z"
+   ]
+  },
+  "ref_moe_qwen3_35a3_skew_5090.jsonl": {
+   "bench_env": {},
+   "bench_tree": {
+    "bench_dirty": null,
+    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
+    "source": "kit"
+   },
+   "card": {
+    "clocks_max_sm_mhz": 3090,
+    "compute_mode": "Default",
+    "driver": "595.58.03",
+    "index": "1",
+    "memory_total_mib": 32607,
+    "name": "NVIDIA GeForce RTX 5090",
+    "pci": "00000000:21:00.0",
+    "power_limit_w": 575,
+    "uuid": "GPU-bdc88aea-7478-c763-79e4-5c8a28bce484"
+   },
+   "clock_flags": {},
+   "clock_policy": {
+    "applied": "sudo -n nvidia-smi -i 00000000:21:00.0 -lgc 2407",
+    "max_sm_mhz": 3090,
+    "mhz": 2407,
+    "mode": "locked"
+   },
+   "drift_accepted": [],
+   "driver": "595.58.03",
+   "environments": {
+    "main": {
+     "packages": {
+      "expecttest": "0.3.0",
+      "flashinfer-python": "0.6.18",
+      "numpy": "2.3.5",
+      "nvidia-cublas": "13.1.1.3",
+      "nvidia-cuda-nvrtc": "13.0.88",
+      "nvidia-cudnn-cu13": "9.20.0.48",
+      "nvidia-cudnn-frontend": "1.30.0",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "torch": "2.13.0+cu130",
+      "triton": "3.7.1",
+      "vllm": "0.29.0"
+     },
+     "python": "/home/stone/workspace/standalone/.venv-sgl/bin/python",
+     "python_version": "3.12.3"
+    },
+    "sglang": {
+     "packages": {
+      "flashinfer-python": "0.6.18",
+      "numpy": "2.3.5",
+      "nvidia-cublas": "13.1.1.3",
+      "nvidia-cuda-nvrtc": "13.0.88",
+      "nvidia-cudnn-cu13": "9.20.0.48",
+      "nvidia-cudnn-frontend": "1.30.0",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "sgl-deep-gemm": "0.2.0",
+      "sglang": "0.5.20",
+      "sglang-kernel": "0.4.7",
+      "torch": "2.13.0+cu130",
+      "triton": "3.7.1"
+     },
+     "python": "/home/stone/workspace/standalone/.venv-sglang/bin/python",
+     "python_version": "3.12.3"
+    }
+   },
+   "fso": {
+    "build_info": {
+     "arch_list": "9.0a;10.0f;12.0a",
+     "built_at": "2026-10-10T15:55:17Z",
+     "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+     "cuda_toolkit": "13.0.3",
+     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+     "dirty": false,
+     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
+     "glibc_required": "GLIBC_2.34",
+     "image": {
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
+     },
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
+     "nvrtc": {
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+     },
+     "python": "CPython 3.12.15",
+     "torch": "2.13.0+cu130",
+     "version": "0.2.1"
+    },
+    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+    "extension_sha256": "dfae2d579c6d36cd9c5819f19664bdd7dd0f1f25e3900090e13f9225c082f903",
+    "source_build": false,
+    "version": "0.2.1"
+   },
+   "host": "gpu5090-03",
+   "installed_utc": "2026-10-10T20:02:02Z",
+   "jit_compiler_sm90": null,
+   "lock_sha256": "683cf6da12cedb0b751b466f843ac28098d75bb5092bec92dddc53c07a89aa12",
+   "machine": "5090",
+   "manifest_sha256": "bf477333159c524c417e140dd08124e73837fc4b560b4c8950280da50285a9db",
+   "observed_clocks": {
+    "srv_skew_ref_35a3": {
+     "busy_samples": 95,
+     "hw_slowdown_busy_samples": 0,
+     "power_cap_busy_samples": 21,
+     "power_capped_busy_samples": 21,
+     "power_capped_share_of_busy": 0.2211,
+     "power_limit_w": 575,
+     "power_throttle_share_of_busy": 0.2211,
+     "power_w_max": 317.11,
+     "power_w_max_busy": 317.11,
+     "power_w_mean_busy": 81.8,
+     "samples": 676,
+     "sm_mhz_max_busy": 2392,
+     "sm_mhz_mean_busy": 2390.4,
+     "sm_mhz_median_busy": 2392,
+     "sm_mhz_min_busy": 2355,
+     "temperature_c_max": 48,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 21,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.2211
+    },
+    "srv_skew_ref_sgl_35a3": {
+     "busy_samples": 88,
+     "hw_slowdown_busy_samples": 0,
+     "power_cap_busy_samples": 11,
+     "power_capped_busy_samples": 11,
+     "power_capped_share_of_busy": 0.125,
+     "power_limit_w": 575,
+     "power_throttle_share_of_busy": 0.125,
+     "power_w_max": 333.06,
+     "power_w_max_busy": 200.81,
+     "power_w_mean_busy": 77.0,
+     "samples": 762,
+     "sm_mhz_max_busy": 2400,
+     "sm_mhz_mean_busy": 2390.9,
+     "sm_mhz_median_busy": 2392.0,
+     "sm_mhz_min_busy": 2377,
+     "temperature_c_max": 44,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 11,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.125
+    }
+   },
+   "power_flags": {
+    "srv_skew_ref_35a3": [
+     "the power cap held the clock in 21 of 95 busy samples (22 %); busy SM clock min 2355 MHz, mean 2390.4 MHz; busy power mean 81.8 W, max 317.11 W of the 575 W limit"
+    ],
+    "srv_skew_ref_sgl_35a3": [
+     "the power cap held the clock in 11 of 88 busy samples (12 %); busy SM clock min 2377 MHz, mean 2390.9 MHz; busy power mean 77.0 W, max 200.81 W of the 575 W limit"
+    ]
+   },
+   "run": "perf_serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/5090/perf_serving",
+   "steps": [
+    {
+     "command": [
+      "/home/stone/workspace/standalone/.venv-sglang/bin/python",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "--run",
+      "--routing",
+      "skew",
+      "--impls",
+      "triton_fp8b",
+      "--out",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/perf_serving/ref_sgl020_skew_35a3_5090.jsonl"
+     ],
+     "end_utc": "2026-10-10T17:06:25.552Z",
+     "env": "sglang",
+     "error_rows": 0,
+     "exit_code": 0,
+     "name": "srv_skew_ref_sgl_35a3",
+     "rows": 14,
+     "start_utc": "2026-10-10T17:03:52.932Z"
+    },
+    {
+     "command": [
+      "/home/stone/workspace/standalone/.venv-sgl/bin/python",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "--run",
+      "--routing",
+      "skew",
+      "--impls",
+      "vllm_fp8b",
+      "--out",
+      "/mnt/share/stone-bench-runs/fso_0.2.1_20261010/S12/run-55f138c/perf_serving/ref_skew_35a3_5090.jsonl"
+     ],
+     "end_utc": "2026-10-10T17:08:40.891Z",
+     "env": "main",
+     "error_rows": 0,
+     "exit_code": 0,
+     "name": "srv_skew_ref_35a3",
+     "rows": 14,
+     "start_utc": "2026-10-10T17:06:25.652Z"
+    }
+   ],
+   "window_utc": [
+    "2026-10-10T17:03:52.932Z",
+    "2026-10-10T17:08:40.891Z"
    ]
   }
  },
