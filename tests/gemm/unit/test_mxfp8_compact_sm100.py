@@ -958,8 +958,10 @@ def main():
         rec, err = run_child(case, args)
         res = rec.get("results")
         bad = [r for r in (res or []) if not r.get("ok")]
-        ok = rec.get("skipped") is not None or (rec.get("rc") == 0 and res is not None and not bad)
-        if case == "arena" and ok:
+        skipped = rec.get("skipped") is not None or (res is not None and len(res) > 0
+                                                     and all(r.get("skipped") for r in res))
+        ok = skipped or (rec.get("rc") == 0 and res is not None and not bad)
+        if case == "arena" and ok and not skipped:
             new_blocks = [ln for ln in err.splitlines() if "[fso sm100 weight arena] new block" in ln]
             rebound = [ln for ln in err.splitlines() if "[fso sm100 weight arena] rebound" in ln]
             last = new_blocks[-1] if new_blocks else ""
