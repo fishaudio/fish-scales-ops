@@ -11,20 +11,17 @@ Performance figures are in `docs/perf/`, not here.
   masked slab). Each expert now holds its routed rows in whole 128-row blocks of one compact buffer, so a call needs
   memory for `tokens * topk` rows plus at most 127 rows per expert that holds one. `fso.moe.transient_bytes` returns
   the new, much smaller figure (Family C at 8192 tokens: about 0.65 GiB per call on a B300 instead of 13.2 GiB, and
-  about 0.54 GiB per RTX 5090 rank with 128 local experts instead of 6.6 GiB). The layer's outputs are bit-identical
-  to 0.2.0's, and `FSO_MOE_COMPACT=0` restores the masked slab as an A/B arm. On sm_100/sm_103 the compact layout's
-  decode-band GEMMs have their own route rule between the slot-bound kernel and the pointer-array kernel; the
-  `fso.compat` route queries (`mxfp8_grouped_slot_possible`, `mxfp8_grouped_problem_shapes_consumed`,
-  `mxfp8_grouped_swiglu_fused_route`) take a new keyword `compact=False`, and a caller composing the compact ops asks
-  them with `compact=True`. Without it they answer for the masked ops, as in 0.2.0. The compact layout's slot-bound
-  kernel also runs past 64 tokens per call (the layer takes it up to 512): there it walks a list of the live 64-row
-  token tiles, which `moe_build_routing_compact(..., with_tiles=True)` emits as a tenth output, `slot_tiles`, and the
-  compact GEMM ops take as `slot_tiles=`; a compact GEMM that lands there without one builds the list itself.
+  about 0.54 GiB per RTX 5090 rank with 128 local experts instead of 6.6 GiB). The layout is the same at every
+  number of tokens, the layer's outputs are bit-identical to 0.2.0's, and `FSO_MOE_COMPACT=0` restores the masked
+  slab as an A/B arm.
 - **No routing scratch, no argument-arena abort (#7).** The compact layout's routing op keeps no device state between
   calls, so the 0.2.0 routing builder's limit of 16 graph captures per host thread (after which it fell back to the
   single-CTA builder) no longer applies to `fso.moe.layer`. On sm_100/sm_103 the grouped GEMMs take their per-call
   activation pointers from that routing op and keep only weight-side arguments in their arena, two blocks per layer
   whatever the number of captures; the arena grows on demand and no longer aborts a capture.
+- **PDL at every size.** Every MoE glue launch (routing, gather-quantize, SwiGLU requantize, combine, the router) now
+  follows `FSO_DISABLE_PDL` at every grid size; 0.2.0 launched grids above 4096 CTAs without PDL whatever the
+  setting.
 
 ### New
 
@@ -36,6 +33,23 @@ Performance figures are in `docs/perf/`, not here.
   re-orders the FC1 rows for the fused FC1; it requantizes nothing, so calibrated checkpoints are served as
   written and loading needs no bf16 copy of the layer. The bf16 forms and the int32 dense scale stay as
   they were; sm_90 still refuses `format="mxfp8"`.
+- **The compact layout's building blocks in `fso.compat`.** For callers that compose the MoE steps themselves:
+  the routing op `moe_build_routing_compact`, the compact grouped GEMMs (`linear_mxfp8_grouped_compact`,
+  `linear_mxfp8_grouped_compact_swiglu`, `linear_mxfp8_grouped_compact_combine`) and the out-style glue
+  (`quantize_1x32_grouped_gather_out_fp8`, `silu_chunk_mul_quantize_1x32_grouped_out_fp8`). On sm_100/sm_103 the
+  compact GEMMs have their own route rule, so the route queries (`mxfp8_grouped_slot_possible`,
+  `mxfp8_grouped_problem_shapes_consumed`, `mxfp8_grouped_swiglu_fused_route`) take a new keyword `compact=False`;
+  a caller composing the compact ops asks them with `compact=True`, and without it they answer for the masked ops
+  as in 0.2.0. The contracts are in `docs/api/compat.md`.
+
+### Faster
+
+- **B300 (sm_100/sm_103) MoE layer in the decode band.** The compact layer's grouped GEMMs take the slot-bound route
+  up to 512 tokens per call. That route hands its tiles out dynamically over the experts that hold rows and writes
+  only the routed rows, so Families B and C are faster from 8 to 512 tokens per call, under uniform, skewed and
+  padded routing alike, and the layer no longer runs into the card's power cap at 128–256 tokens.
+- **H200 (sm_90) MoE layer at decode.** The grouped GEMMs and the expert-sorted gather-quantize now launch with PDL,
+  so each starts while its predecessor finishes.
 
 ## 0.2.0 — 2026-10-06
 
