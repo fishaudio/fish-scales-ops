@@ -43,6 +43,7 @@ Groups:
   ``moe_layer_transient_bytes_mxfp8``, ``moe_layer_fused_combine_engages_sm120``;
 * the MoE router: ``moe_router_topk``, ``moe_topk_from_logits``;
 * the MoE routing builders and combines: ``moe_build_routing``,
+  ``moe_build_routing_compact`` (the compact 128-row-block layout),
   ``moe_build_sorted``, ``moe_combine``, ``moe_combine_sorted``;
 * the sm_90 block-FP8 grouped chain: ``linear_fp8_grouped_masked``,
   ``linear_fp8_grouped_contiguous``, ``linear_fp8_grouped_contiguous_swapab``,
@@ -90,6 +91,7 @@ from ..gemm.mxfp8 import (
     linear_mxfp8_grouped_masked_swiglu,
     moe_block_mxfp8_sm120,
     moe_build_routing,
+    moe_build_routing_compact,
     moe_build_sorted,
     moe_combine,
     moe_combine_sorted,
@@ -137,6 +139,7 @@ __all__ = [
     "moe_topk_from_logits",
     # MoE: routing builders and combines
     "moe_build_routing",
+    "moe_build_routing_compact",
     "moe_build_sorted",
     "moe_combine",
     "moe_combine_sorted",

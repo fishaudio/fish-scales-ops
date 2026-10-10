@@ -861,6 +861,109 @@ def moe_build_routing(
     return out
 
 
+def moe_compact_num_blocks(tokens: int, topk: int, num_groups: int) -> int:
+    """The host-static number of 128-row blocks a compact-layout buffer needs for a
+    bucket of ``tokens`` rows: ``max(1, (tokens*topk + 127*min(num_groups, tokens*topk)) // 128)``.
+
+    Expert ``g`` owns ``ceil(cnt[g] / 128)`` blocks, and over the at most
+    ``min(num_groups, tokens*topk)`` experts that hold a row that sum is at most
+    ``(tokens*topk + 127 * active) / 128`` whatever the routing (duplicate ids
+    included), so a buffer of this many blocks can never be overrun. It is the
+    ``num_blocks`` :func:`moe_build_routing_compact` expects.
+    """
+    pairs = int(tokens) * int(topk)
+    return max(1, (pairs + 127 * min(int(num_groups), pairs)) // 128)
+
+
+def moe_build_routing_compact(
+    topk_ids: torch.Tensor,
+    num_groups: int,
+    num_blocks: int | None = None,
+    *,
+    with_slots: bool = False,
+    with_row_map: bool = False,
+    topk_w: torch.Tensor | None = None,
+    problem_shapes_for: list[tuple[int, int]] | None = None,
+    ptr_bases: list | None = None,
+    ptr_strides: list | None = None,
+) -> tuple[torch.Tensor, ...]:
+    """topk routing -> the compact 128-row-block layout, one kernel launch, no scratch.
+
+    The compact layout gives expert ``g`` the ``nb[g] = ceil(cnt[g] / 128)``
+    consecutive 128-row blocks that start at block ``blk0[g]`` (the exclusive
+    prefix of ``nb``); its routed rows are ``blk0[g]*128 + r`` for ``r < cnt[g]``.
+    A buffer of ``num_blocks`` blocks holds any routing (see
+    :func:`moe_compact_num_blocks`). A compact row is exactly a slot of a masked
+    layout with ONE group of ``m_cap = num_blocks * 128`` rows, so the
+    slot-addressed glue (:func:`quantize_1x32_grouped_gather_fp8`, the grouped
+    SwiGLU requantize and :func:`moe_combine`) runs on it unchanged when called
+    with ``num_groups = 1`` and ``m_cap = num_blocks * 128``; in that view an
+    expert's rows and its scale words are contiguous on every architecture.
+
+    The op allocates nothing but its outputs and keeps no device state between
+    calls, so it can be captured into any number of CUDA graphs.
+
+    Args:
+        topk_ids: int32 ``[M, topk]``, contiguous. An id outside ``[0, num_groups)``
+            is skipped exactly as :func:`moe_build_routing` skips it (no count, no
+            row, ``slot_of_flat = -1``): padded rows of a graph bucket, and experts
+            another expert-parallel rank owns.
+        num_groups: G, 1 to 1024.
+        num_blocks: ``B_max``; default :func:`moe_compact_num_blocks`. A smaller
+            value is refused.
+        with_slots: also emit the packed active-expert list (the sm_100/103 slot
+            route's grid index): active experts ascending, then ``-1``.
+        with_row_map: also emit ``row_map`` int32 ``[num_blocks * 128]``: compact
+            row -> source token, at live rows only.
+        topk_w: fp32 ``[M, topk]``; when given, also emit ``weight_of_slot`` fp32
+            ``[num_blocks * 128]``: compact row -> the routed pair's weight, at live
+            rows only.
+        problem_shapes_for: ``[(N, K), ...]``, at most four, one per sm_100/103
+            pointer-array grouped GEMM: emit ``problem_shapes`` int32 ``[P, G, 3]``
+            holding ``(cnt[g], N, K)`` (not clamped).
+        ptr_bases: three tensors per ``problem_shapes_for`` pair, flat or as
+            triples: the A data, A scales and D data buffers of that GEMM (only
+            their ``data_ptr()`` is read). Emits ``ptr_arrays`` int64 ``[P, 3, G]``:
+            ``[p][0][g] = A + blk0[g]*128*a_row``, ``[p][1][g] = SFA +
+            blk0[g]*sfa_blk``, ``[p][2][g] = D + blk0[g]*128*d_row``, for every
+            ``g`` (an empty expert's pointer lands on the next expert's first
+            block and is never read).
+        ptr_strides: three byte strides per pair, flat or as triples, in the same
+            order: A bytes per row, A-scale bytes per 128-row block, D bytes per row.
+
+    Returns:
+        ``(masked_m [G], blk0 [G + 1], slot_of_flat [M*topk], slot_to_expert [G or
+        0], problem_shapes [P, G, 3], ptr_arrays [P or 0, 3, G], row_map
+        [num_blocks*128 or 0], weight_of_slot [num_blocks*128 or 0])``.
+        ``blk0[G]`` is the number of blocks in use. Rows past ``cnt[g]`` in an
+        expert's last block, and every row of an unused block, are never written.
+        The order of the rows inside an expert is unspecified.
+    """
+    m, topk = int(topk_ids.shape[0]), int(topk_ids.shape[1])
+    if num_blocks is None:
+        num_blocks = moe_compact_num_blocks(m, topk, num_groups)
+    nk: list[int] = []
+    for pair in problem_shapes_for or ():
+        n, k = pair
+        nk.extend((int(n), int(k)))
+
+    def _flat(items):
+        out = []
+        for x in items or ():
+            if isinstance(x, (list, tuple)):
+                out.extend(x)
+            else:
+                out.append(x)
+        return out
+
+    bases = _flat(ptr_bases)
+    strides = [int(s) for s in _flat(ptr_strides)]
+    # arch-agnostic glue (plain int32 / int64 + PDL), the same kernels on every architecture
+    return tuple(torch.ops.fish_scales_ops.moe_build_routing_compact(
+        topk_ids, int(num_groups), int(num_blocks), bool(with_slots), bool(with_row_map), topk_w, nk,
+        bases if bases else None, strides))
+
+
 def moe_topk_from_logits(
     logits: torch.Tensor,
     topk: int,

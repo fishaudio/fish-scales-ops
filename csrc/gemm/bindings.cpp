@@ -105,6 +105,13 @@ at::Tensor linear_mxfp8_grouped_masked_combine(at::Tensor a_fp8, at::Tensor w2_f
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_build_routing(
     at::Tensor topk_ids, int64_t num_groups, int64_t m_cap, bool with_slots,
     std::vector<int64_t> problem_shapes_nk, std::optional<at::Tensor> topk_w);
+// The compact 128-row-block routing builder (0.2.1): per-expert counts, block
+// offsets, compact rows per routed pair and, on request, the slot list, the
+// problem shapes, the per-call pointer arrays, row_map and weight_of_slot.
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+moe_build_routing_compact(at::Tensor topk_ids, int64_t num_groups, int64_t num_blocks, bool with_slots,
+    bool with_row_map, std::optional<at::Tensor> topk_w, std::vector<int64_t> problem_shapes_nk,
+    std::optional<std::vector<at::Tensor>> ptr_bases, std::vector<int64_t> ptr_strides);
 at::Tensor moe_combine(at::Tensor dn, at::Tensor slot_of_flat, at::Tensor topk_w,
     std::optional<at::Tensor> bias, std::optional<at::Tensor> bias_scale, std::optional<at::Tensor> out);
 std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_build_sorted(
@@ -183,6 +190,10 @@ TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
     m.def("moe_build_routing(Tensor topk_ids, int num_groups, int m_cap, bool with_slots=False, "
                              "int[] problem_shapes_nk=[], Tensor? topk_w=None) "
                              "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
+    m.def("moe_build_routing_compact(Tensor topk_ids, int num_groups, int num_blocks, bool with_slots=False, "
+                                     "bool with_row_map=False, Tensor? topk_w=None, int[] problem_shapes_nk=[], "
+                                     "Tensor[]? ptr_bases=None, int[] ptr_strides=[]) "
+                                     "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def("linear_mxfp8_grouped_masked_combine(Tensor a_fp8, Tensor w2_fp8, Tensor sa_int32, "
                                               "Tensor sw2_int32, Tensor masked_m, Tensor row_map, "
                                               "Tensor weight_of_slot, Tensor(a!) out, int expected_m, "
@@ -228,6 +239,7 @@ TORCH_LIBRARY_IMPL(fish_scales_ops, CUDA, m)
     m.impl("silu_chunk_mul_quantize_1x32_grouped", &blockscale_gemm::silu_chunk_mul_quantize_1x32_grouped);
     m.impl("linear_mxfp8_grouped_masked_swiglu", &blockscale_gemm::linear_mxfp8_grouped_masked_swiglu);
     m.impl("moe_build_routing", &blockscale_gemm::moe_build_routing);
+    m.impl("moe_build_routing_compact", &blockscale_gemm::moe_build_routing_compact);
     m.impl("linear_mxfp8_grouped_masked_combine", &blockscale_gemm::linear_mxfp8_grouped_masked_combine);
     m.impl("moe_combine", &blockscale_gemm::moe_combine);
     m.impl("moe_topk_from_logits", &blockscale_gemm::moe_topk_from_logits);
