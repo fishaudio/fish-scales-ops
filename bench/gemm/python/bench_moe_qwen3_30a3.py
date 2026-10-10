@@ -1656,121 +1656,43 @@ def run_worker(cell):
                 torch.cuda.synchronize()
                 result["cos"] = cos_sim(out_holder["out"], ref)
             elif base_impl == "fso_mxfp8_layer":
-                # fso M1 composed layer, 6 kernels total and zero torch-op glue:
-                # moe_build_routing + gather-quant + grouped gate_up +
-                # grouped silu-quant + grouped down + moe_combine. Routing is
-                # derived from topk_ids ON DEVICE inside the timed graph, same
-                # boundary as the triton / dg layer cells.
+                # fso's MXFP8 MoE layer as a serving stack calls it: the experts of this
+                # weight copy prepared once with `fso.moe.prepare_experts`, then one
+                # `fso.moe.layer` call per graph step, the routing derived from topk_ids on
+                # the device inside the timed graph (the same boundary as the triton / dg
+                # layer cells). Every host-side decision (the layout, the routes, the fused
+                # FC1, the tile hints) is the library's, so the cell times exactly what the
+                # stable interface runs on this device. Until 0.2.0 the cell composed the
+                # masked-slab ops here instead, which was the same chain as the layer then;
+                # since 0.2.1 the layer runs the compact layout (FSO_MOE_COMPACT=0 restores
+                # the slab), and composing the old ops here would time a chain the layer no
+                # longer runs. The fields below record the routes the library takes.
                 import fish_scales_ops as fso
                 m_cap = (M + 3) // 4 * 4
-                expected_m = max(1, (rows + E - 1) // E)
-                # See the kernel cell above: min(M * TOPK, E) is the host-static
-                # upper bound on the number of experts that can hold a row, which
-                # is what the sm_100 grouped dispatcher needs to size the decode
-                # route's grid. `expected_m` cannot supply it (it is
-                # ceil(rows / E) and equals 1 for every decode M at E = 128).
                 max_active_groups = min(M * TOPK, E)
                 result["m_cap"] = m_cap
                 result["max_active_groups"] = max_active_groups
-                # The fused FC1 (run b300_mxfp8_20260917/M-E2): one grouped GEMM
-                # whose epilogue emits MXFP8(silu(gate) * up), so the separate
-                # SwiGLU kernel and the bf16 [E, m_cap, 2*I] intermediate both
-                # disappear. Two host-static decisions, both taken by the library
-                # so the bench cannot invent a rule of its own:
-                #   * `available` is the LOAD-time one. The fused op needs gate/up
-                #     interleaved weight rows, and a model holds one layout, so it
-                #     decides how w13 is quantised. It is false when
-                #     FSO_FC1_FUSED=0, which is exactly the control arm: the layer
-                #     is then byte-for-byte the one this round started from.
-                #   * `fused_route` is the PER-CALL one. Both grouped routes carry
-                #     a fused FC1 now (run b300_mxfp8_20260917/M-A2 added the
-                #     swap-orientation one), so it answers yes on both sides of the
-                #     route boundary and what it really selects is which fused
-                #     kernel the call lands on. Where it answers no the layer keeps
-                #     the unfused FC1 on interleaved weights, which is what the
-                #     SwiGLU kernel's `pairwise` flag is for.
                 n_w = 2 * INTER
                 fc1_interleaved = fso.compat.mxfp8_grouped_swiglu_available(n_w, HIDDEN)
                 fc1_fused = fc1_interleaved and fso.compat.mxfp8_grouped_swiglu_fused_route(
                     m_cap, n_w, HIDDEN, E, max_active_groups)
                 result["fc1_interleaved"] = int(fc1_interleaved)
                 result["fc1_fused"] = int(fc1_fused)
-                w13_fp8, sw13 = fso.compat.quantize_moe_weights_1x32_fp8(
-                    w13, w13_interleave=fc1_interleaved)
-                w2_fp8, sw2 = fso.compat.quantize_moe_weights_1x32_fp8(w2)
-
-                # The routing kernel emits the packed active-expert list in the
-                # same launch (run b300_mxfp8_20260917/M-I1). Where the dispatcher
-                # takes the slot-bound decode route it then launches only the GEMM.
-                # Where it does not, nothing reads the list, and building it is a
-                # block-wide compaction the layer pays for nothing — so the library
-                # is asked, once per cell, whether EITHER of the layer's two grouped
-                # GEMMs would take that route (FC1 is 2*INTER x HIDDEN, FC2 is
-                # HIDDEN x INTER), and `with_slots` follows that answer. On sm_120,
-                # and on sm_100 above the decode band, the answer is no and the
-                # routing kernel does less work than it did.
-                # Asked for the kernel each GEMM will actually run: the fused FC1
-                # has a shorter row-capacity clause than the plain grouped GEMM
-                # (run b300_round3_20260922/M-A3).
-                want_slots = (
+                result["with_slots"] = int(
                     fso.compat.mxfp8_grouped_slot_possible(
                         m_cap, n_w, HIDDEN, E, max_active_groups, fused_swiglu=fc1_fused)
                     or fso.compat.mxfp8_grouped_slot_possible(
                         m_cap, HIDDEN, INTER, E, max_active_groups))
-                result["with_slots"] = int(want_slots)
-                # The pointer-array route's counterpart of the slot list (run
-                # b300_round3_20260922/M-A4). Wherever the cascade serves a GEMM,
-                # the routing kernel also emits that GEMM's per-group (rows, N, K)
-                # triples in the pass that writes masked_m, and the GEMM then
-                # launches without the argument-preparation kernel it used to run
-                # ahead of itself: seven kernels per layer become five. Asked per
-                # GEMM, so the decode band (slot route, no reader) and sm_120 keep
-                # the routing kernel's old work exactly. Asked with the same
-                # kernel flag as the slot query above, because the two answers
-                # are complements only under the same flag: per GEMM exactly one
-                # of the slot list and the problem shapes is then requested.
-                want_ps = [
+                result["with_ps"] = int(
                     fso.compat.mxfp8_grouped_problem_shapes_consumed(
-                        m_cap, n_w, HIDDEN, E, max_active_groups, fused_swiglu=fc1_fused),
-                    fso.compat.mxfp8_grouped_problem_shapes_consumed(
-                        m_cap, HIDDEN, INTER, E, max_active_groups)]
-                ps_for = [nk for nk, want in zip([(n_w, HIDDEN), (HIDDEN, INTER)], want_ps) if want]
-                result["with_ps"] = int(any(want_ps))
+                        m_cap, n_w, HIDDEN, E, max_active_groups, fused_swiglu=fc1_fused)
+                    or fso.compat.mxfp8_grouped_problem_shapes_consumed(
+                        m_cap, HIDDEN, INTER, E, max_active_groups))
+                result["layout"] = "masked slab" if os.environ.get("FSO_MOE_COMPACT", "")[:1] == "0" else "compact"
+                experts = fso.moe.prepare_experts(w13, w2, format="mxfp8")
 
-                def build_routing():
-                    r = fso.compat.moe_build_routing(topk_ids, E, m_cap, with_slots=want_slots,
-                                                   problem_shapes_for=ps_for or None)
-                    ps = list(r[-1]) if ps_for else []
-                    ps1 = ps.pop(0) if want_ps[0] else None
-                    ps2 = ps.pop(0) if want_ps[1] else None
-                    return r[0], r[2], (r[3] if want_slots else None), ps1, ps2
-
-                if fc1_fused:
-                    def layer_fn():
-                        masked_dev, slot_of_flat, slot_to_expert, ps1, ps2 = build_routing()
-                        hq, sh = fso.compat.quantize_1x32_grouped_gather_fp8(
-                            hidden, slot_of_flat, TOPK, E, m_cap)
-                        dq, sd = fso.compat.linear_mxfp8_grouped_masked_swiglu(
-                            hq, w13_fp8, sh, sw13, masked_dev, expected_m,
-                            max_active_groups, slot_to_expert, ps1)
-                        dn = fso.compat.linear_mxfp8_grouped_masked(
-                            dq, w2_fp8, sd, sw2, masked_dev, expected_m,
-                            max_active_groups, slot_to_expert, ps2)
-                        return fso.compat.moe_combine(dn, slot_of_flat, topk_w)
-                else:
-                    def layer_fn():
-                        masked_dev, slot_of_flat, slot_to_expert, ps1, ps2 = build_routing()
-                        hq, sh = fso.compat.quantize_1x32_grouped_gather_fp8(
-                            hidden, slot_of_flat, TOPK, E, m_cap)
-                        gu = fso.compat.linear_mxfp8_grouped_masked(
-                            hq, w13_fp8, sh, sw13, masked_dev, expected_m,
-                            max_active_groups, slot_to_expert, ps1)
-                        dq, sd = fso.compat.silu_chunk_mul_quantize_1x32_grouped_fp8(
-                            gu, slot_of_flat, pairwise=fc1_interleaved)
-                        dn = fso.compat.linear_mxfp8_grouped_masked(
-                            dq, w2_fp8, sd, sw2, masked_dev, expected_m,
-                            max_active_groups, slot_to_expert, ps2)
-                        return fso.compat.moe_combine(dn, slot_of_flat, topk_w)
+                def layer_fn():
+                    return fso.moe.layer(hidden, experts, topk_ids, topk_w)
 
                 out_holder = {}
                 if shared_fn is not None:
