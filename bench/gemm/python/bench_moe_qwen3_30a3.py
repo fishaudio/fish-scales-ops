@@ -1677,21 +1677,29 @@ def run_worker(cell):
                 # The route queries are asked under the layout the layer runs: on sm_100/103
                 # the compact ops and the masked ops have different slot-route rules.
                 compact = result["layout"] == "compact"
+
+                def query(fn, *args, **kw):
+                    # 0.2.0's route queries take no `compact` keyword (its layer has one layout, the masked
+                    # slab), so an A/B arm on that wheel asks them without it.
+                    try:
+                        return fn(*args, compact=compact, **kw)
+                    except TypeError:
+                        return fn(*args, **kw)
+
                 fc1_interleaved = fso.compat.mxfp8_grouped_swiglu_available(n_w, HIDDEN)
-                fc1_fused = fc1_interleaved and fso.compat.mxfp8_grouped_swiglu_fused_route(
-                    m_cap, n_w, HIDDEN, E, max_active_groups, compact=compact)
+                fc1_fused = fc1_interleaved and query(
+                    fso.compat.mxfp8_grouped_swiglu_fused_route, m_cap, n_w, HIDDEN, E, max_active_groups)
                 result["fc1_interleaved"] = int(fc1_interleaved)
                 result["fc1_fused"] = int(fc1_fused)
-                slot_fc1 = fso.compat.mxfp8_grouped_slot_possible(
-                    m_cap, n_w, HIDDEN, E, max_active_groups, fused_swiglu=fc1_fused, compact=compact)
-                slot_fc2 = fso.compat.mxfp8_grouped_slot_possible(
-                    m_cap, HIDDEN, INTER, E, max_active_groups, compact=compact)
+                slot_fc1 = query(fso.compat.mxfp8_grouped_slot_possible,
+                                 m_cap, n_w, HIDDEN, E, max_active_groups, fused_swiglu=fc1_fused)
+                slot_fc2 = query(fso.compat.mxfp8_grouped_slot_possible, m_cap, HIDDEN, INTER, E, max_active_groups)
                 result["with_slots"] = int(slot_fc1 or slot_fc2)
                 result["with_ps"] = int(
-                    fso.compat.mxfp8_grouped_problem_shapes_consumed(
-                        m_cap, n_w, HIDDEN, E, max_active_groups, fused_swiglu=fc1_fused, compact=compact)
-                    or fso.compat.mxfp8_grouped_problem_shapes_consumed(
-                        m_cap, HIDDEN, INTER, E, max_active_groups, compact=compact))
+                    query(fso.compat.mxfp8_grouped_problem_shapes_consumed,
+                          m_cap, n_w, HIDDEN, E, max_active_groups, fused_swiglu=fc1_fused)
+                    or query(fso.compat.mxfp8_grouped_problem_shapes_consumed,
+                             m_cap, HIDDEN, INTER, E, max_active_groups))
                 # Per-GEMM route on sm_100/103 (slot route or pointer-array cascade); other
                 # architectures have one grouped route ("grouped").
                 sm100 = torch.cuda.get_device_capability()[0] == 10
