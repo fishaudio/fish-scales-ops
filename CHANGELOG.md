@@ -2,7 +2,7 @@
 
 Performance figures are in `docs/perf/`, not here.
 
-## 0.2.1 — unreleased
+## 0.2.1 — 2026-10-10
 
 ### Changed (no action needed; reservations get smaller)
 
