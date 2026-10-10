@@ -11,9 +11,9 @@ checks is that the two compact ops
 
 write, at every live row, exactly the bytes the masked ops
 (``linear_mxfp8_grouped_masked`` / ``_masked_swiglu``) write for the same
-routing, and that they write nothing outside the rows each route is allowed to
-touch (the live rows on the pointer-array route; an active expert's first
-``m_cap`` rows, inside its first block, on the slot route). Both routes, every
+routing, and that they write nothing outside the live rows (on both routes:
+the slot route's stores are bounded by each expert's routed rows since
+S10b-1). Both routes, every
 pointer-array tile ``FSO_FORCE_TILE`` can name, Families B and C, the M grid of
 the brief, uniform / one-hot / padded / expert-parallel routing.
 
@@ -37,7 +37,13 @@ Cases (each runs in its own process, so the process-static knobs
 * ``arena``     40 layer-weight sets x 20 buckets captured into graphs: the
                 weight arena binds 2 blocks per layer and nothing per capture;
 * ``slack``     the end-of-buffer 2-SM tile with and without the one block of
-                allocation slack, for ``compute-sanitizer --tool memcheck``.
+                allocation slack, for ``compute-sanitizer --tool memcheck``;
+* ``sched``     ``FSO_GROUPED_SLOT=force``: the slot route's work-stealing
+                counter (``slot_sched``): the routing op returns it zero, every
+                slot GEMM leaves it zero, and one counter serves consecutive
+                slot GEMMs eagerly and inside one captured graph (every call
+                writes its own poisoned output, so a tile a later call skipped
+                would show), with the bytes of a call that passes none.
 
 The routing is built in torch, exactly to the contract of
 ``moe_build_routing_compact`` (S3): masked_m, blk0 (exclusive prefix of
@@ -208,15 +214,12 @@ def slot_taken(rt, N, K, fused):
 
 
 def allowed_rows(rt, slot_route):
-    """Rows of the compact buffer a GEMM may write: the live rows, plus on the slot
-    route an active expert's first m_cap rows."""
+    """Rows of the compact buffer a GEMM may write: the live rows, on both routes (the
+    slot route's stores are bounded by each expert's routed rows, run
+    fso_0.2.1_20261010/S10b-1; before that it wrote an active expert's first m_cap)."""
+    del slot_route  # the same rows on both routes
     allowed = torch.zeros(rt.R, dtype=torch.bool, device="cuda")
     allowed[rt.slot_c[rt.valid].long()] = True
-    if slot_route:
-        act = torch.nonzero(rt.cnt > 0).flatten()
-        base = rt.blk0_l[act] * 128
-        r = (base[:, None] + torch.arange(rt.m_cap, device="cuda")[None, :]).flatten()
-        allowed[r] = True
     return allowed
 
 
@@ -315,6 +318,122 @@ def child_cells(case, fams, m_list, kinds, gemms, *, prep_ms=()):
                     if M in prep_ms:
                         run_cell(fam, M, kind, gemm, results, prep=True)
             torch.cuda.empty_cache()
+        _W_CACHE.pop(fam, None)
+        torch.cuda.empty_cache()
+    return results
+
+
+# ---- sched -----------------------------------------------------------------
+
+def child_sched():
+    """The compact slot route's work-stealing counter (run fso_0.2.1_20261010/S10b-1)."""
+    import fish_scales_ops as fso
+    results = []
+    reps = 3
+    for fam in ("B", "C"):
+        f = FAMILIES[fam]
+        E, H, I, topk = f["E"], f["H"], f["I"], f["topk"]
+        w13q, sw13, w2q, sw2, inter = weights(fam)
+        for M in (1, 8, 32, 64):
+            for kind in ("uniform", "hot"):
+                ids = make_topk(M, E, topk, kind, seed=M * 31 + E)
+                rt = Routing(ids, E)
+                out = fso.compat.moe_build_routing_compact(ids, E, rt.b_max, with_slots=True)
+                sched = out[8]
+                rec = dict(case="sched", fam=fam, M=M, routing=kind)
+                rec["routing_zero"] = bool(sched.dtype == torch.int32 and sched.numel() == 2
+                                           and not bool((sched != 0).any()))
+                torch.manual_seed(M * 7 + E)
+                x = torch.randn(M, H, device="cuda", dtype=torch.bfloat16) * 0.1
+                _, _, hq, sh = gather_both(x, rt, H)
+                live = rt.slot_c[rt.valid].long()
+
+                def fc1(dq, sd, s=None):
+                    ops.linear_mxfp8_grouped_compact_swiglu(hq, w13q, sh, sw13, rt.cnt, rt.blk0, rt.m_cap,
+                                                            rt.expected_m, rt.max_active, rt.slots, None, None,
+                                                            dq, sd, s)
+
+                def fc2(a, sa, d, s=None):
+                    ops.linear_mxfp8_grouped_compact(a, w2q, sa, sw2, rt.cnt, rt.blk0, rt.m_cap, rt.expected_m,
+                                                     rt.max_active, rt.slots, None, None, d, s)
+
+                def new_fc1_out():
+                    dq = torch.empty(rt.R, I, device="cuda", dtype=torch.float8_e4m3fn)
+                    dq.view(torch.uint8).fill_(0xFF)
+                    sd = torch.full((rt.R * (I // 128),), -1, device="cuda", dtype=torch.int32)
+                    return dq, sd
+
+                def new_fc2_out():
+                    d = torch.empty(rt.R, H, device="cuda", dtype=torch.bfloat16)
+                    d.view(torch.int16).fill_(-1)
+                    return d
+
+                num_kp = I // 128
+                wl = atom_words(live, num_kp).flatten()
+                dq_ref, sd_ref = new_fc1_out()
+                fc1(dq_ref, sd_ref)  # the op's own counter
+                d_ref = new_fc2_out()
+                fc2(dq_ref, sd_ref, d_ref)
+                torch.cuda.synchronize()
+
+                def same1(dq, sd):
+                    return bool(torch.equal(dq.view(torch.uint8)[live], dq_ref.view(torch.uint8)[live])
+                                and torch.equal(sd[wl], sd_ref[wl]))
+
+                def same2(d):
+                    return bool(torch.equal(d[live].view(torch.int16), d_ref[live].view(torch.int16)))
+
+                ok_eager = True
+                for _ in range(reps):
+                    dq, sd = new_fc1_out()
+                    fc1(dq, sd, sched)
+                    d = new_fc2_out()
+                    fc2(dq_ref, sd_ref, d, sched)
+                    torch.cuda.synchronize()
+                    ok_eager = ok_eager and same1(dq, sd) and same2(d) and not bool((sched != 0).any())
+                bufs1 = [new_fc1_out() for _ in range(reps)]
+                bufs2 = [new_fc2_out() for _ in range(reps)]
+                g = torch.cuda.CUDAGraph()
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.graph(g, stream=s):
+                    for i in range(reps):
+                        fc1(bufs1[i][0], bufs1[i][1], sched)
+                        fc2(dq_ref, sd_ref, bufs2[i], sched)
+                torch.cuda.current_stream().wait_stream(s)
+                ok_graph = True
+                for _replay in range(2):
+                    for dq, sd in bufs1:
+                        dq.view(torch.uint8).fill_(0xFF)
+                        sd.fill_(-1)
+                    for d in bufs2:
+                        d.view(torch.int16).fill_(-1)
+                    g.replay()
+                    torch.cuda.synchronize()
+                    ok_graph = ok_graph and all(same1(dq, sd) for dq, sd in bufs1) and all(same2(d) for d in bufs2)
+                    ok_graph = ok_graph and not bool((sched != 0).any())
+                del g
+                # Without a counter the op takes a zeroed one from the caching allocator; inside a capture that is a
+                # captured fill, so every replay starts from zero again.
+                b1, b2 = new_fc1_out(), new_fc2_out()
+                g2 = torch.cuda.CUDAGraph()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.graph(g2, stream=s):
+                    fc1(b1[0], b1[1])
+                    fc2(dq_ref, sd_ref, b2)
+                torch.cuda.current_stream().wait_stream(s)
+                ok_own = True
+                for _replay in range(2):
+                    b1[0].view(torch.uint8).fill_(0xFF)
+                    b1[1].fill_(-1)
+                    b2.view(torch.int16).fill_(-1)
+                    g2.replay()
+                    torch.cuda.synchronize()
+                    ok_own = ok_own and same1(b1[0], b1[1]) and same2(b2)
+                del g2
+                rec.update(eager=ok_eager, graph=ok_graph, graph_own_counter=ok_own, live=int(live.numel()))
+                rec["ok"] = rec["routing_zero"] and ok_eager and ok_graph and ok_own
+                results.append(rec)
         _W_CACHE.pop(fam, None)
         torch.cuda.empty_cache()
     return results
@@ -741,6 +860,8 @@ def child_main(args):
     elif case.startswith("slackvmm:"):
         _, slack, tile, which = case.split(":")
         res = child_slack_guarded(int(slack), tile, which)
+    elif case == "sched":
+        res = child_sched()
     else:
         raise SystemExit(f"unknown case {case}")
     print("@@RESULTS@@" + json.dumps(res))
@@ -755,7 +876,7 @@ def case_env(case):
     env = {}
     if case == "ptrarray":
         env["FSO_GROUPED_SLOT"] = "0"
-    elif case == "slot":
+    elif case in ("slot", "sched"):
         env["FSO_GROUPED_SLOT"] = "force"
     elif case.startswith("tile:"):
         env["FSO_GROUPED_SLOT"] = "0"
@@ -807,7 +928,7 @@ def run_child(case, args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--child", default=None)
-    ap.add_argument("--cases", default="rule,ptrarray,slot,tiles,ref020,chain,arena")
+    ap.add_argument("--cases", default="rule,ptrarray,slot,sched,tiles,ref020,chain,arena")
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--ref", default=None, help="path of the 0.2.0 layer reference file (ref020 writes, chain reads)")
     ap.add_argument("--out", default=None, help="write the per-case JSON here")

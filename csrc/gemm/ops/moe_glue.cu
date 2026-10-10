@@ -1266,6 +1266,9 @@ constexpr int kCompactRows = 128;
 constexpr int kCompactRowShift = 7;
 constexpr int kCompactRegPairs = 8;      // pairs per thread kept in registers between counting and placing
 constexpr int kCompactMaxCluster = 8;    // portable cluster size: no cudaFuncSetAttribute, no capture hazard
+// The sm_100/103 compact slot route's work-stealing counter (tile draws, finished CTAs), emitted zeroed next to
+// the slot list (run fso_0.2.1_20261010/S10b-1; grouped_slot_dispatch.cuh / slot_work_stealing.cuh).
+constexpr int kCompactSlotSchedWords = 2;
 
 struct CompactRoutingArgs
 {
@@ -1275,6 +1278,7 @@ struct CompactRoutingArgs
     int32_t* blk0;           // [G + 1]
     int32_t* slot_of_flat;   // [num_pairs]
     int32_t* slot_to_expert; // [G] or nullptr
+    int32_t* slot_sched;     // [kCompactSlotSchedWords] or nullptr: zeroed (the slot route's work-stealing counter)
     int32_t* problem_shapes; // [P, G, 3] or nullptr
     int64_t* ptr_arrays;     // [P, 3, G] or nullptr
     int32_t* row_map;        // [num_blocks * 128] or nullptr
@@ -1543,7 +1547,15 @@ __global__ void __launch_bounds__(1024) moe_routing_compact_cta_kernel(CompactRo
         }
     }
     if (crank == 0 && tid == 0)
+    {
         a.blk0[G] = blocks_total;
+        if (a.slot_sched != nullptr)
+        {
+#pragma unroll
+            for (int w = 0; w < kCompactSlotSchedWords; ++w)
+                a.slot_sched[w] = 0;
+        }
+    }
     __syncthreads();
 
 #pragma unroll
@@ -2071,7 +2083,7 @@ static cudaError_t compact_launch(KernelT kernel, int ctas, int threads, std::si
 }
 
 // See docs/api and the Python wrapper (fish_scales_ops.gemm.mxfp8.moe_build_routing_compact) for the contract.
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 moe_build_routing_compact(at::Tensor topk_ids, int64_t num_groups, int64_t num_blocks, bool with_slots,
     bool with_row_map, std::optional<at::Tensor> topk_w, std::vector<int64_t> problem_shapes_nk,
     std::optional<std::vector<at::Tensor>> ptr_bases, std::vector<int64_t> ptr_strides)
@@ -2158,12 +2170,16 @@ moe_build_routing_compact(at::Tensor topk_ids, int64_t num_groups, int64_t num_b
     auto ptr_arrays = at::empty({want_ptrs ? num_ps : 0, 3, G}, opts.dtype(at::kLong));
     auto row_map = at::empty({with_row_map ? rows : 0}, opts);
     auto weight_of_slot = at::empty({want_w ? rows : 0}, opts.dtype(at::kFloat));
+    // With the slot list, the slot route's work-stealing counter, zeroed by the kernel: a per-call tensor, so two
+    // calls in flight never share one, and the slot GEMMs of this call leave it zero for each other.
+    auto slot_sched = at::empty({with_slots ? kCompactSlotSchedWords : 0}, opts);
 
     args.topk_ids = reinterpret_cast<int32_t const*>(topk_ids.data_ptr());
     args.masked_m = reinterpret_cast<int32_t*>(masked_m.data_ptr());
     args.blk0 = reinterpret_cast<int32_t*>(blk0.data_ptr());
     args.slot_of_flat = reinterpret_cast<int32_t*>(slot_of_flat.data_ptr());
     args.slot_to_expert = with_slots ? reinterpret_cast<int32_t*>(slot_to_expert.data_ptr()) : nullptr;
+    args.slot_sched = with_slots ? reinterpret_cast<int32_t*>(slot_sched.data_ptr()) : nullptr;
     args.problem_shapes = num_ps > 0 ? reinterpret_cast<int32_t*>(problem_shapes.data_ptr()) : nullptr;
     args.ptr_arrays = want_ptrs ? reinterpret_cast<int64_t*>(ptr_arrays.data_ptr()) : nullptr;
     args.row_map = with_row_map ? reinterpret_cast<int32_t*>(row_map.data_ptr()) : nullptr;
@@ -2197,7 +2213,8 @@ moe_build_routing_compact(at::Tensor topk_ids, int64_t num_groups, int64_t num_b
     }
     }
     TORCH_CHECK(err == cudaSuccess, "moe_build_routing_compact: kernel launch failed: ", cudaGetErrorString(err));
-    return {masked_m, blk0, slot_of_flat, slot_to_expert, problem_shapes, ptr_arrays, row_map, weight_of_slot};
+    return {masked_m, blk0, slot_of_flat, slot_to_expert, problem_shapes, ptr_arrays, row_map, weight_of_slot,
+        slot_sched};
 }
 
 

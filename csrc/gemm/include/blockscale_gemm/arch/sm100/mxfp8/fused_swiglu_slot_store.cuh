@@ -208,6 +208,19 @@ constexpr int kSlotAmaxFloats = 4 * kSlotEpiTokens;
 // The fused store, called once per epilogue subtile in place of the EVT visit
 // loop and the bf16 D store.
 //
+// `kExactN` (fso 0.2.1, compact layout): N is then the EXPERT's routed row
+// count, the store bound the compact slot kernel hands its epilogue (see
+// `fso_store_shape` in the generated kernel), rather than the row capacity
+// m_cap, and it need not be a multiple of four. The chunk walk, the activation
+// pass and the per-token scale pass still run over whole groups of four token
+// columns -- the publish into shared memory goes four tokens at a time from one
+// lane, so stopping inside a group would leave the group's last maxima
+// unpublished and the scale pass would read stale ones for LIVE tokens -- and
+// only the two stores are cut at N exactly. The up to three columns computed
+// past N belong to the same expert's own token tile and are never stored;
+// every reduction is per token column, so they cannot reach a live token. With
+// kExactN = false (the masked route) the function is the one it always was.
+//
 // `acc_frag` is the FP32 accumulator this thread holds for ONE epilogue subtile
 // and `coord_frag` the matching coordinate tensor, both exactly as the stock
 // epilogue built them. (M, N) are the problem extents — M is the expert weight
@@ -215,8 +228,8 @@ constexpr int kSlotAmaxFloats = 4 * kSlotEpiTokens;
 // slot kernel remapped the batch coordinate to. `smem_amax` is
 // `kSlotAmaxFloats` floats of the epilogue's own shared storage and `sync` the
 // epilogue's named-barrier lambda.
-template <class AccEngine, class AccLayout, class CoordEngine, class CoordLayout, class SyncFn>
-CUTLASS_DEVICE void fused_swiglu_slot_mxfp8_store(cute::Tensor<AccEngine, AccLayout> const& acc_frag,
+template <bool kExactN, class AccEngine, class AccLayout, class CoordEngine, class CoordLayout, class SyncFn>
+CUTLASS_DEVICE void fused_swiglu_slot_mxfp8_store_impl(cute::Tensor<AccEngine, AccLayout> const& acc_frag,
     cute::Tensor<CoordEngine, CoordLayout> const& coord_frag, FusedSwiGluSlotArgs const& f, int M, int N, int l_coord,
     float* smem_amax, int thread_idx, SyncFn sync)
 {
@@ -266,7 +279,8 @@ CUTLASS_DEVICE void fused_swiglu_slot_mxfp8_store(cute::Tensor<AccEngine, AccLay
     // chunk loop is uniform across the whole epilogue warpgroup because N and
     // n0 are, which is what keeps the barrier, the redux and the shuffles
     // converged; only the stores are predicated per column.
-    int const kLive = (N - n0) < kRun ? (N - n0) : kRun;
+    int const n_comp = kExactN ? ((N + 3) & ~3) : N; // kExactN: whole publish groups (see above)
+    int const kLive = (n_comp - n0) < kRun ? (n_comp - n0) : kRun;
 
     unsigned char* const hbase = reinterpret_cast<unsigned char*>(f.ptr_h)
         + static_cast<long long>(l_coord) * f.h_group_elems + static_cast<long long>(j);
@@ -375,6 +389,25 @@ CUTLASS_DEVICE void fused_swiglu_slot_mxfp8_store(cute::Tensor<AccEngine, AccLay
                 hbase[static_cast<long long>(c) * I] = fso_slot_fp8(h[t] * qs);
         }
     }
+}
+
+// The masked route's store: N is the row capacity m_cap (a multiple of four).
+template <class AccEngine, class AccLayout, class CoordEngine, class CoordLayout, class SyncFn>
+CUTLASS_DEVICE void fused_swiglu_slot_mxfp8_store(cute::Tensor<AccEngine, AccLayout> const& acc_frag,
+    cute::Tensor<CoordEngine, CoordLayout> const& coord_frag, FusedSwiGluSlotArgs const& f, int M, int N, int l_coord,
+    float* smem_amax, int thread_idx, SyncFn sync)
+{
+    fused_swiglu_slot_mxfp8_store_impl<false>(acc_frag, coord_frag, f, M, N, l_coord, smem_amax, thread_idx, sync);
+}
+
+// The compact route's store: N is the expert's routed row count, and the store
+// writes exactly the token columns below it.
+template <class AccEngine, class AccLayout, class CoordEngine, class CoordLayout, class SyncFn>
+CUTLASS_DEVICE void fused_swiglu_slot_mxfp8_store_bounded(cute::Tensor<AccEngine, AccLayout> const& acc_frag,
+    cute::Tensor<CoordEngine, CoordLayout> const& coord_frag, FusedSwiGluSlotArgs const& f, int M, int N, int l_coord,
+    float* smem_amax, int thread_idx, SyncFn sync)
+{
+    fused_swiglu_slot_mxfp8_store_impl<true>(acc_frag, coord_frag, f, M, N, l_coord, smem_amax, thread_idx, sync);
 }
 
 } // namespace fso_swiglu_slot

@@ -126,6 +126,18 @@ evaluation below `pipeline_init_wait` and puts `wait_on_dependent_grids()` ahead
 of it. The pipeline and TMEM initialisation above it still overlap the producing
 grid; only the read is ordered.
 
+Edit 8i, and why the per-tile skip must not wrap the scheduler handshake
+------------------------------------------------------------------------
+Under a DYNAMIC scheduler (CUTLASS's cluster-launch-control one, or the compact
+route's work-stealing one) the mainloop-load warp releases the scheduler warp's
+next query with one throttle handshake per tile, and the stock kernel issues it
+after the k-tile set-up, which edit 8a puts inside the skip. A dead tile would
+then skip it, the scheduler warp would wait for it forever and the kernel would
+never finish (run fso_0.2.1_20261010/S10a). Edit 8i moves the handshake ahead of
+the skip. Under the static scheduler the block is `if constexpr
+(IsSchedDynamicPersistent)` = false, so the masked class compiles to the same
+code.
+
 Each edit asserts its exact match count, so a CUTLASS bump that moves any of
 these sites fails the build loudly instead of producing a silently different
 kernel.
@@ -166,7 +178,25 @@ slower than the masked kernel on the cells with the most and shortest tiles
       (the per-tile skip on masked_m[expert] is unchanged);
   c4  the declaration of the expert-id local next to `fso_live`;
   c5  the two `collective_mainloop.load` calls receive the load parameters
-      with the weight-side tensors shifted by (expert - slot).
+      with the weight-side tensors shifted by (expert - slot);
+  c6  the epilogue warps' store call receives the problem shape with its token
+      extent N cut to the expert's routed rows (`fso_store_shape`, the row
+      count read by the liveness helper that already loads it), so both compact
+      epilogues -- the plain bf16 slot store and the exact-N fused SwiGLU store
+      -- write only the expert's live token columns instead of all m_cap of
+      them (run fso_0.2.1_20261010/S10b-1). The mainloop and the epilogue-load
+      call keep the full shape;
+  c7  the MMA warp and
+  c8  the epilogue warps fetch the next tile after the current tile's work, not
+      before it (a dynamic scheduler's answer then overlaps the tile instead of
+      delaying its start);
+  c9  the load warp releases one extra scheduler query at its start, so a
+      dynamic scheduler draws two tiles ahead of the mainloop.
+
+The compact twin is instantiated with the work-stealing tile scheduler of
+`slot_work_stealing.cuh` (a per-call counter over the live tiles) rather than
+the static persistent one; that needs no edit here beyond 8i, because the
+scheduler is a template argument of the class.
 
 Usage: make_sm100_slot_kernel.py <output-header>; CUTLASS_DIR (or
 BSGEMM_CUTLASS_DIR) names the CUTLASS checkout to read.
@@ -420,6 +450,26 @@ fso_slot_remap_and_live(int const* slot_to_expert, int const* masked_m, int num_
         "        }\n"
         "        work_tile_info = next_work_tile_info;", 1, "8h epilogue close")
 
+    # ---- 8i. the CLC throttle handshake ahead of the per-tile skip -------------
+    # The mainloop-load warp paces the scheduler warp of a DYNAMIC scheduler with
+    # one throttle handshake per tile (`clc_throttle_pipeline.producer_acquire` /
+    # `producer_commit`), and the scheduler warp waits for it before every query.
+    # Edit 8a opens the per-tile skip ahead of that handshake, so a dead tile would
+    # skip it, leave the scheduler warp waiting forever and the kernel would never
+    # finish (run fso_0.2.1_20261010/S10a, hoist in S10a/scripts/apply_variants_clc2.py).
+    # The handshake therefore moves in front of the skip: every tile, live or dead,
+    # releases the next query. Under the static scheduler the block is
+    # `if constexpr (IsSchedDynamicPersistent)` = false, so the masked class compiles
+    # to the same code.
+    _pat = re.compile(
+        r"(       if \(fso_live\) \{   // fso per-tile skip: a dead tile costs this CTA no mainloop traffic\n)"
+        r"(.*?k_tile_prologue = min\(MainloopPipeline::Stages, k_tile_count\);\n\n)"
+        r"(        if constexpr \(IsSchedDynamicPersistent\) \{\n          if \(is_first_cta_in_cluster && requires_clc_query\) \{\n.*?\n          \}\n        \}\n)",
+        re.S)
+    s, _cnt = _pat.subn(lambda m: m.group(3) + m.group(1) + m.group(2), s)
+    assert _cnt == 1, f"[8i clc throttle hoist] applied {_cnt} times, expected 1"
+    report.append("edit 8i CLC throttle handshake ahead of the per-tile skip: 1 site")
+
     return s, report, src_path
 
 
@@ -430,20 +480,38 @@ COMPACT_HELPERS = """
 // (every active expert owns exactly one block, and the packed slot list and blk0
 // both run over the active experts in ascending order), i.e. the batch index the
 // tokens, their scales and the output use. The expert id, which the weights use,
-// is returned in `a_batch`. Liveness is the masked helper's, unchanged: the N tile
-// against the expert's routed row count. Same totality rules: a coordinate whose
-// slot or expert is out of range is dead.
+// is returned in `a_batch`, and the expert's routed row count in `rows` (the
+// epilogue's store bound, see `fso_store_shape`). Liveness is the masked helper's,
+// unchanged: the N tile against the expert's routed row count. Same totality
+// rules: a coordinate whose slot or expert is out of range is dead.
 template <class Coord>
 CUTLASS_DEVICE bool
 fso_slot_live_compact(int const* slot_to_expert, int const* masked_m, int num_slots, int num_groups,
-                      int tile_n_rows, Coord const& cta_coord_mnkl, int& a_batch) {
+                      int tile_n_rows, Coord const& cta_coord_mnkl, int& a_batch, int& rows) {
   if (slot_to_expert == nullptr) { return false; }
   int const fso_slot = cute::get<3>(cta_coord_mnkl);
   if (fso_slot < 0 || fso_slot >= num_slots) { return false; }
   int const fso_expert = slot_to_expert[fso_slot];
   if (fso_expert < 0 || fso_expert >= num_groups) { return false; }
   a_batch = fso_expert;
-  return int(cute::get<1>(cta_coord_mnkl)) * tile_n_rows < masked_m[fso_expert];
+  rows = masked_m[fso_expert];
+  return int(cute::get<1>(cta_coord_mnkl)) * tile_n_rows < rows;
+}
+
+// fso slot route, compact layout: the problem shape the EPILOGUE is handed, with
+// the token extent N cut to the expert's routed rows. Both compact slot
+// epilogues bound their stores by the N they are given (the direct store of the
+// plain GEMM predicates every element on it, the fused SwiGLU store every token
+// column), so the tile writes the expert's live rows only, instead of all m_cap
+// columns of its token tile. The mainloop keeps the full problem shape: the
+// token TMA still reads its 64-row box, and the dead columns' accumulators are
+// computed and dropped.
+template <class Shape4>
+CUTLASS_DEVICE auto
+fso_store_shape(Shape4 const& shape_mnkl, int rows) {
+  int const n = int(cute::get<1>(shape_mnkl));
+  return cute::make_shape(cute::get<0>(shape_mnkl), rows < n ? rows : n, cute::get<2>(shape_mnkl),
+                          cute::get<3>(shape_mnkl));
 }
 
 // fso slot route, compact layout: the second batch coordinate. The mainloop
@@ -496,17 +564,97 @@ def _compact_class(masked_text: str, report: list[str]) -> str:
     lit("params.fso_num_slots, int(L), cute::size<1>(CtaShape_MNK{}),\n",
         "params.fso_num_slots, params.fso_num_groups, cute::size<1>(CtaShape_MNK{}),\n", 5,
         "c3b expert-id range bound")
-    s2, cnt = re.subn(r"(fso_slot_live_compact\(.*?cta_coord_mnkl)\);", r"\1, fso_a_batch);", s,
+    s2, cnt = re.subn(r"(fso_slot_live_compact\(.*?cta_coord_mnkl)\);", r"\1, fso_a_batch, fso_rows);", s,
                       flags=re.S)
     assert cnt == 5, f"[c3c expert out-parameter] applied {cnt} times, expected 5"
     s = s2
-    report.append(f"edit c3c expert out-parameter: {cnt} site(s)")
+    report.append(f"edit c3c expert and row-count out-parameters: {cnt} site(s)")
     lit("    bool fso_live = true;\n",
-        "    bool fso_live = true;\n    int fso_a_batch = 0;   // compact layout: the weights' batch index\n", 1,
-        "c4 expert-id local")
+        "    bool fso_live = true;\n    int fso_a_batch = 0;   // compact layout: the weights' batch index\n"
+        "    int fso_rows = 0;      // compact layout: the expert's routed rows (the epilogue's store bound)\n", 1,
+        "c4 expert-id and row-count locals")
     lit("          load_inputs,\n          cta_coord_mnkl,\n",
         "          fso_shift_weight_batch(load_inputs, fso_a_batch - int(cute::get<3>(cta_coord_mnkl))),\n"
         "          cta_coord_mnkl,\n", 2, "c5 weight-side batch offset at the load calls")
+    # c6: the epilogue store sees N = the expert's routed rows (fso_store_shape above). Only the epilogue warps'
+    # store call: the epilogue-load call (no accumulator argument) and the mainloop keep the full shape.
+    lit("            accumulator_pipe_consumer_state,\n"
+        "            problem_shape_MNKL,\n"
+        "            CtaShape_MNK{},\n"
+        "            cta_coord_mnkl,\n"
+        "            TileShape{},\n"
+        "            TiledMma{},\n"
+        "            accumulator,\n",
+        "            accumulator_pipe_consumer_state,\n"
+        "            fso_store_shape(problem_shape_MNKL, fso_rows),   // fso: stores bounded by the live rows\n"
+        "            CtaShape_MNK{},\n"
+        "            cta_coord_mnkl,\n"
+        "            TileShape{},\n"
+        "            TiledMma{},\n"
+        "            accumulator,\n", 1, "c6 epilogue store bounded by the expert's routed rows")
+
+    # c7 / c8: the MMA warp and the epilogue warps take the NEXT tile after the current one's work instead of
+    # before it. Under a static scheduler the next tile is arithmetic, but under the work-stealing scheduler it is
+    # a global atomic that the scheduler warp issues while the tile starts; asked for before the current tile's
+    # MMA (or epilogue), its round trip sat in front of every tile's compute, the whole kernel's worth at M = 1
+    # where a CTA has one tile. Asked for after, it overlaps the tile.
+    fetch = ("        // Fetch next work tile\n"
+             "        auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(\n"
+             "          work_tile_info,\n"
+             "          clc_pipeline,\n"
+             "          clc_pipe_consumer_state\n"
+             "        );\n\n"
+             "        if (increment_pipe) {\n"
+             "          ++clc_pipe_consumer_state;\n"
+             "        }\n\n")
+    fetch_after = ("        // fso: the next tile is fetched AFTER this tile's work (see c7 / c8 in the generator)\n"
+                   "        auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(\n"
+                   "          work_tile_info,\n"
+                   "          clc_pipeline,\n"
+                   "          clc_pipe_consumer_state\n"
+                   "        );\n"
+                   "        if (increment_pipe) {\n"
+                   "          ++clc_pipe_consumer_state;\n"
+                   "        }\n")
+    lit("        auto k_tile_count = TileScheduler::get_work_k_tile_count(work_tile_info, problem_shape_MNKL, "
+        "CtaShape_MNK{});\n\n" + fetch,
+        "        auto k_tile_count = TileScheduler::get_work_k_tile_count(work_tile_info, problem_shape_MNKL, "
+        "CtaShape_MNK{});\n\n", 1, "c7a MMA warp: no fetch ahead of the tile")
+    lit("        ++accumulator_pipe_producer_state;\n"
+        "        }\n"
+        "        work_tile_info = next_work_tile_info;",
+        "        ++accumulator_pipe_producer_state;\n"
+        "        }\n" + fetch_after +
+        "        work_tile_info = next_work_tile_info;", 1, "c7b MMA warp: fetch after the tile")
+    lit("      do {\n" + fetch + "        if (fso_live) {   // fso per-tile skip\n"
+        "        // Accumulator stage slice\n",
+        "      do {\n        if (fso_live) {   // fso per-tile skip\n"
+        "        // Accumulator stage slice\n", 1, "c8a epilogue warps: no fetch ahead of the tile")
+    lit("          do_tail_store = true;\n"
+        "        }\n"
+        "        }\n"
+        "        work_tile_info = next_work_tile_info;",
+        "          do_tail_store = true;\n"
+        "        }\n"
+        "        }\n" + fetch_after +
+        "        work_tile_info = next_work_tile_info;", 1, "c8b epilogue warps: fetch after the tile")
+
+    # c9: the scheduler warp may draw one tile further ahead. The load warp's per-tile throttle handshake (8i)
+    # releases one query per tile it starts; one extra release at the start lets the draw for tile k + 2 go out
+    # while tile k loads, so the atomic's round trip under a saturated memory system is not on the load warp's
+    # path from one tile to the next.
+    lit("      bool do_load_order_arrive = is_epi_load_needed;\n"
+        "      bool requires_clc_query = true;\n\n",
+        "      bool do_load_order_arrive = is_epi_load_needed;\n"
+        "      bool requires_clc_query = true;\n\n"
+        "      // fso (c9): one extra throttle release, i.e. a scheduler lookahead of two tiles\n"
+        "      if constexpr (IsSchedDynamicPersistent) {\n"
+        "        if (is_first_cta_in_cluster) {\n"
+        "          clc_throttle_pipeline.producer_acquire(clc_pipe_throttle_producer_state);\n"
+        "          clc_throttle_pipeline.producer_commit(clc_pipe_throttle_producer_state);\n"
+        "          ++clc_pipe_throttle_producer_state;\n"
+        "        }\n"
+        "      }\n\n", 1, "c9 one extra scheduler-throttle release at the load warp's start")
 
     head = "class FsoSm100SlotGemmCompact {"
     start = s.index(head)

@@ -104,21 +104,25 @@ cudaError_t slot_swiglu_kernel_launch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b
 }
 
 // The compact-layout forms (fso 0.2.1): the same route on the one-group
-// compact buffer, weights by expert and tokens / output by blk0[expert].
+// compact buffer, weights by expert and tokens / output by blk0[expert], tiles
+// handed out by the work-stealing scheduler over `slot_sched` (int32 [2], zero on
+// entry) and stores bounded by each expert's routed rows.
 cudaError_t slot_kernel_launch_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bfloat16* mat_d,
     int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int32_t const* blk0, int groups, int num_slots,
-    int m_cap, int b_alloc, int shape_n, int shape_k, int const* slot_to_expert, cudaStream_t stream)
+    int m_cap, int b_alloc, int shape_n, int shape_k, int const* slot_to_expert, int* slot_sched,
+    cudaStream_t stream)
 {
     return gemm_dispatch_sm100_mxfp8_slot_compact(mat_a, mat_b, mat_d, scales_a, scales_b, masked_m, blk0, groups,
-        num_slots, m_cap, b_alloc, shape_n, shape_k, slot_to_expert, stream);
+        num_slots, m_cap, b_alloc, shape_n, shape_k, slot_to_expert, slot_sched, stream);
 }
 
 cudaError_t slot_swiglu_kernel_launch_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_fp8_e4m3* out_h,
     int32_t* out_sfh, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int32_t const* blk0, int groups,
-    int num_slots, int m_cap, int b_alloc, int shape_n, int shape_k, int const* slot_to_expert, cudaStream_t stream)
+    int num_slots, int m_cap, int b_alloc, int shape_n, int shape_k, int const* slot_to_expert, int* slot_sched,
+    cudaStream_t stream)
 {
     return gemm_dispatch_sm100_mxfp8_slot_swiglu_compact(mat_a, mat_b, out_h, out_sfh, scales_a, scales_b, masked_m,
-        blk0, groups, num_slots, m_cap, b_alloc, shape_n, shape_k, slot_to_expert, stream);
+        blk0, groups, num_slots, m_cap, b_alloc, shape_n, shape_k, slot_to_expert, slot_sched, stream);
 }
 
 } // namespace grouped_detail

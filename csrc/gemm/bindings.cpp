@@ -112,11 +112,11 @@ void silu_chunk_mul_quantize_1x32_grouped_out(
 void linear_mxfp8_grouped_compact(at::Tensor a, at::Tensor b, at::Tensor sa, at::Tensor sb, at::Tensor masked_m,
     at::Tensor blk0, int64_t m_cap, int64_t expected_m, int64_t max_active_groups,
     std::optional<at::Tensor> slot_to_expert, std::optional<at::Tensor> problem_shapes,
-    std::optional<at::Tensor> ptr_arrays, at::Tensor d);
+    std::optional<at::Tensor> ptr_arrays, at::Tensor d, std::optional<at::Tensor> slot_sched);
 void linear_mxfp8_grouped_compact_swiglu(at::Tensor a, at::Tensor b, at::Tensor sa, at::Tensor sb,
     at::Tensor masked_m, at::Tensor blk0, int64_t m_cap, int64_t expected_m, int64_t max_active_groups,
     std::optional<at::Tensor> slot_to_expert, std::optional<at::Tensor> problem_shapes,
-    std::optional<at::Tensor> ptr_arrays, at::Tensor dq, at::Tensor sd);
+    std::optional<at::Tensor> ptr_arrays, at::Tensor dq, at::Tensor sd, std::optional<at::Tensor> slot_sched);
 void linear_mxfp8_grouped_compact_combine(at::Tensor a, at::Tensor b, at::Tensor sa, at::Tensor sb,
     at::Tensor masked_m, at::Tensor blk0, at::Tensor row_map, at::Tensor weight_of_slot, int64_t m_cap,
     int64_t expected_m, int64_t max_active_groups, at::Tensor out);
@@ -124,9 +124,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     at::Tensor topk_ids, int64_t num_groups, int64_t m_cap, bool with_slots,
     std::vector<int64_t> problem_shapes_nk, std::optional<at::Tensor> topk_w);
 // The compact 128-row-block routing builder (0.2.1): per-expert counts, block
-// offsets, compact rows per routed pair and, on request, the slot list, the
-// problem shapes, the per-call pointer arrays, row_map and weight_of_slot.
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+// offsets, compact rows per routed pair and, on request, the slot list (with the
+// slot route's zeroed work-stealing counter), the problem shapes, the per-call
+// pointer arrays, row_map and weight_of_slot.
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 moe_build_routing_compact(at::Tensor topk_ids, int64_t num_groups, int64_t num_blocks, bool with_slots,
     bool with_row_map, std::optional<at::Tensor> topk_w, std::vector<int64_t> problem_shapes_nk,
     std::optional<std::vector<at::Tensor>> ptr_bases, std::vector<int64_t> ptr_strides);
@@ -211,7 +212,7 @@ TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
     m.def("moe_build_routing_compact(Tensor topk_ids, int num_groups, int num_blocks, bool with_slots=False, "
                                      "bool with_row_map=False, Tensor? topk_w=None, int[] problem_shapes_nk=[], "
                                      "Tensor[]? ptr_bases=None, int[] ptr_strides=[]) "
-                                     "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
+                                     "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def("linear_mxfp8_grouped_masked_combine(Tensor a_fp8, Tensor w2_fp8, Tensor sa_int32, "
                                               "Tensor sw2_int32, Tensor masked_m, Tensor row_map, "
                                               "Tensor weight_of_slot, Tensor(a!) out, int expected_m, "
@@ -223,10 +224,11 @@ TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
           "bool use_ue8m0, Tensor(a!) x_q, Tensor(b!) packed) -> ()");
     m.def("linear_mxfp8_grouped_compact(Tensor a, Tensor b, Tensor sa, Tensor sb, Tensor masked_m, Tensor blk0, "
           "int m_cap, int expected_m, int max_active_groups, Tensor? slot_to_expert, Tensor? problem_shapes, "
-          "Tensor? ptr_arrays, Tensor(a!) d) -> ()");
+          "Tensor? ptr_arrays, Tensor(a!) d, Tensor(c!)? slot_sched=None) -> ()");
     m.def("linear_mxfp8_grouped_compact_swiglu(Tensor a, Tensor b, Tensor sa, Tensor sb, Tensor masked_m, "
           "Tensor blk0, int m_cap, int expected_m, int max_active_groups, Tensor? slot_to_expert, "
-          "Tensor? problem_shapes, Tensor? ptr_arrays, Tensor(a!) dq, Tensor(b!) sd) -> ()");
+          "Tensor? problem_shapes, Tensor? ptr_arrays, Tensor(a!) dq, Tensor(b!) sd, "
+          "Tensor(c!)? slot_sched=None) -> ()");
     m.def("linear_mxfp8_grouped_compact_combine(Tensor a, Tensor b, Tensor sa, Tensor sb, Tensor masked_m, "
           "Tensor blk0, Tensor row_map, Tensor weight_of_slot, int m_cap, int expected_m, int max_active_groups, "
           "Tensor(a!) out) -> ()");

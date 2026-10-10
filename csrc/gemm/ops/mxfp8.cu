@@ -81,11 +81,12 @@ int sm100_mxfp8_grouped_fused_fc1_route(int m_cap, int N, int K, int groups, int
 cudaError_t launch_sm100_mxfp8_grouped_compact_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D,
     int32_t* SFA, int32_t* SFB, int32_t* masked_m, int32_t const* blk0, int num_groups, int b_alloc, int m_cap, int N,
     int K, int expected_m, int max_active_groups, int const* slot_to_expert, int32_t const* problem_shapes,
-    int64_t const* ptr_arrays, cudaStream_t stream);
+    int64_t const* ptr_arrays, int* slot_sched, cudaStream_t stream);
 cudaError_t launch_sm100_mxfp8_grouped_swiglu_compact_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B,
     __nv_fp8_e4m3* H, int32_t* SFH, int32_t* SFA, int32_t* SFB, int32_t* masked_m, int32_t const* blk0,
     int num_groups, int b_alloc, int m_cap, int N, int K, int expected_m, int max_active_groups,
-    int const* slot_to_expert, int32_t const* problem_shapes, int64_t const* ptr_arrays, cudaStream_t stream);
+    int const* slot_to_expert, int32_t const* problem_shapes, int64_t const* ptr_arrays, int* slot_sched,
+    cudaStream_t stream);
 int sm100_mxfp8_grouped_compact_sfa_rows();
 int sm100_mxfp8_grouped_compact_fits(long long rows, int K);
 int sm100_mxfp8_grouped_fused_fc1_available(int N, int K);
@@ -724,9 +725,9 @@ std::tuple<at::Tensor, at::Tensor> linear_mxfp8_grouped_masked_swiglu(at::Tensor
 // [G + 1], the exclusive prefix of ceil(masked_m / 128)); its routed rows are
 // rows blk0[g] * 128 + r, r < masked_m[g]. The weights b [G, N, K] and their
 // scales keep the batch index g. Every output row of an expert at or past
-// masked_m[g] is left untouched except on the slot route, which writes the
-// expert's first m_cap <= 64 rows (inside its first block) as the masked op
-// writes its slab's first m_cap rows.
+// masked_m[g] is left untouched, on both routes (the slot route's stores are
+// bounded by each expert's routed row count, unlike the masked slot route's,
+// which writes its slab's first m_cap rows).
 //
 // `m_cap` is the masked op's row capacity align(M, 4): a host-static HINT the
 // route rule and the tile cascade key on, so the compact op runs the kernel the
@@ -909,6 +910,32 @@ void check_compact_slot_identity(char const* op, CompactDims const& d, at::Tenso
     }
 }
 
+// The slot route's work-stealing counter (int32 [2]: tile draws, finished CTAs).
+// The kernel needs it zero when it starts and leaves it zero, so one counter
+// serves any number of slot-route GEMMs issued one after another on a stream;
+// moe_build_routing_compact(..., with_slots=True) returns a zeroed one per call
+// (`slot_sched`). A call that lands on the slot route without one gets a zeroed
+// counter from the caching allocator (one fill kernel on the stream); a call
+// that does not land there ignores it. Returns the device pointer or nullptr
+// when the route will not run.
+int* compact_slot_sched(char const* op, std::optional<at::Tensor> const& slot_sched, at::Tensor const& masked_m,
+    bool slot_taken, at::Tensor& owned)
+{
+    if (slot_sched.has_value() && slot_sched->defined())
+    {
+        at::Tensor const& t = *slot_sched;
+        TORCH_CHECK(t.is_cuda() && t.dtype() == at::kInt && t.is_contiguous() && t.numel() >= 2,
+            op, ": slot_sched must be a contiguous CUDA int32 tensor of at least 2 entries (moe_build_routing_compact's "
+            "`slot_sched` output), got ", t.sizes(), " ", t.dtype());
+        TORCH_CHECK(t.device() == masked_m.device(), op, ": slot_sched must be on masked_m's device");
+        return slot_taken ? reinterpret_cast<int*>(t.data_ptr()) : nullptr;
+    }
+    if (!slot_taken)
+        return nullptr;
+    owned = at::zeros({2}, masked_m.options());
+    return reinterpret_cast<int*>(owned.data_ptr());
+}
+
 // The op entries (ops/mxfp8_compact.cu) send sm_100/sm_103 here and serve sm_120/121 themselves, so this only
 // guards the build.
 void compact_arch_gate(char const* op)
@@ -925,7 +952,7 @@ void compact_arch_gate(char const* op)
 void linear_mxfp8_grouped_compact_sm100(at::Tensor a, at::Tensor b, at::Tensor sa, at::Tensor sb,
     at::Tensor masked_m, at::Tensor blk0, int64_t m_cap, int64_t expected_m, int64_t max_active_groups,
     std::optional<at::Tensor> slot_to_expert, std::optional<at::Tensor> problem_shapes,
-    std::optional<at::Tensor> ptr_arrays, at::Tensor d)
+    std::optional<at::Tensor> ptr_arrays, at::Tensor d, std::optional<at::Tensor> slot_sched)
 {
     char const* const op = "linear_mxfp8_grouped_compact";
     compact_arch_gate(op);
@@ -936,9 +963,12 @@ void linear_mxfp8_grouped_compact_sm100(at::Tensor a, at::Tensor b, at::Tensor s
         op, ": d must be a contiguous CUDA bf16 [R, N] = [", dims.R, ", ", dims.N, "] tensor, got ", d.sizes());
     check_compact_slot_refusal(op, dims, static_cast<int>(m_cap), static_cast<int>(max_active_groups));
     int const* const slot_ptr = check_slot_to_expert(slot_to_expert, dims.G, masked_m);
-    if (detail::sm100_mxfp8_grouped_slot_taken(static_cast<int>(m_cap), dims.N, dims.K, dims.G,
-            static_cast<int>(max_active_groups), 0))
+    bool const slot_taken = detail::sm100_mxfp8_grouped_slot_taken(static_cast<int>(m_cap), dims.N, dims.K, dims.G,
+        static_cast<int>(max_active_groups), 0);
+    if (slot_taken)
         check_compact_slot_identity(op, dims, masked_m, blk0, slot_to_expert, static_cast<int>(m_cap));
+    at::Tensor sched_owned;
+    int* const sched_ptr = compact_slot_sched(op, slot_sched, masked_m, slot_taken, sched_owned);
     auto const arrays = check_compact_arrays(op, dims, problem_shapes, ptr_arrays, masked_m, blk0, a.data_ptr(),
         sa.data_ptr(), d.data_ptr(), static_cast<int64_t>(dims.N) * 2);
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -948,14 +978,14 @@ void linear_mxfp8_grouped_compact_sm100(at::Tensor a, at::Tensor b, at::Tensor s
         reinterpret_cast<int32_t*>(sb.data_ptr()), reinterpret_cast<int32_t*>(masked_m.data_ptr()),
         reinterpret_cast<int32_t const*>(blk0.data_ptr()), dims.G, dims.b_alloc, static_cast<int>(m_cap), dims.N,
         dims.K, static_cast<int>(expected_m), static_cast<int>(max_active_groups), slot_ptr, arrays.first,
-        arrays.second, stream);
+        arrays.second, sched_ptr, stream);
     TORCH_CHECK(err == cudaSuccess, "sm100 compact mxfp8 grouped kernel error: ", cudaGetErrorString(err));
 }
 
 void linear_mxfp8_grouped_compact_swiglu_sm100(at::Tensor a, at::Tensor b, at::Tensor sa, at::Tensor sb,
     at::Tensor masked_m, at::Tensor blk0, int64_t m_cap, int64_t expected_m, int64_t max_active_groups,
     std::optional<at::Tensor> slot_to_expert, std::optional<at::Tensor> problem_shapes,
-    std::optional<at::Tensor> ptr_arrays, at::Tensor dq, at::Tensor sd)
+    std::optional<at::Tensor> ptr_arrays, at::Tensor dq, at::Tensor sd, std::optional<at::Tensor> slot_sched)
 {
     char const* const op = "linear_mxfp8_grouped_compact_swiglu";
     compact_arch_gate(op);
@@ -975,9 +1005,12 @@ void linear_mxfp8_grouped_compact_swiglu_sm100(at::Tensor a, at::Tensor b, at::T
         static_cast<int64_t>(dims.R) * (inter / 128), " int32 words");
     check_compact_slot_refusal(op, dims, static_cast<int>(m_cap), static_cast<int>(max_active_groups));
     int const* const slot_ptr = check_slot_to_expert(slot_to_expert, dims.G, masked_m);
-    if (detail::sm100_mxfp8_grouped_slot_taken(static_cast<int>(m_cap), dims.N, dims.K, dims.G,
-            static_cast<int>(max_active_groups), 1))
+    bool const slot_taken = detail::sm100_mxfp8_grouped_slot_taken(static_cast<int>(m_cap), dims.N, dims.K, dims.G,
+        static_cast<int>(max_active_groups), 1);
+    if (slot_taken)
         check_compact_slot_identity(op, dims, masked_m, blk0, slot_to_expert, static_cast<int>(m_cap));
+    at::Tensor sched_owned;
+    int* const sched_ptr = compact_slot_sched(op, slot_sched, masked_m, slot_taken, sched_owned);
     // The fused FC1 is a GEMM of N = 2*I weight rows, so its triples carry that
     // N; its D rows are the fp8 output's (I bytes each).
     auto const arrays = check_compact_arrays(op, dims, problem_shapes, ptr_arrays, masked_m, blk0, a.data_ptr(),
@@ -989,7 +1022,7 @@ void linear_mxfp8_grouped_compact_swiglu_sm100(at::Tensor a, at::Tensor b, at::T
         reinterpret_cast<int32_t*>(sa.data_ptr()), reinterpret_cast<int32_t*>(sb.data_ptr()),
         reinterpret_cast<int32_t*>(masked_m.data_ptr()), reinterpret_cast<int32_t const*>(blk0.data_ptr()), dims.G,
         dims.b_alloc, static_cast<int>(m_cap), dims.N, dims.K, static_cast<int>(expected_m),
-        static_cast<int>(max_active_groups), slot_ptr, arrays.first, arrays.second, stream);
+        static_cast<int>(max_active_groups), slot_ptr, arrays.first, arrays.second, sched_ptr, stream);
     TORCH_CHECK(err == cudaSuccess, "sm100 compact fused-SwiGLU mxfp8 grouped kernel error: ",
         cudaGetErrorString(err));
 }

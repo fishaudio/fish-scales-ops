@@ -1494,13 +1494,17 @@ cudaError_t slot_swiglu_kernel_launch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b
 // batch index `expert`, the tokens, their scales and the output take batch index
 // blk0[expert] over descriptors whose batch is one 128-row block of the R-row
 // compact buffer (`b_alloc` = R / 128 batches). Defined in the same translation
-// unit as the masked ones; see grouped_slot_dispatch.cuh.
+// unit as the masked ones; see grouped_slot_dispatch.cuh. `slot_sched` is the
+// work-stealing scheduler's int32 [2] counter (zero on entry; the kernel leaves it
+// zero), required.
 cudaError_t slot_kernel_launch_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bfloat16* mat_d,
     int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int32_t const* blk0, int groups, int num_slots,
-    int m_cap, int b_alloc, int shape_n, int shape_k, int const* slot_to_expert, cudaStream_t stream);
+    int m_cap, int b_alloc, int shape_n, int shape_k, int const* slot_to_expert, int* slot_sched,
+    cudaStream_t stream);
 cudaError_t slot_swiglu_kernel_launch_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_fp8_e4m3* out_h,
     int32_t* out_sfh, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int32_t const* blk0, int groups,
-    int num_slots, int m_cap, int b_alloc, int shape_n, int shape_k, int const* slot_to_expert, cudaStream_t stream);
+    int num_slots, int m_cap, int b_alloc, int shape_n, int shape_k, int const* slot_to_expert, int* slot_sched,
+    cudaStream_t stream);
 // The token-column chunk the fused epilogue walks (`kSlotChunk` in
 // fused_swiglu_slot_store.cuh: 32 columns, one warp width). `slot_route`
 // admits the fused slot kernel only while the whole row capacity fits ONE such
@@ -3027,7 +3031,8 @@ cudaError_t launch_sm100_mxfp8_grouped_swiglu_gemm_compact(__nv_fp8_e4m3* mat_a,
 inline cudaError_t gemm_dispatch_sm100_mxfp8_grouped_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b,
     __nv_bfloat16* mat_d, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int32_t const* blk0, int groups,
     int b_alloc, int m_cap, int shape_n, int shape_k, int expected_m, int max_active_groups,
-    int const* slot_to_expert, int32_t const* problem_shapes, int64_t const* ptr_arrays, cudaStream_t stream)
+    int const* slot_to_expert, int32_t const* problem_shapes, int64_t const* ptr_arrays, int* slot_sched,
+    cudaStream_t stream)
 {
 #define DISPATCH_SM100_GROUPED_C(TM_, TN_, CM_, CN_, TK_, NOSMEM_)                                                     \
     launch_sm100_mxfp8_grouped_gemm_compact<TM_, TN_, CM_, CN_, TK_, NOSMEM_>(mat_a, mat_b, mat_d, scales_a,          \
@@ -3076,7 +3081,7 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8_grouped_compact(__nv_fp8_e4m3* mat_
     case grouped_detail::kSlotRouteSlot:
         return grouped_detail::slot_kernel_launch_compact(mat_a, mat_b, mat_d, scales_a, scales_b, masked_m, blk0,
             groups, max_active_groups < groups ? max_active_groups : groups, m_cap, b_alloc, shape_n, shape_k,
-            slot_to_expert, stream);
+            slot_to_expert, slot_sched, stream);
     case grouped_detail::kSlotRouteCascade: break;
     default: return cudaErrorInvalidValue;
     }
@@ -3109,7 +3114,7 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8_grouped_swiglu_compact(__nv_fp8_e4m
     __nv_fp8_e4m3* out_h, int32_t* out_sfh, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m,
     int32_t const* blk0, int groups, int b_alloc, int m_cap, int shape_n, int shape_k, int expected_m,
     int max_active_groups, int const* slot_to_expert, int32_t const* problem_shapes, int64_t const* ptr_arrays,
-    cudaStream_t stream)
+    int* slot_sched, cudaStream_t stream)
 {
 #define DISPATCH_SM100_GROUPED_SWIGLU_C(TN_)                                                                          \
     launch_sm100_mxfp8_grouped_swiglu_gemm_compact<128, TN_, 128>(mat_a, mat_b, out_h, out_sfh, scales_a, scales_b, \
@@ -3121,7 +3126,7 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8_grouped_swiglu_compact(__nv_fp8_e4m
     {
         return grouped_detail::slot_swiglu_kernel_launch_compact(mat_a, mat_b, out_h, out_sfh, scales_a, scales_b,
             masked_m, blk0, groups, max_active_groups < groups ? max_active_groups : groups, m_cap, b_alloc, shape_n,
-            shape_k, slot_to_expert, stream);
+            shape_k, slot_to_expert, slot_sched, stream);
     }
 
     auto forced = tensorrt_llm::kernels::blockscale_gemm::read_force_tile();

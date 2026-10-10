@@ -94,7 +94,7 @@ def draw(m, g, topk, routing, seed, device):
 
 def check_contract(ids, g, nb_max, out, want_all, topk_w, bases):
     """The list of contract violations of one call's outputs (empty when it holds)."""
-    masked_m, blk0, sof, slots, ps, ptrs, row_map, wslot = out
+    masked_m, blk0, sof, slots, ps, ptrs, row_map, wslot, sched = out
     errs = []
     m, topk = ids.shape
     flat = ids.reshape(-1).long()
@@ -130,6 +130,9 @@ def check_contract(ids, g, nb_max, out, want_all, topk_w, bases):
         slot_ref[: active.numel()] = active
         if not torch.equal(slots.long(), slot_ref):
             errs.append("slot_to_expert")
+        # the slot route's work-stealing counter: two int32 words, zero (S10b-1)
+        if sched.dtype != torch.int32 or sched.numel() != 2 or bool((sched != 0).any()):
+            errs.append("slot_sched")
         ps_ref = torch.stack([torch.stack([cnt, torch.full_like(cnt, n), torch.full_like(cnt, k)], dim=1)
                               for n, k in PS_PAIRS])
         if tuple(ps.shape) != (len(PS_PAIRS), g, 3) or not torch.equal(ps.long(), ps_ref):
@@ -143,7 +146,7 @@ def check_contract(ids, g, nb_max, out, want_all, topk_w, bases):
         if tuple(ptrs.shape) != (len(PS_PAIRS), 3, g) or not torch.equal(ptrs, torch.stack(ptr_ref)):
             errs.append("ptr_arrays")
     else:
-        if slots.numel() or ps.numel() or ptrs.numel() or row_map.numel() or wslot.numel():
+        if slots.numel() or ps.numel() or ptrs.numel() or row_map.numel() or wslot.numel() or sched.numel():
             errs.append("an output that was not asked for is not empty")
     return errs
 

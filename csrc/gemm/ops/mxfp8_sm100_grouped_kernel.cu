@@ -102,19 +102,21 @@ cudaError_t launch_sm100_mxfp8_grouped_swiglu_dispatch(__nv_fp8_e4m3* A, __nv_fp
 // route and tile decisions are the masked ones for the same m_cap hint.
 // `problem_shapes` (int32 [G, 3]) and `ptr_arrays` (int64 [3, G]) are
 // moe_build_routing_compact's per-call arrays for this GEMM, or both null.
+// `slot_sched` is the slot route's work-stealing counter (int32 [2], zero on
+// entry and on exit), read only when the call lands on the slot route.
 cudaError_t launch_sm100_mxfp8_grouped_compact_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D,
     int32_t* SFA, int32_t* SFB, int32_t* masked_m, int32_t const* blk0, int num_groups, int b_alloc, int m_cap, int N,
     int K, int expected_m, int max_active_groups, int const* slot_to_expert, int32_t const* problem_shapes,
-    int64_t const* ptr_arrays, cudaStream_t stream)
+    int64_t const* ptr_arrays, int* slot_sched, cudaStream_t stream)
 {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
     return sm100_blockscaled_gemm::gemm_dispatch_sm100_mxfp8_grouped_compact(A, B, D, SFA, SFB, masked_m, blk0,
         num_groups, b_alloc, m_cap, N, K, expected_m, max_active_groups, slot_to_expert, problem_shapes, ptr_arrays,
-        stream);
+        slot_sched, stream);
 #else
     (void) A; (void) B; (void) D; (void) SFA; (void) SFB; (void) masked_m; (void) blk0; (void) num_groups;
     (void) b_alloc; (void) m_cap; (void) N; (void) K; (void) expected_m; (void) max_active_groups;
-    (void) slot_to_expert; (void) problem_shapes; (void) ptr_arrays; (void) stream;
+    (void) slot_to_expert; (void) problem_shapes; (void) ptr_arrays; (void) slot_sched; (void) stream;
     return cudaErrorNotSupported;
 #endif
 }
@@ -122,16 +124,18 @@ cudaError_t launch_sm100_mxfp8_grouped_compact_dispatch(__nv_fp8_e4m3* A, __nv_f
 cudaError_t launch_sm100_mxfp8_grouped_swiglu_compact_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B,
     __nv_fp8_e4m3* H, int32_t* SFH, int32_t* SFA, int32_t* SFB, int32_t* masked_m, int32_t const* blk0,
     int num_groups, int b_alloc, int m_cap, int N, int K, int expected_m, int max_active_groups,
-    int const* slot_to_expert, int32_t const* problem_shapes, int64_t const* ptr_arrays, cudaStream_t stream)
+    int const* slot_to_expert, int32_t const* problem_shapes, int64_t const* ptr_arrays, int* slot_sched,
+    cudaStream_t stream)
 {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
     return sm100_blockscaled_gemm::gemm_dispatch_sm100_mxfp8_grouped_swiglu_compact(A, B, H, SFH, SFA, SFB, masked_m,
         blk0, num_groups, b_alloc, m_cap, N, K, expected_m, max_active_groups, slot_to_expert, problem_shapes,
-        ptr_arrays, stream);
+        ptr_arrays, slot_sched, stream);
 #else
     (void) A; (void) B; (void) H; (void) SFH; (void) SFA; (void) SFB; (void) masked_m; (void) blk0;
     (void) num_groups; (void) b_alloc; (void) m_cap; (void) N; (void) K; (void) expected_m;
-    (void) max_active_groups; (void) slot_to_expert; (void) problem_shapes; (void) ptr_arrays; (void) stream;
+    (void) max_active_groups; (void) slot_to_expert; (void) problem_shapes; (void) ptr_arrays; (void) slot_sched;
+    (void) stream;
     return cudaErrorNotSupported;
 #endif
 }

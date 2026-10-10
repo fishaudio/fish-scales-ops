@@ -162,10 +162,13 @@ CompactDims check_compact_gemm(char const* op, at::Tensor const& a, at::Tensor c
 // The sm_100/103 routes' per-call tensors. sm_120/121 has neither the slot-bound route nor the pointer-array
 // route, so nothing would read them; a caller that passes one has built routing tensors for the wrong device.
 void refuse_sm100_route_tensors(char const* op, std::optional<at::Tensor> const& slot_to_expert,
-    std::optional<at::Tensor> const& problem_shapes, std::optional<at::Tensor> const& ptr_arrays)
+    std::optional<at::Tensor> const& problem_shapes, std::optional<at::Tensor> const& ptr_arrays,
+    std::optional<at::Tensor> const& slot_sched)
 {
     TORCH_CHECK(!given(slot_to_expert), op,
         ": the sm_120/121 grouped path has no slot-bound route, so it reads no active-expert list (pass None)");
+    TORCH_CHECK(!given(slot_sched), op,
+        ": the sm_120/121 grouped path has no slot-bound route, so it reads no work-stealing counter (pass None)");
     TORCH_CHECK(!given(problem_shapes), op,
         ": the sm_120/121 grouped path has no pointer-array route, so it reads no per-group problem shapes "
         "(pass None)");
@@ -285,32 +288,34 @@ void silu_chunk_mul_quantize_1x32_grouped_out(
 void linear_mxfp8_grouped_compact_sm100(at::Tensor a, at::Tensor b, at::Tensor sa, at::Tensor sb,
     at::Tensor masked_m, at::Tensor blk0, int64_t m_cap, int64_t expected_m, int64_t max_active_groups,
     std::optional<at::Tensor> slot_to_expert, std::optional<at::Tensor> problem_shapes,
-    std::optional<at::Tensor> ptr_arrays, at::Tensor d);
+    std::optional<at::Tensor> ptr_arrays, at::Tensor d, std::optional<at::Tensor> slot_sched);
 void linear_mxfp8_grouped_compact_swiglu_sm100(at::Tensor a, at::Tensor b, at::Tensor sa, at::Tensor sb,
     at::Tensor masked_m, at::Tensor blk0, int64_t m_cap, int64_t expected_m, int64_t max_active_groups,
     std::optional<at::Tensor> slot_to_expert, std::optional<at::Tensor> problem_shapes,
-    std::optional<at::Tensor> ptr_arrays, at::Tensor dq, at::Tensor sd);
+    std::optional<at::Tensor> ptr_arrays, at::Tensor dq, at::Tensor sd, std::optional<at::Tensor> slot_sched);
 
 // linear_mxfp8_grouped_compact: the grouped MXFP8 GEMM on the compact layout. a fp8 [R, K] (expert g's rows from
 // blk0[g] * 128), b fp8 [G, N, K], sa the one-group scale words [1, K/128, R], sb [G, K/128, N], masked_m [G],
 // blk0 [G + 1]; writes d bf16 [R, N] at the live rows only. m_cap / expected_m / max_active_groups are the masked
 // layout's host-static hints (align(M, 4), ceil(M * topk / G), min(M * topk, G)), so the call runs the instance
-// the masked call of the same shape runs. The three optional tensors belong to the sm_100/103 routes.
+// the masked call of the same shape runs. The optional tensors belong to the sm_100/103 routes: slot_to_expert and
+// slot_sched (the slot route's work-stealing counter, int32 [2], zero) to the slot route, problem_shapes and
+// ptr_arrays to the pointer-array route.
 void linear_mxfp8_grouped_compact(at::Tensor a, at::Tensor b, at::Tensor sa, at::Tensor sb, at::Tensor masked_m,
     at::Tensor blk0, int64_t m_cap, int64_t expected_m, int64_t max_active_groups,
     std::optional<at::Tensor> slot_to_expert, std::optional<at::Tensor> problem_shapes,
-    std::optional<at::Tensor> ptr_arrays, at::Tensor d)
+    std::optional<at::Tensor> ptr_arrays, at::Tensor d, std::optional<at::Tensor> slot_sched)
 {
     char const* const op = "linear_mxfp8_grouped_compact";
     if (current_sm_major() == 10)
     {
         linear_mxfp8_grouped_compact_sm100(a, b, sa, sb, masked_m, blk0, m_cap, expected_m, max_active_groups,
-            slot_to_expert, problem_shapes, ptr_arrays, d);
+            slot_to_expert, problem_shapes, ptr_arrays, d, slot_sched);
         return;
     }
     require_compact_gemm_arch(op);
     CompactDims const s = check_compact_gemm(op, a, b, sa, sb, masked_m, blk0, m_cap, expected_m, max_active_groups);
-    refuse_sm100_route_tensors(op, slot_to_expert, problem_shapes, ptr_arrays);
+    refuse_sm100_route_tensors(op, slot_to_expert, problem_shapes, ptr_arrays, slot_sched);
     TORCH_CHECK(d.is_cuda() && d.dtype() == at::kBFloat16 && d.is_contiguous(), op,
         ": d must be a contiguous CUDA bf16 tensor");
     TORCH_CHECK(d.numel() == s.R * s.N && d.size(-1) == s.N, op, ": d must be [R, N] = [", s.R, ", ", s.N,
@@ -336,18 +341,18 @@ void linear_mxfp8_grouped_compact(at::Tensor a, at::Tensor b, at::Tensor sa, at:
 void linear_mxfp8_grouped_compact_swiglu(at::Tensor a, at::Tensor b, at::Tensor sa, at::Tensor sb,
     at::Tensor masked_m, at::Tensor blk0, int64_t m_cap, int64_t expected_m, int64_t max_active_groups,
     std::optional<at::Tensor> slot_to_expert, std::optional<at::Tensor> problem_shapes,
-    std::optional<at::Tensor> ptr_arrays, at::Tensor dq, at::Tensor sd)
+    std::optional<at::Tensor> ptr_arrays, at::Tensor dq, at::Tensor sd, std::optional<at::Tensor> slot_sched)
 {
     char const* const op = "linear_mxfp8_grouped_compact_swiglu";
     if (current_sm_major() == 10)
     {
         linear_mxfp8_grouped_compact_swiglu_sm100(a, b, sa, sb, masked_m, blk0, m_cap, expected_m,
-            max_active_groups, slot_to_expert, problem_shapes, ptr_arrays, dq, sd);
+            max_active_groups, slot_to_expert, problem_shapes, ptr_arrays, dq, sd, slot_sched);
         return;
     }
     require_compact_gemm_arch(op);
     CompactDims const s = check_compact_gemm(op, a, b, sa, sb, masked_m, blk0, m_cap, expected_m, max_active_groups);
-    refuse_sm100_route_tensors(op, slot_to_expert, problem_shapes, ptr_arrays);
+    refuse_sm100_route_tensors(op, slot_to_expert, problem_shapes, ptr_arrays, slot_sched);
     int64_t const INTER = s.N / 2;
     TORCH_CHECK(s.N % 2 == 0 && INTER % 128 == 0, op,
         ": b must be [G, 2*I, K] with I a multiple of 128 (a 1x32 output scale block must not straddle the packed "
