@@ -209,8 +209,10 @@ def weights(fam):
     return _W_CACHE[fam]
 
 
-def slot_taken(rt, N, K, fused):
-    return bool(ops.mxfp8_grouped_slot_possible(rt.m_cap, N, K, rt.G, rt.max_active, fused))
+def slot_taken(rt, N, K, fused, compact):
+    """The route the op of the given layout lands on: the compact ops have their own rule
+    (run fso_0.2.1_20261010/S10b-3a), the masked ops keep 0.2.0's."""
+    return bool(ops.mxfp8_grouped_slot_possible(rt.m_cap, N, K, rt.G, rt.max_active, fused, compact))
 
 
 def allowed_rows(rt, slot_route):
@@ -248,16 +250,22 @@ def run_cell(fam, M, kind, gemm, results, *, prep=False, seed=0):
     fused = gemm == "fc1_fused"
     if fused and not inter:
         return
-    slot_route = slot_taken(rt, N, K, fused)
+    # Each layout's op is handed the routing tensors of the route ITS rule takes: the
+    # compact rule may send a GEMM to the slot route where 0.2.0's masked rule keeps the
+    # pointer-array cascade (both routes write the same bytes).
+    slot_route = slot_taken(rt, N, K, fused, compact=True)
+    slot_route_m = slot_taken(rt, N, K, fused, compact=False)
     if os.environ.get("FSO_FORCE_TILE") and not fused:
-        slot_route = False  # the unfused force table precedes the route rule
-    ps_m = None if slot_route else rt.masked_shapes(N, K)
+        slot_route = slot_route_m = False  # the unfused force table precedes the route rule
+    ps_m = None if slot_route_m else rt.masked_shapes(N, K)
+    slots_m = rt.slots if slot_route_m else None
     slots = rt.slots if slot_route else None
     rec = dict(fam=fam, M=M, routing=kind, gemm=gemm, route="slot" if slot_route else "ptr",
+               route_masked="slot" if slot_route_m else "ptr",
                prep=prep, live=int(rt.valid.sum()), R=rt.R)
     if not fused:
         out_m = ops.linear_mxfp8_grouped_masked(hq_m, w, sh_m, sw, rt.cnt, rt.expected_m, rt.max_active,
-                                                slots, ps_m)
+                                                slots_m, ps_m)
         d = torch.empty(rt.R, N, device="cuda", dtype=torch.bfloat16)
         d.view(torch.int16).fill_(-1)
         ps = pa = None
@@ -275,7 +283,7 @@ def run_cell(fam, M, kind, gemm, results, *, prep=False, seed=0):
         rec["bounded"] = bool((d[untouched].view(torch.int16) == -1).all())
     else:
         dq_m, sd_m = ops.linear_mxfp8_grouped_masked_swiglu(hq_m, w, sh_m, sw, rt.cnt, rt.expected_m,
-                                                            rt.max_active, slots, ps_m)
+                                                            rt.max_active, slots_m, ps_m)
         dq = torch.empty(rt.R, I, device="cuda", dtype=torch.float8_e4m3fn)
         dq.view(torch.uint8).fill_(0xFF)
         sd = torch.full((rt.R * (I // 128),), -1, device="cuda", dtype=torch.int32)

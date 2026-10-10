@@ -1576,6 +1576,77 @@ inline int slot_route_mode() noexcept
     return slot_route_knob().mode;
 }
 
+// The compact layout's route rule (run fso_0.2.1_20261010/S10b-3a).
+//
+// The compact ops (`linear_mxfp8_grouped_compact`, `_compact_swiglu`) run a
+// different slot kernel from the masked ops: since S10b-1 it hands out its tiles
+// from a work-stealing counter over the LIVE tiles (the experts that hold rows,
+// read on the device), and its plain and fused stores are bounded by each
+// expert's routed row count. Both of the masked rule's clauses (see the note
+// below `slot_route`) were fitted to the masked slot kernel, which has neither:
+//
+// * The fused-SwiGLU clause (m_cap <= 32, one epilogue chunk) priced the masked
+//   fused slot store, which wrote every expert's first m_cap token columns,
+//   against the pointer-array fused store. The compact fused store computes and
+//   writes only the live token columns (in groups of four).
+// * The fourteen-wave clause priced the masked slot kernel's static persistent
+//   schedule of narrow tiles over many waves against the pointer-array kernel's
+//   wider tiles. The compact kernel draws its tiles from the counter from the
+//   second wave on whenever its host-static bound exceeds two waves.
+//
+// Neither mechanism is assumed to carry over or to vanish; the measurement
+// decides.
+//
+// The rule below was set by LAYER measurement (`fso.moe.layer` bench cell, cold
+// L2, B300 148 SMs, natural clock, median of 3 passes with the arm order
+// rotated), each GEMM forced onto the slot route on its own (FSO_GROUPED_SLOT=
+// force@<N>) against both GEMMs on the pointer-array route (FSO_GROUPED_SLOT=0),
+// at M = 16 to 64 (the masked clauses bite from M = 17 on in Family C and from
+// M = 33 on in Family B; M = 16 is the control where neither does):
+//
+//   Family C, G = 256 (FC1 N = 1024, K = 2048; FC2 N = 2048, K = 512)
+//     M                         16     24     32     40     48     56     64
+//     fused FC1 slot / ptr   0.916  0.921  0.915  0.941  0.942  0.946  0.952
+//     plain FC1 slot / ptr   0.912  0.927  0.926  0.937  0.945  0.952  0.961
+//     FC2 slot / ptr         0.971  0.983  0.987  0.990  0.974  0.972  0.966
+//   Family B, G = 128 (FC1 N = 1536, K = 2048; FC2 N = 2048, K = 768)
+//     fused FC1 slot / ptr   0.908  0.926  0.927  0.938  0.934  0.940  0.953
+//     plain FC1 slot / ptr   0.922  0.935  0.934  0.944  0.944  0.949  0.966
+//     FC2 slot / ptr         0.953  0.955  0.953  0.955  0.960  0.964  0.958
+//
+// Each entry is layer us with that GEMM on the slot route over layer us with
+// both GEMMs on the pointer-array route; the plain FC1 row is the same pair under
+// FSO_FC1_FUSED=0 (unfused FC1 plus the separate SwiGLU kernel). Worst
+// pass-to-pass spread 0.34 %. The two GEMMs' savings add up: the layer the
+// single forcings predict, f1 + f2 - ptr, is 1.000 to 1.020 times the layer
+// measured with both GEMMs forced.
+//
+// Every cell is faster on the slot route, for all three kernels (the plain FC1,
+// the fused FC1 and the FC2) and at every row capacity up to the full token
+// tile, so the compact rule keeps only the legality checks of `slot_route`
+// (m_cap <= 64, an instantiation, a slot bound) and one clause on the size of
+// the live tile space: `max_active_groups * ceil(N / 128)` at most 28 waves of
+// the device's SMs. That clause is NOT a measured crossover. Twenty-eight waves
+// (4144 tiles on 148 SMs) is the largest live tile space the measurement covers
+// (Family C FC2 from M = 32 on: 256 experts x 16 tiles = 4096), and the ratio
+// shows no trend toward the pointer-array kernel inside it; a shape with more
+// live tiles than that has not been measured on the compact slot route and stays
+// on the pointer-array kernel, as it did under the masked rule.
+inline SlotRouteDecision slot_route_compact(
+    int m_cap, int shape_n, int shape_k, int max_active_groups, bool fused_swiglu) noexcept
+{
+    // Legality (m_cap <= the token tile, an instantiation, a slot bound) has been
+    // checked by `slot_route` before it gets here; the fused and the plain kernel
+    // share the rule.
+    (void) m_cap;
+    (void) shape_k;
+    (void) fused_swiglu;
+    long long const live_tiles = static_cast<long long>(max_active_groups) * ((shape_n + 127) / 128);
+    if (live_tiles > 28LL * static_cast<long long>(device_sm_count()))
+        return kSlotRouteCascade;
+    return kSlotRouteSlot;
+}
+
 // The rule and the hard guard.
 //
 // Legality, which applies to `force` as well: the whole row capacity must fit
@@ -1692,8 +1763,8 @@ inline int slot_route_mode() noexcept
 // -> 121.1 / 131.7 / 137.6). The crossover between m_cap = 32 and 40 is not
 // resolved finer than the M grid (36 was not measured), so the fused clause
 // stops at the chunk width rather than at a fitted value.
-inline SlotRouteDecision slot_route(
-    int m_cap, int shape_n, int shape_k, int groups, int max_active_groups, bool fused_swiglu = false) noexcept
+inline SlotRouteDecision slot_route(int m_cap, int shape_n, int shape_k, int groups, int max_active_groups,
+    bool fused_swiglu = false, bool compact = false) noexcept
 {
     SlotRouteKnob const& knob = slot_route_knob();
     int const mode = knob.mode;
@@ -1713,6 +1784,10 @@ inline SlotRouteDecision slot_route(
         return forced ? kSlotRouteRefusedShape : kSlotRouteCascade;
     if (forced)
         return kSlotRouteSlot;
+    // The compact layout's entries have their own rule (see the note above
+    // `slot_route_compact`); everything below is 0.2.0's rule for the masked ops.
+    if (compact)
+        return slot_route_compact(m_cap, shape_n, shape_k, max_active_groups, fused_swiglu);
     // The fused-SwiGLU slot kernel only while the row capacity fits one
     // epilogue chunk (see the note above); the plain kernel runs up to the full
     // token tile, which the legality check has already admitted.
@@ -1741,10 +1816,10 @@ inline SlotRouteDecision slot_route(
 // than the plain grouped GEMM (one epilogue chunk against the full token
 // tile), so the two queries are complements only when asked with the same
 // flag, and a layer asks both for its FC1 with the flag set.
-inline bool problem_shapes_consumed(
-    int m_cap, int shape_n, int shape_k, int groups, int max_active_groups, bool fused_swiglu = false) noexcept
+inline bool problem_shapes_consumed(int m_cap, int shape_n, int shape_k, int groups, int max_active_groups,
+    bool fused_swiglu = false, bool compact = false) noexcept
 {
-    return slot_route(m_cap, shape_n, shape_k, groups, max_active_groups, fused_swiglu) != kSlotRouteSlot;
+    return slot_route(m_cap, shape_n, shape_k, groups, max_active_groups, fused_swiglu, compact) != kSlotRouteSlot;
 }
 
 // The tile the pointer-array cascade picks, as data rather than as a sequence
@@ -1879,7 +1954,8 @@ inline bool fused_fc1_available(int shape_n, int shape_k) noexcept
     return (shape_n % 2 == 0) && ((shape_n / 2) % 128 == 0) && (shape_k % 128 == 0);
 }
 
-inline bool fused_fc1_route(int m_cap, int shape_n, int shape_k, int groups, int max_active_groups) noexcept
+inline bool fused_fc1_route(
+    int m_cap, int shape_n, int shape_k, int groups, int max_active_groups, bool compact = false) noexcept
 {
     if (!fused_fc1_available(shape_n, shape_k))
         return false;
@@ -1894,7 +1970,8 @@ inline bool fused_fc1_route(int m_cap, int shape_n, int shape_k, int groups, int
     // with `fused_swiglu = true` because that is the kernel the fused op lands
     // on: its clause stops at one epilogue chunk, one step short of the plain
     // kernel's (run b300_round3_20260922/M-A3).
-    if (slot_route(m_cap, shape_n, shape_k, groups, max_active_groups, /*fused_swiglu=*/true) == kSlotRouteSlot)
+    if (slot_route(m_cap, shape_n, shape_k, groups, max_active_groups, /*fused_swiglu=*/true, compact)
+        == kSlotRouteSlot)
         return slot_swiglu_kernel_instantiated(shape_n, shape_k);
     return true;
 }
@@ -3021,12 +3098,16 @@ cudaError_t launch_sm100_mxfp8_grouped_swiglu_gemm_compact(__nv_fp8_e4m3* mat_a,
         v, groups, stream, 0, &fused, tag);
 }
 
-// The compact-layout twin of `gemm_dispatch_sm100_mxfp8_grouped`: the SAME
-// route decision (`slot_route` on the host-static m_cap hint), the same
-// FSO_FORCE_TILE table and the same `cascade_pick`, so for one
-// (m_cap, N, K, G, expected_m, max_active_groups) the compact op lands on the
-// kernel instantiation the masked op lands on. `m_cap` here is align(M, 4), the
-// value the masked op's tensor shape carried; it is a hint, not a dimension.
+// The compact-layout twin of `gemm_dispatch_sm100_mxfp8_grouped`: the same
+// FSO_FORCE_TILE table and the same `cascade_pick`, so wherever both layouts
+// take the pointer-array route, for one (m_cap, N, K, G, expected_m,
+// max_active_groups) the compact op lands on the tile the masked op lands on.
+// The route itself is the compact layout's own rule (`slot_route` with
+// `compact = true`, i.e. `slot_route_compact`): the compact slot kernel
+// schedules its tiles over the live work and bounds its stores, so it takes the
+// slot route where the masked rule would not (run fso_0.2.1_20261010/S10b-3a).
+// `m_cap` here is align(M, 4), the value the masked op's tensor shape carried;
+// it is a hint, not a dimension.
 // `b_alloc` is R / 128, the token descriptor's batch extent on the slot route.
 inline cudaError_t gemm_dispatch_sm100_mxfp8_grouped_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b,
     __nv_bfloat16* mat_d, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int32_t const* blk0, int groups,
@@ -3076,7 +3157,8 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8_grouped_compact(__nv_fp8_e4m3* mat_
             st);
     }
 
-    switch (grouped_detail::slot_route(m_cap, shape_n, shape_k, groups, max_active_groups, /*fused_swiglu=*/false))
+    switch (grouped_detail::slot_route(
+        m_cap, shape_n, shape_k, groups, max_active_groups, /*fused_swiglu=*/false, /*compact=*/true))
     {
     case grouped_detail::kSlotRouteSlot:
         return grouped_detail::slot_kernel_launch_compact(mat_a, mat_b, mat_d, scales_a, scales_b, masked_m, blk0,
@@ -3109,7 +3191,8 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8_grouped_compact(__nv_fp8_e4m3* mat_
 }
 
 // The compact-layout twin of `gemm_dispatch_sm100_mxfp8_grouped_swiglu`: the
-// same route and the same tile rule, line for line.
+// same tile rule, line for line, and the compact layout's own route rule
+// (`slot_route` with `compact = true`).
 inline cudaError_t gemm_dispatch_sm100_mxfp8_grouped_swiglu_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b,
     __nv_fp8_e4m3* out_h, int32_t* out_sfh, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m,
     int32_t const* blk0, int groups, int b_alloc, int m_cap, int shape_n, int shape_k, int expected_m,
@@ -3120,7 +3203,8 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8_grouped_swiglu_compact(__nv_fp8_e4m
     launch_sm100_mxfp8_grouped_swiglu_gemm_compact<128, TN_, 128>(mat_a, mat_b, out_h, out_sfh, scales_a, scales_b, \
         masked_m, blk0, groups, shape_n, shape_k, stream, problem_shapes, ptr_arrays)
 
-    if (grouped_detail::slot_route(m_cap, shape_n, shape_k, groups, max_active_groups, /*fused_swiglu=*/true)
+    if (grouped_detail::slot_route(
+            m_cap, shape_n, shape_k, groups, max_active_groups, /*fused_swiglu=*/true, /*compact=*/true)
             == grouped_detail::kSlotRouteSlot
         && grouped_detail::slot_swiglu_kernel_instantiated(shape_n, shape_k))
     {

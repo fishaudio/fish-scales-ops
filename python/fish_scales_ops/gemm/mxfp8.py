@@ -331,6 +331,7 @@ def mxfp8_grouped_swiglu_fused_route(
     k: int,
     num_groups: int,
     max_active_groups: int = 0,
+    compact: bool = False,
 ) -> bool:
     """Should this FC1 shape use the fused op, or the old two-kernel pair?
 
@@ -356,10 +357,15 @@ def mxfp8_grouped_swiglu_fused_route(
         k: the hidden size.
         num_groups: G.
         max_active_groups: ``min(M * topk, G)``.
+        compact: ``True`` when the FC1 will run on the compact layout
+            (:func:`linear_mxfp8_grouped_compact_swiglu`), ``False`` for the masked
+            op. On sm_100/103 the two layouts have different slot-route rules (see
+            :func:`mxfp8_grouped_slot_possible`), so the answer is the rule of the op
+            the call lands on. Ignored on every other architecture.
     """
     return bool(
         torch.ops.fish_scales_ops.mxfp8_grouped_swiglu_fused_route(
-            m_cap, n_w, k, num_groups, max_active_groups
+            m_cap, n_w, k, num_groups, max_active_groups, compact
         )
     )
 
@@ -392,6 +398,7 @@ def mxfp8_grouped_slot_possible(
     num_groups: int,
     max_active_groups: int = 0,
     fused_swiglu: bool = False,
+    compact: bool = False,
 ) -> bool:
     """Would a grouped GEMM of this shape take the slot-bound decode route?
 
@@ -428,11 +435,23 @@ def mxfp8_grouped_slot_possible(
             different row-capacity clauses — one 32-column epilogue chunk for
             the fused kernel, the full 64-wide token tile for the plain one
             (run b300_round3_20260922/M-A3) — so a layer asks for its FC1 with
-            the flag set and for its FC2 with it clear.
+            the flag set and for its FC2 with it clear. These clauses are the
+            masked ops' rule; see ``compact``.
+        compact: ``True`` when the call will be one of the compact-layout ops
+            (:func:`linear_mxfp8_grouped_compact`,
+            :func:`linear_mxfp8_grouped_compact_swiglu`), ``False`` (the default,
+            0.2.0's meaning) for the masked ops. The compact slot route schedules its
+            tiles over the live work and bounds its stores by each expert's routed
+            rows, so it has its own rule, set by layer measurement (run
+            fso_0.2.1_20261010/S10b-3a): the plain and the fused kernel alike take the
+            slot route wherever it is legal (``m_cap <= 64`` and a slot bound) while the
+            live tile space ``max_active_groups * ceil(n_w / 128)`` is at most 28 waves of
+            the device's SMs. The masked ops keep 0.2.0's rule. ``FSO_GROUPED_SLOT``
+            steers both.
     """
     return bool(
         torch.ops.fish_scales_ops.mxfp8_grouped_slot_possible(
-            m_cap, n_w, k, num_groups, max_active_groups, fused_swiglu
+            m_cap, n_w, k, num_groups, max_active_groups, fused_swiglu, compact
         )
     )
 
@@ -444,6 +463,7 @@ def mxfp8_grouped_problem_shapes_consumed(
     num_groups: int,
     max_active_groups: int = 0,
     fused_swiglu: bool = False,
+    compact: bool = False,
 ) -> bool:
     """Would a grouped GEMM of this shape read a ``problem_shapes`` tensor?
 
@@ -470,6 +490,11 @@ def mxfp8_grouped_problem_shapes_consumed(
     list and the problem shapes is requested and the GEMM launches nothing
     but itself.
 
+    ``compact`` names the layout of the op the call will land on, as for
+    :func:`mxfp8_grouped_slot_possible`: the compact ops have their own slot-route
+    rule, so the two queries are complements only when asked with the same
+    ``fused_swiglu`` AND the same ``compact``.
+
     Returns ``False`` on every architecture but sm_100/sm_103. On sm_120/121
     :func:`linear_mxfp8_grouped_masked` validates such a tensor and ignores it,
     while :func:`linear_mxfp8_grouped_masked_swiglu` refuses a non-empty one, so
@@ -477,7 +502,7 @@ def mxfp8_grouped_problem_shapes_consumed(
     """
     return bool(
         torch.ops.fish_scales_ops.mxfp8_grouped_problem_shapes_consumed(
-            m_cap, n_w, k, num_groups, max_active_groups, fused_swiglu
+            m_cap, n_w, k, num_groups, max_active_groups, fused_swiglu, compact
         )
     )
 
@@ -793,8 +818,11 @@ def linear_mxfp8_grouped_masked_combine(
 #
 # The GEMM ops take the masked layout's host-static hints unchanged (``m_cap =
 # align(M, 4)``, ``expected_m = ceil(M * topk / G)``, ``max_active_groups = min(M * topk,
-# G)``), so a compact call runs exactly the kernel instance the masked call of the same
-# shape runs, and its live rows are bit-identical to the masked call's.
+# G)``), so a compact call on the pointer-array route runs the tile the masked call of
+# the same shape runs. On sm_100/103 the slot route has the compact layout's own rule
+# (the route queries' ``compact=True``): the compact slot kernel schedules its tiles over
+# the live work and bounds its stores, so it is taken where the masked rule keeps the
+# pointer-array route. Either way the live rows are bit-identical to the masked call's.
 
 
 def quantize_1x32_grouped_gather_out_fp8(
@@ -1464,13 +1492,17 @@ def _mxfp8_layer_plan(m: int, topk: int, num_experts: int, n_w: int, hidden_size
     # each per bucket.
     expected_m = max(1, (rows + num_experts - 1) // num_experts)
     max_active_groups = min(rows, num_experts)
+    # The layout comes first: on sm_100/103 the compact ops and the masked ops have
+    # different slot-route rules, so every route query below is asked under the layout
+    # this plan runs (`compact=`).
+    compact = _moe_compact_enabled()
     # The fused FC1 needs the interleaved weight rows, which is what
     # `w13_interleaved` asserts the caller quantized; whether this call takes it is
     # the library's host-static route query. It is asked before the routing is built
-    # because on sm_100/103 the fused and the plain FC1 leave the slot route at
+    # because on sm_100/103 the fused and the plain FC1 may leave the slot route at
     # different row capacities, so the routing tensors the FC1 reads depend on it.
     fused_fc1 = bool(w13_interleaved) and bool(ops.mxfp8_grouped_swiglu_fused_route(
-        m_cap, n_w, hidden_size, num_experts, max_active_groups))
+        m_cap, n_w, hidden_size, num_experts, max_active_groups, compact))
     want_slots = want_ps_fc1 = want_ps_fc2 = scatter = False
     if sm_major() == 10:
         # sm_100/103: ask, per GEMM, whether it takes the slot route (which reads the
@@ -1481,13 +1513,13 @@ def _mxfp8_layer_plan(m: int, topk: int, num_experts: int, n_w: int, hidden_size
         # kernel reads.
         want_slots = bool(
             ops.mxfp8_grouped_slot_possible(
-                m_cap, n_w, hidden_size, num_experts, max_active_groups, fused_fc1)
+                m_cap, n_w, hidden_size, num_experts, max_active_groups, fused_fc1, compact)
             or ops.mxfp8_grouped_slot_possible(
-                m_cap, hidden_size, inter, num_experts, max_active_groups, False))
+                m_cap, hidden_size, inter, num_experts, max_active_groups, False, compact))
         want_ps_fc1 = bool(ops.mxfp8_grouped_problem_shapes_consumed(
-            m_cap, n_w, hidden_size, num_experts, max_active_groups, fused_fc1))
+            m_cap, n_w, hidden_size, num_experts, max_active_groups, fused_fc1, compact))
         want_ps_fc2 = bool(ops.mxfp8_grouped_problem_shapes_consumed(
-            m_cap, hidden_size, inter, num_experts, max_active_groups, False))
+            m_cap, hidden_size, inter, num_experts, max_active_groups, False, compact))
     else:
         # sm_120 has neither the slot-bound decode route nor the pointer-array
         # cascade of sm_100/103, so no kernel here reads the packed active-expert
@@ -1498,7 +1530,6 @@ def _mxfp8_layer_plan(m: int, topk: int, num_experts: int, n_w: int, hidden_size
         # slot -> weight) and is taken only where the slab it removes would have
         # spilled the L2; both are host-static decisions.
         scatter = bool(fused_combine) and moe_layer_fused_combine_engages_sm120(m, topk, hidden_size)
-    compact = _moe_compact_enabled()
     num_blocks = moe_compact_num_blocks(m, topk, num_experts) if compact else 0
     # One block of slack past the routing's bound: a tile that starts inside the last
     # expert's run may extend past it (the sm_100/103 2-SM tiles are 256 rows, and their
@@ -1800,7 +1831,8 @@ def _moe_layer_mxfp8_compact(
     also writes the per-call pointer arrays of the pointer-array GEMMs from the buffers'
     addresses; the ops that fill the buffers take them as outputs. The host-side
     decisions (routes, the fused FC1, the fused combine, the tile hints) are the plan's,
-    exactly as on the masked slab, so both layouts run the same kernels per bucket.
+    asked under the compact layout (``compact=True`` on sm_100/103, where the compact slot
+    route has its own rule); everything else is decided exactly as on the masked slab.
     """
     ops = torch.ops.fish_scales_ops
     m = int(hidden.shape[0])

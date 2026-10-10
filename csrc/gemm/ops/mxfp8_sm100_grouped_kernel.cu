@@ -167,17 +167,19 @@ int sm100_mxfp8_grouped_compact_fits(long long rows, int K)
 // `masked_m` and the slot list. The ATen layer exposes it so a caller asks
 // `moe_build_routing` for the shapes exactly where a GEMM will consume them.
 // `fused_swiglu` names the kernel, as for `sm100_mxfp8_grouped_slot_taken`
-// below: the two answers are complements only under the same flag.
+// below: the two answers are complements only under the same flags.
+// `compact` names the layout the call runs on: the compact ops have their own
+// route rule (`slot_route_compact`), the masked ops keep 0.2.0's.
 int sm100_mxfp8_grouped_problem_shapes_consumed(
-    int m_cap, int N, int K, int groups, int max_active_groups, int fused_swiglu)
+    int m_cap, int N, int K, int groups, int max_active_groups, int fused_swiglu, int compact)
 {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
     return sm100_blockscaled_gemm::grouped_detail::problem_shapes_consumed(
-               m_cap, N, K, groups, max_active_groups, fused_swiglu != 0)
+               m_cap, N, K, groups, max_active_groups, fused_swiglu != 0, compact != 0)
         ? 1
         : 0;
 #else
-    (void) m_cap; (void) N; (void) K; (void) groups; (void) max_active_groups; (void) fused_swiglu;
+    (void) m_cap; (void) N; (void) K; (void) groups; (void) max_active_groups; (void) fused_swiglu; (void) compact;
     return 0;
 #endif
 }
@@ -192,12 +194,15 @@ int sm100_mxfp8_grouped_problem_shapes_consumed(
 // dispatcher and this only exposes its verdict to the ATen layer, so the
 // bench, the tests and any future layer op all read the same decision.
 // Returns 1 for "use the fused FC1", 0 for "keep the old pair".
-int sm100_mxfp8_grouped_fused_fc1_route(int m_cap, int N, int K, int groups, int max_active_groups)
+int sm100_mxfp8_grouped_fused_fc1_route(int m_cap, int N, int K, int groups, int max_active_groups, int compact)
 {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-    return sm100_blockscaled_gemm::grouped_detail::fused_fc1_route(m_cap, N, K, groups, max_active_groups) ? 1 : 0;
+    return sm100_blockscaled_gemm::grouped_detail::fused_fc1_route(
+               m_cap, N, K, groups, max_active_groups, compact != 0)
+        ? 1
+        : 0;
 #else
-    (void) m_cap; (void) N; (void) K; (void) groups; (void) max_active_groups;
+    (void) m_cap; (void) N; (void) K; (void) groups; (void) max_active_groups; (void) compact;
     return 0;
 #endif
 }
@@ -253,16 +258,20 @@ int sm100_mxfp8_grouped_slot_refusal(int m_cap, int N, int K, int groups, int ma
 // `fused_swiglu` names the kernel the call would land on — the fused-SwiGLU FC1
 // (`linear_mxfp8_grouped_masked_swiglu`) or the plain grouped GEMM — because
 // the two have different row-capacity clauses (run b300_round3_20260922/M-A3).
-int sm100_mxfp8_grouped_slot_taken(int m_cap, int N, int K, int groups, int max_active_groups, int fused_swiglu)
+// `compact` names the layout: the compact ops (`linear_mxfp8_grouped_compact`,
+// `_compact_swiglu`) are routed by `slot_route_compact`, the masked ops by
+// 0.2.0's rule, and the answer must be the rule of the op the call lands on.
+int sm100_mxfp8_grouped_slot_taken(
+    int m_cap, int N, int K, int groups, int max_active_groups, int fused_swiglu, int compact)
 {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
     return sm100_blockscaled_gemm::grouped_detail::slot_route(
-               m_cap, N, K, groups, max_active_groups, fused_swiglu != 0)
+               m_cap, N, K, groups, max_active_groups, fused_swiglu != 0, compact != 0)
             == sm100_blockscaled_gemm::grouped_detail::kSlotRouteSlot
         ? 1
         : 0;
 #else
-    (void) m_cap; (void) N; (void) K; (void) groups; (void) max_active_groups; (void) fused_swiglu;
+    (void) m_cap; (void) N; (void) K; (void) groups; (void) max_active_groups; (void) fused_swiglu; (void) compact;
     return 0;
 #endif
 }

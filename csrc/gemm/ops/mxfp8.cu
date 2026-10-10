@@ -63,10 +63,11 @@ cudaError_t launch_sm100_mxfp8_grouped_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3*
     cudaStream_t stream);
 bool sm100_mxfp8_grouped_compiled();
 int sm100_mxfp8_grouped_slot_refusal(int m_cap, int N, int K, int groups, int max_active_groups);
-int sm100_mxfp8_grouped_slot_taken(int m_cap, int N, int K, int groups, int max_active_groups, int fused_swiglu);
+int sm100_mxfp8_grouped_slot_taken(
+    int m_cap, int N, int K, int groups, int max_active_groups, int fused_swiglu, int compact);
 int sm100_mxfp8_grouped_slot_tile_n();
 int sm100_mxfp8_grouped_problem_shapes_consumed(
-    int m_cap, int N, int K, int groups, int max_active_groups, int fused_swiglu);
+    int m_cap, int N, int K, int groups, int max_active_groups, int fused_swiglu, int compact);
 // Fused-SwiGLU FC1 (sm_100/sm_103) and the host-side router that says whether a
 // call should take it. Both grouped routes carry the fusion now -- the
 // pointer-array cascade and the swap-orientation slot kernel -- so the
@@ -76,7 +77,7 @@ cudaError_t launch_sm100_mxfp8_grouped_swiglu_dispatch(__nv_fp8_e4m3* A, __nv_fp
     int32_t* SFH, int32_t* SFA, int32_t* SFB, int32_t* masked_m, int num_groups, int m_cap, int N, int K,
     int expected_m, int max_active_groups, int const* slot_to_expert, int32_t const* problem_shapes,
     cudaStream_t stream);
-int sm100_mxfp8_grouped_fused_fc1_route(int m_cap, int N, int K, int groups, int max_active_groups);
+int sm100_mxfp8_grouped_fused_fc1_route(int m_cap, int N, int K, int groups, int max_active_groups, int compact);
 // The compact activation layout (fso 0.2.1), same translation unit.
 cudaError_t launch_sm100_mxfp8_grouped_compact_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D,
     int32_t* SFA, int32_t* SFB, int32_t* masked_m, int32_t const* blk0, int num_groups, int b_alloc, int m_cap, int N,
@@ -964,7 +965,7 @@ void linear_mxfp8_grouped_compact_sm100(at::Tensor a, at::Tensor b, at::Tensor s
     check_compact_slot_refusal(op, dims, static_cast<int>(m_cap), static_cast<int>(max_active_groups));
     int const* const slot_ptr = check_slot_to_expert(slot_to_expert, dims.G, masked_m);
     bool const slot_taken = detail::sm100_mxfp8_grouped_slot_taken(static_cast<int>(m_cap), dims.N, dims.K, dims.G,
-        static_cast<int>(max_active_groups), 0);
+        static_cast<int>(max_active_groups), /*fused_swiglu=*/0, /*compact=*/1);
     if (slot_taken)
         check_compact_slot_identity(op, dims, masked_m, blk0, slot_to_expert, static_cast<int>(m_cap));
     at::Tensor sched_owned;
@@ -1006,7 +1007,7 @@ void linear_mxfp8_grouped_compact_swiglu_sm100(at::Tensor a, at::Tensor b, at::T
     check_compact_slot_refusal(op, dims, static_cast<int>(m_cap), static_cast<int>(max_active_groups));
     int const* const slot_ptr = check_slot_to_expert(slot_to_expert, dims.G, masked_m);
     bool const slot_taken = detail::sm100_mxfp8_grouped_slot_taken(static_cast<int>(m_cap), dims.N, dims.K, dims.G,
-        static_cast<int>(max_active_groups), 1);
+        static_cast<int>(max_active_groups), /*fused_swiglu=*/1, /*compact=*/1);
     if (slot_taken)
         check_compact_slot_identity(op, dims, masked_m, blk0, slot_to_expert, static_cast<int>(m_cap));
     at::Tensor sched_owned;
@@ -1114,11 +1115,13 @@ at::Tensor linear_mxfp8_grouped_masked_combine(at::Tensor a_fp8, at::Tensor w2_f
 // true wherever an instantiation covers the shape, and the slot-route verdict
 // only decides which fused kernel runs. sm_120/121 has one grouped route, so
 // the per-call answer is the load-time one (mxfp8_grouped_swiglu_available).
-// Every other device answers false: it has no fused FC1.
+// Every other device answers false: it has no fused FC1. `compact` names the
+// layout of the fused op the call will be (the compact and the masked ops have
+// different slot-route rules on sm_100/103); other architectures ignore it.
 bool mxfp8_grouped_swiglu_available(int64_t n_w, int64_t k); // defined below
 
 bool mxfp8_grouped_swiglu_fused_route(
-    int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups, int64_t max_active_groups)
+    int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups, int64_t max_active_groups, bool compact)
 {
     auto const* prop = at::cuda::getCurrentDeviceProperties();
     if (prop->major == 12)
@@ -1128,12 +1131,14 @@ bool mxfp8_grouped_swiglu_fused_route(
         (void) m_cap;
         (void) num_groups;
         (void) max_active_groups;
+        (void) compact;
         return mxfp8_grouped_swiglu_available(n_w, k);
     }
     if (!is_sm100_family() || !detail::sm100_mxfp8_grouped_compiled())
         return false;
     return detail::sm100_mxfp8_grouped_fused_fc1_route(static_cast<int>(m_cap), static_cast<int>(n_w),
-               static_cast<int>(k), static_cast<int>(num_groups), static_cast<int>(max_active_groups))
+               static_cast<int>(k), static_cast<int>(num_groups), static_cast<int>(max_active_groups),
+               compact ? 1 : 0)
         != 0;
 }
 
@@ -1187,15 +1192,19 @@ bool mxfp8_grouped_swiglu_available(int64_t n_w, int64_t k)
 // (`linear_mxfp8_grouped_masked_swiglu`) takes the slot route one step short
 // of the plain grouped GEMM — one 32-column epilogue chunk instead of the full
 // 64-wide token tile (run b300_round3_20260922/M-A3) — so a layer asks for its
-// FC1 with the flag set and for its FC2 with it clear.
-bool mxfp8_grouped_slot_possible(
-    int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups, int64_t max_active_groups, bool fused_swiglu)
+// FC1 with the flag set and for its FC2 with it clear. `compact` says which
+// layout's op the call will be: the compact ops (`linear_mxfp8_grouped_compact`,
+// `_compact_swiglu`) are routed by their own rule (`slot_route_compact` in the
+// dispatcher, run fso_0.2.1_20261010/S10b-3a), the masked ops by 0.2.0's, which
+// is also the answer with the flag clear.
+bool mxfp8_grouped_slot_possible(int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups,
+    int64_t max_active_groups, bool fused_swiglu, bool compact)
 {
     if (!is_sm100_family() || !detail::sm100_mxfp8_grouped_compiled())
         return false;
     return detail::sm100_mxfp8_grouped_slot_taken(static_cast<int>(m_cap), static_cast<int>(n_w),
                static_cast<int>(k), static_cast<int>(num_groups), static_cast<int>(max_active_groups),
-               fused_swiglu ? 1 : 0)
+               fused_swiglu ? 1 : 0, compact ? 1 : 0)
         != 0;
 }
 
@@ -1216,16 +1225,17 @@ bool mxfp8_grouped_slot_possible(
 // names the kernel the call will land on, exactly as for
 // `mxfp8_grouped_slot_possible`: the fused-SwiGLU FC1 leaves the slot route
 // one step earlier than the plain grouped GEMM, so the two queries are
-// complements only when both are asked with the same flag (a layer asks both
-// for its FC1 with the flag set and for its FC2 with it clear).
-bool mxfp8_grouped_problem_shapes_consumed(
-    int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups, int64_t max_active_groups, bool fused_swiglu)
+// complements only when both are asked with the same flags (a layer asks both
+// for its FC1 with the flag set and for its FC2 with it clear, and both under
+// the `compact` flag of the layout it runs).
+bool mxfp8_grouped_problem_shapes_consumed(int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups,
+    int64_t max_active_groups, bool fused_swiglu, bool compact)
 {
     if (!is_sm100_family() || !detail::sm100_mxfp8_grouped_compiled())
         return false;
     return detail::sm100_mxfp8_grouped_problem_shapes_consumed(static_cast<int>(m_cap), static_cast<int>(n_w),
                static_cast<int>(k), static_cast<int>(num_groups), static_cast<int>(max_active_groups),
-               fused_swiglu ? 1 : 0)
+               fused_swiglu ? 1 : 0, compact ? 1 : 0)
         != 0;
 }
 

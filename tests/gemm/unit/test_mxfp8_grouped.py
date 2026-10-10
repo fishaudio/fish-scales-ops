@@ -1017,6 +1017,69 @@ def test_layer_route_consistency() -> None:
             + "  (F=fused FC1, u=unfused; s=slot list, p=problem shapes)  OK")
 
 
+def test_compact_route_rule() -> None:
+    """The compact layout's own route rule (run fso_0.2.1_20261010/S10b-3a).
+
+    The compact ops' slot kernel schedules its tiles over the live work and bounds
+    its stores, and its route rule was set by layer measurement: the plain FC1, the
+    fused FC1 and the FC2 take the slot route wherever it is legal (m_cap <= 64,
+    a slot bound) while the live tile space ``max_active_groups * ceil(N / 128)`` is
+    at most 28 waves of the device's SMs. The route queries answer it under
+    ``compact=True`` and keep 0.2.0's masked rule under the default
+    ``compact=False`` (``test_layer_route_consistency`` states that one). Per GEMM
+    the slot list and the problem shapes must stay complements under the compact
+    flag too, so the compact layer requests exactly one of the two for each GEMM."""
+    knob_free = os.environ.get("FSO_GROUPED_SLOT") is None
+    fc1_off = os.environ.get("FSO_FC1_FUSED") == "0"
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    grid = [1, 2, 3, 4, 8, 16, 24, 32, 36, 40, 48, 56, 64, 68, 96, 128, 256, 1024, 8192]
+    for fam, (G, topk, hidden, inter) in FUSED_FAMILIES.items():
+        n_w = 2 * inter
+        avail = fso.compat.mxfp8_grouped_swiglu_available(n_w, hidden)
+        bands = []
+        for M in grid:
+            m_cap = (M + 3) // 4 * 4
+            mag = min(M * topk, G)
+            fc1_fused = avail and fso.compat.mxfp8_grouped_swiglu_fused_route(m_cap, n_w, hidden, G, mag,
+                                                                              compact=True)
+            per_gemm = []
+            for name, (N, K, fused) in (("FC1", (n_w, hidden, bool(fc1_fused))),
+                                        ("FC2", (hidden, inter, False))):
+                slot = fso.compat.mxfp8_grouped_slot_possible(m_cap, N, K, G, mag, fused_swiglu=fused,
+                                                              compact=True)
+                ps = fso.compat.mxfp8_grouped_problem_shapes_consumed(m_cap, N, K, G, mag, fused_swiglu=fused,
+                                                                    compact=True)
+                assert slot != ps, (
+                    f"compact fam {fam} M={M} {name} (N={N}, K={K}, fused_swiglu={fused}): "
+                    f"slot_possible={slot} and problem_shapes_consumed={ps}")
+                if knob_free:
+                    want = m_cap <= 64 and mag * ((N + 127) // 128) <= 28 * sms
+                    assert slot == want, (
+                        f"compact fam {fam} M={M} {name} (N={N}, fused_swiglu={fused}): slot_possible={slot}, "
+                        f"the compact rule says {want}")
+                per_gemm.append("slot" if slot else "ps")
+            bands.append((M, int(fc1_fused), per_gemm[0], per_gemm[1]))
+        if knob_free and not fc1_off:
+            # The published compact route: both families, both GEMMs on the slot route
+            # through M = 64 (the fused FC1 included), the pointer-array cascade above.
+            by_m = {M: (f1, f2) for M, _, f1, f2 in bands}
+            for M in grid:
+                want = ("slot", "slot") if M <= 64 else ("ps", "ps")
+                assert by_m[M] == want, f"Family {fam} compact route at M={M} is {by_m[M]}, expected {want}"
+        if knob_free:
+            # Where the two rules differ, the default (masked) answer must still be 0.2.0's.
+            if fam == "C":
+                assert not fso.compat.mxfp8_grouped_slot_possible(64, n_w, hidden, G, G, fused_swiglu=True) \
+                    and not fso.compat.mxfp8_grouped_slot_possible(64, hidden, inter, G, G), \
+                    "the masked rule moved: Family C M = 64 must stay on the pointer-array route there"
+            assert not fso.compat.mxfp8_grouped_slot_possible(36, n_w, hidden, G, min(36 * topk, G),
+                                                              fused_swiglu=True), \
+                f"the masked rule moved: Family {fam} fused FC1 at m_cap = 36 must stay on the cascade"
+        print(f"  compact-route {fam}  " + "  ".join(
+            f"M{M}:{'F' if f else 'u'}/{a[0]}{b[0]}" for M, f, a, b in bands)
+            + "  (F=fused FC1, u=unfused; s=slot list, p=problem shapes)  OK")
+
+
 def test_fused_slot_persistent_skip(fam: str, M: int) -> None:
     """The fused FC1 on the slot route, at a grid with more tiles than the
     machine has SMs.
@@ -2235,6 +2298,8 @@ def main() -> int:
         run_problem_shapes_cases()
         print("== layer route consistency (slot list vs problem shapes, per GEMM) ==")
         test_layer_route_consistency()
+        print("== compact layout route rule ==")
+        test_compact_route_rule()
     else:
         for M in (8, 64, 512):
             test_problem_shapes_contract(M, "B")

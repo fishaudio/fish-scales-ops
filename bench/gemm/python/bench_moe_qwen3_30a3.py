@@ -1673,22 +1673,30 @@ def run_worker(cell):
                 result["m_cap"] = m_cap
                 result["max_active_groups"] = max_active_groups
                 n_w = 2 * INTER
+                result["layout"] = "masked slab" if os.environ.get("FSO_MOE_COMPACT", "")[:1] == "0" else "compact"
+                # The route queries are asked under the layout the layer runs: on sm_100/103
+                # the compact ops and the masked ops have different slot-route rules.
+                compact = result["layout"] == "compact"
                 fc1_interleaved = fso.compat.mxfp8_grouped_swiglu_available(n_w, HIDDEN)
                 fc1_fused = fc1_interleaved and fso.compat.mxfp8_grouped_swiglu_fused_route(
-                    m_cap, n_w, HIDDEN, E, max_active_groups)
+                    m_cap, n_w, HIDDEN, E, max_active_groups, compact=compact)
                 result["fc1_interleaved"] = int(fc1_interleaved)
                 result["fc1_fused"] = int(fc1_fused)
-                result["with_slots"] = int(
-                    fso.compat.mxfp8_grouped_slot_possible(
-                        m_cap, n_w, HIDDEN, E, max_active_groups, fused_swiglu=fc1_fused)
-                    or fso.compat.mxfp8_grouped_slot_possible(
-                        m_cap, HIDDEN, INTER, E, max_active_groups))
+                slot_fc1 = fso.compat.mxfp8_grouped_slot_possible(
+                    m_cap, n_w, HIDDEN, E, max_active_groups, fused_swiglu=fc1_fused, compact=compact)
+                slot_fc2 = fso.compat.mxfp8_grouped_slot_possible(
+                    m_cap, HIDDEN, INTER, E, max_active_groups, compact=compact)
+                result["with_slots"] = int(slot_fc1 or slot_fc2)
                 result["with_ps"] = int(
                     fso.compat.mxfp8_grouped_problem_shapes_consumed(
-                        m_cap, n_w, HIDDEN, E, max_active_groups, fused_swiglu=fc1_fused)
+                        m_cap, n_w, HIDDEN, E, max_active_groups, fused_swiglu=fc1_fused, compact=compact)
                     or fso.compat.mxfp8_grouped_problem_shapes_consumed(
-                        m_cap, HIDDEN, INTER, E, max_active_groups))
-                result["layout"] = "masked slab" if os.environ.get("FSO_MOE_COMPACT", "")[:1] == "0" else "compact"
+                        m_cap, HIDDEN, INTER, E, max_active_groups, compact=compact))
+                # Per-GEMM route on sm_100/103 (slot route or pointer-array cascade); other
+                # architectures have one grouped route ("grouped").
+                sm100 = torch.cuda.get_device_capability()[0] == 10
+                result["route_fc1"] = ("slot" if slot_fc1 else "ptr") if sm100 else "grouped"
+                result["route_fc2"] = ("slot" if slot_fc2 else "ptr") if sm100 else "grouped"
                 experts = fso.moe.prepare_experts(w13, w2, format="mxfp8")
 
                 def layer_fn():
@@ -1855,6 +1863,24 @@ def run_all(args):
         cells = [c for c in cells if c["impl"] in keep]
     if args.Ms:
         keep_m = {int(m) for m in args.Ms.split(",")}
+        # An M strictly inside an (impl, proj) grid's range but not on it is an off-grid
+        # point (see M_GRID): it gets a cell cloned from that group's first cell. Points
+        # outside a grid's range stay out (a decode-only impl's grid, the fso layer's
+        # memory-capped top end). Padded cells are (bucket, live) pairs from --bucket /
+        # --live and are only filtered.
+        if routing != "padded":
+            first, have, span = {}, set(), {}
+            for c in cells:
+                g = (c["impl"], c["proj"])
+                first.setdefault(g, c)
+                have.add(g + (c["M"],))
+                lo, hi = span.get(g, (c["M"], c["M"]))
+                span[g] = (min(lo, c["M"]), max(hi, c["M"]))
+            extra = [dict(c0, M=m) for g, c0 in first.items() for m in sorted(keep_m)
+                     if g + (m,) not in have and span[g][0] < m < span[g][1]]
+            if extra:
+                order = {k: i for i, k in enumerate(first)}
+                cells = sorted(cells + extra, key=lambda c: (order[(c["impl"], c["proj"])], c["M"]))
         cells = [c for c in cells if c["M"] in keep_m]
     if args.projs:
         keep_p = set(args.projs.split(","))
