@@ -36,6 +36,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -1240,10 +1241,15 @@ __global__ void moe_topk_from_logits_kernel(TLogit const* __restrict__ logits, /
 // blk0[e]*128 + (its rank inside expert e), and blk0[e] is a prefix over the
 // FINAL counts of every expert below e, so no pair can be placed before every
 // pair has been counted. The builder is count -> scan -> place in one launch,
-// with no scratch memory, no zeroing launch and no grid-wide barrier, in two
-// launch shapes of one kernel (moe_routing_compact_cta_kernel):
+// with no scratch memory, no zeroing launch and no grid-wide barrier, in three
+// launch shapes:
 //
-//   * one CTA, up to kCompactCtaMaxPairs routed pairs (M <= 512 at top-8): a
+//   * up to kCompactSmallMaxPairs = 128 routed pairs (M <= 16 at top-8), the
+//     decode kernel moe_routing_compact_small_kernel: every active expert owns
+//     one block, so blk0 comes from a shared bitmap of the active experts and a
+//     per-warp shuffle scan of its words, with no block-wide prefix (below);
+//   * one CTA of moe_routing_compact_cta_kernel, up to kCompactCtaMaxPairs routed
+//     pairs (M <= 512 at top-8): a
 //     shared histogram whose atomics hand every pair its rank (kept in
 //     registers), a block-wide prefix with one thread per expert, placement;
 //   * above, one thread-block cluster of kCompactMaxCluster CTAs doing the same
@@ -1291,11 +1297,39 @@ struct CompactRoutingArgs
     int num_groups;
 };
 
+// The decode kernel's arguments: everything but the per-call pointer arrays, whose bases and steps make
+// CompactRoutingArgs about 330 bytes of kernel parameters. A call that asks for pointer arrays at a decode pair
+// count takes the one-CTA kernel instead (no layer plan does).
+struct CompactRoutingSmallArgs
+{
+    int32_t const* topk_ids;
+    float const* topk_w;
+    int32_t* masked_m;
+    int32_t* blk0;
+    int32_t* slot_of_flat;
+    int32_t* slot_to_expert;
+    int32_t* slot_sched;
+    int32_t* problem_shapes;
+    int32_t* row_map;
+    float* weight_of_slot;
+    ProblemShapeList ps;
+    int num_pairs;
+    int topk;
+    int num_groups;
+};
+
+template <class Args>
+constexpr bool compact_has_ptrs()
+{
+    return std::is_same_v<Args, CompactRoutingArgs>;
+}
+
 // Expert g's per-expert outputs: its routed row count, its first block, the
 // (cnt, N, K) triple of every requested GEMM and, when asked, the per-call
 // pointers of every pointer-array GEMM (written for empty experts too: such a
 // pointer lands on the next expert's first block and is never dereferenced).
-__device__ __forceinline__ void compact_emit_expert(CompactRoutingArgs const& a, int g, int cnt, int b0)
+template <class Args>
+__device__ __forceinline__ void compact_emit_expert(Args const& a, int g, int cnt, int b0)
 {
     int const G = a.num_groups;
     a.masked_m[g] = cnt;
@@ -1310,15 +1344,18 @@ __device__ __forceinline__ void compact_emit_expert(CompactRoutingArgs const& a,
             d[2] = a.ps.k[q];
         }
     }
-    if (a.ptr_arrays != nullptr)
+    if constexpr (compact_has_ptrs<Args>())
     {
-        uint64_t const blocks = static_cast<uint64_t>(b0);
-        for (int q = 0; q < a.ps.count; ++q)
+        if (a.ptr_arrays != nullptr)
         {
-            int64_t* d = a.ptr_arrays + static_cast<size_t>(q) * 3 * G + g;
+            uint64_t const blocks = static_cast<uint64_t>(b0);
+            for (int q = 0; q < a.ps.count; ++q)
+            {
+                int64_t* d = a.ptr_arrays + static_cast<size_t>(q) * 3 * G + g;
 #pragma unroll
-            for (int j = 0; j < 3; ++j)
-                d[j * G] = static_cast<int64_t>(a.ptr_base[q][j] + blocks * a.ptr_step[q][j]);
+                for (int j = 0; j < 3; ++j)
+                    d[j * G] = static_cast<int64_t>(a.ptr_base[q][j] + blocks * a.ptr_step[q][j]);
+            }
         }
     }
 }
@@ -1327,7 +1364,8 @@ __device__ __forceinline__ void compact_emit_expert(CompactRoutingArgs const& a,
 // to slot act_rank = the number of active experts below g, and every slot from
 // n_active on gets -1. The two write sets are disjoint (act_rank < n_active),
 // so the threads that write them need no ordering between them.
-__device__ __forceinline__ void compact_emit_slot(CompactRoutingArgs const& a, int g, int cnt, int act_rank, int n_active)
+template <class Args>
+__device__ __forceinline__ void compact_emit_slot(Args const& a, int g, int cnt, int act_rank, int n_active)
 {
     if (a.slot_to_expert == nullptr)
         return;
@@ -1338,7 +1376,8 @@ __device__ __forceinline__ void compact_emit_slot(CompactRoutingArgs const& a, i
 }
 
 // Routed pair i lands on compact row `row`.
-__device__ __forceinline__ void compact_place_pair(CompactRoutingArgs const& a, int i, int row)
+template <class Args>
+__device__ __forceinline__ void compact_place_pair(Args const& a, int i, int row)
 {
     a.slot_of_flat[i] = row;
     if (a.row_map != nullptr)
@@ -1417,6 +1456,106 @@ __device__ __forceinline__ void compact_cluster_wait()
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     asm volatile("barrier.cluster.wait.acquire.aligned;\n" ::: "memory");
 #endif
+}
+
+// The decode shape: up to kCompactSmallMaxPairs = 128 routed pairs (M <= 16 at
+// top-8), one CTA, one pair per thread. No expert can then hold more than 128
+// rows, so every active expert owns exactly ONE block and blk0[g] is the number
+// of active experts below g. That count needs no prefix over the expert counts:
+// each pair also sets its expert's bit in a 1024-bit shared bitmap, and after
+// the counting barrier every warp reads the bitmap words (lane w holds word w)
+// and runs one shuffle scan of their popcounts over the ceil(G/32) words, which
+// gives it blk0 of any expert as excl[g/32] + popc(word[g/32] & bits below g).
+// Every warp computes that for itself, so the kernel has the two barriers of the
+// 0.2.0 builder (after zeroing, after counting) and nothing after the second:
+// the general one-CTA kernel's block-wide two-level scan and third barrier cost
+// 0.3 us per call on sm_120 at decode, where the layer is 24-70 us long (run
+// fso_0.2.1_20261010/S3b). The slot in the active-expert list equals blk0 here.
+// Two more things measured there: the kernel takes the slim CompactRoutingSmallArgs
+// (the pointer-array fields of CompactRoutingArgs are about 330 bytes of kernel
+// parameters, and dropping them took 0.04-0.12 us off each call), and zeroing the
+// counters before the PDL wait instead of after it was no faster at layer level
+// (0.0-0.08 us slower at M = 1-16), so the order is the existing builders'.
+constexpr int kCompactSmallMaxPairs = 128;
+
+__global__ void __launch_bounds__(1024) moe_routing_compact_small_kernel(CompactRoutingSmallArgs a, bool pdl)
+{
+    static_assert(kCompactSmallMaxPairs <= kCompactRows, "one block per active expert needs <= 128 pairs");
+    __shared__ int32_t s_cnt[kMaxGroups];
+    __shared__ uint32_t s_bits[kMaxGroups / 32];
+
+    int const tid = static_cast<int>(threadIdx.x); // blockDim >= max(G, P): thread t owns expert t and pair t
+    int const lane = tid & 31;
+    int const warp = tid >> 5;
+    int const G = a.num_groups;
+    if (pdl)
+    {
+        cudaGridDependencySynchronize();
+        if (threadIdx.x == 0)
+            cudaTriggerProgrammaticLaunchCompletion();
+    }
+    if (tid < G)
+        s_cnt[tid] = 0;
+    if (tid < kMaxGroups / 32)
+        s_bits[tid] = 0u;
+    int const id = tid < a.num_pairs ? a.topk_ids[tid] : -1;
+    int const e = static_cast<unsigned>(id) < static_cast<unsigned>(G) ? id : -1;
+    __syncthreads();
+    int rank = 0;
+    if (e >= 0)
+    {
+        rank = atomicAdd(&s_cnt[e], 1);
+        atomicOr(&s_bits[e >> 5], 1u << (e & 31));
+    }
+    __syncthreads();
+
+    // Every warp: the exclusive prefix of the bitmap words' popcounts (lane w: word w, w < ceil(G/32)).
+    int const num_words = (G + 31) >> 5;
+    uint32_t const word = lane < num_words ? s_bits[lane] : 0u;
+    int const pc = __popc(word);
+    int incl = pc;
+    for (int off = 1; off < num_words; off <<= 1) // warp-uniform bound: log2 of the word count steps
+    {
+        int const v = __shfl_up_sync(0xffffffffu, incl, off);
+        if (lane >= off)
+            incl += v;
+    }
+    int const excl = incl - pc;
+    int const active = __shfl_sync(0xffffffffu, incl, num_words - 1); // = blocks in use
+
+    // The pair of this thread.
+    int const ew = e >= 0 ? (e >> 5) : 0;
+    uint32_t const word_e = __shfl_sync(0xffffffffu, word, ew);
+    int const excl_e = __shfl_sync(0xffffffffu, excl, ew);
+    if (tid < a.num_pairs)
+    {
+        if (e < 0)
+            a.slot_of_flat[tid] = -1; // skipped: padded row, or an expert another rank owns
+        else
+            compact_place_pair(
+                a, tid, ((excl_e + __popc(word_e & ((1u << (e & 31)) - 1u))) << kCompactRowShift) + rank);
+    }
+    // The expert of this thread: g = tid, whose bitmap word is this warp's. One expert per thread: spreading the
+    // experts over fewer threads measured slower at every width (S3b, route_width).
+    uint32_t const word_g = __shfl_sync(0xffffffffu, word, warp & 31);
+    int const excl_g = __shfl_sync(0xffffffffu, excl, warp & 31);
+    if (tid < G)
+    {
+        int const b0 = excl_g + __popc(word_g & ((1u << lane) - 1u));
+        int const cnt = s_cnt[tid];
+        compact_emit_expert(a, tid, cnt, b0);
+        compact_emit_slot(a, tid, cnt, b0, active);
+    }
+    if (tid == 0)
+    {
+        a.blk0[G] = active;
+        if (a.slot_sched != nullptr)
+        {
+#pragma unroll
+            for (int w = 0; w < kCompactSlotSchedWords; ++w)
+                a.slot_sched[w] = 0;
+        }
+    }
 }
 
 // One CTA (kCluster = false), or each CTA of one cluster of up to
@@ -1981,12 +2120,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
 // 128-row-block layout (see the kernels above), one launch, no scratch.
 //
 // Which launch shape runs is a function of the routed-pair count only.
-// FSO_ROUTING_COMPACT_PATH forces one for an A/B or a test: cta (one CTA) or
-// clusterN (one cluster of N = 2..8 CTAs). FSO_ROUTING_COMPACT_THREADS
-// overrides the CTA width (never below one thread per expert). Both are read
-// once per process.
+// FSO_ROUTING_COMPACT_PATH forces one for an A/B or a test: small (the decode
+// kernel, up to 128 pairs), cta (one CTA) or clusterN (one cluster of N = 2..8
+// CTAs). FSO_ROUTING_COMPACT_THREADS overrides the CTA width of the cta and
+// cluster shapes (never below one thread per expert). Both are read once per
+// process.
 enum class CompactPath
 {
+    kSmall,
     kCta,
     kCluster,
 };
@@ -2011,7 +2152,7 @@ static int compact_round32(int x)
     return (x + 31) / 32 * 32;
 }
 
-static CompactPlan compact_plan(int P, int G)
+static CompactPlan compact_plan(int P, int G, bool want_ptrs)
 {
     static std::string const forced = []
     {
@@ -2036,8 +2177,12 @@ static CompactPlan compact_plan(int P, int G)
         int const k = per_thread <= 1 ? 1 : per_thread <= 2 ? 2 : per_thread <= 4 ? 4 : kCompactRegPairs;
         return {path, t, ctas, k};
     };
+    // The decode kernel: one pair and one expert per thread.
+    int const small_threads = std::max(32, std::max(compact_round32(G), compact_round32(P)));
     if (!forced.empty())
     {
+        if (forced == "small" && P <= kCompactSmallMaxPairs && !want_ptrs)
+            return {CompactPath::kSmall, small_threads, 1, 1};
         if (forced == "cta")
             return cta_plan(CompactPath::kCta, 1);
         if (forced.rfind("cluster", 0) == 0)
@@ -2048,6 +2193,8 @@ static CompactPlan compact_plan(int P, int G)
         }
         // A forced shape that cannot take this pair count falls through to the default.
     }
+    if (P <= kCompactSmallMaxPairs && !want_ptrs)
+        return {CompactPath::kSmall, small_threads, 1, 1};
     if (P <= kCompactCtaMaxPairs)
         return cta_plan(CompactPath::kCta, 1);
     return cta_plan(CompactPath::kCluster, kCompactMaxCluster);
@@ -2190,10 +2337,18 @@ moe_build_routing_compact(at::Tensor topk_ids, int64_t num_groups, int64_t num_b
 
     auto stream = at::cuda::getCurrentCUDAStream();
     bool const pdl = fso_pdl_enabled();
-    CompactPlan const plan = compact_plan(static_cast<int>(pairs), static_cast<int>(G));
+    CompactPlan const plan = compact_plan(static_cast<int>(pairs), static_cast<int>(G), want_ptrs);
     cudaError_t err = cudaSuccess;
     switch (plan.path)
     {
+    case CompactPath::kSmall:
+    {
+        CompactRoutingSmallArgs sa{args.topk_ids, args.topk_w, args.masked_m, args.blk0, args.slot_of_flat,
+            args.slot_to_expert, args.slot_sched, args.problem_shapes, args.row_map, args.weight_of_slot, args.ps,
+            args.num_pairs, args.topk, args.num_groups};
+        err = compact_launch(moe_routing_compact_small_kernel, 1, plan.threads, 0, stream, pdl, sa);
+        break;
+    }
     case CompactPath::kCta:
     case CompactPath::kCluster:
     {

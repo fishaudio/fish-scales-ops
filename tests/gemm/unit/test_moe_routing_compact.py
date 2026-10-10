@@ -18,11 +18,12 @@ its routed rows are blk0[g]*128 + r, r < cnt[g]. What is checked:
      skipped form of every output run. Where G < topk the ids are drawn with
      replacement (a token may repeat an expert), which the builder must place
      like any other pair.
-  2. Both launch shapes at every pair count (the one-CTA kernel, which the
-     default takes up to 4096 pairs, and clusters of 2, 4 and 8 CTAs, which it
-     takes above), forced through FSO_ROUTING_COMPACT_PATH in a child process
-     (the knob is read once per process), with a profiler record that the
-     forced kernel is the one that ran.
+  2. Every launch shape (the decode kernel, which the default takes up to 128
+     pairs, on the cases it can take; the one-CTA kernel, which the default takes
+     up to 4096 pairs, and clusters of 2, 4 and 8 CTAs, which it takes above, at
+     every pair count), forced through FSO_ROUTING_COMPACT_PATH in a child
+     process (the knob is read once per process), with a profiler record that
+     the forced kernel is the one that ran.
   3. Glue reuse (sm_100/103 and sm_120/121, the architectures with the MXFP8
      grouped glue): the gather-quantize (both its pair-space and, on sm_100/103,
      its token-scatter form), the grouped SwiGLU requantize and the combine,
@@ -63,6 +64,7 @@ PS_PAIRS = [(1024, 2048), (2048, 512)]          # two GEMMs, as a layer's FC1 / 
 PTR_STRIDES = [2048, 128 * 2048 // 32, 1024,      # FC1: A bytes / row, SFA bytes / block, D bytes / row
                512, 128 * 512 // 32, 2 * 2048]    # FC2
 PATHS = {  # forced shape -> (largest pair count it takes, kernel-name fragments)
+    "small": (128, ("moe_routing_compact_small_kernel",)),
     "cta": (None, (", false>", ", 0>")),
     "cluster2": (None, (", true>", ", 1>")),
     "cluster4": (None, (", true>", ", 1>")),
@@ -139,11 +141,14 @@ def check_contract(ids, g, nb_max, out, want_all, topk_w, bases):
             errs.append("problem_shapes")
         b = blk0_ref[:g]
         ptr_ref = []
-        for p in range(len(PS_PAIRS)):
+        for p in range(len(PS_PAIRS) if bases is not None else 0):
             a_row, sfa_blk, d_row = PTR_STRIDES[3 * p: 3 * p + 3]
             ba, bs, bd = (bases[3 * p + j].data_ptr() for j in range(3))
             ptr_ref.append(torch.stack([ba + b * ROWS * a_row, bs + b * sfa_blk, bd + b * ROWS * d_row]))
-        if tuple(ptrs.shape) != (len(PS_PAIRS), 3, g) or not torch.equal(ptrs, torch.stack(ptr_ref)):
+        if bases is None:
+            if ptrs.numel():
+                errs.append("ptr_arrays not asked for but not empty")
+        elif tuple(ptrs.shape) != (len(PS_PAIRS), 3, g) or not torch.equal(ptrs, torch.stack(ptr_ref)):
             errs.append("ptr_arrays")
     else:
         if slots.numel() or ps.numel() or ptrs.numel() or row_map.numel() or wslot.numel() or sched.numel():
@@ -152,11 +157,13 @@ def check_contract(ids, g, nb_max, out, want_all, topk_w, bases):
 
 
 def call(ids, g, want_all, topk_w, bases, num_blocks=None):
+    """want_all: every optional output; with bases=None every one but the pointer arrays (a request the decode
+    shape takes: pointer arrays send a decode pair count to the one-CTA shape)."""
     nb_max = num_blocks if num_blocks is not None else moe_compact_num_blocks(ids.shape[0], ids.shape[1], g)
     if want_all:
         out = fso.compat.moe_build_routing_compact(
             ids, g, nb_max, with_slots=True, with_row_map=True, topk_w=topk_w, problem_shapes_for=PS_PAIRS,
-            ptr_bases=bases, ptr_strides=PTR_STRIDES)
+            ptr_bases=bases, ptr_strides=PTR_STRIDES if bases is not None else None)
     else:
         out = fso.compat.moe_build_routing_compact(ids, g, nb_max)
     return nb_max, out
@@ -167,8 +174,9 @@ def make_bases(dev):
 
 
 def contract_grid(dev, cases=None, label="default shapes"):
-    """Section 1 (and, with `cases`, the cases a forced shape runs in section 2)."""
-    bases = make_bases(dev)
+    """Section 1 (and, with `cases`, the cases a forced shape runs in section 2). The cases cycle through three
+    requests: every optional output, every one but the pointer arrays, and none."""
+    all_bases = make_bases(dev)
     n = 0
     bad = []
     if cases is None:
@@ -176,12 +184,13 @@ def contract_grid(dev, cases=None, label="default shapes"):
     for idx, (m, g, k, r) in enumerate(cases):
         ids = draw(m, g, k, r, seed=m * 7919 + g * 31 + k * 3 + ROUTINGS.index(r), device=dev)
         topk_w = torch.rand(m, k, device=dev, dtype=torch.float32)
-        want_all = idx % 2 == 0
+        want_all = idx % 3 != 2
+        bases = all_bases if idx % 3 == 0 else None
         nb_max, out = call(ids, g, want_all, topk_w, bases)
         errs = check_contract(ids, g, nb_max, out, want_all, topk_w, bases)
         n += 1
         if errs:
-            bad.append(f"M={m} G={g} topk={k} {r} all={want_all}: {', '.join(errs)}")
+            bad.append(f"M={m} G={g} topk={k} {r} all={want_all} ptrs={bases is not None}: {', '.join(errs)}")
     torch.cuda.synchronize()
     print(f"  {label}: {n} cases, {len(bad)} failing" + "".join(f"\n    FAIL {b}" for b in bad[:20]))
     return bad
@@ -196,7 +205,8 @@ def forced_child(path):
     bad = contract_grid(dev, cases, label=f"forced {path}")
     ids = draw(2048 if limit is None else limit // 8, 256, 8, "uniform", 1, dev)
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
-        call(ids, 256, True, torch.rand(ids.shape, device=dev), make_bases(dev))
+        # the decode shape takes every request but pointer arrays
+        call(ids, 256, True, torch.rand(ids.shape, device=dev), None if path == "small" else make_bases(dev))
         torch.cuda.synchronize()
     names = sorted({ev.key for ev in prof.key_averages() if "moe_routing_compact" in ev.key})
     frags = frag if isinstance(frag, tuple) else (frag,)
