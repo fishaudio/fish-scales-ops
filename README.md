@@ -140,7 +140,7 @@ in [`docs/perf/`](docs/perf/README.md).
 
 Open items after 0.2.1: the known issues of [`CHANGELOG.md`](CHANGELOG.md),
 whose measured gaps are in the summaries of [`docs/perf/`](docs/perf/README.md),
-and two build items.
+one planned feature, and two build items.
 
 - **H200 MoE layer at some decode batch sizes**, against sglang's Triton FP8 MoE layer
   ([`docs/perf/layer/sm90.md`](docs/perf/layer/sm90.md), Families B and C).
@@ -153,6 +153,9 @@ and two build items.
 - **Blackwell dense MLP block at some batch sizes**, against sglang's DeepGEMM linear on the B300 and vLLM's on the
   RTX 5090 ([`docs/perf/layer/sm100.md`](docs/perf/layer/sm100.md),
   [`docs/perf/layer/sm120.md`](docs/perf/layer/sm120.md), Family A).
+- **Cross-rank reduction fused with the MoE GEMM / combine (#6)**, for tensor- and expert-parallel serving over
+  PCIe or NVLink: all-reduce and reduce-scatter forms behind a communicator prepared once. Planned for the next
+  release.
 - **Pin the PTX at build time.** Compile the kernels to PTX once with a pinned front end and turn that PTX into SASS
   with one pinned `ptxas`, so that a toolkit update changes only that last step. 0.2.1 compiles everything with the
   CUDA 13.0 that torch 2.13.0+cu130 uses.
