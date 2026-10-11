@@ -140,7 +140,7 @@ in [`docs/perf/`](docs/perf/README.md).
 
 Open items after 0.2.1: the known issues of [`CHANGELOG.md`](CHANGELOG.md),
 whose measured gaps are in the summaries of [`docs/perf/`](docs/perf/README.md),
-one planned feature, and two build items.
+two planned items, and two build items.
 
 - **H200 MoE layer at some decode batch sizes**, against sglang's Triton FP8 MoE layer
   ([`docs/perf/layer/sm90.md`](docs/perf/layer/sm90.md), Families B and C).
@@ -153,6 +153,11 @@ one planned feature, and two build items.
 - **Blackwell dense MLP block at some batch sizes**, against sglang's DeepGEMM linear on the B300 and vLLM's on the
   RTX 5090 ([`docs/perf/layer/sm100.md`](docs/perf/layer/sm100.md),
   [`docs/perf/layer/sm120.md`](docs/perf/layer/sm120.md), Family A).
+- **MoE layer transient memory at decode batch sizes.** On Blackwell the compact layout reserves a whole 128-row
+  block for every expert that can receive a row, so at decode-band M one call's transient
+  (`fso.moe.transient_bytes`) is several times that of trtllm-gen's and Triton's MoE layers. Candidates: store the
+  down projection's rows at their token positions without block padding, and gather the activation rows inside the
+  first grouped GEMM instead of keeping a gathered copy.
 - **Cross-rank reduction fused with the MoE GEMM / combine (#6)**, for tensor- and expert-parallel serving over
   PCIe or NVLink: all-reduce and reduce-scatter forms behind a communicator prepared once. Planned for the next
   release.
