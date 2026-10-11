@@ -177,7 +177,9 @@ GEMMs and the `[tokens, H]` result, for the route the layer takes at that token
 count on this device (the layer and the query read one host-side plan). Each
 tensor is charged as the caching allocator can charge it — 512-byte blocks, and up
 to 1 MiB more for a tensor above 1 MiB that a cached block serves without splitting
-— so the figure is an upper bound, tight to about 1 MiB per large tensor. It does not count the inputs,
+— so the figure is an upper bound, tight to about 1 MiB per large tensor. The gathered activation (with its
+scales, and the gate/up output when the FC1 is not fused) and the down-projection output are never live at the
+same time, so they share one allocation, which the figure counts once. It does not count the inputs,
 the weights, a `bias` or the library's persistent pools. The intermediates are
 freed when the call returns, so one reservation for the largest bucket a forward
 can carry covers every MoE layer of a model. Both layouts grow with the routed rows:

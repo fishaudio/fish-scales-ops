@@ -15,6 +15,7 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cstdlib>
+#include <optional>
 #include <torch/torch.h>
 
 #include <cuda_bf16.h>
@@ -676,13 +677,31 @@ std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x128_grouped_sm90(
 
 static inline int align_up4(int x) { return (x + 3) / 4 * 4; }
 
+// The result buffer of an op that takes an optional caller-owned output: the given tensor after checking that it is
+// exactly what the op would have allocated (CUDA, `dtype`, contiguous, `sizes`, on `like`'s device), or a new tensor.
+// A caller passes views of one region whose parts have disjoint lifetimes (moe_layer_fp8_sm90 shares one allocation
+// between the gathered activation and the down-projection output); the op itself never reads the buffer before it
+// writes it.
+static at::Tensor sm90_out_or_empty(std::optional<at::Tensor> const& out, at::IntArrayRef sizes, at::ScalarType dtype,
+    at::Tensor const& like, char const* op, char const* name)
+{
+    if (!out.has_value() || !out->defined())
+        return at::empty(sizes, like.options().dtype(dtype));
+    at::Tensor const& t = *out;
+    TORCH_CHECK(t.is_cuda() && t.device() == like.device(), op, ": ", name, " must be on ", like.device());
+    TORCH_CHECK(t.scalar_type() == dtype, op, ": ", name, " must be ", dtype, ", got ", t.scalar_type());
+    TORCH_CHECK(t.is_contiguous(), op, ": ", name, " must be contiguous");
+    TORCH_CHECK(t.sizes() == sizes, op, ": ", name, " must be ", sizes, ", got ", t.sizes());
+    return t;
+}
+
 // linear_fp8_grouped_contiguous: contiguous grouped GEMM on the expert-sorted
 // activation. a_fp8 [P_max, K], w_fp8 [G, N, K], sa = SFA ColMajor
 // [K/128, align(P_max,4)], sw = SFB [G, N/128, K/128],
 // sorted_expert_ids [P_max] (grouped_layout, -1 past the real length).
 // Returns D [P_max, N] bf16 in sorted order.
 at::Tensor linear_fp8_grouped_contiguous(at::Tensor a_fp8, at::Tensor w_fp8, at::Tensor sa, at::Tensor sw,
-    at::Tensor sorted_expert_ids, int64_t block_m, int64_t expected_m)
+    at::Tensor sorted_expert_ids, int64_t block_m, int64_t expected_m, std::optional<at::Tensor> out)
 {
     TORCH_CHECK(a_fp8.is_cuda() && a_fp8.dtype() == at::kFloat8_e4m3fn && a_fp8.dim() == 2,
         "a_fp8 must be CUDA float8_e4m3fn [P_max, K]");
@@ -703,7 +722,7 @@ at::Tensor linear_fp8_grouped_contiguous(at::Tensor a_fp8, at::Tensor w_fp8, at:
     TORCH_CHECK(K % 128 == 0 && N % 128 == 0, "N and K must be multiples of 128");
     TORCH_CHECK(block_m == 64, "H4a supports block_m = 64 only");
 
-    auto y = at::empty({P_max, N}, a_fp8.options().dtype(at::kBFloat16));
+    auto y = sm90_out_or_empty(out, {P_max, N}, at::kBFloat16, a_fp8, "linear_fp8_grouped_contiguous", "out");
     auto stream = at::cuda::getCurrentCUDAStream();
     auto err = detail::launch_sm90_fp8_grouped_contiguous_dispatch(
         reinterpret_cast<__nv_fp8_e4m3*>(a_fp8.data_ptr()),
@@ -814,7 +833,7 @@ std::tuple<at::Tensor, at::Tensor> linear_fp8_grouped_contiguous_swiglu(at::Tens
 // swap-AB B matrix and the weight the A matrix. sorted_expert_ids must be built
 // with padding = block_n.
 at::Tensor linear_fp8_grouped_contiguous_swapab(at::Tensor a_fp8, at::Tensor w_fp8, at::Tensor sa, at::Tensor sw,
-    at::Tensor sorted_expert_ids, int64_t block_n, int64_t expected_m)
+    at::Tensor sorted_expert_ids, int64_t block_n, int64_t expected_m, std::optional<at::Tensor> out)
 {
     TORCH_CHECK(a_fp8.is_cuda() && a_fp8.dtype() == at::kFloat8_e4m3fn && a_fp8.dim() == 2,
         "a_fp8 must be CUDA float8_e4m3fn [P_max, K]");
@@ -836,7 +855,7 @@ at::Tensor linear_fp8_grouped_contiguous_swapab(at::Tensor a_fp8, at::Tensor w_f
     TORCH_CHECK(block_n == 16 || block_n == 32 || block_n == 64,
         "swap-AB grouped GEMM: block_n must be 16, 32 or 64 (= the moe_build_sorted padding)");
 
-    auto y = at::empty({P_max, N}, a_fp8.options().dtype(at::kBFloat16));
+    auto y = sm90_out_or_empty(out, {P_max, N}, at::kBFloat16, a_fp8, "linear_fp8_grouped_contiguous_swapab", "out");
     auto stream = at::cuda::getCurrentCUDAStream();
     auto err = detail::launch_sm90_fp8_grouped_contiguous_swapab_dispatch(
         reinterpret_cast<__nv_fp8_e4m3*>(a_fp8.data_ptr()),
@@ -950,9 +969,11 @@ std::tuple<at::Tensor, at::Tensor> linear_fp8_grouped_contiguous_swapab_swiglu(a
 // [M, K] bf16, flat_to_sorted [R] (pair -> sorted row), p_max (output rows).
 // Iterates the R real pairs; padding rows of the output are left uninitialised
 // (the GroupedContiguous GEMM is row-independent and the combine reads only
-// real rows). Returns (x_q [P_max, K] fp8, sfa [K/128, align(P_max,4)] fp32).
+// real rows). Returns (x_q [P_max, K] fp8, sfa [K/128, align(P_max,4)] fp32); a given `x_q_out` / `sa_out` is written
+// and returned instead of a new tensor.
 std::tuple<at::Tensor, at::Tensor> quantize_1x128_sorted_gather_sm90(
-    at::Tensor x, at::Tensor flat_to_sorted, int64_t p_max, int64_t topk)
+    at::Tensor x, at::Tensor flat_to_sorted, int64_t p_max, int64_t topk, std::optional<at::Tensor> x_q_out,
+    std::optional<at::Tensor> sa_out)
 {
     TORCH_CHECK(x.is_cuda() && x.dtype() == at::kBFloat16 && x.dim() == 2 && x.is_contiguous(),
         "x must be contiguous CUDA bf16 [M, K]");
@@ -965,8 +986,8 @@ std::tuple<at::Tensor, at::Tensor> quantize_1x128_sorted_gather_sm90(
     int const sfa_ld = align_up4(P_max);
     TORCH_CHECK(K % 128 == 0, "K must be a multiple of 128");
 
-    auto x_q = at::empty({P_max, K}, x.options().dtype(at::kFloat8_e4m3fn));
-    auto sfa = at::empty({Kb, sfa_ld}, x.options().dtype(at::kFloat));
+    auto x_q = sm90_out_or_empty(x_q_out, {P_max, K}, at::kFloat8_e4m3fn, x, "quantize_1x128_sorted_gather_sm90", "x_q");
+    auto sfa = sm90_out_or_empty(sa_out, {Kb, sfa_ld}, at::kFloat, x, "quantize_1x128_sorted_gather_sm90", "sa");
     auto stream = at::cuda::getCurrentCUDAStream();
     detail::fp8bs_quantize_1x128_fp32_sorted_gather(
         reinterpret_cast<__nv_fp8_e4m3*>(x_q.data_ptr()),

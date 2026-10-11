@@ -36,10 +36,14 @@ std::tuple<at::Tensor, at::Tensor> quantize_1x128_grouped_gather_sm90(
     at::Tensor x, at::Tensor slot_of_flat, int64_t topk, int64_t num_groups, int64_t m_cap);
 std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x128_grouped_sm90(
     at::Tensor gu, at::Tensor slot_of_flat);
+// `out`, when given, is the bf16 [P_max, N] result buffer (a caller-owned view, e.g. of a region the caller shares
+// between buffers whose lifetimes do not overlap); the op writes it and returns it. Without it the op allocates.
 at::Tensor linear_fp8_grouped_contiguous(at::Tensor a_fp8, at::Tensor w_fp8, at::Tensor sa,
-    at::Tensor sw, at::Tensor sorted_expert_ids, int64_t block_m, int64_t expected_m);
+    at::Tensor sw, at::Tensor sorted_expert_ids, int64_t block_m, int64_t expected_m,
+    std::optional<at::Tensor> out);
 at::Tensor linear_fp8_grouped_contiguous_swapab(at::Tensor a_fp8, at::Tensor w_fp8, at::Tensor sa,
-    at::Tensor sw, at::Tensor sorted_expert_ids, int64_t block_n, int64_t expected_m);
+    at::Tensor sw, at::Tensor sorted_expert_ids, int64_t block_n, int64_t expected_m,
+    std::optional<at::Tensor> out);
 at::Tensor linear_fp8_grouped_contiguous_swapab_pair(at::Tensor a_fp8, at::Tensor w_fp8, at::Tensor sa,
     at::Tensor sw, at::Tensor sorted_expert_ids, int64_t block_n, int64_t expected_m);
 std::tuple<at::Tensor, at::Tensor> linear_fp8_grouped_contiguous_swapab_swiglu(at::Tensor a_fp8, at::Tensor w_fp8,
@@ -48,8 +52,11 @@ at::Tensor linear_fp8_grouped_contiguous_2wg(at::Tensor a_fp8, at::Tensor w_fp8,
     at::Tensor sw, at::Tensor sorted_expert_ids, int64_t block_m, int64_t expected_m);
 std::tuple<at::Tensor, at::Tensor> linear_fp8_grouped_contiguous_swiglu(at::Tensor a_fp8, at::Tensor w_fp8,
     at::Tensor sa, at::Tensor sw, at::Tensor sorted_expert_ids, int64_t block_m, int64_t expected_m);
+// `x_q` and `sa`, when given, are the fp8 [P_max, K] and fp32 [K/128, align4(P_max)] result buffers (caller-owned;
+// each may be given on its own); the op writes and returns them. Without them the op allocates.
 std::tuple<at::Tensor, at::Tensor> quantize_1x128_sorted_gather_sm90(
-    at::Tensor x, at::Tensor flat_to_sorted, int64_t p_max, int64_t topk);
+    at::Tensor x, at::Tensor flat_to_sorted, int64_t p_max, int64_t topk, std::optional<at::Tensor> x_q,
+    std::optional<at::Tensor> sa);
 std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x128_sorted_sm90(
     at::Tensor gu, at::Tensor flat_to_sorted);
 // The compiler of the sm_90 deep_gemm JIT in this process: "NVRTC 13.0 (<path>)", or "nvcc <path>".
@@ -156,9 +163,11 @@ TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
     m.def("silu_chunk_mul_quantize_1x128_grouped_sm90(Tensor gu, Tensor slot_of_flat) "
           "-> (Tensor, Tensor)");
     m.def("linear_fp8_grouped_contiguous(Tensor a_fp8, Tensor w_fp8, Tensor sa, Tensor sw, "
-                                         "Tensor sorted_expert_ids, int block_m, int expected_m) -> Tensor");
+                                         "Tensor sorted_expert_ids, int block_m, int expected_m, "
+                                         "Tensor(a!)? out=None) -> Tensor");
     m.def("linear_fp8_grouped_contiguous_swapab(Tensor a_fp8, Tensor w_fp8, Tensor sa, Tensor sw, "
-                                         "Tensor sorted_expert_ids, int block_n, int expected_m) -> Tensor");
+                                         "Tensor sorted_expert_ids, int block_n, int expected_m, "
+                                         "Tensor(a!)? out=None) -> Tensor");
     m.def("linear_fp8_grouped_contiguous_swapab_pair(Tensor a_fp8, Tensor w_fp8, Tensor sa, Tensor sw, "
                                          "Tensor sorted_expert_ids, int block_n, int expected_m) -> Tensor");
     m.def("linear_fp8_grouped_contiguous_swapab_swiglu(Tensor a_fp8, Tensor w_fp8, Tensor sa, Tensor sw, "
@@ -167,8 +176,8 @@ TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
                                              "Tensor sorted_expert_ids, int block_m, int expected_m) -> Tensor");
     m.def("linear_fp8_grouped_contiguous_swiglu(Tensor a_fp8, Tensor w_fp8, Tensor sa, Tensor sw, "
           "Tensor sorted_expert_ids, int block_m, int expected_m) -> (Tensor, Tensor)");
-    m.def("quantize_1x128_sorted_gather_sm90(Tensor x, Tensor flat_to_sorted, int p_max, int topk) "
-          "-> (Tensor, Tensor)");
+    m.def("quantize_1x128_sorted_gather_sm90(Tensor x, Tensor flat_to_sorted, int p_max, int topk, "
+          "Tensor(a!)? x_q=None, Tensor(b!)? sa=None) -> (Tensor, Tensor)");
     m.def("silu_chunk_mul_quantize_1x128_sorted_sm90(Tensor gu, Tensor flat_to_sorted) "
           "-> (Tensor, Tensor)");
     // A pure host-side query (no tensor argument), so it carries its own catch-all kernel, like the route queries

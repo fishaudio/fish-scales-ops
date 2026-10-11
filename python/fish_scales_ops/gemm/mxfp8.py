@@ -1588,6 +1588,43 @@ def _alloc_bytes(nbytes: int) -> int:
     return r + (1 << 20) if r > (1 << 20) else r
 
 
+# Alignment of every view's byte offset inside a shared intermediate region: whole 1 KiB units, more than TMA's
+# 16-byte global-address rule and the 512-byte alignment the caching allocator gives a tensor of its own.
+_REGION_ALIGN = 1024
+
+
+def _align_up(n: int, a: int) -> int:
+    return (n + a - 1) // a * a
+
+
+@dataclasses.dataclass(frozen=True)
+class _CompactRegion:
+    """The byte layout of the one allocation a compact-layout call shares between the intermediates whose lifetimes
+    do not overlap. The gathered FP8 activation ``hq`` sits at offset 0 and its scale words ``sh`` at ``sh_off``
+    (both read for the last time by the FC1); the bf16 gate/up output ``gu`` of the unfused FC1 follows at
+    ``gu_off`` (-1 with the fused FC1; read for the last time by the SwiGLU requantize); the bf16 down-projection
+    output ``dn`` is born at the FC2, after all of them are dead, and takes the region from offset 0. ``total`` is
+    the larger of the two uses. `_moe_layer_mxfp8_compact` carves its views from this layout and
+    `_mxfp8_plan_bytes_compact` charges ``total`` once, so the figure and the allocation cannot drift apart."""
+
+    sh_off: int
+    gu_off: int
+    total: int
+
+
+def _compact_region(plan: _Mxfp8LayerPlan, hidden: int, n_w: int) -> _CompactRegion:
+    r = plan.rows
+    sh_off = _align_up(r * hidden, _REGION_ALIGN)
+    end = sh_off + 4 * r * (hidden // 128)            # one int32 word per row per 128 columns, on both arches
+    gu_off = -1
+    if not plan.fused_fc1:
+        gu_off = _align_up(end, _REGION_ALIGN)
+        end = gu_off + 2 * r * n_w
+    # The fused combine (sm_120/121) adds its rows into the output and stores no down-projection output.
+    dn_bytes = 0 if plan.scatter else 2 * r * hidden
+    return _CompactRegion(sh_off, gu_off, max(end, dn_bytes))
+
+
 def _mxfp8_plan_bytes(plan: _Mxfp8LayerPlan, m: int, topk: int, num_experts: int,
                       hidden: int, inter: int) -> int:
     """Device bytes the tensors of one call under ``plan`` occupy at once. Every
@@ -1622,9 +1659,11 @@ def _mxfp8_plan_bytes_compact(plan: _Mxfp8LayerPlan, m: int, topk: int, num_expe
                               hidden: int, inter: int) -> int:
     """Device bytes the tensors of one compact-layout call under ``plan`` occupy at once:
     every tensor `_moe_layer_mxfp8_compact` allocates, the routing op's outputs included,
-    stays referenced until the call returns, so the peak is their sum. The intermediates
-    have ``plan.rows`` rows whatever the routing, which is what makes the figure exact
-    for a host-static bucket."""
+    stays referenced until the call returns, so the peak is their sum. The gathered
+    activation, its scales, the unfused FC1's gate/up output and the down-projection
+    output are views of one region (`_compact_region`), charged once at its size. The
+    intermediates have ``plan.rows`` rows whatever the routing, which is what makes the
+    figure exact for a host-static bucket."""
     g, r = num_experts, plan.rows
     a = _alloc_bytes
     n_ps = int(plan.want_ps_fc1) + int(plan.want_ps_fc2)
@@ -1639,12 +1678,9 @@ def _mxfp8_plan_bytes_compact(plan: _Mxfp8LayerPlan, m: int, topk: int, num_expe
         total += a(8 * 3 * g * n_ps)                          # per-call A / A-scale / D pointers
     if plan.scatter:
         total += 2 * a(4 * plan.num_blocks * 128)             # row_map, weight_of_slot
-    total += a(r * hidden) + a(4 * r * (hidden // 128))       # gathered FP8 activation + scales
-    if not plan.fused_fc1:
-        total += a(2 * r * 2 * inter)                         # bf16 gate/up output
+    # One region: gathered FP8 activation + scales [+ bf16 gate/up output], then the bf16 down-projection output.
+    total += a(_compact_region(plan, hidden, 2 * inter).total)
     total += a(r * inter) + a(4 * r * (inter // 128))         # FP8 SwiGLU output + scales
-    if not plan.scatter:
-        total += a(2 * r * hidden)                            # bf16 down-projection output
     total += a(2 * m * hidden)                                # the [M, HIDDEN] result
     return total
 
@@ -1674,6 +1710,9 @@ def moe_layer_transient_bytes_mxfp8(
     1 MiB that a cached block serves unsplit), so it is an upper bound on what the
     call occupies; it does not count the inputs, the weights or the library's
     persistent pools (the sm_100/103 argument arena, which holds two blocks per layer).
+    On the compact layout the intermediates whose lifetimes do not overlap (the gathered
+    activation and its scales, the unfused FC1's gate/up output, and the down-projection
+    output) share one allocation, which is counted once at its size.
 
     The layer's intermediates are compact: each local expert holds its routed rows in
     whole 128-row blocks, so the cost grows with the routed rows,
@@ -1870,6 +1909,16 @@ def _moe_layer_mxfp8_compact(
     decisions (routes, the fused FC1, the fused combine, the tile hints) are the plan's,
     asked under the compact layout (``compact=True`` on sm_100/103, where the compact slot
     route has its own rule); everything else is decided exactly as on the masked slab.
+
+    Buffers whose lifetimes do not overlap share one allocation (`_compact_region`): the
+    gathered activation and its scales are read for the last time by the FC1, the unfused
+    FC1's gate/up output by the SwiGLU requantize, and the down-projection output is first
+    written by the FC2, so the FC2 stores into the same bytes. The SwiGLU output and the
+    result stay separate (each is live while one of the others is). This is safe under
+    programmatic dependent launch because every FC2 writes its output only after its
+    ``griddepcontrol.wait`` (which returns once the preceding kernel has completed), and
+    the requantize between the unfused FC1 and the FC2 waits in every CTA before it exits,
+    so the FC2's wait also covers the FC1.
     """
     ops = torch.ops.fish_scales_ops
     m = int(hidden.shape[0])
@@ -1883,19 +1932,22 @@ def _moe_layer_mxfp8_compact(
     sm100 = sm_major() == 10
     fp8 = torch.float8_e4m3fn
 
-    def scales(k: int) -> torch.Tensor:
+    def scale_shape(k: int) -> tuple[int, ...]:
         # The scale words of an R-row one-group slab, as the gather / requantize kernels
         # write them: sm_100/103 one Sm1xx atom per 128 rows, sm_120/121 K-major words.
-        if sm100:
-            return torch.empty(1, r * (k // 128), device=dev, dtype=torch.int32)
-        return torch.empty(1, k // 128, r, device=dev, dtype=torch.int32)
+        return (1, r * (k // 128)) if sm100 else (1, k // 128, r)
 
-    hq = torch.empty(1, r, hsz, device=dev, dtype=fp8)
-    sh = scales(hsz)
-    gu = None if plan.fused_fc1 else torch.empty(1, r, n_w, device=dev, dtype=torch.bfloat16)
+    # One region for the buffers whose lifetimes do not overlap (see the docstring): hq, sh
+    # and the unfused FC1's gu at the front, dn from offset 0 once they are dead.
+    reg = _compact_region(plan, hsz, n_w)
+    region = torch.empty(reg.total, device=dev, dtype=torch.uint8)
+    hq = region[: r * hsz].view(fp8).view(1, r, hsz)
+    sh = region[reg.sh_off: reg.sh_off + 4 * r * (hsz // 128)].view(torch.int32).view(scale_shape(hsz))
+    gu = None if plan.fused_fc1 else (
+        region[reg.gu_off: reg.gu_off + 2 * r * n_w].view(torch.bfloat16).view(1, r, n_w))
     dq = torch.empty(1, r, inter, device=dev, dtype=fp8)
-    sd = scales(inter)
-    dn = None if plan.scatter else torch.empty(1, r, hsz, device=dev, dtype=torch.bfloat16)
+    sd = torch.empty(scale_shape(inter), device=dev, dtype=torch.int32)
+    dn = None if plan.scatter else region[: 2 * r * hsz].view(torch.bfloat16).view(1, r, hsz)
 
     # The sm_100/103 pointer-array GEMMs (the plan asks for their problem shapes) take
     # per-call pointer arrays: A data, A scales (one atom of 4 * K bytes per 128-row
