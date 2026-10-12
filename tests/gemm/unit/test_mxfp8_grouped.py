@@ -169,8 +169,8 @@ def test_gather_quant_roundtrip(M: int, G: int, topk: int, K: int) -> None:
 # times. The token-scatter kernel does that work once per token and stores the
 # finished FP8 word and scale word to each of the topk destinations. Both are
 # selected by `FSO_GATHER_QUANT_ONCE` (0 / 1) or, unset, by the launcher's
-# rule, and the sm_100/103 scale layout is the only layout that offers the
-# second one.
+# rule, on both Blackwell scale layouts (sm_100/103 atoms; sm_120/121 K-major
+# words since 0.2.1).
 #
 # The two forms perform exactly the same arithmetic on exactly the same inputs,
 # so the contract is stricter than a cosine: every byte of `a_fp8` and every
@@ -2252,7 +2252,7 @@ def main() -> int:
     test_gather_quant_roundtrip(M=96, G=8, topk=4, K=768)      # m_cap=96 < 128
     test_gather_quant_roundtrip(M=256, G=256, topk=8, K=512)   # m_cap=256 > 128
 
-    if major == 10:
+    if major in (10, 12):
         print("== gather-quant pair-space vs token-scatter, bit identity "
               "(subprocess per knob setting) ==")
         run_quant_once_cases()

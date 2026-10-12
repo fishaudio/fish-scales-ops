@@ -862,6 +862,51 @@ inline void gemm_dispatch_sm120_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b
         // to (160,128,2) by 5–15% (smem 95KB caps occupancy at 1/SM and
         // bigger M-tile doesn't amortize), so it never appears in the
         // cascade.
+        //
+        // P3 (2026-10-11, run fso_0.2.1_20261010/P3, RTX 5090): the Stream-K band above M = 128. k_split > 1
+        // here means the chooser found a narrow-N, long-K shape (tn < 32, K >= 9728) whose (128,128) tiles
+        // under-fill the machine: the Family A `down` (N=2560, K=9728) at M in (128, 1024). The chooser's
+        // split (K / 2048, capped at 4) and the tiles the rules below would pick -- (64,128,2) at M < 512,
+        // E30's (128,64,2) at M >= 512 -- ran the K slices over more rounds than the machine needs, and those
+        // smaller tiles run at about two thirds of the (128,128,2) tile's per-SM rate on this shape. This
+        // branch keeps the (128,128,2) tile and picks the split k in [1, min(4, K / 2048)] that minimises
+        // the critical path in full-K tile times, ceil(tiles / floor(SMs / k)) / k (the launcher gives each
+        // slice floor(SMs / k) CTAs), the smaller k on a tie because every slice adds a partial and the
+        // reduce. Per GEMM, cold weights, graph median (µs, cascade before -> this rule):
+        //   M=256 (64,128,2)k4 36.5 -> k4 29.0   M=384 (64,128,2)k4 52.3 -> k2 46.8
+        //   M=512 (128,64,2)k4 68.3 -> k2 50.9   M=640 (128,128,2)k4 84.6 -> k3 70.1
+        //   M=768 (128,128,2)k4 77.9 -> k4 77.7
+        // and the MLP block (bench_qwen3_4b_mlp_forward.py, 3 alternating passes) M=256 97.2 -> 88.1, M=512
+        // 186.7 -> 166.8, every other M within 0.1 %. M >= 1024 never reaches this branch (the chooser's 90 %
+        // saturation gate returns 1), and no other dense shape of the tables does (K >= 9728 with tn < 32).
+        if (k_split > 1)
+        {
+            int const sms = std::max(1, num_device_sms);
+            int const tiles = ((static_cast<int>(shape_m) + 127) / 128) * tiles_n;
+            int const max_k = std::min(4, std::max(1, static_cast<int>(shape_k) / 2048));
+            int best_k = 1;
+            int best_rounds = (tiles + sms - 1) / sms;
+            for (int k = 2; k <= max_k; ++k)
+            {
+                int const slice_ctas = std::max(1, sms / k);
+                int const rounds = (tiles + slice_ctas - 1) / slice_ctas;
+                if (rounds * best_k < best_rounds * k) // rounds / k < best_rounds / best_k
+                {
+                    best_k = k;
+                    best_rounds = rounds;
+                }
+            }
+            if (best_k <= 1)
+                launch_sm120_mxfp8_gemm_kernel<128, 128, 2>(mat_a, ld_a, stride, mat_b, ld_b, stride, mat_d, ld_d,
+                    stride, scales_a, stride, scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream,
+                    num_device_sms);
+            else
+                launch_sm120_mxfp8_streamk_gemm<128, 128, 2>(mat_a, static_cast<int>(ld_a), mat_b,
+                    static_cast<int>(ld_b), mat_d, static_cast<int>(ld_d), static_cast<int>(shape_m),
+                    static_cast<int>(shape_n), static_cast<int>(shape_k), scales_a, scales_b, best_k,
+                    num_device_sms, stream);
+            return;
+        }
         if (tiles_n >= 96)
         {
             // E29 (2026-05-28): TileM=160 only when M ≥ 2048 — at smaller M
@@ -1192,6 +1237,20 @@ inline void gemm_dispatch_sm120_mxfp8_grouped(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m
         // gate_up (K=2048) and the Family B down (K=768, 6 k-tiles) are outside
         // the gate.
         bool const very_short_k = ((shape_k + 127) / 128) <= 4;
+        // P3 (2026-10-11, run fso_0.2.1_20261010/P3, RTX 5090 card 22): the Family C geometry (FC1 N = 1024,
+        // i.e. tiles_n <= 8, K = 2048; FC2 very short K) at em in (20, 40] takes the two-stage 2-CTA/SM
+        // (16,64,2) instance for both GEMMs instead of (16,64,4) 2-CTA/SM (em <= 32) or (32,128,4) (em > 32).
+        // Decided on the routed-layer cell (both GEMMs forced, 2 passes, us graph median, cascade -> this rule):
+        //   em=22 (M=704) 573.0 -> 569.9  em=24 (M=768) 572.9 -> 570.6  em=28 (M=896) 585.7 -> 583.0
+        //   em=30 (M=960) 590.8 -> 584.8  em=32 (M=1024) 596.0 -> 588.8  em=36 (M=1152) 624.8 -> 610.6
+        //   em=40 (M=1280) 646.2 -> 629.1
+        // and outside the band it loses or ties: em=16 (M=512) 566.0 -> 566.4, em=48 (M=1536) 658.8 -> 674.8,
+        // em=64 (M=2048) 665.1 -> 841.2. It is checked before the v5 rule below, which
+        // therefore keeps em 16..20 of the FC2. Either GEMM alone gives about half of it at em=32 (FC1 -3.5 us, FC2
+        // -3.2 us). The Family B GEMMs (FC1 N = 1536, tiles_n = 12; FC2 K = 768, a partial span) are outside the
+        // gate: forced the same way they lose at em=32 (M=512 435.3 -> 438.7) and em=40 (436.3 -> 450.4).
+        if (em > 20 && em <= 40 && !partial_span && (very_short_k || tiles_n <= 8))
+            DISPATCH_GROUPED_TILE_MX_MB2(16, 64, 2);
         if (very_short_k && em >= 16 && em <= 24)
             DISPATCH_GROUPED_TILE_MX_MB2(16, 64, 4);
         if (em > 128)

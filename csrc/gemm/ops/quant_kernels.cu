@@ -72,6 +72,25 @@ static inline int fso_device_sm_count()
     return v;
 }
 
+// Compute capability major of the current device, queried once (same source and timing as fso_device_sm_count). The
+// token-scatter gather-quantize kernels are compiled for compute capability 10.0 and above only, so the launcher asks
+// this before it selects them.
+static inline int fso_device_cc_major()
+{
+    static int const v = []
+    {
+        int dev = 0;
+        int major = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess
+            && cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess)
+        {
+            return major;
+        }
+        return 0;
+    }();
+    return v;
+}
+
 // One wave of a glue kernel instantiation: the CTAs of it that are resident on the device at once, i.e. the SM count
 // times its occupancy at `kThreads` threads and no dynamic shared memory (queried once per instantiation).
 template <auto kKernel, int kThreads>
@@ -1455,10 +1474,12 @@ __global__ void __launch_bounds__(256, FSO_GLUE_MIN_CTAS_256) fp8bs_quantize_1x3
 // loads can be hoisted above the arithmetic and the store loop fully unrolled;
 // TOPK_STATIC == 0 keeps the runtime loop for any other topk.
 //
-// Architecture. This is an sm_100/103 path: the launcher only selects it when
-// the sm_100 scale-factor layout was requested, and the body below is compiled
-// out on every other architecture so the sm_90 and sm_120 SASS passes emit an
-// empty stub (the same technique the sm_90 fatbin uses for sm_120-only code).
+// Architecture. This is an MXFP8 path of the Blackwell arches: sm_100/103 with the
+// Sm1xx atom scale layout (SM1XX_SF) and, since 0.2.1 (run fso_0.2.1_20261010/P3),
+// sm_120/121 with the K-major word layout. The launcher selects it only on a
+// device of compute capability 10 or above, and the body below is compiled out
+// of the sm_90 SASS pass, which emits an empty stub (the same technique the
+// sm_90 fatbin uses for sm_120-only code).
 template <bool USE_UE8M0, int K_BLOCKS_PER_WARP, bool SM1XX_SF, int TOPK_STATIC>
 __global__ void fp8bs_quantize_1x32_packed_grouped_scatter_kernel(
     __nv_fp8_e4m3* __restrict__ out_fp8, int32_t* __restrict__ out_packed,
@@ -1469,7 +1490,7 @@ __global__ void fp8bs_quantize_1x32_packed_grouped_scatter_kernel(
         "K_BLOCKS_PER_WARP must be 4 (1 int32/warp) or 8 (2 int32/warp).");
     static_assert(TOPK_STATIC >= 0, "TOPK_STATIC must be 0 (runtime) or a positive topk.");
 
-#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200)
+#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 1000)
     constexpr int kVec = kMxFp8VecSize;
     constexpr int kIterKBlocks = 4;
     constexpr int kNumIters = K_BLOCKS_PER_WARP / kIterKBlocks;
@@ -1608,7 +1629,7 @@ fp8bs_quantize_1x32_packed_grouped_scatter_stride_kernel(
         "K_BLOCKS_PER_WARP must be 4 (1 int32/warp) or 8 (2 int32/warp).");
     static_assert(TOPK_STATIC >= 0, "TOPK_STATIC must be 0 (runtime) or a positive topk.");
 
-#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200)
+#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 1000)
     constexpr int kVec = kMxFp8VecSize;
     constexpr int kIterKBlocks = 4;
     constexpr int kNumIters = K_BLOCKS_PER_WARP / kIterKBlocks;
@@ -2085,10 +2106,13 @@ static inline bool fso_gather_quant_use_scatter(int num_tokens, int topk, int k_
 // Two kernels implement this call and produce byte-identical output on every
 // defined row: the pair-space kernel (one warp per routed pair) and the
 // token-scatter kernel (one warp per token, result scattered to the topk
-// slots). The scatter form is offered on the sm_100/103 layout only and is
-// selected by fso_gather_quant_use_scatter; sm_120 and sm_90 always take the
-// pair-space kernel, exactly as before. Applying the same idea on sm_120 is a
-// separate exercise: the arch is first-class, it is deferred, not dismissed.
+// slots). The scatter form is offered on both Blackwell scale layouts (sm_100/103
+// atoms and, since 0.2.1, the sm_120/121 K-major words) and is selected by
+// fso_gather_quant_use_scatter; sm_90 (no MXFP8) never takes it. On sm_120/121 it is
+// taken only in its one-item form (see the launch below). On the RTX 5090 the Family C
+// routed layer gains 0.5 / 0.8 / 1.4 / 1.2 % at M = 256 / 512 / 1024 / 2048 from it
+// (layer cell, 3 passes against FSO_GATHER_QUANT_ONCE=0, run fso_0.2.1_20261010/P3);
+// the output is byte-identical (test_mxfp8_grouped's quant-once cases, the layer dumps).
 void fp8bs_quantize_1x32_packed_grouped_gather(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
     __nv_bfloat16 const* x, int32_t const* slot_of_flat, int n_pairs, int topk,
     int m_cap, int K, cudaStream_t stream, bool use_ue8m0, bool sm1xx_sf_layout)
@@ -2099,7 +2123,9 @@ void fp8bs_quantize_1x32_packed_grouped_gather(__nv_fp8_e4m3* x_q, int32_t* pack
     auto launch = [&](auto kBlocksPerWarpT, auto ue8m0T, auto sfAtomT) {
         constexpr int kBlocksPerWarp = decltype(kBlocksPerWarpT)::value;
         int const k_groups = K / (kMxFp8VecSize * kBlocksPerWarp);
-        // Token-scatter form, sm_100/103 scale layout only. The pair space is
+        // Token-scatter form, both Blackwell scale layouts (the kernel's body is
+        // compiled for compute capability 10.0 and above only, hence the device
+        // check). The pair space is
         // dense and token-major (n_pairs = num_tokens * topk), which is what
         // lets a token's topk destinations be read as one contiguous run of
         // slot_of_flat; if a caller ever passes a ragged pair space the
@@ -2109,28 +2135,51 @@ void fp8bs_quantize_1x32_packed_grouped_gather(__nv_fp8_e4m3* x_q, int32_t* pack
         // beyond; the token-scatter kernel switches already beyond kFsoGlueWaves waves, to the grid-stride form that
         // releases the FC1 GEMM at exit (see that kernel).
         bool const pdl = fso_pdl_enabled();
-        if constexpr (decltype(sfAtomT)::value) {
+        {
+            constexpr bool kSm1xxSf = decltype(sfAtomT)::value;
             int const num_tokens = topk > 0 ? n_pairs / topk : 0;
             bool const dense = topk > 0 && num_tokens * topk == n_pairs;
-            if (dense && fso_gather_quant_use_scatter(num_tokens, topk, k_groups, kWarpsPerBlock)) {
+            if (dense && fso_device_cc_major() >= 10
+                && fso_gather_quant_use_scatter(num_tokens, topk, k_groups, kWarpsPerBlock)) {
                 int64_t const warps = static_cast<int64_t>(num_tokens) * k_groups;
                 int64_t const ctas = (warps + kWarpsPerBlock - 1) / kWarpsPerBlock;
-                if (topk == 8 && fso_gather_quant_topk_static()) {
-                    fso_glue_launch<fp8bs_quantize_1x32_packed_grouped_scatter_kernel<decltype(ue8m0T)::value,
-                                        kBlocksPerWarp, true, 8>,
-                        fp8bs_quantize_1x32_packed_grouped_scatter_stride_kernel<decltype(ue8m0T)::value,
-                            kBlocksPerWarp, true, 8>,
-                        kThreadsPerBlock, kFsoGlueWaves>(ctas, stream, pdl, x_q, packed_scales, x, slot_of_flat,
-                        num_tokens, topk, m_cap, K);
-                } else {
-                    fso_glue_launch<fp8bs_quantize_1x32_packed_grouped_scatter_kernel<decltype(ue8m0T)::value,
-                                        kBlocksPerWarp, true, 0>,
-                        fp8bs_quantize_1x32_packed_grouped_scatter_stride_kernel<decltype(ue8m0T)::value,
-                            kBlocksPerWarp, true, 0>,
-                        kThreadsPerBlock, kFsoGlueWaves>(ctas, stream, pdl, x_q, packed_scales, x, slot_of_flat,
-                        num_tokens, topk, m_cap, K);
+                // The sm_120/121 (K-major) layout takes the token-scatter form in its one-item-per-warp kernel
+                // only, within kFsoGlueFlatWaves waves of it (the bound the pair-space kernel's one-item form has),
+                // and the pair-space kernel keeps any larger call. Every gather launch on this arch therefore
+                // releases its dependent at CTA start, as it did before 0.2.1. Run fso_0.2.1_20261010/P3 (RTX 5090,
+                // f0f0364 base, 2 alternating passes, M = 4096 / 8192): the scatter's grid-stride form, which
+                // releases the FC1 only at exit (the sm_100/103 design, see that kernel), cost the Family C routed +
+                // shared block +1.4 % at M = 8192; the one-item form up to 16 waves gives routed layer C -2.3 / -0.8 %,
+                // B -3.0 / -2.3 %, one expert-parallel rank C -5.8 / -5.8 %, B -5.2 / -5.8 %, and the C block -1.7 /
+                // +0.5 %. FSO_GATHER_QUANT_ONCE=1 forces the token-scatter form at every size (A/B knob).
+                bool const one_item_only = !kSm1xxSf && fso_gather_quant_once_mode() != 1;
+                bool const topk8 = topk == 8 && fso_gather_quant_topk_static();
+                int64_t const one_item_cap = kFsoGlueFlatWaves
+                    * (topk8 ? fso_glue_wave<fp8bs_quantize_1x32_packed_grouped_scatter_kernel<
+                                                 decltype(ue8m0T)::value, kBlocksPerWarp, kSm1xxSf, 8>,
+                                   kThreadsPerBlock>()
+                             : fso_glue_wave<fp8bs_quantize_1x32_packed_grouped_scatter_kernel<
+                                                 decltype(ue8m0T)::value, kBlocksPerWarp, kSm1xxSf, 0>,
+                                   kThreadsPerBlock>());
+                if (!one_item_only || ctas <= one_item_cap) {
+                    constexpr int kScatterFlatWaves = kSm1xxSf ? kFsoGlueWaves : kFsoGlueFlatWaves;
+                    if (topk8) {
+                        fso_glue_launch<fp8bs_quantize_1x32_packed_grouped_scatter_kernel<decltype(ue8m0T)::value,
+                                            kBlocksPerWarp, kSm1xxSf, 8>,
+                            fp8bs_quantize_1x32_packed_grouped_scatter_stride_kernel<decltype(ue8m0T)::value,
+                                kBlocksPerWarp, kSm1xxSf, 8>,
+                            kThreadsPerBlock, kScatterFlatWaves>(ctas, stream, pdl, x_q, packed_scales, x,
+                            slot_of_flat, num_tokens, topk, m_cap, K);
+                    } else {
+                        fso_glue_launch<fp8bs_quantize_1x32_packed_grouped_scatter_kernel<decltype(ue8m0T)::value,
+                                            kBlocksPerWarp, kSm1xxSf, 0>,
+                            fp8bs_quantize_1x32_packed_grouped_scatter_stride_kernel<decltype(ue8m0T)::value,
+                                kBlocksPerWarp, kSm1xxSf, 0>,
+                            kThreadsPerBlock, kScatterFlatWaves>(ctas, stream, pdl, x_q, packed_scales, x,
+                            slot_of_flat, num_tokens, topk, m_cap, K);
+                    }
+                    return;
                 }
-                return;
             }
         }
         int64_t const total_warps = static_cast<int64_t>(n_pairs) * k_groups;
