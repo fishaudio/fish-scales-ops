@@ -10,10 +10,15 @@ Performance figures are in `docs/perf/`, not here.
   sm_120/sm_121 `fso.moe.layer` no longer gives every local expert `align(tokens, 4)` rows of every intermediate (the
   masked slab). Each expert now holds its routed rows in whole 128-row blocks of one compact buffer, so a call needs
   memory for `tokens * topk` rows plus at most 127 rows per expert that holds one. `fso.moe.transient_bytes` returns
-  the new, much smaller figure (Family C at 8192 tokens: about 0.65 GiB per call on a B300 instead of 13.2 GiB, and
-  about 0.54 GiB per RTX 5090 rank with 128 local experts instead of 6.6 GiB). The layout is the same at every
-  number of tokens, the layer's outputs are bit-identical to 0.2.0's, and `FSO_MOE_COMPACT=0` restores the masked
-  slab as an A/B arm.
+  the new, much smaller figure (Family C at 8192 tokens: about 0.46 GiB per call on a B300 instead of 13.2 GiB, and
+  about 0.39 GiB per RTX 5090 rank with 128 local experts instead of 6.6 GiB, with the shared allocation below).
+  The layout is the same at every number of tokens, the layer's outputs are bit-identical to 0.2.0's, and
+  `FSO_MOE_COMPACT=0` restores the masked slab as an A/B arm.
+- **One allocation for the gathered activation and the down-projection output, on every architecture.** The two
+  buffers are never alive at the same time within a call, so the layer now places them in one region, and
+  `fso.moe.transient_bytes` charges it once: about 30 % less per call (H200 Family C at 8192 tokens: 0.55 → 0.39
+  GiB). A chain of layer calls captured into one graph pool no longer keeps an extra copy of the largest
+  intermediate through allocator splitting. Outputs are unchanged.
 - **No routing scratch, no argument-arena abort (#7).** The compact layout's routing op keeps no device state between
   calls, so the 0.2.0 routing builder's limit of 16 graph captures per host thread (after which it fell back to the
   single-CTA builder) no longer applies to `fso.moe.layer`. On sm_100/sm_103 the grouped GEMMs take their per-call
@@ -41,8 +46,10 @@ Performance figures are in `docs/perf/`, not here.
   `mxfp8_grouped_problem_shapes_consumed`, `mxfp8_grouped_swiglu_fused_route`) take two new keywords:
   `compact=False`, which a caller composing the compact ops sets to `True` (without it they answer for the masked
   ops as in 0.2.0), and `expected_m=0`, the expected rows per expert `ceil(M * topk / G)` that the compact rule
-  bounds (passed as the compact ops receive it, the queries return the route those ops take). The contracts are in
-  `docs/api/compat.md`.
+  bounds (passed as the compact ops receive it, the queries return the route those ops take). On sm_90 the
+  expert-sorted gather-quantize and the grouped FC2 GEMMs (`quantize_1x128_sorted_gather_sm90`,
+  `linear_fp8_grouped_contiguous[_swapab]`) take optional output tensors, so a caller can place them in memory of its
+  own. The contracts are in `docs/api/compat.md`.
 
 ### Faster
 
@@ -52,6 +59,14 @@ Performance figures are in `docs/perf/`, not here.
   rows and writes only the routed rows. Both families are faster from 16 tokens per call up to that bound, under
   uniform, skewed and padded routing alike, and the layer no longer runs into the card's power cap there. fso is now level with or faster than
   TensorRT-LLM's trtllm-gen block-FP8 MoE at every batch size of the tables.
+- **B300 (sm_100/sm_103) dense linear.** The activation quantizer reads and writes 16 bytes per thread, and the
+  quantizer and the dense GEMMs launch with PDL; small-batch tile and split-K choices were corrected. The Family A
+  MLP block is faster at every batch size and now faster than sglang's block-FP8 (DeepGEMM) linear at every batch
+  size of the tables.
+- **RTX 5090 (sm_120/sm_121).** The dense down projection picks its Stream-K split by the rounds each slice runs
+  (the MLP block is faster from 256 to 768 tokens), the MoE gather-quantize quantizes each token once and writes its
+  top-k copies, and the Qwen3.5-35B-A3B experts take a better grouped tile around 1024 tokens; the MoE layer is
+  faster from 256 tokens up.
 - **H200 (sm_90) MoE layer and block.** The grouped GEMMs and the expert-sorted gather-quantize now launch with PDL,
   so each starts while its predecessor finishes; the layer is faster at decode and in prefill.
 
