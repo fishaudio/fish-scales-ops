@@ -299,6 +299,14 @@ def test_routing() -> None:
     assert _sm100_smm.wave_tile_owns(64, 6144) is True
     assert _sm100_smm.wave_tile_owns(64, 2560) is True     # 2-SM (256, 64) tile
     assert _sm100_smm.wave_tile_owns(48, 2560) is False    # below its M floor
+    # The C++ cascade's wave rule takes the 64-wide pick up to M = 256, in its 2-SM (256, 64) form while one
+    # 256-row cluster row covers M; above that tier 1 keeps the cell (2026-10-12).
+    assert _sm100_smm.wave_tile_owns(160, 2560) is True    # 2-SM (256, 64): one cluster row covers M
+    assert _sm100_smm.wave_tile_owns(256, 2560) is True
+    assert _sm100_smm.wave_tile_owns(257, 2560) is False   # two cluster rows: tier 1 again
+    assert _sm100_smm.wave_tile_owns(160, 2048) is False   # 64 CTAs leave half the SMs idle
+    assert _sm100_smm.should_route(160, 2560, 9728) is False
+    assert _sm100_smm.should_route(257, 2560, 9728) is True
     assert _sm100_dsl.pick_config(1, 6144, 2560) is None
     assert _sm100_dsl.pick_config(64, 6144, 2560) is None
     assert _sm100_dsl.pick_config(4096, 19456, 2560) is not None

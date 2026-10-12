@@ -60,9 +60,10 @@ Performance figures are in `docs/perf/`, not here.
   uniform, skewed and padded routing alike, and the layer no longer runs into the card's power cap there. fso is now level with or faster than
   TensorRT-LLM's trtllm-gen block-FP8 MoE at every batch size of the tables.
 - **B300 (sm_100/sm_103) dense linear.** The activation quantizer reads and writes 16 bytes per thread, and the
-  quantizer and the dense GEMMs launch with PDL; small-batch tile and split-K choices were corrected. The Family A
-  MLP block is faster at every batch size and now faster than sglang's block-FP8 (DeepGEMM) linear at every batch
-  size of the tables.
+  quantizer and the dense GEMMs launch with PDL; small-batch tile and split-K choices were corrected, and the
+  2560-wide projections (`wo`, `down`) run the 2-SM 256×64 tile up to 256 tokens instead of a 40-CTA cuBLAS grid.
+  The Family A MLP block is faster at every batch size, and level with or faster than sglang's block-FP8 (DeepGEMM)
+  linear at every batch size of the tables except M = 96 (see Known issues).
 - **RTX 5090 (sm_120/sm_121).** The dense down projection picks its Stream-K split by the rounds each slice runs
   (the MLP block is faster from 256 to 768 tokens), the MoE gather-quantize quantizes each token once and writes its
   top-k copies, and the Qwen3.5-35B-A3B experts take a better grouped tile around 1024 tokens; the MoE layer is

@@ -187,14 +187,25 @@ inline int grid_ctas(int M, int N, int cluster_rows, int ctas_per_cluster, int t
 //     144 CTAs on the machine; the very narrow Family C projections
 //     (N = 1024, N = 2048) would get a 32- or 64-CTA grid, outside the range
 //     this rule was calibrated on.
-//   * TileN = 64 only while the problem is a single 128-row M-tile (M <= 128).
-//     At M = 256 the 64-wide tile is a tie with tier 1 on the isolated GEMM
-//     (`wo` 8.27 against 8.26, `down` 14.39 against 14.40) and 3.5 % SLOWER on
-//     the Family A MLP layer cell, where `down` runs straight after the SwiGLU
-//     quantize. At M = 512 with N = 2048 it doubles the CTA count to 128 and is
-//     still 10 % slower than tier 1, so the rate penalty of the narrow atom is
-//     not always repaid. The 192-wide tile has no such counter-example up to
-//     M = 1024.
+//   * TileN = 64 only while one 256-row cluster row covers the problem
+//     (M <= 256). Above a single 128-row M-tile (128 < M <= 256) the 1-SM and
+//     the 2-SM 64-wide tiles launch the same number of CTAs, and the equal-CTA
+//     tie-break below always takes the 2-SM 256x64 form there; on the tables
+//     this adds `wo` and `down` (N = 2560) at 128 < M <= 256. The two forms
+//     differ in how often they stream the weight: the 1-SM tile makes one pass
+//     per 128-row M-tile, and at M = 256 it tied with tier 1 on the isolated
+//     GEMM (`wo` 8.27 against 8.26, `down` 14.39 against 14.40) and was 3.5 %
+//     SLOWER on the Family A MLP layer cell, where `down` runs straight after
+//     the SwiGLU quantize (2026-09-17, when this bound was M <= 128). The 2-SM
+//     tile makes one pass, and with cold weights it beats tier 1, whose kernel
+//     puts 40 CTAs on these shapes, at every M from 144 to 256: alone `wo` by
+//     4 to 5 % and `down` by 5 to 6 % (MXFP8 and BSFP8 alike), and the Family A
+//     MXFP8 MLP block by 1.5 to 2.7 % (run fso_0.2.1_20261010/P1b, e4_gemm64 and
+//     e1_band2). Above M = 256 a 64-wide tile needs two cluster rows or three
+//     128-row tiles, which this rule has no measurement for, and at M = 512
+//     with N = 2048 it doubles the CTA count to 128 and is still 10 % slower
+//     than tier 1, so the rate penalty of the narrow atom is not always repaid.
+//     The 192-wide tile has no such counter-example up to M = 1024.
 //   * The 2-SM 192-wide form is not shipped. The only cells where it is the
 //     CTA-maximising pick are Family C `gdn.in_proj` (N = 12288) at M = 64 and
 //     M = 128, and there it measured 1.3x SLOWER than tier 1 even though it
@@ -238,8 +249,8 @@ inline int pick_wave_tile(int M, int N) noexcept
         return 0;                 // the pick is a tile the cascade already had
     if (2 * best_ctas < sms)
         return 0;                 // narrowing would still leave the machine half idle
-    if (best_n == 64 && M > 128)
-        return 0;                 // tie at M = 256, loses at M = 512
+    if (best_n == 64 && M > 256)
+        return 0;                 // 64-wide only while one 256-row cluster row covers M
     if (best_m == 256 && best_n == 192)
         return 0;                 // measured counter-example at gdn.in_proj M = 64 / 128
     // Equal-CTA tie-break, applied after the guards above so that each of their
@@ -248,7 +259,10 @@ inline int pick_wave_tile(int M, int N) noexcept
     // passes over the weight matrix explained in the comment above. The test is
     // an equality on CTA counts, so it can only fire above M = 128 (below it a
     // 2-SM tile always doubles the count) and it never changes which cells the
-    // rule owns -- only which tile an already-owned cell gets.
+    // rule owns -- only which tile an already-owned cell gets. A 64-wide cell
+    // with 128 < M <= 256 always ties here (one 256-row cluster row against two
+    // 128-row tiles), so it always leaves with the 2-SM 256x64 tile, never with
+    // the 1-SM 128x64 tile that lost at M = 256.
     if (best_m == 128 && grid_ctas(M, N, 256, 2, best_n) == best_ctas)
         best_m = 256;
     return best_m * 1000 + best_n;
