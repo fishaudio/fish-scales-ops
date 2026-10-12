@@ -18,8 +18,9 @@ generated from `tests/baselines/*.jsonl` by
   and intermediate buffers stay warm.
 - **Clocks.** The H200 and the B300 run at their natural clock, with a clock
   sampler beside every run; the RTX 5090 is locked at 2407 MHz.
-- **Bands.** Decode is M 1–128 (1, 2, 4, 8, 16, 32, 64, 128) and prefill
-  M > 128 (256, 512, 1024, 2048, 4096, 8192); the MoE tables add M = 96.
+- **Bands.** Decode is M 1–128 (1, 2, 4, 8, 16, 32, 64, 96, 128) and prefill
+  M > 128 (160, 192, 256, 512, 1024, 2048, 4096, 8192). M = 96, 160 and 192 are
+  the batch sizes a serving stack's decode steps fill most at high concurrency.
 - **Precision.** BSFP8 is block-FP8 with 1×128 activation and 128×128 weight
   scales, MXFP8 has 1×32 scales. fso runs BSFP8 on every card and MXFP8 on
   sm_100 / sm_103 and sm_120, where the MoE layers and `fso.dense` use it. A

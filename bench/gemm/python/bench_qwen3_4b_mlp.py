@@ -1,7 +1,7 @@
 """Frozen perf bench for the blockscale_gemm public PyTorch interface.
 Pre-quantize / pre-pack scales OUTSIDE the timing loop.
 
-Shapes: M ∈ {1, 2, 4, 8, 16, 32, 64, 128, 512, 1024, 2048, 4096}
+Shapes: M ∈ {1, 2, 4, 8, 16, 32, 64, 96, 128, 160, 192, 256, 512, 1024, 2048, 4096, 8192}
         × Qwen3-4B attention + MLP projections (hidden=2560, 32 Q-heads,
           8 KV-heads, head_dim=128, intermediate=9728):
           - wqkv  (fused Q+K+V): N=6144,  K=2560
@@ -122,7 +122,7 @@ def set_family(name):
     FAMILY = name
     SHAPES = FAMILIES[name]
     RUN_CUBIC = (name == "qwen3-4b")
-M_GRID = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]  # docs/perf/README.md, What is measured
+M_GRID = [1, 2, 4, 8, 16, 32, 64, 96, 128, 160, 192, 256, 512, 1024, 2048, 4096, 8192]  # docs/perf/README.md, What is measured
 
 # Cubic (M=N=K) sizes covering small-and-host-bound (1024) through peak-MFU
 # (16384). Single cell per S; not crossed with M_GRID.

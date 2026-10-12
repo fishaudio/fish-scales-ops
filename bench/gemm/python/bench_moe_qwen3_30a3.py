@@ -140,7 +140,7 @@ def set_expert_parallel(ep_size):
 
 set_model(MODEL)
 
-M_GRID = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]  # docs/perf/README.md, What is measured; off-grid points via --Ms
+M_GRID = [1, 2, 4, 8, 16, 32, 64, 96, 128, 160, 192, 256, 512, 1024, 2048, 4096, 8192]  # docs/perf/README.md, What is measured; off-grid points via --Ms
 DECODE_M = [m for m in M_GRID if m <= 128]
 
 KERNEL_IMPLS = ("dg_fp8_cont", "dg_bf16_cont", "dg_fp8_masked", "dg_bf16_masked",
