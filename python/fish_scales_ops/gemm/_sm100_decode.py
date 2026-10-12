@@ -262,19 +262,20 @@ def pick_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
     against the kernels' own validity predicates; there is no per-shape table.
 
     * ``m > 64`` → None. Above the band the C++ cascade's two-kernel split-K
-      keeps the narrow-N long-K cells (its route extends to M ≤ 128), its
+      keeps the narrow-N long-K cells (its route extends to M ≤ 104), its
       wave-tile rule keeps the cells it was measured to win from M = 64 up, and
       tier 1 keeps the rest. Nothing measured above M = 64 asked for a change.
     * ``32 < m <= 64`` runs on the persistent kernel with a 64-wide token tile
       and the 2-CTA 256-row weight tile in a cluster of two, swap-AB, one K
       slice (``_wide_token_config``); the split-K class refuses the band and the
-      narrower token tiles refuse it too. Two shape classes are declined and
-      left to the tiers below, where the same sweep kept them:
-      the long-K narrow-N class (``k >= 8192`` with ``tiles_n <= 32``), whose
-      two-kernel split-K in the C++ cascade keeps the whole machine busy while
-      one weight tile per cluster cannot, and the short-K class
-      (``k < MIN_WIDE_TOKEN_K``), where the form's mainloop is shorter than
-      its pipeline.
+      narrower token tiles refuse it too. Three shape classes are declined and
+      left to the tiers below: the long-K narrow-N class (``k >= 8192`` with
+      ``tiles_n <= 32``), whose two-kernel split-K in the C++ cascade keeps the
+      whole machine busy while one weight tile per cluster cannot; the short-K
+      class (``k < MIN_WIDE_TOKEN_K``), where the form's mainloop is shorter
+      than its pipeline (both as the M-D5 sweep kept them); and a shape whose
+      ``ceil(N / 256)`` clusters of two exceed the resident clusters where the
+      cascade's wave rule owns the cell (``gate_up`` at M = 64).
     * How deep to split K is one question asked of every shape, and it has
       three parts, all of them about how much of the machine the shape already
       uses and how long each slice's mainloop would be:
@@ -386,11 +387,11 @@ def _wide_token_config(m: int, n: int, k: int, tiles_n: int,
     lost on every cell measured. FlashInfer's own autotuner picks this tactic
     for the narrow-N shape at M = 64 and M = 128.
 
-    Two shape classes are declined, and the same sweep kept them on the tier
-    that serves them:
+    Three shape classes are declined; the same sweep kept the first two on the
+    tier that serves them:
 
     * long-K narrow-N (``k >= 8192`` with ``tiles_n <= 32``), which the C++
-      cascade's two-kernel split-K route owns to M = 128. With twenty weight
+      cascade's two-kernel split-K route owns to M = 104. With twenty weight
       tiles and one K slice this kernel keeps twenty CTAs busy on 148 SMs for
       the whole of a 9728-deep mainloop, while the cascade's split spreads the
       same K over the machine and pays only a small reduce launch.
@@ -398,14 +399,26 @@ def _wide_token_config(m: int, n: int, k: int, tiles_n: int,
       shorter than the pipeline that fills it and the form has nothing to
       gain (see the constant).
 
-    The very wide shapes are NOT declined: on `gate_up` (152 weight tiles,
-    more than the 74 clusters of two the persistent scheduler keeps resident)
-    the sweep still put the cells below M = 64 and the cell at M = 64 on this
-    form, second round of clusters and all.
+    * very wide N where the cascade's wave rule owns the cell. The form puts
+      ceil(N / 256) clusters of two on the machine and the persistent
+      scheduler keeps at most half the SM count of them resident (74 on a
+      148-SM B300), so a wider grid runs its excess clusters as a second round
+      in which the rest of the machine is idle: `gate_up` (N = 19456) launches
+      76. Where the wave rule of the C++ cascade owns the cell (M >= 64, see
+      ``_sm100_smm.wave_tile_owns``) its tile covers the whole problem in one
+      wave (128 x 192 on 102 SMs for `gate_up`), and measured inside the
+      Qwen3-4B MLP block with cold weights it is 3.4 % faster at M = 64
+      (27.56 against 28.54 us, run fso_0.2.1_20261010/P1 ab3_probe). Below
+      M = 64 the wave rule owns nothing and this form stays: there the same
+      measurement put both the cascade (+9 to +12 %) and tier 1 (+0.2 to
+      +2.1 %) behind it, as the M-D5 sweep did with warm weights.
     """
     if k >= 8192 and tiles_n <= 32:
         return None
     if k < MIN_WIDE_TOKEN_K:
+        return None
+    from . import _sm100_smm
+    if 2 * ((n + 255) // 256) > _sm100_smm._sm_count() and _sm100_smm.wave_tile_owns(m, n):
         return None
     tile, cluster = (256, _WIDE_TOKEN_TILE), (2, 1)
     ok = PK.can_implement(

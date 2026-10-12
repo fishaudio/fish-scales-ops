@@ -6,7 +6,9 @@ MXFP8 router for the band M ≤ 64: the split-K and persistent kernels at the
 8/16/32-wide token tile up to M = 32, and the persistent kernel at the 64-wide
 token tile with the 2-CTA 256-row weight tile in a cluster of two from M = 33
 to 64 (the long-K narrow-N cells of that upper band stay with the C++
-cascade). This file checks the three things that can go wrong when a kernel is
+cascade, and so does a shape whose clusters of two exceed the resident ones
+where the cascade's wave rule owns the cell: `gate_up` at M = 64). This file
+checks the three things that can go wrong when a kernel is
 swapped in under an existing public op:
 
 1. **Accuracy.** For every Family A dense shape at M ∈ {1, 2, 4, 8, 16, 32} and
@@ -70,7 +72,12 @@ def _row_takes(N: int, K: int, M: int) -> bool:
         return False
     if K < 1024:
         return False
-    return not (K >= 8192 and (N + 127) // 128 <= 32)
+    if K >= 8192 and (N + 127) // 128 <= 32:
+        return False
+    # ceil(N/256) clusters of two beyond the resident ones (half the SM count): the cascade's wave tile takes
+    # the cell wherever its rule owns it (gate_up at M = 64).
+    from fish_scales_ops.gemm import _sm100_smm
+    return not (2 * ((N + 255) // 256) > _sm100_smm._sm_count() and _sm100_smm.wave_tile_owns(M, N))
 
 
 def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -236,7 +243,7 @@ def test_routing() -> None:
                     f"{tag} M={M}: expected {WIDE_FORM}, got {cfg}"
             else:
                 assert cfg is None, \
-                    f"{tag} M={M}: a long-K narrow-N cell was taken ({cfg})"
+                    f"{tag} M={M}: a cell the row declines was taken ({cfg})"
     # The class boundary is in k and tiles_n, not in the shape name: a
     # 2560-wide shape one K-tile short of 8192 is taken, one at 8192 is not,
     # and a long-K shape that is not narrow (48 tiles) is taken.
@@ -252,6 +259,12 @@ def test_routing() -> None:
             f"shared_down M={M}: the wide-token form took a K = 512 cell"
     assert _sm100_decode.pick_config(64, 2048, _sm100_decode.MIN_WIDE_TOKEN_K) == WIDE_FORM
     assert _sm100_decode.pick_config(64, 2048, _sm100_decode.MIN_WIDE_TOKEN_K - 128) is None
+    # gate_up's 76 clusters of two exceed the 74 resident ones: at M = 64, where the cascade's wave rule owns
+    # the cell, the row declines; below M = 64 (the rule owns nothing) the form keeps it.
+    from fish_scales_ops.gemm import _sm100_smm
+    if 2 * ((19456 + 255) // 256) > _sm100_smm._sm_count():
+        assert _sm100_decode.pick_config(64, 19456, 2560) is None
+        assert _sm100_decode.pick_config(63, 19456, 2560) == WIDE_FORM
     # An N or K that is not a multiple of 128 is declined in this band too.
     assert _sm100_decode.pick_config(64, 2560, 2560 + 64) is None
     assert _sm100_decode.pick_config(64, 2560 + 64, 4096) is None

@@ -146,7 +146,9 @@ def should_route(m: int, n: int, k: int) -> bool:
     Small-M bounds are unchanged from the per-GEMM bench of 2026-07-07:
     * Wide-N (tiles_n ≥ 40) M ≤ 1024: route to cuBLAS.
     * Narrow-N (tiles_n ≤ 32, i.e. down/wo class) M ≤ 128 with K ≥ 4096:
-      decline, so FSO's split-K double-kernel scheme takes the cell.
+      decline, so the C++ cascade takes the cell (its two-kernel split-K, or
+      from M = 64 its wave-rule tile where ``wave_tile_owns`` already
+      declined the cell above; for K ≥ 8192 the split ends at M = 104).
     * K % 128 alignment required by scaled_mm.
 
     The large-M rules (M > 1024) come from the per-projection sweep in

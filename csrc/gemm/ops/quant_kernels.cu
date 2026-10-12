@@ -500,9 +500,215 @@ __global__ void fp8bs_quantize_1x32_packed_kernel(
 
 } // anonymous namespace
 
+// ----- sm_100/sm_103 dense activation quantizers: wide form with PDL (2026-10-11) --------------------------
+//
+// The SM1XX_ATOM (sm_100/sm_103) cases of fp8bs_quantize_1x32_packed and
+// fp8bs_silu_chunk_mul_quantize_1x32_packed run these two kernels. They sit on the critical path of the dense
+// MLP block at every M (quantize -> gate_up -> SwiGLU + quantize -> down), and the narrow kernels above spend
+// their time on issue and launch, not on bytes: one warp per 256 K-elements with an 8-byte load per lane put
+// 1280 CTAs on the machine to quantize a 1024 x 2560 activation in 5.9 us (about 1.3 TB/s), and a plain launch
+// let neither kernel overlap the GEMM on either side of it.
+//
+// Thread map: one thread owns 16 consecutive K-elements of one row (two 16-byte loads for the plain quantize,
+// four for the SwiGLU form: gate and up), two threads own one 32-element scale block (one shuffle completes
+// the block's amax), eight threads own one int32 scale word (4 blocks = 128 K-elements; three width-8
+// shuffles gather its bytes), and a thread's 16 FP8 bytes leave in one 16-byte store. An 8-thread group never
+// straddles a row because K % 128 == 0, and the grid is exactly M_pad * (K/128) * 8 threads.
+//
+// Numerics: identical bytes to the narrow kernels. Each block's amax is the fmaxf of the same 32 values (fmaxf
+// is exact and order-free), floored at the same 1e-10f, and goes through the same e8m0_from_amax; every FP8
+// byte is the same fp32 product converted by the same fp8x4_from_floats; the SwiGLU form applies the same
+// bf16x2 silu2_mul to the same elements (it is elementwise, so the pairing does not matter); the scale words
+// land at the same sf_word_index and the padded rows get the same zero words.
+//
+// PDL: launched with programmatic stream serialization unless FSO_DISABLE_PDL=1. Every thread waits on the
+// parent grid (cudaGridDependencySynchronize) before its first global access, read or write, and thread 0 of
+// every CTA then releases the dependent launch, so the GEMM that consumes the output can be created and run
+// its prologue while this kernel still runs; that GEMM waits for this grid's completion before it reads.
+namespace
+{
+
+constexpr int kWideQuantThreads = 256;
+
+__device__ __forceinline__ void bf16x8_to_floats(uint4 const& w, float* f)
+{
+    __nv_bfloat162 const* p = reinterpret_cast<__nv_bfloat162 const*>(&w);
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+        float2 const t = __bfloat1622float2(p[i]);
+        f[2 * i] = t.x;
+        f[2 * i + 1] = t.y;
+    }
+}
+
+__device__ __forceinline__ void silu_bf16x8_to_floats(uint4 const& g, uint4 const& u, float* f)
+{
+    __nv_bfloat162 const* g2 = reinterpret_cast<__nv_bfloat162 const*>(&g);
+    __nv_bfloat162 const* u2 = reinterpret_cast<__nv_bfloat162 const*>(&u);
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+        float2 const t = __bfloat1622float2(silu2_mul(g2[i], u2[i]));
+        f[2 * i] = t.x;
+        f[2 * i + 1] = t.y;
+    }
+}
+
+// The thread's 16 values -> its 16 FP8 bytes (one 16-byte store) and, from lane 0 of its 8-thread group, the
+// group's int32 scale word.
+template <bool USE_UE8M0>
+__device__ __forceinline__ void quantize16_store(float const (&v)[16], __nv_fp8_e4m3* out16, int32_t* sf_word,
+    unsigned group_mask, int j)
+{
+    float ax = fabsf(v[0]);
+#pragma unroll
+    for (int i = 1; i < 16; ++i)
+        ax = fmaxf(ax, fabsf(v[i]));
+    ax = fmaxf(ax, __shfl_xor_sync(group_mask, ax, 1, 8));   // the other half of the 32-element block
+    ax = fmaxf(ax, 1e-10f);
+
+    float qs;
+    uint8_t byte_v;
+    e8m0_from_amax<USE_UE8M0>(ax, qs, byte_v);
+
+    uint4 o;
+    o.x = fp8x4_from_floats(v[0] * qs, v[1] * qs, v[2] * qs, v[3] * qs);
+    o.y = fp8x4_from_floats(v[4] * qs, v[5] * qs, v[6] * qs, v[7] * qs);
+    o.z = fp8x4_from_floats(v[8] * qs, v[9] * qs, v[10] * qs, v[11] * qs);
+    o.w = fp8x4_from_floats(v[12] * qs, v[13] * qs, v[14] * qs, v[15] * qs);
+    *reinterpret_cast<uint4*>(out16) = o;
+
+    // Threads 2b and 2b+1 of the group hold block b's byte; lane 0 packs blocks 0..3 into the word.
+    uint32_t const b0 = byte_v;
+    uint32_t const b1 = __shfl_sync(group_mask, b0, 2, 8);
+    uint32_t const b2 = __shfl_sync(group_mask, b0, 4, 8);
+    uint32_t const b3 = __shfl_sync(group_mask, b0, 6, 8);
+    if (j == 0)
+        *sf_word = static_cast<int32_t>(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+}
+
+template <bool USE_UE8M0>
+__global__ void __launch_bounds__(kWideQuantThreads) fp8bs_quantize_1x32_packed_wide_kernel(
+    __nv_fp8_e4m3* __restrict__ out_fp8, int32_t* __restrict__ out_packed,
+    __nv_bfloat16 const* __restrict__ input, int M, int K, int M_pad, bool pdl)
+{
+    if (pdl)
+    {
+        cudaGridDependencySynchronize();
+        if (threadIdx.x == 0)
+            cudaTriggerProgrammaticLaunchCompletion();
+    }
+    int const num_kp = K >> 7;
+    int64_t const t = static_cast<int64_t>(blockIdx.x) * kWideQuantThreads + threadIdx.x;
+    int64_t const word = t >> 3;
+    if (word >= static_cast<int64_t>(M_pad) * num_kp)
+        return;   // whole 8-thread groups only; the launcher sizes the grid exactly
+    int const j = static_cast<int>(t & 7);
+    int const m = static_cast<int>(word / num_kp);
+    int const kp = static_cast<int>(word - static_cast<int64_t>(m) * num_kp);
+    int32_t* const sf_word = out_packed + sf_word_index<MxSfLayout::SM1XX_ATOM>(m, kp, M_pad, num_kp);
+    if (m >= M)
+    {
+        if (j == 0)
+            *sf_word = 0;
+        return;
+    }
+    int64_t const off = static_cast<int64_t>(m) * K + kp * 128 + j * 16;
+    uint4 const w0 = *reinterpret_cast<uint4 const*>(input + off);
+    uint4 const w1 = *reinterpret_cast<uint4 const*>(input + off + 8);
+    float v[16];
+    bf16x8_to_floats(w0, v);
+    bf16x8_to_floats(w1, v + 8);
+    quantize16_store<USE_UE8M0>(v, out_fp8 + off, sf_word, 0xFFu << (threadIdx.x & 24), j);
+}
+
+template <bool USE_UE8M0>
+__global__ void __launch_bounds__(kWideQuantThreads) silu_chunk_mul_quantize_1x32_packed_wide_kernel(
+    __nv_fp8_e4m3* __restrict__ out_fp8, int32_t* __restrict__ out_packed,
+    __nv_bfloat16 const* __restrict__ gu, int M, int K, int M_pad, bool pdl)
+{
+    if (pdl)
+    {
+        cudaGridDependencySynchronize();
+        if (threadIdx.x == 0)
+            cudaTriggerProgrammaticLaunchCompletion();
+    }
+    int const num_kp = K >> 7;
+    int64_t const t = static_cast<int64_t>(blockIdx.x) * kWideQuantThreads + threadIdx.x;
+    int64_t const word = t >> 3;
+    if (word >= static_cast<int64_t>(M_pad) * num_kp)
+        return;
+    int const j = static_cast<int>(t & 7);
+    int const m = static_cast<int>(word / num_kp);
+    int const kp = static_cast<int>(word - static_cast<int64_t>(m) * num_kp);
+    int32_t* const sf_word = out_packed + sf_word_index<MxSfLayout::SM1XX_ATOM>(m, kp, M_pad, num_kp);
+    if (m >= M)
+    {
+        if (j == 0)
+            *sf_word = 0;
+        return;
+    }
+    // gu row m: gate at [0, K), up at [K, 2K).
+    int64_t const in = static_cast<int64_t>(m) * (2 * static_cast<int64_t>(K)) + kp * 128 + j * 16;
+    uint4 const g0 = *reinterpret_cast<uint4 const*>(gu + in);
+    uint4 const g1 = *reinterpret_cast<uint4 const*>(gu + in + 8);
+    uint4 const u0 = *reinterpret_cast<uint4 const*>(gu + in + K);
+    uint4 const u1 = *reinterpret_cast<uint4 const*>(gu + in + K + 8);
+    float v[16];
+    silu_bf16x8_to_floats(g0, u0, v);
+    silu_bf16x8_to_floats(g1, u1, v + 8);
+    int64_t const off = static_cast<int64_t>(m) * K + kp * 128 + j * 16;
+    quantize16_store<USE_UE8M0>(v, out_fp8 + off, sf_word, 0xFFu << (threadIdx.x & 24), j);
+}
+
+// The wide kernels' 16-byte accesses need 16-byte-aligned bases; K % 128 == 0 keeps every row start aligned.
+inline bool wide_quant_aligned(void const* a, void const* b)
+{
+    return ((reinterpret_cast<uintptr_t>(a) | reinterpret_cast<uintptr_t>(b)) & 15u) == 0;
+}
+
+template <bool kSilu>
+void launch_quantize_1x32_wide(__nv_fp8_e4m3* x_q, int32_t* packed_scales, __nv_bfloat16 const* in, int M, int K,
+    cudaStream_t stream, bool use_ue8m0)
+{
+    int const m_pad = ((M + 127) / 128) * 128;
+    int64_t const threads = static_cast<int64_t>(m_pad) * (K / 128) * 8;
+    if (threads == 0)
+        return;
+    dim3 const grid(static_cast<unsigned>((threads + kWideQuantThreads - 1) / kWideQuantThreads));
+    bool const pdl = fso_pdl_enabled();
+    if (kSilu)
+    {
+        if (use_ue8m0)
+            fso_pdl_launch(silu_chunk_mul_quantize_1x32_packed_wide_kernel<true>, grid, dim3(kWideQuantThreads),
+                stream, pdl, x_q, packed_scales, in, M, K, m_pad);
+        else
+            fso_pdl_launch(silu_chunk_mul_quantize_1x32_packed_wide_kernel<false>, grid, dim3(kWideQuantThreads),
+                stream, pdl, x_q, packed_scales, in, M, K, m_pad);
+    }
+    else
+    {
+        if (use_ue8m0)
+            fso_pdl_launch(fp8bs_quantize_1x32_packed_wide_kernel<true>, grid, dim3(kWideQuantThreads), stream,
+                pdl, x_q, packed_scales, in, M, K, m_pad);
+        else
+            fso_pdl_launch(fp8bs_quantize_1x32_packed_wide_kernel<false>, grid, dim3(kWideQuantThreads), stream,
+                pdl, x_q, packed_scales, in, M, K, m_pad);
+    }
+}
+
+} // anonymous namespace
+
 void fp8bs_quantize_1x32_packed(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
     __nv_bfloat16 const* x, int M, int K, cudaStream_t stream, bool use_ue8m0, bool sm1xx_sf_layout)
 {
+    // sm_100/sm_103: the wide kernel with PDL (see the block above); sm_120 keeps the narrow kernel below.
+    if (sm1xx_sf_layout && wide_quant_aligned(x, x_q))
+    {
+        launch_quantize_1x32_wide<false>(x_q, packed_scales, x, M, K, stream, use_ue8m0);
+        return;
+    }
     // K_BLOCKS_PER_WARP = 8 (256 K-elements/warp, 2 int32 outputs/warp) when
     // K is a multiple of 256 — fewer CTAs, better amortisation of launch
     // overhead. Falls back to 4 when K % 256 != 0 (e.g. shapes where K is
@@ -665,6 +871,13 @@ void fp8bs_silu_chunk_mul_quantize_1x32_packed(
     __nv_fp8_e4m3* x_q, int32_t* packed_scales,
     __nv_bfloat16 const* gu, int M, int K, cudaStream_t stream, bool use_ue8m0, bool sm1xx_sf_layout)
 {
+    // sm_100/sm_103: the wide kernel with PDL (see fp8bs_quantize_1x32_packed_wide_kernel); sm_120 keeps the
+    // narrow kernel below.
+    if (sm1xx_sf_layout && wide_quant_aligned(gu, x_q))
+    {
+        launch_quantize_1x32_wide<true>(x_q, packed_scales, gu, M, K, stream, use_ue8m0);
+        return;
+    }
     // See fp8bs_quantize_1x32_packed for the sm1xx_sf_layout contract.
     int const m_pad = sm1xx_sf_layout ? ((M + 127) / 128) * 128 : ((M + 3) / 4) * 4;
     constexpr int kThreadsPerBlock = 256;
