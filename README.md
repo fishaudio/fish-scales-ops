@@ -184,7 +184,9 @@ measured.
 
 Apache-2.0 (declared in `python/pyproject.toml`). Vendored upstream files under
 `csrc/gemm/.../jit/deep_gemm/` keep their original Apache-2.0 NVIDIA copyright
-headers.
+headers. Its subdirectories `comm/`, `common/`, `epilogue/`, `impls/`, `mma/`,
+`ptx/` and `scheduler/` are DeepGEMM v2's dense sm_90 kernel from
+sgl-project/DeepGEMM v0.2.0 under the MIT License (`deep_gemm/LICENSE.DeepGEMM`).
 
 ## Acknowledgments
 
@@ -194,7 +196,9 @@ upstream copyright headers keep them.
 
 - **[DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)** — the sm_90 block-FP8
   path derives from DeepGEMM's WGMMA kernels and its JIT driver, and the sm_90
-  dense GEMM's output store follows DeepGEMM's `sm90_fp8_gemm_1d2d`.
+  dense GEMM runs DeepGEMM v2's `sm90_fp8_gemm_1d2d` kernel (vendored from
+  sgl-project/DeepGEMM v0.2.0) at DeepGEMM's own configuration for the tiles
+  fish-scales-ops' kernel cannot run.
 - **[TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM)** — the compat shim
   under `csrc/common/compat/include/tensorrt_llm/` is a minimal vendored subset
   of TRT-LLM's common headers, and the block-scaled GEMM runner follows its

@@ -408,6 +408,30 @@ __global__ void dummy_kernel() {
     return code;
 }
 
+// The source of one instantiation of DeepGEMM v2's dense kernel (deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh) at `c`, with
+// the template arguments DeepGEMM's own launcher passes (csrc/jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp of
+// sgl-project/DeepGEMM v0.2.0): K-major B scales, M and K at run time, N compiled in only for DeepGEMM's
+// specialize_n case (c.shape_n), one group, BLOCK_K 128, 128-byte swizzles for A and B, c.swizzle_d for D, 128 TMA
+// threads, 128 or 256 math threads, multicast on A when cluster_n > 1, the SM count, GemmType::Normal, BF16 D and the
+// identity epilogue. As in generateKernel, a dummy kernel takes the instantiation's address so that NVRTC emits it.
+inline std::string generateKernelDg2(Dg2DenseConfig const& c)
+{
+    std::string const args = "cute::UMMA::Major::K, 0u, " + std::to_string(c.shape_n) + "u, 0u, 1u, "
+        + std::to_string(c.block_m) + "u, " + std::to_string(c.block_n) + "u, 128u, 128u, 128u, "
+        + std::to_string(c.swizzle_d) + "u, " + std::to_string(c.num_stages) + "u, 128u, "
+        + std::to_string(c.num_math_threads()) + "u, " + std::to_string(c.cluster_size()) + "u, "
+        + (c.multicast_on_a() ? "true" : "false") + ", " + std::to_string(c.num_sms)
+        + "u, deep_gemm::GemmType::Normal, cutlass::bfloat16_t, deep_gemm::epilogue::transform::EpilogueIdentity";
+    return R"(
+#include <deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh>
+
+__global__ void dummy_kernel() {
+  void *ptr = (void *)&deep_gemm::sm90_fp8_gemm_1d2d_impl<)"
+        + args + R"(>;
+}
+)";
+}
+
 // FNV-1a, 64-bit. The disk cache's content key must come out the same in every process and every build of the
 // extension, which std::hash does not promise; FNV-1a is fixed by its definition. Integers are fed as 8 little-endian
 // bytes and strings with a length prefix, so two different field sequences never produce the same byte stream.
@@ -669,6 +693,72 @@ public:
 
         std::string code = generateKernel(shape_n, shape_k, block_m, block_n, block_k, num_groups, num_stages,
             num_tma_multicast, gemm_type, swapAB, two_wg, swiglu, swapab_pair, swapab_split);
+
+        return compileAndCache(name, code, flags, gemm_type);
+    }
+
+    // DeepGEMM v2's dense kernel at `c` (generateKernelDg2). Its own name prefix ("gemm_dg2_") keeps it apart from
+    // fp8_gemm_kernel's runtimes in the in-memory cache. The flags are DeepGEMM's (C++20, register-usage level 10,
+    // the diagnostics it suppresses) plus what NVRTC needs for these headers: 128-bit integers (ptx/ld_st.cuh) and,
+    // first on the include path, deep_gemm/nvrtc_shim/ with the two standard headers NVRTC does not have (<utility>
+    // for std::integer_sequence, <cstddef>). nvcc (FSO_JIT_USE_NVCC) has both natively and gets neither.
+    Runtime* buildDg2(Dg2DenseConfig const& c)
+    {
+        int sm_version = tensorrt_llm::common::getSMVersion();
+        if (sm_version != 90)
+        {
+            TLLM_THROW("DeepGEMM v2's sm90_fp8_gemm_1d2d only runs on Hopper (SM90); this device is SM%d.", sm_version);
+        }
+        std::string const name = "gemm_dg2_" + std::to_string(c.block_m) + "x" + std::to_string(c.block_n) + "_s"
+            + std::to_string(c.num_stages) + "_c" + std::to_string(c.cluster_m) + "x" + std::to_string(c.cluster_n)
+            + "_d" + std::to_string(c.swizzle_d) + "_n" + std::to_string(c.shape_n) + "_sm" + std::to_string(c.num_sms);
+        auto& runtimeCache = getGlobalRuntimeCache();
+        if (Runtime* cachedRuntime = runtimeCache.find(name))
+        {
+            return cachedRuntime;
+        }
+
+        std::vector<std::string> flags = {"-std=c++20", "--gpu-architecture=sm_90a",
+            "--ptxas-options=--register-usage-level=10", "--diag-suppress=39,161,174,177,186,940", "-DNDEBUG"};
+        if (char const* extra = std::getenv("FSO_JIT_EXTRA_FLAGS"))
+        {
+            std::istringstream tokens(extra);
+            for (std::string tok; tokens >> tok;)
+                flags.push_back(tok);
+        }
+        if (kJitUseNvcc)
+        {
+            for (char const* f : {"-O3", "-cubin", "--expt-relaxed-constexpr", "--expt-extended-lambda",
+                     "--compiler-options=-fPIC,-O3,-Wno-deprecated-declarations,-Wno-abi"})
+                flags.push_back(f);
+        }
+        else
+        {
+            flags.push_back("-default-device");
+            flags.push_back("--device-int128");
+            for (auto const& dir : includeDirs_)
+            {
+                std::error_code ec;
+                if (std::filesystem::is_directory(dir / "deep_gemm" / "nvrtc_shim", ec))
+                {
+                    flags.push_back("-I" + (dir / "deep_gemm" / "nvrtc_shim").string());
+                    break;
+                }
+            }
+        }
+        for (auto const& dir : includeDirs_)
+        {
+            flags.push_back("-I" + dir.string());
+        }
+        return compileAndCache(name, generateKernelDg2(c), flags, deep_gemm::GemmType::Normal);
+    }
+
+    // Compiles `code` with `flags` (or loads it from the disk cache) into a Runtime and records it in the in-memory
+    // runtime cache under `name`: the part of build() and buildDg2() after the source and the flag list are known.
+    Runtime* compileAndCache(std::string const& name, std::string const& code, std::vector<std::string> const& flags,
+        deep_gemm::GemmType const gemm_type)
+    {
+        auto& runtimeCache = getGlobalRuntimeCache();
 
         // Disk cache, used only with FSO_JIT_DUMP_CUBIN or FSO_JIT_USE_NVCC (the default NVRTC build stays in memory
         // and never touches the file system). A cubin lives in <cache>/<content key>_<name>/, the key covering the

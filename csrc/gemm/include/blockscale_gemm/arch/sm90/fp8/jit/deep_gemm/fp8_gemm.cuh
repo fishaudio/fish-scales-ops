@@ -218,6 +218,68 @@ void runGemm(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, 
     DG_HOST_ASSERT(status == cudaSuccess);
 }
 
+// Launches DeepGEMM v2's dense kernel (Compiler::buildDg2 at `cfg`) as DeepGEMM's own launcher does
+// (csrc/jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp and runtime_utils.hpp of sgl-project/DeepGEMM v0.2.0): A and B
+// K-major with 128-byte swizzled boxes of block_m (block_n) rows by 128 bytes; D boxes of block_m rows by
+// swizzle_d / 2 columns with that swizzle, one TMA store per box; the activation scales as fso's 1x128 quantizer
+// writes them, M-major with M rounded up to 4 (make_2d_tma_scales_a_desc, which is DeepGEMM's MN-major SF
+// descriptor); the weight scales [N/128, K/128] FP32 K-major through the plain pointer. One persistent CTA per SM
+// (the kernel's scheduler strides by its compiled SM count), 128 TMA + 128 or 256 math threads, and programmatic
+// stream serialization when `pdl` (the kernel waits on its predecessor with griddepcontrol.wait after its prologue and
+// does not trigger its dependents early, like fp8_gemm_kernel). The cluster-dimension attribute is set only for a
+// two-CTA cluster (multicast), as DeepGEMM's runtime does: a launch that carries the attribute is a cluster launch
+// even at size 1, and the hardware then places the CTAs on the SMs in another order. With one CTA per SM the order
+// decides which L2 partition serves each tile's operands; for the 64-row tiles it made the same kernel 25 % slower
+// (Family A down GEMM, M = 160, ncu with cold caches: 22.6 against 17.2-18.2 us, 50 % more L2 lookups and fabric
+// sectors; P2, /data/bench-runs/fso_0.2.1_20261010/P2/runs/gpu2_ncu).
+inline void runGemmDg2(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, int ld_d,
+    float* scales_a, float* scales_b, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+    jit::Dg2DenseConfig const& cfg, cudaStream_t stream, bool pdl)
+{
+    constexpr uint32_t block_k = 128;
+    auto tma_a_desc = make_2d_tma_a_desc(reinterpret_cast<__nv_fp8_e4m3*>(mat_a), shape_m, shape_k, cfg.block_m,
+        block_k, 1, GemmType::Normal, ld_a);
+    auto tma_b_desc = make_2d_tma_b_desc(reinterpret_cast<__nv_fp8_e4m3*>(mat_b), shape_n, shape_k, cfg.block_n,
+        block_k, 1, GemmType::Normal, ld_b);
+    auto tma_sfa_desc = make_2d_tma_scales_a_desc(scales_a, shape_m, shape_k, cfg.block_m, block_k, 1, GemmType::Normal);
+    CUtensorMapSwizzle const swizzle_d = cfg.swizzle_d == 128 ? CU_TENSOR_MAP_SWIZZLE_128B
+        : cfg.swizzle_d == 64                                 ? CU_TENSOR_MAP_SWIZZLE_64B
+        : cfg.swizzle_d == 32                                 ? CU_TENSOR_MAP_SWIZZLE_32B
+                                                              : CU_TENSOR_MAP_SWIZZLE_NONE;
+    uint32_t const d_box_n = cfg.swizzle_d >= 16 ? cfg.swizzle_d / 2 : cfg.block_n;
+    auto tma_d_desc = make_2d_tma_desc(reinterpret_cast<__nv_bfloat16*>(mat_d), Layout::RowMajor, shape_m, shape_n,
+        cfg.block_m, d_box_n, static_cast<uint64_t>(ld_d) * 2, swizzle_d);
+
+    DG_HOST_ASSERT(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, cfg.smem_size)
+        == cudaSuccess);
+    cudaLaunchConfig_t config;
+    config.gridDim = cfg.num_sms;
+    config.blockDim = 128 + cfg.num_math_threads();
+    config.dynamicSmemBytes = cfg.smem_size;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[2];
+    unsigned int num_attrs = 0;
+    if (cfg.cluster_size() > 1)
+    {
+        attrs[num_attrs].id = cudaLaunchAttributeClusterDimension;
+        attrs[num_attrs].val.clusterDim = {cfg.cluster_size(), 1, 1};
+        ++num_attrs;
+    }
+    if (pdl)
+    {
+        attrs[num_attrs].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[num_attrs].val.programmaticStreamSerializationAllowed = 1;
+        ++num_attrs;
+    }
+    config.attrs = num_attrs == 0 ? nullptr : attrs;
+    config.numAttrs = num_attrs;
+
+    int* grouped_layout = nullptr;
+    auto status = cudaLaunchKernelEx(&config, kernel, scales_b, grouped_layout, shape_m, shape_n, shape_k, tma_a_desc,
+        tma_b_desc, tma_d_desc, tma_sfa_desc);
+    DG_HOST_ASSERT(status == cudaSuccess);
+}
+
 // `pdl`: as runGemm.
 template <typename LayoutIndexType>
 void runGemmSwapAB(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, int ld_d,

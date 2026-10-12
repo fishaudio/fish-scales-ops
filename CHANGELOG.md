@@ -68,6 +68,12 @@ Performance figures are in `docs/perf/`, not here.
   (the MLP block is faster from 256 to 768 tokens), the MoE gather-quantize quantizes each token once and writes its
   top-k copies, and the Qwen3.5-35B-A3B experts take a better grouped tile around 1024 tokens; the MoE layer is
   faster from 256 tokens up.
+- **H200 (sm_90) dense linear.** The block-FP8 GEMM also runs DeepGEMM v2's dense kernel (`sm90_fp8_gemm_1d2d`,
+  vendored and compiled by the bundled NVRTC) at DeepGEMM's own configuration, for the tiles fso's kernel cannot run
+  (256×128 with multicast, 128×160 and 128×192 from 512 tokens), for batches of 129–255 tokens, where fso's 128-row
+  tiles left a second, mostly empty block, and for the long-K projections at 64 and 128 tokens. The choice depends
+  on the shape only, and the outputs are bitwise identical either way. The Family A MLP block is about a third faster
+  at 160–192 tokens and 3–11 % faster from 1024 tokens; `FSO_SM90_DENSE_DG2=0` keeps every dense GEMM on fso's own kernel.
 - **H200 (sm_90) MoE layer and block.** The grouped GEMMs and the expert-sorted gather-quantize now launch with PDL,
   so each starts while its predecessor finishes. The swap-AB grouped GEMMs of the decode routes (the 16- and 32-row
   activation tiles) load the expert weights evict-first in L2, so the weights they stream once no longer push the

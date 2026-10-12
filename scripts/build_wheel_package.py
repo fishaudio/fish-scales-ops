@@ -171,6 +171,11 @@ deep_gemm/
     csrc/gemm/include/blockscale_gemm/arch/sm90/fp8/jit/deep_gemm/.
     These JIT headers come from NVIDIA TensorRT-LLM, which adapted them from DeepSeek's DeepGEMM (MIT License);
     each file keeps its NVIDIA copyright header and its license, the Apache License 2.0.
+    The subdirectories comm/, common/, epilogue/, impls/, mma/, ptx/ and scheduler/ are DeepGEMM v2's dense sm_90
+    kernel (impls/sm90_fp8_gemm_1d2d.cuh) and the headers it includes, from sgl-project/DeepGEMM tag v0.2.0
+    (commit 7fec51c2eeb29b755a27d86b851c9996b6b5dca5), MIT License, Copyright (c) 2025 DeepSeek; the license text is
+    deep_gemm/LICENSE.DeepGEMM. Two files are modified for NVRTC, as their first lines say; nvrtc_shim/ holds two
+    small standard-header shims of fish-scales-ops.
 
 cute/, cutlass/
     Source: NVIDIA CUTLASS commit {cutlass_commit} (v4.4.2), include/.

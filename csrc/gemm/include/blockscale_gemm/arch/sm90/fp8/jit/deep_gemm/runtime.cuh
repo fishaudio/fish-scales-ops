@@ -126,12 +126,15 @@ public:
             std::vector<CUkernel> kernels(numKernels);
             CHECK_CUDA(cuLibraryEnumerateKernels(kernels.data(), numKernels, lib_));
 
+            // The GEMM is fso's fp8_gemm_kernel* or DeepGEMM v2's sm90_fp8_gemm_1d2d_impl (Compiler::buildDg2); the
+            // other kernel of the cubin is the generated source's dummy_kernel.
             for (auto kernel : kernels)
             {
                 char const* kernelName;
                 CHECK_CUDA(cuKernelGetName(&kernelName, kernel));
                 std::string kernelNameStr(kernelName);
-                if (kernelNameStr.find("fp8_gemm_kernel") != std::string::npos)
+                if (kernelNameStr.find("fp8_gemm_kernel") != std::string::npos
+                    || kernelNameStr.find("sm90_fp8_gemm_1d2d_impl") != std::string::npos)
                 {
                     kernel_ = kernel;
                     break;
@@ -140,7 +143,7 @@ public:
 
             if (!kernel_)
             {
-                throw std::runtime_error("Failed to find fp8_gemm_kernel");
+                throw std::runtime_error("Failed to find fp8_gemm_kernel or sm90_fp8_gemm_1d2d_impl");
             }
         }
 

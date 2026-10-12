@@ -29,6 +29,47 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels::blockscale_gemm
 {
 
+// FSO_SM90_DENSE_DG2, read once per process: which dense (non-swap-AB) GEMMs run DeepGEMM v2's kernel. Unset or "1":
+// the tile classes deep_gemm::jit::use_dg2_dense accepts (the default); "0": none, every dense GEMM runs
+// fp8_gemm_kernel at get_dense_gemm_config's pick (0.2.1's behaviour); "all": every DeepGEMM v2 pick (for sweeps).
+// The outputs are bitwise identical in all three settings.
+enum class Sm90DenseDg2Mode
+{
+    kRule,
+    kOff,
+    kAll
+};
+
+inline Sm90DenseDg2Mode sm90_dense_dg2_mode()
+{
+    static Sm90DenseDg2Mode const mode = []
+    {
+        char const* e = std::getenv("FSO_SM90_DENSE_DG2");
+        if (e == nullptr || e[0] == '\0' || std::string(e) == "1")
+            return Sm90DenseDg2Mode::kRule;
+        if (std::string(e) == "0")
+            return Sm90DenseDg2Mode::kOff;
+        if (std::string(e) == "all")
+            return Sm90DenseDg2Mode::kAll;
+        std::fprintf(stderr, "[fish_scales_ops] FSO_SM90_DENSE_DG2=%s is not 0, 1 or all; using the default (1)\n", e);
+        return Sm90DenseDg2Mode::kRule;
+    }();
+    return mode;
+}
+
+// FSO_SM90_DENSE_DG2_K=<K>, read once per process: with FSO_SM90_DENSE_DG2=all, apply "all" only to GEMMs whose K
+// equals the value (the others follow the default rule), so that a sweep inside an MLP block can move one projection
+// at a time. 0 (unset): every K.
+inline uint32_t sm90_dense_dg2_k()
+{
+    static uint32_t const k = []
+    {
+        char const* e = std::getenv("FSO_SM90_DENSE_DG2_K");
+        return e != nullptr ? static_cast<uint32_t>(std::strtoul(e, nullptr, 10)) : 0u;
+    }();
+    return k;
+}
+
 inline void gemm_dispatch_sm90(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, int ld_d, float* scales_a,
     float* scales_b, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, cudaStream_t stream,
     int num_device_sms = kNumDeviceSMs)
@@ -54,6 +95,26 @@ inline void gemm_dispatch_sm90(void* mat_a, int ld_a, void* mat_b, int ld_b, voi
     // quantize runs and waits on it with griddepcontrol.wait after its prologue (fp8_gemm_impl.cuh). On for every
     // shape, off for every shape with FSO_DISABLE_PDL=1.
     bool const pdl = fso_pdl_enabled();
+
+    // Main path: DeepGEMM v2's kernel at DeepGEMM's own configuration where that configuration is one of the tile
+    // classes deep_gemm::jit::use_dg2_dense accepts (256 x 128 with multicast on A and 128 x 160 / 192 from M = 512 on;
+    // every configuration but 80-wide tiles at 128 < M < 256; 64-row tiles at M = 64 / 128 with K >= 8192), else
+    // fp8_gemm_kernel. Both kernels compute the same bits; the choice depends on (M, N, K) and the SM count only.
+    if (!use_swap_ab && sm90_dense_dg2_mode() != Sm90DenseDg2Mode::kOff)
+    {
+        deep_gemm::jit::Dg2DenseConfig const dg2
+            = deep_gemm::jit::get_dg2_dense_config_cached(shape_m, shape_n, shape_k, num_device_sms);
+        bool const all = sm90_dense_dg2_mode() == Sm90DenseDg2Mode::kAll
+            && (sm90_dense_dg2_k() == 0 || sm90_dense_dg2_k() == shape_k);
+        if (all || deep_gemm::jit::use_dg2_dense(dg2, shape_m, shape_k))
+        {
+            auto runtime = deep_gemm::jit::getGlobalCompiler().buildDg2(dg2);
+            auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
+            deep_gemm::runGemmDg2(kernel, mat_a, ld_a, mat_b, ld_b, mat_d, ld_d, scales_a, scales_b, shape_m, shape_n,
+                shape_k, dg2, stream, pdl);
+            return;
+        }
+    }
 
     // Tile rules of the dense GEMM on top of the shared picker: deep_gemm::jit::get_dense_gemm_config.
     if (!use_swap_ab)
