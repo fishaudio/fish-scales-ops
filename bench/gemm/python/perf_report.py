@@ -361,8 +361,6 @@ def layer_report(perf, ref, title):
     out = [f"\n### {title}\n", "|    M | fso µs |" + "".join(f" {t}{' (eager)' if i in eager else ''} µs | ×fso |" for i, t in cols),
            "|-----:|-------:|" + "".join("------:|-----:|" for _ in cols)]
     for M in sorted(fso):
-        if M == 96:
-            continue
         line = f"| {M:4d} | {fso[M]:6.1f} |"
         for i, _ in cols:
             r = rows.get((i, M))
@@ -370,7 +368,7 @@ def layer_report(perf, ref, title):
         out.append(line)
     out += ["", "| geomean ×fso |" + "".join(f" {t} |" for _, t in cols), "|---|" + "---:|" * len(cols)]
     for name, pred in BANDS:
-        xs = {i: [rows[(i, M)]["us"] / fso[M] for M in fso if M != 96 and pred(M) and (i, M) in rows] for i, _ in cols}
+        xs = {i: [rows[(i, M)]["us"] / fso[M] for M in fso if pred(M) and (i, M) in rows] for i, _ in cols}
         out.append(f"| {name} |" + "".join(f" {geo(xs[i]):.2f}× (n={len(xs[i])}) |" if xs[i] else " — |" for i, _ in cols))
     return "\n".join(out)
 
@@ -386,7 +384,7 @@ def kernel_report(perf, ref, title):
     cols = [(i, t) for i, t in KERN_IMPLS if any(k[0] == i for k in rows)]
     out = []
     for proj in ("gate_up", "down"):
-        Ms = sorted(M for (p, M) in fso if p == proj and M != 96)
+        Ms = sorted(M for (p, M) in fso if p == proj)
         out += [f"\n### {title} — `moe.{proj}`\n", "|    M | fso MXFP8 µs | cos |" + "".join(f" {t} µs | ×fso | cos |" for _, t in cols),
                 "|-----:|-------------:|----:|" + "".join("-----:|-----:|----:|" for _ in cols)]
         for M in Ms:

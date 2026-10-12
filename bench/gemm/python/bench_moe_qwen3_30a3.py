@@ -226,8 +226,8 @@ def torch_impls_for_device():
 # instead of hard-coding one. The estimate deliberately still counts the gate/up
 # slab, so it over-states the peak by that term whenever the fused FC1 is on, which
 # is the headroom the allocator gets.
-# 96/256 are off-grid sweep points (dense E33: off-grid mid-M is where
-# cascade bugs hide).
+# 96 and 256 were off-grid sweep points before they joined M_GRID (dense E33:
+# off-grid mid-M is where cascade bugs hide); the union keeps them on any grid.
 FSO_M_CAPPED = sorted(set([m for m in M_GRID if m <= 4096] + [96, 256]))
 
 
