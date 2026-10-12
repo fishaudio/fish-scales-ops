@@ -1678,13 +1678,20 @@ def run_worker(cell):
                 # the compact ops and the masked ops have different slot-route rules.
                 compact = result["layout"] == "compact"
 
+                # The expected rows per expert the layer's plan passes (max(1, ceil(M * topk / E))): the compact
+                # slot-route rule bounds them since 0.2.1's run S16b.
+                expected_m = max(1, (M * TOPK + E - 1) // E)
+
                 def query(fn, *args, **kw):
-                    # 0.2.0's route queries take no `compact` keyword (its layer has one layout, the masked
-                    # slab), so an A/B arm on that wheel asks them without it.
-                    try:
-                        return fn(*args, compact=compact, **kw)
-                    except TypeError:
-                        return fn(*args, **kw)
+                    # The queries of a wheel before S16b take no `expected_m` keyword, and 0.2.0's no `compact`
+                    # keyword either (its layer has one layout, the masked slab), so an A/B arm on such a wheel
+                    # asks them without.
+                    for extra in (dict(compact=compact, expected_m=expected_m), dict(compact=compact), {}):
+                        try:
+                            return fn(*args, **extra, **kw)
+                        except TypeError:
+                            continue
+                    raise TypeError(f"{fn.__name__}: no accepted signature")
 
                 fc1_interleaved = fso.compat.mxfp8_grouped_swiglu_available(n_w, HIDDEN)
                 fc1_fused = fc1_interleaved and query(

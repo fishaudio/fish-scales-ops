@@ -91,23 +91,24 @@ std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x32_grouped(
 std::tuple<at::Tensor, at::Tensor> linear_mxfp8_grouped_masked_swiglu(at::Tensor a_fp8, at::Tensor w13_fp8,
     at::Tensor sa_int32, at::Tensor sw13_int32, at::Tensor masked_m, int64_t expected_m, int64_t max_active_groups,
     std::optional<at::Tensor> slot_to_expert, std::optional<at::Tensor> problem_shapes);
-bool mxfp8_grouped_swiglu_fused_route(
-    int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups, int64_t max_active_groups, bool compact);
+bool mxfp8_grouped_swiglu_fused_route(int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups,
+    int64_t max_active_groups, bool compact, int64_t expected_m);
 bool mxfp8_grouped_swiglu_available(int64_t n_w, int64_t k);
 // Would this grouped GEMM shape take the slot-bound decode route? The only
 // consumer of moe_build_routing's packed active-expert list, so a caller uses
 // it to decide whether to ask for that list at all. `compact` names the layout the
 // call runs on: the compact ops (0.2.1) have their own route rule, the masked ops
-// keep 0.2.0's.
+// keep 0.2.0's. `expected_m` (the expected rows per expert, 0 = unknown) is what
+// the compact rule bounds.
 bool mxfp8_grouped_slot_possible(int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups,
-    int64_t max_active_groups, bool fused_swiglu, bool compact);
+    int64_t max_active_groups, bool fused_swiglu, bool compact, int64_t expected_m);
 // Would this grouped GEMM shape read a caller-supplied problem_shapes tensor
 // (the pointer-array route's counterpart of the slot list)? A caller uses it
 // to ask moe_build_routing for the shapes exactly where a GEMM consumes them.
 // `fused_swiglu` names the kernel, as above: the two queries are complements
 // only when asked with the same flags.
 bool mxfp8_grouped_problem_shapes_consumed(int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups,
-    int64_t max_active_groups, bool fused_swiglu, bool compact);
+    int64_t max_active_groups, bool fused_swiglu, bool compact, int64_t expected_m);
 at::Tensor linear_mxfp8_grouped_masked_combine(at::Tensor a_fp8, at::Tensor w2_fp8, at::Tensor sa_int32,
     at::Tensor sw2_int32, at::Tensor masked_m, at::Tensor row_map, at::Tensor weight_of_slot, at::Tensor out,
     int64_t expected_m, int64_t max_active_groups);
@@ -211,16 +212,17 @@ TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
     // A pure host-side query (no tensor argument), so it carries its own
     // catch-all kernel here instead of a CUDA-dispatched impl below.
     m.def("mxfp8_grouped_swiglu_fused_route(int m_cap, int n_w, int k, int num_groups, "
-                                            "int max_active_groups, bool compact=False) -> bool",
+                                            "int max_active_groups, bool compact=False, int expected_m=0) -> bool",
         &blockscale_gemm::mxfp8_grouped_swiglu_fused_route);
     m.def("mxfp8_grouped_swiglu_available(int n_w, int k) -> bool",
         &blockscale_gemm::mxfp8_grouped_swiglu_available);
     m.def("mxfp8_grouped_slot_possible(int m_cap, int n_w, int k, int num_groups, "
-                                       "int max_active_groups, bool fused_swiglu=False, bool compact=False) -> bool",
+                                       "int max_active_groups, bool fused_swiglu=False, bool compact=False, "
+                                       "int expected_m=0) -> bool",
         &blockscale_gemm::mxfp8_grouped_slot_possible);
     m.def("mxfp8_grouped_problem_shapes_consumed(int m_cap, int n_w, int k, int num_groups, "
                                                  "int max_active_groups, bool fused_swiglu=False, "
-                                                 "bool compact=False) -> bool",
+                                                 "bool compact=False, int expected_m=0) -> bool",
         &blockscale_gemm::mxfp8_grouped_problem_shapes_consumed);
     m.def("moe_build_routing(Tensor topk_ids, int num_groups, int m_cap, bool with_slots=False, "
                              "int[] problem_shapes_nk=[], Tensor? topk_w=None) "

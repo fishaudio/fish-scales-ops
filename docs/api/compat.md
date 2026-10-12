@@ -765,18 +765,27 @@ re-measured for it at the layer level, each GEMM forced onto the slot route on
 its own against both on the pointer-array route. Every measured cell was faster
 on the slot route — the plain FC1, the fused FC1 and the FC2 of Qwen3-30B-A3B and
 Qwen3.5-35B-A3B at every `M` measured from 16 to 512 (below that the masked rule
-already takes the slot route) — so the compact rule takes the slot route
-wherever it is legal (a slot bound) up to a row capacity of `m_cap = 512`, the
-largest measured, while the live tile space `max_active_groups * ceil(N / 128)`
-is at most 28 waves of the device's SMs, for all three kernels alike. Both
-bounds are the edges of the measurement (the 28 waves are Qwen3.5-35B-A3B
-`down`, 4096 tiles on 148 SMs), not measured crossovers; a larger row capacity or
-tile space stays on the pointer-array kernel. For both models that means every
-grouped GEMM of the layer takes the slot route through `M = 512` and the
-pointer-array kernel above. Ask the route queries with
-`compact=True` (`mxfp8_grouped_slot_possible`, `mxfp8_grouped_problem_shapes_consumed`,
-`mxfp8_grouped_swiglu_fused_route`) when composing these ops, as `fso.moe.layer`
-does; without it they answer for the masked ops. A caller composing them asks
+already takes the slot route). Past `M = 512` both GEMMs forced onto the slot
+route against the pointer-array route showed one crossover, at the same place in
+both models: the slot route is faster while an expert holds at most one 64-row
+token tile on average, `expected_m = max(1, ceil(M * topk / G)) <= 64`, and slower
+from 96 rows per expert on, under uniform and skewed routing alike. So the compact
+rule takes the slot route wherever it is legal (a slot bound) while
+`expected_m <= 64` — the `expected_m` the compact ops receive — and the live tile
+space `max_active_groups * ceil(N / 128)` is at most 28 waves of the device's SMs,
+for all three kernels alike. The 28 waves are the edge of the measurement
+(Qwen3.5-35B-A3B `down`, 4096 tiles on 148 SMs), not a crossover; a larger tile
+space stays on the pointer-array kernel. For Qwen3.5-35B-A3B (G = 256, top-8) that
+means the slot route through `M = 2048`, for Qwen3-30B-A3B (G = 128) through
+`M = 1024`, and the pointer-array kernel above. Ask the route queries with
+`compact=True` and `expected_m=` (`mxfp8_grouped_slot_possible`,
+`mxfp8_grouped_problem_shapes_consumed`, `mxfp8_grouped_swiglu_fused_route`) when
+composing these ops, as `fso.moe.layer` does: without `compact` they answer for
+the masked ops, and without `expected_m` (0, unknown) they answer with the compact
+rule's previous bound, `m_cap <= 512`, which is then not necessarily the route the
+compact op takes (the op always has its `expected_m`; a caller that withholds the
+slot list or the token-tile list where the op takes the slot route gets correct
+results at the cost of the op's own preparation kernels). A caller composing them asks
 `moe_build_routing_compact` for `with_tiles=True` where a GEMM lands on the slot
 route with `m_cap > 64`, and passes `slot_tiles` to both GEMMs. `FSO_GROUPED_SLOT`
 steers both rules alike; `force` takes the compact slot route at any row capacity
@@ -939,10 +948,10 @@ linear_mxfp8_grouped_masked(Tensor a_fp8, Tensor w_fp8, Tensor sa_int32, Tensor 
 quantize_1x32_grouped_gather(Tensor x, Tensor slot_of_flat, int topk, int num_groups, int m_cap, bool use_ue8m0=True) -> (Tensor, Tensor)
 silu_chunk_mul_quantize_1x32_grouped(Tensor gu, Tensor slot_of_flat, bool use_ue8m0=True, bool pairwise=False) -> (Tensor, Tensor)
 linear_mxfp8_grouped_masked_swiglu(Tensor a_fp8, Tensor w13_fp8, Tensor sa_int32, Tensor sw13_int32, Tensor masked_m, int expected_m, int max_active_groups=0, Tensor? slot_to_expert=None, Tensor? problem_shapes=None) -> (Tensor, Tensor)
-mxfp8_grouped_swiglu_fused_route(int m_cap, int n_w, int k, int num_groups, int max_active_groups, bool compact=False) -> bool
+mxfp8_grouped_swiglu_fused_route(int m_cap, int n_w, int k, int num_groups, int max_active_groups, bool compact=False, int expected_m=0) -> bool
 mxfp8_grouped_swiglu_available(int n_w, int k) -> bool
-mxfp8_grouped_slot_possible(int m_cap, int n_w, int k, int num_groups, int max_active_groups, bool fused_swiglu=False, bool compact=False) -> bool
-mxfp8_grouped_problem_shapes_consumed(int m_cap, int n_w, int k, int num_groups, int max_active_groups, bool fused_swiglu=False, bool compact=False) -> bool
+mxfp8_grouped_slot_possible(int m_cap, int n_w, int k, int num_groups, int max_active_groups, bool fused_swiglu=False, bool compact=False, int expected_m=0) -> bool
+mxfp8_grouped_problem_shapes_consumed(int m_cap, int n_w, int k, int num_groups, int max_active_groups, bool fused_swiglu=False, bool compact=False, int expected_m=0) -> bool
 moe_build_routing(Tensor topk_ids, int num_groups, int m_cap, bool with_slots=False, int[] problem_shapes_nk=[], Tensor? topk_w=None) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)
 moe_build_routing_compact(Tensor topk_ids, int num_groups, int num_blocks, bool with_slots=False, bool with_row_map=False, Tensor? topk_w=None, int[] problem_shapes_nk=[], Tensor[]? ptr_bases=None, int[] ptr_strides=[], bool with_tiles=False) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)
 linear_mxfp8_grouped_masked_combine(Tensor a_fp8, Tensor w2_fp8, Tensor sa_int32, Tensor sw2_int32, Tensor masked_m, Tensor row_map, Tensor weight_of_slot, Tensor(a!) out, int expected_m, int max_active_groups=0) -> Tensor(a!)

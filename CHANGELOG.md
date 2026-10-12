@@ -38,16 +38,19 @@ Performance figures are in `docs/perf/`, not here.
   `linear_mxfp8_grouped_compact_swiglu`, `linear_mxfp8_grouped_compact_combine`) and the out-style glue
   (`quantize_1x32_grouped_gather_out_fp8`, `silu_chunk_mul_quantize_1x32_grouped_out_fp8`). On sm_100/sm_103 the
   compact GEMMs have their own route rule, so the route queries (`mxfp8_grouped_slot_possible`,
-  `mxfp8_grouped_problem_shapes_consumed`, `mxfp8_grouped_swiglu_fused_route`) take a new keyword `compact=False`;
-  a caller composing the compact ops asks them with `compact=True`, and without it they answer for the masked ops
-  as in 0.2.0. The contracts are in `docs/api/compat.md`.
+  `mxfp8_grouped_problem_shapes_consumed`, `mxfp8_grouped_swiglu_fused_route`) take two new keywords:
+  `compact=False`, which a caller composing the compact ops sets to `True` (without it they answer for the masked
+  ops as in 0.2.0), and `expected_m=0`, the expected rows per expert `ceil(M * topk / G)` that the compact rule
+  bounds (passed as the compact ops receive it, the queries return the route those ops take). The contracts are in
+  `docs/api/compat.md`.
 
 ### Faster
 
-- **B300 (sm_100/sm_103) MoE layer and block.** The compact layer's grouped GEMMs take the slot-bound route up to
-  512 tokens per call, which hands its tiles out dynamically over the experts that hold rows and writes only the
-  routed rows. Both families are faster from 16 to 512 tokens per call, under uniform, skewed and padded routing
-  alike, and the layer no longer runs into the card's power cap there. fso is now level with or faster than
+- **B300 (sm_100/sm_103) MoE layer and block.** The compact layer's grouped GEMMs take the slot-bound route while
+  an expert holds at most 64 routed rows on average (`ceil(tokens * topk / experts) <= 64`: up to 2048 tokens per
+  call on Qwen3.5-35B-A3B, 1024 on Qwen3-30B-A3B), which hands its tiles out dynamically over the experts that hold
+  rows and writes only the routed rows. Both families are faster from 16 tokens per call up to that bound, under
+  uniform, skewed and padded routing alike, and the layer no longer runs into the card's power cap there. fso is now level with or faster than
   TensorRT-LLM's trtllm-gen block-FP8 MoE at every batch size of the tables.
 - **H200 (sm_90) MoE layer and block.** The grouped GEMMs and the expert-sorted gather-quantize now launch with PDL,
   so each starts while its predecessor finishes; the layer is faster at decode and in prefill.

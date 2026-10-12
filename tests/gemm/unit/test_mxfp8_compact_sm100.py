@@ -85,7 +85,9 @@ FAMILIES = {
     "B": dict(E=128, H=2048, I=768, topk=8),
     "C": dict(E=256, H=2048, I=512, topk=8),
 }
-M_GRID = [1, 2, 3, 4, 7, 8, 16, 32, 40, 64, 96, 128, 256, 512, 1024, 2048, 4096, 8192]
+# 1024 / 1025 and 2048 / 2049 hold the compact slot-route bound on both sides: 64 and 65 expected rows per expert
+# (Family B at 1024 / 1025, Family C at 2048 / 2049; run fso_0.2.1_20261010/S16b).
+M_GRID = [1, 2, 3, 4, 7, 8, 16, 32, 40, 64, 96, 128, 256, 512, 1024, 1025, 2048, 2049, 4096, 8192]
 ROUTINGS = ["uniform", "hot", "padded", "ep"]
 
 # Every unfused code the sm_100 grouped force table wires (grouped_dispatch.cuh).
@@ -226,8 +228,10 @@ def weights(fam):
 
 def slot_taken(rt, N, K, fused, compact):
     """The route the op of the given layout lands on: the compact ops have their own rule
-    (run fso_0.2.1_20261010/S10b-3a), the masked ops keep 0.2.0's."""
-    return bool(ops.mxfp8_grouped_slot_possible(rt.m_cap, N, K, rt.G, rt.max_active, fused, compact))
+    (runs fso_0.2.1_20261010/S10b-3a and S16b), asked with the expected rows per expert the op
+    receives; the masked ops keep 0.2.0's."""
+    return bool(ops.mxfp8_grouped_slot_possible(rt.m_cap, N, K, rt.G, rt.max_active, fused, compact,
+                                                rt.expected_m if compact else 0))
 
 
 def allowed_rows(rt, slot_route):
