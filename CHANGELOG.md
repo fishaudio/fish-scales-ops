@@ -68,7 +68,10 @@ Performance figures are in `docs/perf/`, not here.
   top-k copies, and the Qwen3.5-35B-A3B experts take a better grouped tile around 1024 tokens; the MoE layer is
   faster from 256 tokens up.
 - **H200 (sm_90) MoE layer and block.** The grouped GEMMs and the expert-sorted gather-quantize now launch with PDL,
-  so each starts while its predecessor finishes; the layer is faster at decode and in prefill.
+  so each starts while its predecessor finishes. The swap-AB grouped GEMMs of the decode routes (the 16- and 32-row
+  activation tiles) load the expert weights evict-first in L2, so the weights they stream once no longer push the
+  layer's own intermediates out of L2 between the kernel that writes them and the one that reads them. The layer is
+  faster at decode and in prefill.
 
 ### Known issues
 

@@ -564,7 +564,7 @@ public:
     Runtime* build(uint32_t const shape_n, uint32_t const shape_k, uint32_t const block_m, uint32_t const block_n,
         uint32_t const block_k, uint32_t const num_groups, uint32_t const num_stages, uint32_t const num_tma_multicast,
         deep_gemm::GemmType const gemm_type, bool swapAB = false, uint32_t const ctas_per_sm = 1, bool two_wg = false,
-        bool swiglu = false, bool swapab_pair = false, bool swapab_split = false)
+        bool swiglu = false, bool swapab_pair = false, bool swapab_split = false, bool weight_evict_first = false)
     {
         int sm_version = tensorrt_llm::common::getSMVersion();
         if (sm_version != 90)
@@ -590,7 +590,8 @@ public:
             + std::to_string(shape_k) + "_" + std::to_string(block_m) + "_" + std::to_string(block_n) + "_"
             + std::to_string(block_k) + "_" + std::to_string(num_groups) + "_" + std::to_string(num_stages)
             + std::to_string(num_groups) + "_" + std::to_string(num_stages) + "_" + std::to_string(num_tma_multicast)
-            + "_" + gemm_type_to_string(gemm_type) + (ctas_per_sm > 1 ? "_c" + std::to_string(ctas_per_sm) : "");
+            + "_" + gemm_type_to_string(gemm_type) + (ctas_per_sm > 1 ? "_c" + std::to_string(ctas_per_sm) : "")
+            + (weight_evict_first ? "_ef" : "");
 
         // Hit path, taken by every sm_90 GEMM launch after the first one of its kernel in this process: the name
         // above and one in-memory lookup. No hashing, file-system access or environment read happens here; the rest
@@ -612,6 +613,10 @@ public:
                 "-D__FORCE_INCLUDE_CUDA_FP16_HPP_FROM_FP16_H__=1", "-D__FORCE_INCLUDE_CUDA_BF16_HPP_FROM_BF16_H__=1"};
         if (ctas_per_sm > 1)
             flags.push_back("-DFSO_SWAPAB_CTAS_PER_SM=" + std::to_string(ctas_per_sm));
+        // The grouped swap-AB GEMMs' weight boxes loaded evict-first in L2 (fp8_gemm_impl.cuh, kWeightEvictFirst;
+        // the dispatch decides, dispatch.cuh sm90_swapab_weight_evict_first).
+        if (weight_evict_first)
+            flags.push_back("-DFSO_SWAPAB_WEIGHT_EVICT_FIRST=1");
         // Developer passthrough: FSO_JIT_EXTRA_FLAGS="-DFOO=1 -DBAR=0" appends to every JIT compile. Like every other
         // flag they are part of the disk cache's content key, so a cubin built under different extra flags is never
         // loaded in their place.

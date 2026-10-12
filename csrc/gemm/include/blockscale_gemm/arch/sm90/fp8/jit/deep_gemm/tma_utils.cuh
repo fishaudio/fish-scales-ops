@@ -151,4 +151,15 @@ __device__ __forceinline__ void tma_copy(
     }
 }
 
+// A weight box of the grouped (MoE) GEMMs, with an L2 eviction hint chosen by the caller: kEvictFirst marks the lines
+// evict-first (weights the call streams once), otherwise exactly tma_copy's load (evict-normal, no multicast).
+template <bool kEvictFirst>
+__device__ __forceinline__ void tma_copy_weight(
+    void const* desc_ptr, uint64_t* barrier_ptr, void* smem_ptr, int32_t const& crd_0, int32_t const& crd_1)
+{
+    constexpr auto cache_hint = static_cast<uint64_t>(
+        kEvictFirst ? cute::TMA::CacheHintSm90::EVICT_FIRST : cute::TMA::CacheHintSm90::EVICT_NORMAL);
+    cute::SM90_TMA_LOAD_2D::copy(desc_ptr, barrier_ptr, cache_hint, smem_ptr, crd_0, crd_1);
+}
+
 } // namespace deep_gemm
