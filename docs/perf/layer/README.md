@@ -41,3 +41,22 @@ Comparators that implement only the routed layer are set against `fso routed`.
 
 Comparator columns differ per machine, so a column of one page is not
 comparable with a column of another page.
+
+## Serving-shaped cases
+
+Each page ends with the routed MoE layer of Families B and C under the three
+serving-shaped routing families of [`../README.md`](../README.md#routing),
+one table per family, every row set against the uniform rows of the same page.
+The comparators are the machine's block-FP8 serving comparators; one that does
+not serve a family natively is listed under its table with the reason.
+
+| column | meaning |
+|---|---|
+| `h` | skewed routing: rows of the hottest expert under the skewed draw divided by those of the uniform draw's hottest expert, at the same M |
+| `fso skew / uniform` | fso's µs under the skewed draw divided by its µs under the uniform draw at the same M |
+| `×fso`, `×fso uniform` | a comparator's µs over fso's µs in the case at hand, and the same ratio in the uniform table at that M |
+| `bucket rows`, `live rows` | padded bucket: rows the call executes, and the rows that carry tokens |
+| `fso µs, M = live rows` / `M = bucket rows` | the uniform rows at those M: the same live tokens without padding, and a full bucket |
+| `padding cost` | the padded call's µs over the unpadded call of the same live rows (the uniform row at M = live rows), minus one |
+| `active local experts` | expert-parallel rank: the rank's experts that receive at least one token |
+| `fso rank / all experts`, `rank / all experts` | the rank's µs over the uniform row at the same M, where the same tokens reach all experts of one card |

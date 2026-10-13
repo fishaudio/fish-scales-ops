@@ -1,0 +1,8 @@
+// NVRTC shim for <utility>: NVRTC's builtin header already declares std::forward / std::move; DeepGEMM v2's
+// common/utils.cuh also needs std::integer_sequence.
+#pragma once
+#include <cuda/std/utility>
+namespace std {
+using cuda::std::integer_sequence;
+using cuda::std::make_integer_sequence;
+}

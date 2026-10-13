@@ -457,6 +457,31 @@ def _sm90_fc2_swap(use_swap):
     return True
 
 
+# Alignment of every view's byte offset inside the shared intermediate region of an sm_90 layer call: whole 1 KiB
+# units, more than TMA's 16-byte global-address rule and the 512-byte alignment the caching allocator gives a tensor
+# of its own.
+_SM90_REGION_ALIGN = 1024
+
+
+def _sm90_region(p_max, hidden, inter, fused_fc1):
+    """The byte layout of the one allocation an sm_90 layer call shares between the intermediates whose lifetimes do
+    not overlap: ``(sh_off, gu_off, total)``. The gathered FP8 activation ``[p_max, hidden]`` sits at offset 0 and
+    its fp32 scales ``[hidden/128, align4(p_max)]`` at ``sh_off`` (both read for the last time by the FC1); the bf16
+    gate/up output ``[p_max, 2*inter]`` of the unfused FC1 follows at ``gu_off`` (-1 with the fused FC1; read for the
+    last time by the SwiGLU requantize); the bf16 down output ``[p_max, hidden]`` is born at the FC2, after all of
+    them are dead, and takes the region from offset 0. `moe_layer_fp8_sm90` carves its views from this layout and
+    `moe_layer_transient_bytes_sm90` charges ``total`` once."""
+    a = _SM90_REGION_ALIGN
+    ld = (p_max + 3) // 4 * 4
+    sh_off = (p_max * hidden + a - 1) // a * a
+    end = sh_off + 4 * (hidden // 128) * ld
+    gu_off = -1
+    if not fused_fc1:
+        gu_off = (end + a - 1) // a * a
+        end = gu_off + 2 * p_max * 2 * inter
+    return sh_off, gu_off, max(end, 2 * p_max * hidden)
+
+
 def moe_layer_transient_bytes_sm90(tokens, num_experts, topk, hidden, inter):
     """Device memory one :func:`moe_layer_fp8_sm90` call allocates for a bucket of
     ``tokens`` rows, in bytes: the expert-sorted routing tensors, the gathered FP8
@@ -466,7 +491,9 @@ def moe_layer_transient_bytes_sm90(tokens, num_experts, topk, hidden, inter):
     its scales, the bf16 down output and the ``[tokens, hidden]`` result, each
     charged as the caching allocator can charge it (512-byte blocks, and up to 1 MiB
     more for a tensor above 1 MiB that a cached block serves unsplit), so the figure
-    is an upper bound on what the call occupies. The sorted layout sizes
+    is an upper bound on what the call occupies. The gathered activation, its scales and
+    the gate/up output are dead before the down output is first written, so the down
+    output shares their allocation, which is counted once at its size. The sorted layout sizes
     everything by the routed rows (``tokens * topk`` plus at most ``block - 1``
     padding rows per active expert), so unlike the masked slab this grows with
     ``topk`` rather than with the expert count. Inputs, weights and the library's
@@ -496,11 +523,9 @@ def moe_layer_transient_bytes_sm90(tokens, num_experts, topk, hidden, inter):
     _, _, _, p_max, fused_fc1 = _sm90_layer_plan(tokens, num_experts, topk, hidden, inter)
     ld = (p_max + 3) // 4 * 4
     total = a(4 * p_max) + a(4 * tokens * topk) + a(4)          # sorted ids, pair -> row, padded length
-    total += a(p_max * hidden) + a(4 * (hidden // 128) * ld)     # gathered FP8 activation + scales
-    if not fused_fc1:
-        total += a(2 * p_max * 2 * inter)                        # bf16 gate/up output
+    # One region: gathered FP8 activation + scales [+ bf16 gate/up output], then the bf16 down output.
+    total += a(_sm90_region(p_max, hidden, inter, fused_fc1)[2])
     total += a(p_max * inter) + a(4 * (inter // 128) * ld)       # FP8 SwiGLU output + scales
-    total += a(2 * p_max * hidden)                               # bf16 down output
     total += a(2 * tokens * hidden)                              # the combined result
     return total
 
@@ -545,22 +570,38 @@ def moe_layer_fp8_sm90(hidden, w13_fp8, sw13, w2_fp8, sw2, topk_ids, topk_w):
 
     se, fts, _ = ops.moe_build_sorted(topk_ids, E, block)
     p_max = int(se.shape[0])
-    hq, sh = ops.quantize_1x128_sorted_gather_sm90(hidden.contiguous(), fts, p_max, topk)
+    H = int(w13_fp8.shape[2])
+    I = int(w13_fp8.shape[1]) // 2
+    # The buffers whose lifetimes do not overlap share one allocation (`_sm90_region`): the gathered activation and
+    # its scales (last read by the FC1) and the unfused FC1's gate/up output (last read by the SwiGLU requantize) at
+    # the front, the down output from offset 0, first written by the FC2. That is safe under programmatic dependent
+    # launch because the FC2 writes its output only after its griddepcontrol.wait, which returns once the preceding
+    # kernel has completed. With the fused FC1 that kernel is the FC1 itself. With the unfused FC1 it is the SwiGLU
+    # requantize, which is a plain launch (no programmatic attribute): it cannot start before the FC1 has completed,
+    # so the FC2's wait on it also covers the FC1.
+    sh_off, gu_off, region_bytes = _sm90_region(p_max, H, I, fused_fc1)
+    region = torch.empty(region_bytes, device=hidden.device, dtype=torch.uint8)
+    ld = (p_max + 3) // 4 * 4
+    hq = region[: p_max * H].view(torch.float8_e4m3fn).view(p_max, H)
+    sh = region[sh_off: sh_off + 4 * (H // 128) * ld].view(torch.float32).view(H // 128, ld)
+    ops.quantize_1x128_sorted_gather_sm90(hidden.contiguous(), fts, p_max, topk, x_q=hq, sa=sh)
     if fused_fc1:
         if use_swap:
             dq, sd = ops.linear_fp8_grouped_contiguous_swapab_swiglu(hq, w13_fp8, sh, sw13, se, block, expected_m)
         else:
             dq, sd = ops.linear_fp8_grouped_contiguous_swiglu(hq, w13_fp8, sh, sw13, se, block, expected_m)
     else:
+        gu = region[gu_off: gu_off + 2 * p_max * 2 * I].view(torch.bfloat16).view(p_max, 2 * I)
         if use_swap:
-            gu = ops.linear_fp8_grouped_contiguous_swapab(hq, w13_fp8, sh, sw13, se, block, expected_m)
+            ops.linear_fp8_grouped_contiguous_swapab(hq, w13_fp8, sh, sw13, se, block, expected_m, out=gu)
         else:
-            gu = ops.linear_fp8_grouped_contiguous(hq, w13_fp8, sh, sw13, se, block, expected_m)
+            ops.linear_fp8_grouped_contiguous(hq, w13_fp8, sh, sw13, se, block, expected_m, out=gu)
         dq, sd = ops.silu_chunk_mul_quantize_1x128_sorted_sm90(gu, fts)
+    dn = region[: 2 * p_max * H].view(torch.bfloat16).view(p_max, H)
     if _sm90_fc2_swap(use_swap):
-        dn = ops.linear_fp8_grouped_contiguous_swapab(dq, w2_fp8, sd, sw2, se, block, expected_m)
+        ops.linear_fp8_grouped_contiguous_swapab(dq, w2_fp8, sd, sw2, se, block, expected_m, out=dn)
     else:
-        dn = ops.linear_fp8_grouped_contiguous(dq, w2_fp8, sd, sw2, se, block, expected_m)
+        ops.linear_fp8_grouped_contiguous(dq, w2_fp8, sd, sw2, se, block, expected_m, out=dn)
     return ops.moe_combine_sorted(dn, fts, topk_w)
 
 

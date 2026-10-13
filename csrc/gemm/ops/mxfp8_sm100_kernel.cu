@@ -7,6 +7,26 @@
  * toolchains without SM100 support (< CUDA 12.8) the launcher degrades to
  * cudaErrorNotSupported so the extension still links.
  */
+// Grid dependency control (GDC) for the dense GEMMs of this translation unit (2026-10-11).
+//
+// CUTLASS guards every `griddepcontrol` instruction behind CUTLASS_GDC_ENABLED, which
+// cutlass/arch/grid_dependency_control.h derives from CUTLASS_ENABLE_GDC_FOR_SM100. With it compiled in, the
+// dense sm_100 kernel executes `griddepcontrol.wait` in its load and scheduler participants before their
+// first global access, and `griddepcontrol.launch_dependents` once its MMA warp has issued the last MMA, so
+// the dense GEMM may be launched as a programmatic dependent of the kernel before it (the activation
+// quantize in front of it) and may release the kernel after it (the SwiGLU quantize, the split-K reduce)
+// before its epilogue drains. That is what makes `launch_with_pdl` safe on these kernels; without the macro
+// the instructions compile to nothing and a PDL launch would read its input early.
+//
+// Scoping, as in mxfp8_sm100_grouped_kernel.cu: the macro is defined only in the DEVICE passes for sm_100 /
+// sm_103 (the second enabling block in grid_dependency_control.h would otherwise also switch GDC on for the
+// sm_120 / sm_121 passes of this file), and FSO_SM100_DENSE_GDC is the host-visible twin dispatch.cuh reads
+// before it hands `launch_with_pdl` to CUTLASS. Both macros are local to this file.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030)
+#define CUTLASS_ENABLE_GDC_FOR_SM100 1
+#endif
+#define FSO_SM100_DENSE_GDC 1
+
 #include "cutlass/arch/config.h"
 
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)

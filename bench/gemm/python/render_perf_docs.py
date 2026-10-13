@@ -14,6 +14,12 @@ Targets (only the first table after each known heading and the generated blocks 
                             band and every M at which it is more than 1 % faster than fso (layer_sections, summary_row)
   docs/perf/layer/sm120.md  same for the RTX 5090, plus the grouped GEMM kernel-level comparison tables (no summary)
   docs/perf/layer/sm100.md  same for the B300 (torch scaled_grouped_mm / _grouped_mm and TRT-LLM trtllm-gen comparators)
+                            Each layer page also ends with the "Serving-shaped cases" block between the markers
+                            `<!-- BEGIN GENERATED: serving-shaped cases (bench/gemm/python/render_perf_docs.py) -->` and
+                            `<!-- END GENERATED: serving-shaped cases -->`: the routed layer under skewed routing, in
+                            padded buckets and as one expert-parallel rank (serving_cases.py), each set against the
+                            uniform rows of the same page (serving_block). The block exists only while the device has
+                            a serving-shaped baseline file; it is appended at the end of the page when one appears.
   README.md                 the two hot-shape tables (sm_90, sm_120) — no comparisons, by policy
   docs/perf/README.md       two blocks between their BEGIN GENERATED / END GENERATED markers:
                             - the cross-machine summary: the summary rows of the three layer pages, one table per
@@ -46,8 +52,9 @@ import sys
 # and `perf_report.py report` cannot disagree on a band or on how its mean is taken. perf_report.py imports only the
 # standard library, and this directory is sys.path[0] however the script is started.
 from perf_report import BANDS, geo
+import serving_cases
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+ROOT =os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 BASE = os.path.join(ROOT, "tests", "baselines")
 DASH = "—"
 
@@ -651,6 +658,135 @@ def render_layer(lines, sm):
         pos = replace_table_after(lines, starts(sec["heading"]), sec["table"], pos)
         if sec["summary"] is not None:
             pos = put_block_after(lines, pos, *summary_markers(sec["family"]), summary_body(sec["summary"]))
+    render_serving_block(lines, sm)
+
+
+# ----------------------------------------------------------------------------- serving-shaped cases (layer pages)
+# The routed MoE layer under the serving-shaped routing families of serving_cases.py (defined for readers in
+# docs/perf/README.md, Routing), from perf_moe_qwen3_<fam>_<tag>_<dev>.jsonl and ref_moe_qwen3_<fam>_<tag>_<dev>.jsonl,
+# each row set against the uniform rows of the same page at the same M (padded: at M = live rows and M = bucket).
+# The comparators are the machine's block-FP8 serving comparators (serving_cases.DEVICE_COMPARATORS) that have rows;
+# one the family does not serve gets its reason under the table instead of a column.
+SERVING_BEGIN = "<!-- BEGIN GENERATED: serving-shaped cases (bench/gemm/python/render_perf_docs.py) -->"
+SERVING_END = "<!-- END GENERATED: serving-shaped cases -->"
+SERVING_FAMILIES = (("30a3", "B"), ("35a3", "C"))
+SERVING_HEADINGS = {"skew": "### Skewed routing",
+                    "padded": "### Padded buckets",
+                    "ep": f"### One expert-parallel rank (E / {serving_cases.EP_SIZE} local experts)"}
+
+
+def serving_rows(*names):
+    """(impl, M, live) -> row of the serving-shaped files that exist (live is None outside the padded family)."""
+    out = {}
+    for n in names:
+        if os.path.exists(os.path.join(BASE, n)):
+            for r in load(n):
+                if "impl" in r and r.get("us") is not None:
+                    out[(r["impl"], r["M"], r.get("live"))] = r
+    return out
+
+
+def ratio(a, b):
+    return a / b if a is not None and b else None
+
+
+def fpct(x):
+    return DASH if x is None else f"{(x - 1.0) * 100.0:+.1f} %"
+
+
+def serving_block(sm):
+    """The body of the serving-shaped block of layer/sm<sm>.md: a heading, then one table per family that has rows,
+    with the n/a comparators' reasons under it; [] when the device has no serving-shaped baseline file."""
+    sfx = SFX[sm]
+    fso_impl = f"fso_{'bsfp8' if sm == 90 else 'mxfp8'}_layer"
+    labels = {c: summary_label(t).replace(" (routed)", "") for c, t in layer_comparators(sm)}
+    out = []
+    for routing, tag in serving_cases.TAGS.items():
+        names = [n for fam, _ in SERVING_FAMILIES for n in (f"perf_moe_qwen3_{fam}_{tag}_{sfx}.jsonl",
+                                                            f"ref_moe_qwen3_{fam}_{tag}_{sfx}.jsonl")]
+        check_device(sm, *names)
+        rows = {fam: serving_rows(f"perf_moe_qwen3_{fam}_{tag}_{sfx}.jsonl", f"ref_moe_qwen3_{fam}_{tag}_{sfx}.jsonl")
+                for fam, _ in SERVING_FAMILIES}
+        fso_keys = {fam: sorted((M, live) for (i, M, live) in r if i == fso_impl) for fam, r in rows.items()}
+        if not any(fso_keys.values()):
+            continue
+        uni = {fam: {**moe_rows(f"perf_moe_qwen3_{fam}_{sfx}.jsonl"), **moe_rows(f"ref_moe_qwen3_{fam}_{sfx}.jsonl")}
+               for fam, _ in SERVING_FAMILIES}
+        devc = serving_cases.DEVICE_COMPARATORS[sfx]
+        cols = [c for c in devc if serving_cases.na_reason(c, routing) is None
+                and any(k[0] == c for r in rows.values() for k in r)]
+
+        def us(fam, impl, M, live=None):
+            r = rows[fam].get((impl, M, live))
+            return r["us"] if r else None
+
+        def us_uni(fam, impl, M):
+            r = uni[fam].get((impl, M))
+            return r["us"] if r else None
+
+        if routing == "skew":
+            hdr = (["family", "M", "h", "active experts", "fso µs", "fso skew / uniform"]
+                   + [x for c in cols for x in (f"{labels[c]} µs", "×fso", "×fso uniform")])
+        elif routing == "padded":
+            hdr = (["family", "bucket rows", "live rows", "fso µs", "fso µs, M = live rows", "padding cost",
+                    "fso µs, M = bucket rows"] + [x for c in cols for x in (f"{labels[c]} µs", "×fso", "padding cost")])
+        else:
+            hdr = (["family", "M", "active local experts", "fso µs", "fso rank / all experts"]
+                   + [x for c in cols for x in (f"{labels[c]} µs", "×fso", "rank / all experts")])
+        table = ["| " + " | ".join(hdr) + " |", "|---|" + "---:|" * (len(hdr) - 1)]
+        for fam, letter in SERVING_FAMILIES:
+            for M, live in fso_keys[fam]:
+                f = rows[fam][(fso_impl, M, live)]
+                if routing == "skew":
+                    line = [letter, str(M), f2(f.get("h")), str(f["active_experts"]), f1(f["us"]),
+                            f2(ratio(f["us"], us_uni(fam, fso_impl, M)))]
+                    for c in cols:
+                        cu = us(fam, c, M)
+                        line += [f1(cu), f2(ratio(cu, f["us"])), f2(ratio(us_uni(fam, c, M), us_uni(fam, fso_impl, M)))]
+                elif routing == "padded":
+                    line = [letter, str(M), str(live), f1(f["us"]), f1(us_uni(fam, fso_impl, live)),
+                            fpct(ratio(f["us"], us_uni(fam, fso_impl, live))), f1(us_uni(fam, fso_impl, M))]
+                    for c in cols:
+                        cu = us(fam, c, M, live)
+                        line += [f1(cu), f2(ratio(cu, f["us"])), fpct(ratio(cu, us_uni(fam, c, live)))]
+                else:
+                    line = [letter, str(M), str(f["active_experts"]), f1(f["us"]),
+                            f2(ratio(f["us"], us_uni(fam, fso_impl, M)))]
+                    for c in cols:
+                        cu = us(fam, c, M)
+                        line += [f1(cu), f2(ratio(cu, f["us"])), f2(ratio(cu, us_uni(fam, c, M)))]
+                table.append("| " + " | ".join(line) + " |")
+        out += [SERVING_HEADINGS[routing], ""] + align(table) + [""]
+        notes = [f"- {labels[c]}: n/a. {serving_cases.na_reason(c, routing)}." for c in devc
+                 if serving_cases.na_reason(c, routing) is not None]
+        if notes:
+            out += notes + [""]
+    if not out:
+        return []
+    return (["## Serving-shaped cases", "",
+             "The routed MoE layer under the serving-shaped routing families of "
+             "[`../README.md`](../README.md#routing), set against the uniform rows of this page at the same M "
+             "(padded buckets: at M = live rows, the same live tokens without padding, and at M = bucket rows). "
+             "Ratios divide unrounded µs; a padding cost is the padded µs over the unpadded µs at M = live rows.", ""]
+            + out)
+
+
+def render_serving_block(lines, sm):
+    """Write, replace or remove the serving-shaped block of a layer page (see serving_block)."""
+    body = serving_block(sm)
+    b = next((i for i, l in enumerate(lines) if l.strip() == SERVING_BEGIN), None)
+    if b is not None:
+        e = next((i for i in range(b + 1, len(lines)) if lines[i].strip() == SERVING_END), None)
+        if e is None:
+            raise SystemExit(f"the marker {SERVING_END!r} is missing after {SERVING_BEGIN!r}")
+        if body:
+            lines[b + 1:e] = body
+        else:
+            lines[b - 1 if b and not lines[b - 1].strip() else b:e + 1] = []
+        return
+    if body:
+        at = len(lines) - 1 if lines and lines[-1] == "" else len(lines)
+        lines[at:at] = ["", SERVING_BEGIN] + body + [SERVING_END]
 
 
 # ----------------------------------------------------------------------------- README hot rows (no comparisons)

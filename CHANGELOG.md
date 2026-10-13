@@ -2,6 +2,120 @@
 
 Performance figures are in `docs/perf/`, not here.
 
+## 0.2.1 — 2026-10-13
+
+### Changed (no action needed; reservations get smaller)
+
+- **The Blackwell MoE layer's intermediates are sized by the routed rows (#7, #10).** On sm_100/sm_103 and
+  sm_120/sm_121 `fso.moe.layer` no longer gives every local expert `align(tokens, 4)` rows of every intermediate (the
+  masked slab). Each expert now holds its routed rows in whole 128-row blocks of one compact buffer, so a call needs
+  memory for `tokens * topk` rows plus at most 127 rows per expert that holds one. `fso.moe.transient_bytes` returns
+  the new, much smaller figure (Family C at 8192 tokens: about 0.46 GiB per call on a B300 instead of 13.2 GiB, and
+  about 0.39 GiB per RTX 5090 rank with 128 local experts instead of 6.6 GiB, with the shared allocation below).
+  The layout is the same at every number of tokens, the layer's outputs are bit-identical to 0.2.0's, and
+  `FSO_MOE_COMPACT=0` restores the masked slab as an A/B arm.
+- **One allocation for the gathered activation and the down-projection output, on every architecture.** The two
+  buffers are never alive at the same time within a call, so the layer now places them in one region, and
+  `fso.moe.transient_bytes` charges it once: about 30 % less per call (H200 Family C at 8192 tokens: 0.55 → 0.39
+  GiB). A chain of layer calls captured into one graph pool no longer keeps an extra copy of the largest
+  intermediate through allocator splitting. Outputs are unchanged.
+- **No routing scratch, no argument-arena abort (#7).** The compact layout's routing op keeps no device state between
+  calls, so the 0.2.0 routing builder's limit of 16 graph captures per host thread (after which it fell back to the
+  single-CTA builder) no longer applies to `fso.moe.layer`. On sm_100/sm_103 the grouped GEMMs take their per-call
+  activation pointers from that routing op and keep only weight-side arguments in their arena, two blocks per layer
+  whatever the number of captures; the arena grows on demand and no longer aborts a capture.
+- **PDL at every size.** Every MoE glue launch (routing, gather-quantize, SwiGLU requantize, combine, the router) now
+  follows `FSO_DISABLE_PDL` at every grid size; 0.2.0 launched grids above 4096 CTAs without PDL whatever the
+  setting.
+
+### New
+
+- **MXFP8 weights load as stored (#9).** `fso.moe.prepare_experts(w13, w2, format="mxfp8", sw13=..., sw2=...)`
+  and `fso.dense.prepare_weight(w, format="mxfp8", scale=...)` take an MXFP8 checkpoint as it is written:
+  float8_e4m3fn weights with uint8 UE8M0 scales, one byte per 32 elements along K (`sw13 [E, 2I, H/32]`,
+  `sw2 [E, H, I/32]`, `scale [N, K/32]`), row-major, byte `b` meaning 2^(b − 127). The bytes are the same on
+  sm_100/sm_103 and sm_120/sm_121. The library only packs the scale bytes into the device's layout and
+  re-orders the FC1 rows for the fused FC1; it requantizes nothing, so calibrated checkpoints are served as
+  written and loading needs no bf16 copy of the layer. The bf16 forms and the int32 dense scale stay as
+  they were; sm_90 still refuses `format="mxfp8"`.
+- **The compact layout's building blocks in `fso.compat`.** For callers that compose the MoE steps themselves:
+  the routing op `moe_build_routing_compact`, the compact grouped GEMMs (`linear_mxfp8_grouped_compact`,
+  `linear_mxfp8_grouped_compact_swiglu`, `linear_mxfp8_grouped_compact_combine`) and the out-style glue
+  (`quantize_1x32_grouped_gather_out_fp8`, `silu_chunk_mul_quantize_1x32_grouped_out_fp8`). On sm_100/sm_103 the
+  compact GEMMs have their own route rule, so the route queries (`mxfp8_grouped_slot_possible`,
+  `mxfp8_grouped_problem_shapes_consumed`, `mxfp8_grouped_swiglu_fused_route`) take two new keywords:
+  `compact=False`, which a caller composing the compact ops sets to `True` (without it they answer for the masked
+  ops as in 0.2.0), and `expected_m=0`, the expected rows per expert `ceil(M * topk / G)` that the compact rule
+  bounds (passed as the compact ops receive it, the queries return the route those ops take). On sm_90 the
+  expert-sorted gather-quantize and the grouped FC2 GEMMs (`quantize_1x128_sorted_gather_sm90`,
+  `linear_fp8_grouped_contiguous[_swapab]`) take optional output tensors, so a caller can place them in memory of its
+  own. The contracts are in `docs/api/compat.md`.
+
+### Faster
+
+- **B300 (sm_100/sm_103) MoE layer and block.** The compact layer's grouped GEMMs take the slot-bound route while
+  an expert holds at most 64 routed rows on average (`ceil(tokens * topk / experts) <= 64`: up to 2048 tokens per
+  call on Qwen3.5-35B-A3B, 1024 on Qwen3-30B-A3B), which hands its tiles out dynamically over the experts that hold
+  rows and writes only the routed rows. Both families are faster from 16 tokens per call up to that bound, under
+  uniform, skewed and padded routing alike, and the layer no longer runs into the card's power cap there. fso is now level with or faster than
+  TensorRT-LLM's trtllm-gen block-FP8 MoE at every batch size of the tables.
+- **B300 (sm_100/sm_103) dense linear.** The activation quantizer reads and writes 16 bytes per thread, and the
+  quantizer and the dense GEMMs launch with PDL; small-batch tile and split-K choices were corrected, and the
+  2560-wide projections (`wo`, `down`) run the 2-SM 256×64 tile up to 256 tokens instead of a 40-CTA cuBLAS grid.
+  The Family A MLP block is faster at every batch size, and level with or faster than sglang's block-FP8 (DeepGEMM)
+  linear at every batch size of the tables except M = 96 (see Known issues).
+- **RTX 5090 (sm_120/sm_121).** The dense down projection picks its Stream-K split by the rounds each slice runs
+  (the MLP block is faster from 256 to 768 tokens), the MoE gather-quantize quantizes each token once and writes its
+  top-k copies, and the Qwen3.5-35B-A3B experts take a better grouped tile around 1024 tokens; the MoE layer is
+  2–5 % faster from 1024 tokens up.
+- **H200 (sm_90) dense linear.** The block-FP8 GEMM also runs DeepGEMM v2's dense kernel (`sm90_fp8_gemm_1d2d`,
+  vendored and compiled by the bundled NVRTC) at DeepGEMM's own configuration, for the tiles fso's kernel cannot run
+  (256×128 with multicast, 128×160 and 128×192 from 512 tokens), for batches of 129–255 tokens, where fso's 128-row
+  tiles left a second, mostly empty block, and for the long-K projections at 64 and 128 tokens. The choice depends
+  on the shape only, and the outputs are bitwise identical either way. The Family A MLP block is about a third faster
+  at 160 and 192 tokens, about 4 % faster at 64 and 128 tokens and 3–11 % faster from 1024 tokens up;
+  `FSO_SM90_DENSE_DG2=0` keeps every dense GEMM on fso's own kernel.
+- **H200 (sm_90) MoE layer and block.** The grouped GEMMs and the expert-sorted gather-quantize now launch with PDL,
+  so each starts while its predecessor finishes. The swap-AB grouped GEMMs of the decode routes (the 16- and 32-row
+  activation tiles) load the expert weights evict-first in L2, so the weights they stream once no longer push the
+  layer's own intermediates out of L2 between the kernel that writes them and the one that reads them. The layer is
+  2–9 % faster at decode (the most at the smallest batches), and level or faster in prefill under uniform and
+  skewed routing.
+
+### Known issues
+
+The gaps below are measured against the serving libraries on the same card; the summary under each table of
+`docs/perf/layer/` gives the batch sizes and the size of every gap.
+
+- **H200, dense MLP block.** sglang 0.5.20's block-FP8 linear layer (DeepGEMM `sm90_fp8_gemm_1d2d`, with the
+  programmatic dependent launch sglang serves it with) is faster than fso's block on the Family A MLP block at
+  M = 96, 160 and 192 by 6–12 % and at M = 64, 128, 256, 1024 and 8192 by 1–3 %. At 160 and 192 both libraries run
+  the same DeepGEMM kernels. fso's activation quantizer lets the next GEMM start early, so the GEMM's thread blocks
+  land on other SMs, and the 64-row down-projection tiles then read through other L2 partitions, which costs them
+  about 3 µs at M = 160.
+- **H200, MoE layer under one-EP-rank routing in prefill, against 0.2.0.** With E / 2 local experts the layer is
+  2.4 % slower than 0.2.0 on Family B at M = 2048 and 1.9 % slower on Family C at M = 8192; at the other prefill
+  sizes, and under uniform and skewed routing, it is level with 0.2.0 or faster. About 1.3 % of the Family C cell is
+  the cost of the shared allocation that takes 30 % off the call's transient memory.
+- **RTX 5090, Family C MoE layer at M = 64.** vLLM 0.29.0's Triton FP8 MoE layer is 1.8 % faster than fso at M = 64,
+  under uniform and under skewed routing; under skewed routing sglang 0.5.20's is also 1.6 % faster at M = 1024.
+- **RTX 5090, Family C MoE at M = 1 and 2, against 0.2.0.** The routed layer at M = 2 is 1.2 % slower than in
+  0.2.0; at every other M it is within 1 % of 0.2.0 or faster. With the shared expert computed after the routed layer
+  and added to its output, the block at M = 1 is 2.0 % slower than in 0.2.0: the shared expert's first GEMM, whose
+  machine code is unchanged, runs slower right after the compact routed chain, and the routing kernel's start is no
+  longer hidden behind the preceding add. Passing the shared expert's output to `fso.moe.layer` as `bias` instead of
+  adding it afterwards brings the block within 1 % of 0.2.0 in the same form, and is faster than the add form in
+  either release.
+- **Blackwell, dense MLP block at one batch size each.** On the B300, sglang's block-FP8 linear (DeepGEMM) is 1.6 %
+  faster than fso's MXFP8 block at M = 96, where fso's 2560-wide down projection runs on 80 thread blocks and
+  DeepGEMM's on 120; on the RTX 5090, vLLM's block-FP8 linear (DeepGEMM, run as eager ops) is 1.2 % faster at
+  M = 1024.
+- **Blackwell, the direct block-FP8 GEMM.** On sm_100/sm_103 and sm_120/sm_121, `fso.dense` serves a block-FP8
+  checkpoint through the MXFP8 path, the MXFP8 rows of the tables. The direct block-FP8 GEMM that `fso.compat`
+  keeps for callers who pass 1×128 / 128×128 operands themselves (`linear_fp8`, the BSFP8 rows) is slower than the
+  comparators' block-FP8 linear: on the B300 sglang's is faster at every M from 16 to 8192, by 16–21 % from M = 32
+  to M = 192; on the RTX 5090 vLLM's is faster from M = 512 up, by 5–14 %.
+
 ## 0.2.0 — 2026-10-06
 
 First stable release. The supported interface is `fso.dense`, `fso.moe` and `fso.attention`. The same

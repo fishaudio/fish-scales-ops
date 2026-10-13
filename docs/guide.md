@@ -110,6 +110,7 @@ the source tree.
 | block-FP8: float8_e4m3fn `[N, K]` + fp32 `[ceil(N/128), K/128]` scales (value = fp8 × scale) | `prepare_weight(w, format="bsfp8", scale=s)` | served as it is (block-FP8, 1×128 activations) | dequantized and requantized to MXFP8 1×32 at load (a second rounding of the weights) |
 | bf16 `[N, K]` | `prepare_weight(w, format="bsfp8")` | quantized to block-FP8 | quantized to MXFP8 1×32 |
 | bf16 `[N, K]` | `prepare_weight(w, format="mxfp8")` | refused: sm_90 has no MXFP8 | quantized to MXFP8 1×32 |
+| MXFP8: float8_e4m3fn `[N, K]` + uint8 UE8M0 scales `[N, K/32]` (one byte per 32 elements along K, byte b = 2^(b − 127)), the same bytes on every architecture | `prepare_weight(w, format="mxfp8", scale=s_u8)` | refused | served as it is; the scale bytes are packed into the device's layout |
 | MXFP8: float8_e4m3fn `[N, K]` + the int32 scale `fso.compat.quantize_1x32_fp8` returned for it on this architecture | `prepare_weight(w, format="mxfp8", scale=s)` | refused | served as it is |
 
 - **Constraints.** `K % 128 == 0` everywhere. On sm_100/103 and sm_120/121, also `N % 128 == 0`.
@@ -145,13 +146,17 @@ multiples of 128. The all-reduce after a row-parallel layer is the caller's, as 
 ```python
 experts = fso.moe.prepare_experts(w13, w2, format="bsfp8", sw13=sw13, sw2=sw2)  # block-FP8 experts
 experts = fso.moe.prepare_experts(w13, w2, format="mxfp8")                        # bf16 experts -> MXFP8 (Blackwell)
+experts = fso.moe.prepare_experts(w13, w2, format="mxfp8", sw13=s13, sw2=s2)      # MXFP8 checkpoint, as stored (Blackwell)
 ```
 
 `w13 [E_local, 2 * I_local, H]` has the gate rows first. `w2` is `[E_local, H, I_local]`. These are this
 rank's local experts, on the serving device.
 - **`"bsfp8"`.** Served as it is on sm_90. On sm_100/103 and sm_120/121 each expert is requantized to
   MXFP8 at load, a few experts at a time.
-- **`"mxfp8"`.** Takes bf16 experts. It is refused on sm_90.
+- **`"mxfp8"`.** Takes bf16 experts, which are quantized at load, or an MXFP8 checkpoint as it is stored:
+  float8_e4m3fn experts with uint8 UE8M0 scales `sw13 [E_local, 2 * I_local, H/32]` and
+  `sw2 [E_local, H, I_local/32]`, one byte per 32 elements along K. The checkpoint's bytes are kept; only
+  the scales are packed into the device's layout and the FC1 rows re-ordered. It is refused on sm_90.
 - **Constraints.** `H % 128 == 0` and `I_local % 128 == 0`. Under tensor parallelism, choose a tp that
   keeps `I_local` a multiple of 128. At most 1024 local experts.
 

@@ -7,6 +7,30 @@ only AOT-incompatible code path in the library**: on sm_90, the first
 `(N, K, BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES, NUM_TMA_MULTICAST)`
 tuple and keeps the resulting cubin in memory for the rest of the process.
 
+## Two dense kernels
+
+The dense GEMM (`gemm_dispatch_sm90`, `GemmType::Normal`) runs one of two kernels; both compute every
+output element in one CTA, accumulate each 128-wide K block in FP32 and promote it with the same scale product
+in the same K order, so their outputs are bitwise identical and the choice between them is a tile choice:
+
+- `fp8_gemm_kernel` / `fp8_gemm_kernel_swapAB` (`deep_gemm/fp8_gemm_impl.cuh`), at
+  `get_dense_gemm_config`'s pick, for every shape not listed below. Every grouped (MoE) kernel is this family.
+- DeepGEMM v2's `sm90_fp8_gemm_1d2d_impl` (`deep_gemm/impls/`, vendored with the headers it includes from
+  sgl-project/DeepGEMM v0.2.0, MIT, `deep_gemm/LICENSE.DeepGEMM`), at DeepGEMM's own configuration
+  (`get_dg2_dense_config`, a port of its sm_90 heuristic), when that configuration is a 256 x 128 tile with
+  multicast on A or a 128 x 160 / 128 x 192 tile and M >= 512 (tiles the first kernel cannot run), any
+  configuration but the 80-wide tiles at 128 < M < 256 (where the first kernel's 128-row tiles leave a second,
+  partly filled M block),
+  or a 64-row tile at M = 64 / 128 with K >= 8192 (the same tiles with a stage ring of up to 16, where the first
+  kernel stops at 6 or 8) (`use_dg2_dense`). `FSO_SM90_DENSE_DG2_K=<K>` restricts `all` to one `K`.
+  `FSO_SM90_DENSE_DG2=0` turns the route off, `all` takes every DeepGEMM pick on the non-swap path.
+  Its programs are compiled with C++20, `--device-int128` and `deep_gemm/nvrtc_shim/` first on the include
+  path (NVRTC lacks `<utility>` and `<cstddef>`); its runtimes are named `gemm_dg2_*`. `runGemmDg2` launches
+  it as DeepGEMM's runtime does: one persistent CTA per SM, programmatic stream serialization when PDL is on,
+  and the cluster-dimension attribute only for a two-CTA (multicast) cluster. A launch that carries the
+  attribute is a cluster launch even at size 1; the CTAs then land on the SMs in another order, which changes
+  the L2 partition each tile's operands come from and slows the 64-row tiles markedly.
+
 ## Compile-time cost
 
 ~300–800 ms per unique tuple at first call; cached in memory after that, so
@@ -107,7 +131,8 @@ The result should be empty.
 | `deep_gemm/scheduler.cuh` | persistent + grouped + strided-batched schedulers |
 | `deep_gemm/compiler.cuh` | NVRTC driver — generates kernel source, compiles through the NVRTC table (loaded once per process), keys the opt-in disk cache by content |
 | `deep_gemm/runtime.cuh` | runtime cubin loader, the in-memory runtime cache and the `FSO_JIT_*` knobs |
-| `deep_gemm/jit_utils.cuh` | `get_best_gemm_config` + `get_smem_size` heuristic (every caller), `get_dense_gemm_config` (the dense GEMM's two tile rules on top of it); the NVRTC function table and its loader |
+| `deep_gemm/jit_utils.cuh` | `get_best_gemm_config` + `get_smem_size` heuristic (every caller), `get_dense_gemm_config` (the dense GEMM's tile rules on top of it), `get_dg2_dense_config` + `use_dg2_dense` (DeepGEMM v2's configuration and the route to its kernel); the NVRTC function table and its loader |
+| `deep_gemm/{comm,common,epilogue,impls,mma,ptx,scheduler}/` | DeepGEMM v2's dense kernel `sm90_fp8_gemm_1d2d_impl` and its headers (sgl-project/DeepGEMM v0.2.0, MIT); `nvrtc_shim/` holds the two standard headers its NVRTC build needs |
 | `deep_gemm/{mma,tma}_utils.cuh` | WGMMA + TMA helpers |
 | `deep_gemm/utils.cuh` | misc primitives (`ceil_div`, `lane_id`, etc.) |
 | `deep_gemm/nvrtc_std.cuh` | minimal `<type_traits>` / `<utility>` shim for NVRTC |

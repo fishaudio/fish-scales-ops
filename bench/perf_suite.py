@@ -10,7 +10,8 @@ Each step is one bench invocation in one environment of the machine's lock (benc
   group    the table group: dense (the dense GEMM and MLP-block tables), moe (the fso rows of the MoE layer and
            grouped-kernel tables), moe_ref (layer-level comparators), moe_kern (kernel-level comparators),
            shared (the routed + shared-expert block of Family C, its fso rows and its comparators), mlp_ref (the
-           serving-library comparators of the Family A MLP block)
+           serving-library comparators of the Family A MLP block), serving (the serving-shaped cases of the routed
+           MoE layer: skewed routing, padded buckets and expert-parallel rank shapes, fso rows and comparators)
 
 The steps encode the chains that produced the 2026-10-01 tables, with the same benches, implementations, grids
 (the benches' defaults) and file names; nothing here is a new invocation:
@@ -35,9 +36,20 @@ card with when it does not use fso; and on every machine the mlp_ref steps at th
 libraries' block-FP8 dense linear (sglang everywhere, vLLM on the RTX 5090) and, on the H200 only, cuBLAS's
 block-FP8 scaled_mm, each driving the same Family A MLP block as the fso BSFP8 cell, in the environment where that
 library lives.
+
+The serving group (2026-10-10, issue #8 ask A) is new as well: the routed MoE layer of Families B and C under the
+three serving-shaped routing families of bench/gemm/python/serving_cases.py (skewed routing, padded buckets, one
+expert-parallel rank), fso's rows on every machine and the machine's block-FP8 comparators where they serve the
+family; the uniform cells of the other groups are untouched by it.
 """
 
-GROUPS = ("dense", "moe", "moe_ref", "moe_kern", "shared", "mlp_ref")
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "gemm", "python"))
+import serving_cases  # noqa: E402  (bench/gemm/python/serving_cases.py; standard library only)
+
+GROUPS = ("dense", "moe", "moe_ref", "moe_kern", "shared", "mlp_ref", "serving")
 
 B = "bench/gemm/python"
 DENSE = B + "/bench_qwen3_4b_mlp.py"
@@ -163,5 +175,35 @@ def mlp_ref(lib, env, dtypes, dev):
 H200 += [mlp_ref("sgl", "main", "sgl_fp8b", "h200"), mlp_ref("cublas", "main", "cublas_fp8b", "h200")]
 RTX5090 += [mlp_ref("sgl", "sglang", "sgl_fp8b", "5090"), mlp_ref("vllm", "main", "vllm_fp8b", "5090")]
 B300 += [mlp_ref("sgl", "main", "sgl_fp8b", "b300")]
+
+
+# ----------------------------------------------------------------------------- serving-shaped cases (2026-10-10)
+# bench/gemm/python/serving_cases.py: the routed MoE layer of Families B and C under skewed routing, in padded
+# buckets and as one expert-parallel rank (issue #8 ask A). Per family and model: one step of fso rows,
+# perf_moe_qwen3_<fam>_<tag>_<dev>.jsonl, and one step per environment of the machine's block-FP8 comparators that
+# serve the family (serving_cases.DEVICE_COMPARATORS, na_reason), ref_[sgl020_]<tag>_<fam>_<dev>.jsonl, which
+# perf_report.py merges into ref_moe_qwen3_<fam>_<tag>_<dev>.jsonl. The sglang Triton comparator runs where the
+# uniform table's runs: the main environment on the H200 and the B300, the sglang one on the RTX 5090.
+def serving_steps(dev, fso_impl, sglang_env="main"):
+    out = []
+    for routing, tag in serving_cases.TAGS.items():
+        args = ["--run", "--routing", routing] + (["--ep-size", str(serving_cases.EP_SIZE)] if routing == "ep" else [])
+        for f, s in MOE.items():
+            out.append(step(f"srv_{tag}_{f}", "main", s, args + ["--impls", fso_impl],
+                            f"perf_moe_qwen3_{f}_{tag}_{dev}.jsonl", "serving"))
+            by_env = {}
+            for c in serving_cases.DEVICE_COMPARATORS[dev]:
+                if serving_cases.na_reason(c, routing) is None:
+                    by_env.setdefault(sglang_env if c.startswith("triton") else "main", []).append(c)
+            for env, impls in by_env.items():
+                sgl = env != "main"
+                out.append(step(f"srv_{tag}_ref{'_sgl' if sgl else ''}_{f}", env, s, args + ["--impls", ",".join(impls)],
+                                f"ref_{'sgl020_' if sgl else ''}{tag}_{f}_{dev}.jsonl", "serving"))
+    return out
+
+
+H200 += serving_steps("h200", "fso_bsfp8_layer")
+RTX5090 += serving_steps("5090", "fso_mxfp8_layer", sglang_env="sglang")
+B300 += serving_steps("b300", "fso_mxfp8_layer")
 
 SUITES = {"h200": H200, "5090": RTX5090, "b300": B300}

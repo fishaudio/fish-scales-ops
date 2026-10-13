@@ -14,6 +14,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/torch.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <optional>
@@ -62,11 +63,12 @@ cudaError_t launch_sm100_mxfp8_grouped_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3*
     int expected_m, int max_active_groups, int const* slot_to_expert, int32_t const* problem_shapes,
     cudaStream_t stream);
 bool sm100_mxfp8_grouped_compiled();
-int sm100_mxfp8_grouped_slot_refusal(int m_cap, int N, int K, int groups, int max_active_groups);
-int sm100_mxfp8_grouped_slot_taken(int m_cap, int N, int K, int groups, int max_active_groups, int fused_swiglu);
+int sm100_mxfp8_grouped_slot_refusal(int m_cap, int N, int K, int groups, int max_active_groups, int compact);
+int sm100_mxfp8_grouped_slot_taken(
+    int m_cap, int N, int K, int groups, int max_active_groups, int fused_swiglu, int compact, int expected_m);
 int sm100_mxfp8_grouped_slot_tile_n();
 int sm100_mxfp8_grouped_problem_shapes_consumed(
-    int m_cap, int N, int K, int groups, int max_active_groups, int fused_swiglu);
+    int m_cap, int N, int K, int groups, int max_active_groups, int fused_swiglu, int compact, int expected_m);
 // Fused-SwiGLU FC1 (sm_100/sm_103) and the host-side router that says whether a
 // call should take it. Both grouped routes carry the fusion now -- the
 // pointer-array cascade and the swap-orientation slot kernel -- so the
@@ -76,7 +78,20 @@ cudaError_t launch_sm100_mxfp8_grouped_swiglu_dispatch(__nv_fp8_e4m3* A, __nv_fp
     int32_t* SFH, int32_t* SFA, int32_t* SFB, int32_t* masked_m, int num_groups, int m_cap, int N, int K,
     int expected_m, int max_active_groups, int const* slot_to_expert, int32_t const* problem_shapes,
     cudaStream_t stream);
-int sm100_mxfp8_grouped_fused_fc1_route(int m_cap, int N, int K, int groups, int max_active_groups);
+int sm100_mxfp8_grouped_fused_fc1_route(
+    int m_cap, int N, int K, int groups, int max_active_groups, int compact, int expected_m);
+// The compact activation layout (fso 0.2.1), same translation unit.
+cudaError_t launch_sm100_mxfp8_grouped_compact_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D,
+    int32_t* SFA, int32_t* SFB, int32_t* masked_m, int32_t const* blk0, int num_groups, int b_alloc, int m_cap, int N,
+    int K, int expected_m, int max_active_groups, int const* slot_to_expert, int32_t const* problem_shapes,
+    int64_t const* ptr_arrays, int* slot_sched, int* slot_tiles, int tiles_cap, bool build_tiles, cudaStream_t stream);
+cudaError_t launch_sm100_mxfp8_grouped_swiglu_compact_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B,
+    __nv_fp8_e4m3* H, int32_t* SFH, int32_t* SFA, int32_t* SFB, int32_t* masked_m, int32_t const* blk0,
+    int num_groups, int b_alloc, int m_cap, int N, int K, int expected_m, int max_active_groups,
+    int const* slot_to_expert, int32_t const* problem_shapes, int64_t const* ptr_arrays, int* slot_sched,
+    int* slot_tiles, int tiles_cap, bool build_tiles, cudaStream_t stream);
+int sm100_mxfp8_grouped_compact_sfa_rows();
+int sm100_mxfp8_grouped_compact_fits(long long rows, int K);
 int sm100_mxfp8_grouped_fused_fc1_available(int N, int K);
 void fp8bs_quantize_1x32_packed_grouped_gather(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
     __nv_bfloat16 const* x, int32_t const* slot_of_flat, int n_pairs, int topk,
@@ -511,7 +526,7 @@ at::Tensor linear_mxfp8_grouped_masked(at::Tensor a_fp8, at::Tensor w_fp8, at::T
         // to be refused here, before any kernel is launched. The rule itself
         // lives in the dispatcher; this reads its verdict.
         int const slot_refusal = detail::sm100_mxfp8_grouped_slot_refusal(
-            m_cap, N, K, G, static_cast<int>(max_active_groups));
+            m_cap, N, K, G, static_cast<int>(max_active_groups), /*compact=*/0);
         TORCH_CHECK(slot_refusal != 2,
             "FSO_GROUPED_SLOT=force: the sm_100 slot-bound grouped MXFP8 route needs the whole row capacity to "
             "fit one token tile, but m_cap=", m_cap, " exceeds TileN=", detail::sm100_mxfp8_grouped_slot_tile_n(),
@@ -698,6 +713,407 @@ std::tuple<at::Tensor, at::Tensor> linear_mxfp8_grouped_masked_swiglu(at::Tensor
 }
 
 
+
+// ---------------------------------------------------------------------------
+// The compact activation layout (fso 0.2.1), sm_100/sm_103 half of
+// linear_mxfp8_grouped_compact and linear_mxfp8_grouped_compact_swiglu. The op
+// entries live in ops/mxfp8_compact.cu and call these on sm_100/sm_103.
+// ---------------------------------------------------------------------------
+//
+// Layout (charter D1, the one-group view). The activations are ONE group of
+// R = 128 * B_alloc rows: a fp8 [R, K], sa the arch's one-group scale tensor of
+// R rows (sm_100/103: the Sm1xx atom slab, R * K/128 int32 words, one 128-row
+// atom per 128 rows), d bf16 [R, N] / dq fp8 [R, I] with sd the one-group atom
+// slab of R rows. Expert g owns the 128-row blocks starting at blk0[g] (int32
+// [G + 1], the exclusive prefix of ceil(masked_m / 128)); its routed rows are
+// rows blk0[g] * 128 + r, r < masked_m[g]. The weights b [G, N, K] and their
+// scales keep the batch index g. Every output row of an expert at or past
+// masked_m[g] is left untouched, on both routes (the slot route's stores are
+// bounded by each expert's routed row count, unlike the masked slot route's,
+// which writes its slab's first m_cap rows).
+//
+// `m_cap` is the masked op's row capacity align(M, 4): a host-static HINT the
+// route rule and the tile cascade key on, so the compact op runs the kernel the
+// masked op runs for the same (m_cap, N, K, G, expected_m, max_active_groups).
+// It is not a tensor dimension. The slot route additionally relies on
+// masked_m[g] <= m_cap, which no-replacement top-k routing guarantees (one row
+// per token per expert), exactly as the masked layout does.
+//
+// The three optional tensors are moe_build_routing_compact's: the packed
+// active-expert list (slot route), and for the pointer-array route this GEMM's
+// problem shapes int32 [G, 3] = (masked_m[g], N, K) together with its per-call
+// pointer arrays int64 [3, G] (row 0 = a + blk0[g] * 128 * K, row 1 = sa +
+// blk0[g] * 4K bytes, row 2 = d + blk0[g] * 128 * row bytes of d). Give both or
+// neither; without them the op launches its own preparation kernel. The weight
+// side of the pointer-array arguments lives in a block keyed by the weights and
+// (G, N, K), bound on first sight and never per capture.
+//
+// FSO_CHECK_PROBLEM_SHAPES=1 also checks the content of problem_shapes and
+// ptr_arrays against masked_m, blk0 and the operand addresses (a device-to-host
+// copy; a debugging aid, never on in a timed path).
+
+namespace
+{
+
+struct CompactDims
+{
+    int G, R, K, N, b_alloc;
+};
+
+CompactDims check_compact_operands(char const* op, at::Tensor const& a, at::Tensor const& b, at::Tensor const& sa,
+    at::Tensor const& sb, at::Tensor const& masked_m, at::Tensor const& blk0, int64_t m_cap, int64_t expected_m,
+    int64_t max_active_groups)
+{
+    TORCH_CHECK(a.is_cuda() && b.is_cuda(), op, ": a/b must be on CUDA");
+    TORCH_CHECK(a.dtype() == at::kFloat8_e4m3fn && b.dtype() == at::kFloat8_e4m3fn,
+        op, ": a / b must be float8_e4m3fn");
+    TORCH_CHECK(sa.dtype() == at::kInt && sb.dtype() == at::kInt, op, ": sa / sb must be int32 (packed UE8M0)");
+    TORCH_CHECK(masked_m.dtype() == at::kInt && masked_m.is_cuda(), op, ": masked_m must be CUDA int32");
+    TORCH_CHECK(blk0.dtype() == at::kInt && blk0.is_cuda(), op, ": blk0 must be CUDA int32");
+    TORCH_CHECK(a.dim() == 2 && b.dim() == 3, op, ": a must be [R, K] (one group of R rows) and b [G, N, K]");
+    TORCH_CHECK(a.is_contiguous() && b.is_contiguous() && sa.is_contiguous() && sb.is_contiguous()
+            && masked_m.is_contiguous() && blk0.is_contiguous(),
+        op, ": a, b, sa, sb, masked_m and blk0 must be contiguous");
+    CompactDims d{};
+    d.R = static_cast<int>(a.size(0));
+    d.K = static_cast<int>(a.size(1));
+    d.G = static_cast<int>(b.size(0));
+    d.N = static_cast<int>(b.size(1));
+    TORCH_CHECK(b.size(2) == d.K, op, ": b.size(2) must equal a.size(1) (K)");
+    TORCH_CHECK(d.R >= 128 && d.R % 128 == 0, op, ": a.size(0) must be a positive multiple of 128 (R = 128 * B_alloc), "
+        "got ", d.R);
+    d.b_alloc = d.R / 128;
+    TORCH_CHECK(masked_m.numel() == d.G, op, ": masked_m must have G = ", d.G, " entries");
+    TORCH_CHECK(blk0.numel() == d.G + 1, op, ": blk0 must have G + 1 = ", d.G + 1, " entries");
+    TORCH_CHECK(d.K % 128 == 0, op, ": K must be a multiple of 128");
+    TORCH_CHECK(d.N % 128 == 0, op, ": N must be a multiple of 128 (BlockScaled atom requires it)");
+    TORCH_CHECK(m_cap >= 4 && m_cap % 4 == 0, op, ": m_cap (the masked op's align(M, 4)) must be a positive multiple "
+        "of 4, got ", m_cap);
+    TORCH_CHECK(expected_m >= 1, op, ": expected_m must be >= 1");
+    TORCH_CHECK(max_active_groups >= 0 && max_active_groups <= d.G,
+        op, ": max_active_groups must be in [0, G]; got ", max_active_groups, " with G=", d.G);
+    TORCH_CHECK(d.G >= 1 && d.G <= 1024, op, ": the grouped MXFP8 path supports 1 to 1024 experts, got ", d.G);
+    int64_t const kp = d.K / 128;
+    TORCH_CHECK(sa.numel() == static_cast<int64_t>(d.R) * kp,
+        op, ": sa must be the one-group Sm1xx atom slab of R rows, R * K/128 = ", static_cast<int64_t>(d.R) * kp,
+        " int32 words, got ", sa.numel());
+    TORCH_CHECK(sb.numel() == static_cast<int64_t>(d.G) * d.N * kp,
+        op, ": sb must be [G, N * K/128] (per-group Sm1xx atom slab)");
+    TORCH_CHECK(detail::sm100_mxfp8_grouped_compact_fits(d.R, d.K) != 0,
+        op, ": R = ", d.R, " rows at K = ", d.K, " exceeds the compact scale-factor layout's constant row extent (",
+        detail::sm100_mxfp8_grouped_compact_sfa_rows(), " rows, K < 65536)");
+    return d;
+}
+
+// The route refusals the masked op makes, made on the compact op's m_cap hint.
+void check_compact_slot_refusal(char const* op, CompactDims const& d, int m_cap, int max_active_groups)
+{
+    int const r = detail::sm100_mxfp8_grouped_slot_refusal(m_cap, d.N, d.K, d.G, max_active_groups, /*compact=*/1);
+    TORCH_CHECK(r != 2, op, ": FSO_GROUPED_SLOT=force: the sm_100 slot-bound route needs the whole row capacity to fit "
+        "one token tile, but m_cap=", m_cap, " exceeds TileN=", detail::sm100_mxfp8_grouped_slot_tile_n(),
+        ". Outside that bound the kernel silently scales its output by 2^-127. Unset FSO_GROUPED_SLOT or call with "
+        "m_cap <= ", detail::sm100_mxfp8_grouped_slot_tile_n(), ".");
+    TORCH_CHECK(r != 3, op, ": FSO_GROUPED_SLOT=force: no sm_100 slot-bound instantiation covers N=", d.N, " K=", d.K,
+        ".");
+    TORCH_CHECK(r != 4, op, ": FSO_GROUPED_SLOT=force: the sm_100 slot-bound route needs max_active_groups > 0 "
+        "(= min(M * topk, G)) to size its slot list and grid; the op was called with max_active_groups=0.");
+}
+
+// problem_shapes [G, 3] int32 and ptr_arrays [3, G] int64: both or neither.
+// Returns the two device pointers (or two nullptrs).
+std::pair<int32_t const*, int64_t const*> check_compact_arrays(char const* op, CompactDims const& d,
+    std::optional<at::Tensor> const& problem_shapes, std::optional<at::Tensor> const& ptr_arrays,
+    at::Tensor const& masked_m, at::Tensor const& blk0, void const* a_base, void const* sa_base, void const* d_base,
+    int64_t d_row_bytes)
+{
+    bool const has_ps = problem_shapes.has_value() && problem_shapes->defined();
+    bool const has_pa = ptr_arrays.has_value() && ptr_arrays->defined();
+    TORCH_CHECK(has_ps == has_pa, op, ": problem_shapes and ptr_arrays come together from "
+        "moe_build_routing_compact; pass both or neither");
+    if (!has_ps)
+        return {nullptr, nullptr};
+    at::Tensor const& ps = *problem_shapes;
+    at::Tensor const& pa = *ptr_arrays;
+    TORCH_CHECK(ps.is_cuda() && ps.dtype() == at::kInt && ps.is_contiguous() && ps.dim() == 2 && ps.size(0) == d.G
+            && ps.size(1) == 3,
+        op, ": problem_shapes must be a contiguous CUDA int32 [G, 3] tensor (G=", d.G, "), got ", ps.sizes());
+    TORCH_CHECK(pa.is_cuda() && pa.dtype() == at::kLong && pa.is_contiguous() && pa.dim() == 2 && pa.size(0) == 3
+            && pa.size(1) == d.G,
+        op, ": ptr_arrays must be a contiguous CUDA int64 [3, G] tensor (G=", d.G, "), got ", pa.sizes());
+    TORCH_CHECK(ps.device() == masked_m.device() && pa.device() == masked_m.device(),
+        op, ": problem_shapes / ptr_arrays must be on masked_m's device");
+    char const* check = std::getenv("FSO_CHECK_PROBLEM_SHAPES");
+    if (check && check[0] == '1')
+    {
+        at::Tensor const hps = ps.to(at::kCPU);
+        at::Tensor const hpa = pa.to(at::kCPU);
+        at::Tensor const hm = masked_m.to(at::kCPU);
+        at::Tensor const hb = blk0.to(at::kCPU);
+        auto const aps = hps.accessor<int32_t, 2>();
+        auto const apa = hpa.accessor<int64_t, 2>();
+        auto const am = hm.accessor<int32_t, 1>();
+        auto const ab = hb.accessor<int32_t, 1>();
+        int64_t const sfa_blk = static_cast<int64_t>(d.K / 128) * 512;
+        for (int g = 0; g < d.G; ++g)
+        {
+            TORCH_CHECK(aps[g][0] == am[g] && aps[g][1] == d.N && aps[g][2] == d.K, "FSO_CHECK_PROBLEM_SHAPES: ",
+                op, ": problem_shapes[", g, "] = (", aps[g][0], ", ", aps[g][1], ", ", aps[g][2],
+                ") does not match (masked_m[g]=", am[g], ", N=", d.N, ", K=", d.K, ")");
+            int64_t const b0 = ab[g];
+            TORCH_CHECK(b0 >= 0 && (b0 + (am[g] + 127) / 128) <= d.b_alloc, "FSO_CHECK_PROBLEM_SHAPES: ", op,
+                ": expert ", g, " (blk0=", b0, ", rows=", am[g], ") does not fit B_alloc=", d.b_alloc);
+            TORCH_CHECK(apa[0][g] == reinterpret_cast<int64_t>(a_base) + b0 * 128 * d.K
+                    && apa[1][g] == reinterpret_cast<int64_t>(sa_base) + b0 * sfa_blk
+                    && apa[2][g] == reinterpret_cast<int64_t>(d_base) + b0 * 128 * d_row_bytes,
+                "FSO_CHECK_PROBLEM_SHAPES: ", op, ": ptr_arrays[:, ", g, "] do not point at expert ", g,
+                "'s first block of this call's a / sa / output");
+        }
+    }
+    return {reinterpret_cast<int32_t const*>(ps.data_ptr()), reinterpret_cast<int64_t const*>(pa.data_ptr())};
+}
+
+// The slot route runs the token side on the slot index, which equals blk0[e] for
+// the expert e in that slot when every active expert holds at most m_cap <= 64 rows
+// (one block each) and the slot list is the packed ascending list of active
+// experts. Under FSO_CHECK_PROBLEM_SHAPES=1 the op checks that on the host.
+void check_compact_slot_identity(char const* op, CompactDims const& d, at::Tensor const& masked_m,
+    at::Tensor const& blk0, std::optional<at::Tensor> const& slot_to_expert, int m_cap)
+{
+    char const* check = std::getenv("FSO_CHECK_PROBLEM_SHAPES");
+    if (!(check && check[0] == '1'))
+        return;
+    at::Tensor const hm = masked_m.to(at::kCPU);
+    at::Tensor const hb = blk0.to(at::kCPU);
+    auto const am = hm.accessor<int32_t, 1>();
+    auto const ab = hb.accessor<int32_t, 1>();
+    int rank = 0;
+    for (int g = 0; g < d.G; ++g)
+    {
+        TORCH_CHECK(am[g] <= m_cap, "FSO_CHECK_PROBLEM_SHAPES: ", op, ": the slot route needs masked_m[g] <= m_cap, "
+            "but expert ", g, " holds ", am[g], " rows with m_cap=", m_cap);
+        if (am[g] > 0)
+        {
+            TORCH_CHECK(ab[g] == rank, "FSO_CHECK_PROBLEM_SHAPES: ", op, ": blk0[", g, "] = ", ab[g],
+                " but expert ", g, " is active expert number ", rank, " in ascending order");
+            ++rank;
+        }
+    }
+    if (slot_to_expert.has_value() && slot_to_expert->defined())
+    {
+        at::Tensor const hs = slot_to_expert->to(at::kCPU);
+        auto const as = hs.accessor<int32_t, 1>();
+        int s = 0;
+        for (int g = 0; g < d.G; ++g)
+            if (am[g] > 0)
+            {
+                TORCH_CHECK(as[s] == g, "FSO_CHECK_PROBLEM_SHAPES: ", op, ": slot_to_expert[", s, "] = ", as[s],
+                    " is not the packed ascending list of active experts (expected ", g, ")");
+                ++s;
+            }
+    }
+}
+
+// The slot route's work-stealing counter (int32 [2]: tile draws, finished CTAs).
+// The kernel needs it zero when it starts and leaves it zero, so one counter
+// serves any number of slot-route GEMMs issued one after another on a stream;
+// moe_build_routing_compact(..., with_slots=True) returns a zeroed one per call
+// (`slot_sched`). A call that lands on the slot route without one gets a zeroed
+// counter from the caching allocator (one fill kernel on the stream); a call
+// that does not land there ignores it. Returns the device pointer or nullptr
+// when the route will not run.
+int* compact_slot_sched(char const* op, std::optional<at::Tensor> const& slot_sched, at::Tensor const& masked_m,
+    bool slot_taken, at::Tensor& owned)
+{
+    if (slot_sched.has_value() && slot_sched->defined())
+    {
+        at::Tensor const& t = *slot_sched;
+        TORCH_CHECK(t.is_cuda() && t.dtype() == at::kInt && t.is_contiguous() && t.numel() >= 2,
+            op, ": slot_sched must be a contiguous CUDA int32 tensor of at least 2 entries (moe_build_routing_compact's "
+            "`slot_sched` output), got ", t.sizes(), " ", t.dtype());
+        TORCH_CHECK(t.device() == masked_m.device(), op, ": slot_sched must be on masked_m's device");
+        return slot_taken ? reinterpret_cast<int*>(t.data_ptr()) : nullptr;
+    }
+    if (!slot_taken)
+        return nullptr;
+    owned = at::zeros({2}, masked_m.options());
+    return reinterpret_cast<int*>(owned.data_ptr());
+}
+
+// The compact slot route's packed list of live 64-row token tiles (run
+// fso_0.2.1_20261010/S10b-3b), int32 [T + 1]: entries [0, count) the live tiles,
+// entries [count, T) -1, entry T the count (moe_build_routing_compact(...,
+// with_tiles=True)'s `slot_tiles`; packing in grouped_slot_dispatch.cuh,
+// `pack_token_tile`). The slot route reads it past a row capacity of one token tile
+// (m_cap > 64), where an expert spans several token tiles and blocks; at m_cap <= 64
+// it keeps its slot mode and ignores the list. A call that needs the list and was
+// handed none gets one from the caching allocator, of 2 * B_alloc entries (every
+// 128-row block holds at most two token tiles), which the launch fills from
+// masked_m and blk0 first (one small kernel). Returns the device pointer, or nullptr
+// when the route reads no list; `cap` gets T and `build` whether the launch must
+// fill it.
+int* compact_slot_tiles(char const* op, std::optional<at::Tensor> const& slot_tiles, at::Tensor const& masked_m,
+    at::Tensor const& blk0, CompactDims const& d, bool list_mode, at::Tensor& owned, int& cap, bool& build)
+{
+    cap = 0;
+    build = false;
+    bool const given = slot_tiles.has_value() && slot_tiles->defined();
+    if (given)
+    {
+        at::Tensor const& t = *slot_tiles;
+        TORCH_CHECK(t.is_cuda() && t.dtype() == at::kInt && t.is_contiguous() && t.dim() == 1 && t.numel() >= 2,
+            op, ": slot_tiles must be a contiguous 1-D CUDA int32 tensor of T + 1 >= 2 entries "
+            "(moe_build_routing_compact's `slot_tiles` output), got ", t.sizes(), " ", t.dtype());
+        TORCH_CHECK(t.device() == masked_m.device(), op, ": slot_tiles must be on masked_m's device");
+        TORCH_CHECK(t.numel() - 1 <= int64_t{2} * d.b_alloc, op, ": slot_tiles holds ", t.numel() - 1,
+            " entries, more than the 2 * B_alloc = ", int64_t{2} * d.b_alloc, " token tiles the compact buffer has");
+    }
+    if (!list_mode)
+        return nullptr;
+    TORCH_CHECK(d.b_alloc <= 8192, op, ": the slot route past a row capacity of one token tile packs a 128-row "
+        "block index into 13 bits, so it needs R <= 8192 * 128 rows; got B_alloc = ", d.b_alloc,
+        ". Unset FSO_GROUPED_SLOT.");
+    if (given)
+    {
+        cap = static_cast<int>(slot_tiles->numel() - 1);
+        char const* check = std::getenv("FSO_CHECK_PROBLEM_SHAPES");
+        if (check && check[0] == '1')
+        {
+            // The list against masked_m and blk0: every expert's token tiles, in order, then -1, then the count.
+            at::Tensor const ht = slot_tiles->to(at::kCPU);
+            at::Tensor const hm = masked_m.to(at::kCPU);
+            at::Tensor const hb = blk0.to(at::kCPU);
+            auto const at_ = ht.accessor<int32_t, 1>();
+            auto const am = hm.accessor<int32_t, 1>();
+            auto const ab = hb.accessor<int32_t, 1>();
+            int t = 0;
+            for (int g = 0; g < d.G; ++g)
+                for (int k = 0; k * 64 < am[g]; ++k, ++t)
+                {
+                    int const r = std::min(64, am[g] - 64 * k);
+                    int const want = (2 * ab[g] + k) | (g << 14) | ((r - 1) << 24);
+                    TORCH_CHECK(t < cap && at_[t] == want, "FSO_CHECK_PROBLEM_SHAPES: ", op, ": slot_tiles[", t,
+                        "] does not hold token tile ", k, " of expert ", g, " (blk0=", ab[g], ", rows=", am[g], ")");
+                }
+            TORCH_CHECK(at_[cap] == t, "FSO_CHECK_PROBLEM_SHAPES: ", op, ": slot_tiles[T] = ", at_[cap],
+                " but the routing has ", t, " live token tiles");
+            for (int u = t; u < cap; ++u)
+                TORCH_CHECK(at_[u] == -1, "FSO_CHECK_PROBLEM_SHAPES: ", op, ": slot_tiles[", u,
+                    "] past the live tiles is not -1");
+        }
+        return reinterpret_cast<int*>(slot_tiles->data_ptr());
+    }
+    cap = 2 * d.b_alloc;
+    owned = at::empty({cap + 1}, masked_m.options());
+    build = true;
+    return reinterpret_cast<int*>(owned.data_ptr());
+}
+
+// The op entries (ops/mxfp8_compact.cu) send sm_100/sm_103 here and serve sm_120/121 themselves, so this only
+// guards the build.
+void compact_arch_gate(char const* op)
+{
+    auto const* prop = at::cuda::getCurrentDeviceProperties();
+    TORCH_CHECK(prop->major == 10, op, ": the sm_100/sm_103 half was called on sm_", prop->major, "x");
+    TORCH_CHECK(detail::sm100_mxfp8_grouped_compiled(),
+        op, " on sm_100/sm_103 requires the extension to be built with CUDA >= 12.8 and TORCH_CUDA_ARCH_LIST "
+        "including 10.0f (family target for B200 + B300).");
+}
+
+} // anonymous namespace
+
+void linear_mxfp8_grouped_compact_sm100(at::Tensor a, at::Tensor b, at::Tensor sa, at::Tensor sb,
+    at::Tensor masked_m, at::Tensor blk0, int64_t m_cap, int64_t expected_m, int64_t max_active_groups,
+    std::optional<at::Tensor> slot_to_expert, std::optional<at::Tensor> problem_shapes,
+    std::optional<at::Tensor> ptr_arrays, at::Tensor d, std::optional<at::Tensor> slot_sched,
+    std::optional<at::Tensor> slot_tiles)
+{
+    char const* const op = "linear_mxfp8_grouped_compact";
+    compact_arch_gate(op);
+    CompactDims const dims
+        = check_compact_operands(op, a, b, sa, sb, masked_m, blk0, m_cap, expected_m, max_active_groups);
+    TORCH_CHECK(d.is_cuda() && d.dtype() == at::kBFloat16 && d.is_contiguous() && d.dim() == 2 && d.size(0) == dims.R
+            && d.size(1) == dims.N,
+        op, ": d must be a contiguous CUDA bf16 [R, N] = [", dims.R, ", ", dims.N, "] tensor, got ", d.sizes());
+    check_compact_slot_refusal(op, dims, static_cast<int>(m_cap), static_cast<int>(max_active_groups));
+    int const* const slot_ptr = check_slot_to_expert(slot_to_expert, dims.G, masked_m);
+    bool const slot_taken = detail::sm100_mxfp8_grouped_slot_taken(static_cast<int>(m_cap), dims.N, dims.K, dims.G,
+        static_cast<int>(max_active_groups), /*fused_swiglu=*/0, /*compact=*/1, static_cast<int>(expected_m));
+    bool const list_mode = slot_taken && m_cap > detail::sm100_mxfp8_grouped_slot_tile_n();
+    if (slot_taken && !list_mode)
+        check_compact_slot_identity(op, dims, masked_m, blk0, slot_to_expert, static_cast<int>(m_cap));
+    at::Tensor sched_owned;
+    int* const sched_ptr = compact_slot_sched(op, slot_sched, masked_m, slot_taken, sched_owned);
+    at::Tensor tiles_owned;
+    int tiles_cap = 0;
+    bool build_tiles = false;
+    int* const tiles_ptr
+        = compact_slot_tiles(op, slot_tiles, masked_m, blk0, dims, list_mode, tiles_owned, tiles_cap, build_tiles);
+    auto const arrays = check_compact_arrays(op, dims, problem_shapes, ptr_arrays, masked_m, blk0, a.data_ptr(),
+        sa.data_ptr(), d.data_ptr(), static_cast<int64_t>(dims.N) * 2);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    cudaError_t const err = detail::launch_sm100_mxfp8_grouped_compact_dispatch(
+        reinterpret_cast<__nv_fp8_e4m3*>(a.data_ptr()), reinterpret_cast<__nv_fp8_e4m3*>(b.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(d.data_ptr()), reinterpret_cast<int32_t*>(sa.data_ptr()),
+        reinterpret_cast<int32_t*>(sb.data_ptr()), reinterpret_cast<int32_t*>(masked_m.data_ptr()),
+        reinterpret_cast<int32_t const*>(blk0.data_ptr()), dims.G, dims.b_alloc, static_cast<int>(m_cap), dims.N,
+        dims.K, static_cast<int>(expected_m), static_cast<int>(max_active_groups), slot_ptr, arrays.first,
+        arrays.second, sched_ptr, tiles_ptr, tiles_cap, build_tiles, stream);
+    TORCH_CHECK(err == cudaSuccess, "sm100 compact mxfp8 grouped kernel error: ", cudaGetErrorString(err));
+}
+
+void linear_mxfp8_grouped_compact_swiglu_sm100(at::Tensor a, at::Tensor b, at::Tensor sa, at::Tensor sb,
+    at::Tensor masked_m, at::Tensor blk0, int64_t m_cap, int64_t expected_m, int64_t max_active_groups,
+    std::optional<at::Tensor> slot_to_expert, std::optional<at::Tensor> problem_shapes,
+    std::optional<at::Tensor> ptr_arrays, at::Tensor dq, at::Tensor sd, std::optional<at::Tensor> slot_sched,
+    std::optional<at::Tensor> slot_tiles)
+{
+    char const* const op = "linear_mxfp8_grouped_compact_swiglu";
+    compact_arch_gate(op);
+    CompactDims const dims
+        = check_compact_operands(op, a, b, sa, sb, masked_m, blk0, m_cap, expected_m, max_active_groups);
+    int const inter = dims.N / 2;
+    TORCH_CHECK(dims.N % 2 == 0 && inter % 128 == 0,
+        op, ": b.size(1) must be 2*I with I a multiple of 128 (a 1x32 output scale block must not straddle the atom "
+        "slab's 128-column block), got N=", dims.N);
+    TORCH_CHECK(dq.is_cuda() && dq.dtype() == at::kFloat8_e4m3fn && dq.is_contiguous() && dq.dim() == 2
+            && dq.size(0) == dims.R && dq.size(1) == inter,
+        op, ": dq must be a contiguous CUDA float8_e4m3fn [R, I] = [", dims.R, ", ", inter, "] tensor, got ",
+        dq.sizes());
+    TORCH_CHECK(sd.is_cuda() && sd.dtype() == at::kInt && sd.is_contiguous()
+            && sd.numel() == static_cast<int64_t>(dims.R) * (inter / 128),
+        op, ": sd must be the contiguous one-group Sm1xx atom slab of R rows, R * I/128 = ",
+        static_cast<int64_t>(dims.R) * (inter / 128), " int32 words");
+    check_compact_slot_refusal(op, dims, static_cast<int>(m_cap), static_cast<int>(max_active_groups));
+    int const* const slot_ptr = check_slot_to_expert(slot_to_expert, dims.G, masked_m);
+    bool const slot_taken = detail::sm100_mxfp8_grouped_slot_taken(static_cast<int>(m_cap), dims.N, dims.K, dims.G,
+        static_cast<int>(max_active_groups), /*fused_swiglu=*/1, /*compact=*/1, static_cast<int>(expected_m));
+    bool const list_mode = slot_taken && m_cap > detail::sm100_mxfp8_grouped_slot_tile_n();
+    if (slot_taken && !list_mode)
+        check_compact_slot_identity(op, dims, masked_m, blk0, slot_to_expert, static_cast<int>(m_cap));
+    at::Tensor sched_owned;
+    int* const sched_ptr = compact_slot_sched(op, slot_sched, masked_m, slot_taken, sched_owned);
+    at::Tensor tiles_owned;
+    int tiles_cap = 0;
+    bool build_tiles = false;
+    int* const tiles_ptr
+        = compact_slot_tiles(op, slot_tiles, masked_m, blk0, dims, list_mode, tiles_owned, tiles_cap, build_tiles);
+    // The fused FC1 is a GEMM of N = 2*I weight rows, so its triples carry that
+    // N; its D rows are the fp8 output's (I bytes each).
+    auto const arrays = check_compact_arrays(op, dims, problem_shapes, ptr_arrays, masked_m, blk0, a.data_ptr(),
+        sa.data_ptr(), dq.data_ptr(), static_cast<int64_t>(inter));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    cudaError_t const err = detail::launch_sm100_mxfp8_grouped_swiglu_compact_dispatch(
+        reinterpret_cast<__nv_fp8_e4m3*>(a.data_ptr()), reinterpret_cast<__nv_fp8_e4m3*>(b.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3*>(dq.data_ptr()), reinterpret_cast<int32_t*>(sd.data_ptr()),
+        reinterpret_cast<int32_t*>(sa.data_ptr()), reinterpret_cast<int32_t*>(sb.data_ptr()),
+        reinterpret_cast<int32_t*>(masked_m.data_ptr()), reinterpret_cast<int32_t const*>(blk0.data_ptr()), dims.G,
+        dims.b_alloc, static_cast<int>(m_cap), dims.N, dims.K, static_cast<int>(expected_m),
+        static_cast<int>(max_active_groups), slot_ptr, arrays.first, arrays.second, sched_ptr, tiles_ptr, tiles_cap,
+        build_tiles, stream);
+    TORCH_CHECK(err == cudaSuccess, "sm100 compact fused-SwiGLU mxfp8 grouped kernel error: ",
+        cudaGetErrorString(err));
+}
+
 // linear_mxfp8_grouped_masked_combine: the grouped FC2 (down projection) with the
 // weighted combine in its epilogue (sm_120/121).
 //
@@ -785,11 +1201,13 @@ at::Tensor linear_mxfp8_grouped_masked_combine(at::Tensor a_fp8, at::Tensor w2_f
 // true wherever an instantiation covers the shape, and the slot-route verdict
 // only decides which fused kernel runs. sm_120/121 has one grouped route, so
 // the per-call answer is the load-time one (mxfp8_grouped_swiglu_available).
-// Every other device answers false: it has no fused FC1.
+// Every other device answers false: it has no fused FC1. `compact` names the
+// layout of the fused op the call will be (the compact and the masked ops have
+// different slot-route rules on sm_100/103); other architectures ignore it.
 bool mxfp8_grouped_swiglu_available(int64_t n_w, int64_t k); // defined below
 
-bool mxfp8_grouped_swiglu_fused_route(
-    int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups, int64_t max_active_groups)
+bool mxfp8_grouped_swiglu_fused_route(int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups,
+    int64_t max_active_groups, bool compact, int64_t expected_m)
 {
     auto const* prop = at::cuda::getCurrentDeviceProperties();
     if (prop->major == 12)
@@ -799,12 +1217,15 @@ bool mxfp8_grouped_swiglu_fused_route(
         (void) m_cap;
         (void) num_groups;
         (void) max_active_groups;
+        (void) compact;
+        (void) expected_m;
         return mxfp8_grouped_swiglu_available(n_w, k);
     }
     if (!is_sm100_family() || !detail::sm100_mxfp8_grouped_compiled())
         return false;
     return detail::sm100_mxfp8_grouped_fused_fc1_route(static_cast<int>(m_cap), static_cast<int>(n_w),
-               static_cast<int>(k), static_cast<int>(num_groups), static_cast<int>(max_active_groups))
+               static_cast<int>(k), static_cast<int>(num_groups), static_cast<int>(max_active_groups),
+               compact ? 1 : 0, static_cast<int>(expected_m))
         != 0;
 }
 
@@ -858,15 +1279,24 @@ bool mxfp8_grouped_swiglu_available(int64_t n_w, int64_t k)
 // (`linear_mxfp8_grouped_masked_swiglu`) takes the slot route one step short
 // of the plain grouped GEMM — one 32-column epilogue chunk instead of the full
 // 64-wide token tile (run b300_round3_20260922/M-A3) — so a layer asks for its
-// FC1 with the flag set and for its FC2 with it clear.
-bool mxfp8_grouped_slot_possible(
-    int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups, int64_t max_active_groups, bool fused_swiglu)
+// FC1 with the flag set and for its FC2 with it clear. `compact` says which
+// layout's op the call will be: the compact ops (`linear_mxfp8_grouped_compact`,
+// `_compact_swiglu`) are routed by their own rule (`slot_route_compact` in the
+// dispatcher, run fso_0.2.1_20261010/S10b-3a), the masked ops by 0.2.0's, which
+// is also the answer with the flag clear. `expected_m` is the expected rows per
+// expert, ceil(M * topk / G), which the compact rule bounds since run
+// fso_0.2.1_20261010/S16b; 0 (unknown, the default) keeps the compact rule's
+// previous bound, m_cap <= 512, so a caller that does not pass it keeps its
+// answers. The compact ops always know it (it is their `expected_m` argument), so
+// a caller that composes them should pass it to get the route the op takes.
+bool mxfp8_grouped_slot_possible(int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups,
+    int64_t max_active_groups, bool fused_swiglu, bool compact, int64_t expected_m)
 {
     if (!is_sm100_family() || !detail::sm100_mxfp8_grouped_compiled())
         return false;
     return detail::sm100_mxfp8_grouped_slot_taken(static_cast<int>(m_cap), static_cast<int>(n_w),
                static_cast<int>(k), static_cast<int>(num_groups), static_cast<int>(max_active_groups),
-               fused_swiglu ? 1 : 0)
+               fused_swiglu ? 1 : 0, compact ? 1 : 0, static_cast<int>(expected_m))
         != 0;
 }
 
@@ -887,16 +1317,17 @@ bool mxfp8_grouped_slot_possible(
 // names the kernel the call will land on, exactly as for
 // `mxfp8_grouped_slot_possible`: the fused-SwiGLU FC1 leaves the slot route
 // one step earlier than the plain grouped GEMM, so the two queries are
-// complements only when both are asked with the same flag (a layer asks both
-// for its FC1 with the flag set and for its FC2 with it clear).
-bool mxfp8_grouped_problem_shapes_consumed(
-    int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups, int64_t max_active_groups, bool fused_swiglu)
+// complements only when both are asked with the same flags (a layer asks both
+// for its FC1 with the flag set and for its FC2 with it clear, and both under
+// the `compact` flag of the layout it runs).
+bool mxfp8_grouped_problem_shapes_consumed(int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups,
+    int64_t max_active_groups, bool fused_swiglu, bool compact, int64_t expected_m)
 {
     if (!is_sm100_family() || !detail::sm100_mxfp8_grouped_compiled())
         return false;
     return detail::sm100_mxfp8_grouped_problem_shapes_consumed(static_cast<int>(m_cap), static_cast<int>(n_w),
                static_cast<int>(k), static_cast<int>(num_groups), static_cast<int>(max_active_groups),
-               fused_swiglu ? 1 : 0)
+               fused_swiglu ? 1 : 0, compact ? 1 : 0, static_cast<int>(expected_m))
         != 0;
 }
 

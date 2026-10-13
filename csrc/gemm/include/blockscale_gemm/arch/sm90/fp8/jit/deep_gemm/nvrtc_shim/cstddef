@@ -1,0 +1,4 @@
+// NVRTC shim for <cstddef>
+#pragma once
+#include <cuda/std/cstddef>
+namespace std { using cuda::std::size_t; using cuda::std::ptrdiff_t; using cuda::std::nullptr_t; }

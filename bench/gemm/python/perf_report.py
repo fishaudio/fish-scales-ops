@@ -10,7 +10,7 @@ docs, and prints the comparison reports — so a rerun after any change is
   python bench/gemm/python/perf_report.py merge   --run <dir> [--out <dir>]      raw files -> canonical baseline files (n/a cells listed)
   python bench/gemm/python/perf_report.py diff    --a <dir|baselines> --b <dir>   cell-by-cell delta of every shared cell (A/B of an optimisation)
   python bench/gemm/python/perf_report.py report  [--run <dir>]                  MLP-block, layer-level and kernel-level comparison tables, ×fso and band geomeans
-  python bench/gemm/python/perf_report.py install --run <dir> [--accept-drift]   merge + diff against the installed baselines + copy + provenance + render docs
+  python bench/gemm/python/perf_report.py install --run <dir> [--groups G,...] [--accept-drift]   merge + diff against the installed baselines + copy + provenance + render docs
 
 install takes only a run directory written by bench/run_perf.py: it reads <dir>/manifest.json, takes the device and
 the SM tag from it, and refuses a --smoke run always, a run that did not complete, a file whose producing step exited
@@ -32,6 +32,10 @@ Raw-file manifest (device suffix `--device`, families 30a3 / 35a3):
   gemm_sm<sm>_qwen3_4b.jsonl, gemm_sm<sm>_qwen3_4b_mlp_fwd.jsonl, gemm_sm<sm>_qwen3_{30a3,35a3}_dense.jsonl   dense tables -> same name
   ref_mlp_sgl_<dev>.jsonl, ref_mlp_vllm_<dev>.jsonl, ref_mlp_cublas_<dev>.jsonl   Family A MLP-block comparators, one
                                               row per M with one entry per dtype, merged by M -> ref_mlp_qwen3_4b_<dev>.jsonl
+  perf_moe_qwen3_<fam>_<tag>_<dev>.jsonl      fso rows of a serving-shaped family (tag skew / padded / ep2,
+                                              serving_cases.py)                                     -> same name
+  ref_<tag>_<fam>_<dev>.jsonl, ref_sgl020_<tag>_<fam>_<dev>.jsonl   its comparators -> ref_moe_qwen3_<fam>_<tag>_<dev>.jsonl
+A padded-bucket row is keyed by its executed rows M and its live rows (`live`), so two cells of one bucket stay apart.
 Bands (stone, 2026-09-28): decode = M 1..128, prefill = M > 128.
 """
 from __future__ import annotations
@@ -49,6 +53,9 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import serving_cases  # noqa: E402  (beside this file; standard library only)
+
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 BASELINES = os.path.join(ROOT, "tests", "baselines")
 PROVENANCE = os.path.join(BASELINES, "provenance")
@@ -152,6 +159,9 @@ def manifest(run, dev, sm):
                                                  f"ref_torchma_smm_{fam}_{dev}.jsonl"]
         m[f"ref_kern_moe_qwen3_{fam}_{dev}.jsonl"] = [f"ref_kern_c1_vllm_{fam}_{dev}.jsonl", f"ref_kern_c1_sgl_{fam}_{dev}.jsonl",
                                                       f"ref_kern_c1_fi_{fam}_{dev}.jsonl"]
+        for tag in serving_cases.TAGS.values():     # the serving-shaped cases (bench/perf_suite.py, group serving)
+            m[f"perf_moe_qwen3_{fam}_{tag}_{dev}.jsonl"] = [f"perf_moe_qwen3_{fam}_{tag}_{dev}.jsonl"]
+            m[f"ref_moe_qwen3_{fam}_{tag}_{dev}.jsonl"] = [f"ref_{tag}_{fam}_{dev}.jsonl", f"ref_sgl020_{tag}_{fam}_{dev}.jsonl"]
     m[f"perf_moe_qwen3_35a3_shared_{dev}.jsonl"] = [f"perf_moe_qwen3_35a3_shared_{dev}.jsonl"]
     m[f"ref_moe_qwen3_35a3_shared_{dev}.jsonl"] = [f"ref_new_35a3_shared_{dev}.jsonl"]   # the block's comparators (sm_100: torch-native)
     for n in (f"gemm_sm{sm}_qwen3_4b.jsonl", f"gemm_sm{sm}_qwen3_4b_mlp_fwd.jsonl",
@@ -246,14 +256,14 @@ def cmd_merge(args):
 
 # ----------------------------------------------------------------------------- cells of any baseline file
 def cells_of(path):
-    """(key, µs) for every timed cell: MoE rows keyed (impl, proj, M); dense rows
-    keyed (tag, M, dtype); MLP-block rows keyed ('mlp', M, dtype)."""
+    """(key, µs) for every timed cell: MoE rows keyed (impl, proj, M), plus the live rows of a padded-bucket row
+    (impl, proj, M, live); dense rows keyed (tag, M, dtype); MLP-block rows keyed ('mlp', M, dtype)."""
     out = {}
     for r in load(path):
         if r.get("kind") == "meta":
             continue
         if "impl" in r and r.get("us") is not None:
-            out[(r["impl"], r.get("proj", "layer"), r["M"])] = r["us"]
+            out[(r["impl"], r.get("proj", "layer"), r["M"]) + ((r["live"],) if "live" in r else ())] = r["us"]
         elif "tag" in r and "M" in r:
             for dt, v in r.items():
                 if isinstance(v, dict) and v.get("us") is not None:
@@ -351,8 +361,6 @@ def layer_report(perf, ref, title):
     out = [f"\n### {title}\n", "|    M | fso µs |" + "".join(f" {t}{' (eager)' if i in eager else ''} µs | ×fso |" for i, t in cols),
            "|-----:|-------:|" + "".join("------:|-----:|" for _ in cols)]
     for M in sorted(fso):
-        if M == 96:
-            continue
         line = f"| {M:4d} | {fso[M]:6.1f} |"
         for i, _ in cols:
             r = rows.get((i, M))
@@ -360,7 +368,7 @@ def layer_report(perf, ref, title):
         out.append(line)
     out += ["", "| geomean ×fso |" + "".join(f" {t} |" for _, t in cols), "|---|" + "---:|" * len(cols)]
     for name, pred in BANDS:
-        xs = {i: [rows[(i, M)]["us"] / fso[M] for M in fso if M != 96 and pred(M) and (i, M) in rows] for i, _ in cols}
+        xs = {i: [rows[(i, M)]["us"] / fso[M] for M in fso if pred(M) and (i, M) in rows] for i, _ in cols}
         out.append(f"| {name} |" + "".join(f" {geo(xs[i]):.2f}× (n={len(xs[i])}) |" if xs[i] else " — |" for i, _ in cols))
     return "\n".join(out)
 
@@ -376,7 +384,7 @@ def kernel_report(perf, ref, title):
     cols = [(i, t) for i, t in KERN_IMPLS if any(k[0] == i for k in rows)]
     out = []
     for proj in ("gate_up", "down"):
-        Ms = sorted(M for (p, M) in fso if p == proj and M != 96)
+        Ms = sorted(M for (p, M) in fso if p == proj)
         out += [f"\n### {title} — `moe.{proj}`\n", "|    M | fso MXFP8 µs | cos |" + "".join(f" {t} µs | ×fso | cos |" for _, t in cols),
                 "|-----:|-------------:|----:|" + "".join("-----:|-----:|----:|" for _ in cols)]
         for M in Ms:
@@ -507,6 +515,7 @@ def provenance_entry(man, man_sha, files, run):
                          "max_sm_mhz": cp.get("max_sm_mhz")},
         "observed_clocks": {s["name"]: s.get("clocks") for s in steps},
         "clock_flags": {s["name"]: s["clock_flags"] for s in steps if s.get("clock_flags")},
+        "power_flags": {s["name"]: s["power_flags"] for s in steps if s.get("power_flags")},
         "steps": [{k: s.get(k) for k in ("name", "env", "command", "start_utc", "end_utc", "exit_code", "rows",
                                          "error_rows")} for s in steps],
         "environments": envs,
@@ -550,6 +559,11 @@ def cmd_install(args):
         args.device, args.sm = mdev, msm
     args.device, args.sm = args.device or "5090", args.sm or "120"
     names = manifest(args.run, args.device, args.sm)
+    if args.groups and man is not None:
+        # Only the files every producing step of which belongs to the named table groups; the others keep their
+        # installed numbers and provenance (for example a run that also re-measured unchanged kernels).
+        keep = {g.strip() for g in args.groups.split(",") if g.strip()}
+        names = {n: f for n, f in names.items() if {s.get("group") for s in feeding_steps(man, f)} <= keep}
     why = install_refusals(man, args, names, conflict)
     if why:
         print(f"install refused: {args.run}")
@@ -588,6 +602,9 @@ def main():
                     help="SM tag of the dense files (120 | 90 | 100); default 120, and install takes it from the manifest")
     ap.add_argument("--threshold", type=float, default=1.0, help="diff: list cells moving more than this percent")
     ap.add_argument("--show", type=int, default=40, help="diff: how many moved cells to list")
+    ap.add_argument("--groups", default=None,
+                    help="install: only the baseline files whose producing steps all belong to these table groups "
+                         "(comma list); the other files keep their installed numbers and provenance")
     ap.add_argument("--accept-drift", action="store_true",
                     help="install: install a run that deviated from its environment lock (the drift goes into the provenance)")
     args = ap.parse_args()

@@ -32,10 +32,10 @@ torch 2.13.0+cu130. One extension carries the kernels of all three architectures
   is the `tests/`, `bench/`, `scripts/` and `docs/` of the same commit; steps 3 and 4 run from it.
 - **Torch guard.** The wheel is tied to the torch it was built against. Importing it under another torch raises
   `ImportError`.
-- **Memory.** Each architecture pass of `csrc/gemm/ops/mxfp8_kernel.cu` peaks near 16 GB on its own, and four jobs
-  together peaked near 29 GB: give one job 16 GB and each further job about 12 GB. More than four jobs barely shortens
-  the build, because that one translation unit takes most of it. `--cpus N --memory SIZE` limit the container, for
-  example to reproduce a CI runner.
+- **Memory.** Each architecture pass of `csrc/gemm/ops/mxfp8_kernel.cu` and of `csrc/gemm/ops/mxfp8_compact_kernel.cu`
+  peaks near 16 GB on its own, and four jobs together peaked near 29 GB: give one job 16 GB and each further job
+  about 12 GB. More than four jobs barely shortens the build, because those two translation units take most of it.
+  `--cpus N --memory SIZE` limit the container, for example to reproduce a CI runner.
 - **Compiler cache.** `--ccache DIR --ccache-bin FILE` compiles the CUDA translation units through ccache, with the
   cache in `DIR` outside the repository. `FILE` must be a static ccache build, such as
   `ccache-4.14.1-linux-x86_64-musl-static` from the ccache releases, because it also runs inside the container. A
@@ -115,8 +115,14 @@ python3 bench/run_perf.py --machine h200 --out /data/bench-runs/<run> --fso-path
 - **Preflight.** The run first compares the machine with its lock: the interpreter and the exact package versions
   of every environment a step uses, the driver, the card, the clock policy, and on sm_90 the compiler the JIT loaded.
   A difference is drift, and the run refuses it. `--dry-run` prints the plan and that verdict without touching a GPU.
-- **Steps.** The steps of every table of record are listed once, in `bench/perf_suite.py`.
-- **Manifest.** `manifest.json` in the run directory records what ran and on what.
+- **Steps.** The steps of every table of record are listed once, in `bench/perf_suite.py`. `--tables` selects
+  table groups; `serving` is the serving-shaped cases of the MoE layer (skewed routing, padded buckets, one
+  expert-parallel rank; `docs/perf/README.md`, Routing).
+- **Manifest.** `manifest.json` in the run directory records what ran and on what. Per step it also records the
+  clocks, power and throttling the sampler saw: the SM clock over the busy samples (median, minimum, mean,
+  maximum), the board power (busy mean and maximum, and the card's limit), and the share of busy samples that a
+  power or a thermal limiter held. A step whose busy samples hit the power cap carries a power flag naming that
+  share, so its numbers are read as measured under the cap.
 
 **The lock.** `bench/env/<machine>.lock.json` pins, for every environment a step uses, the interpreter and the exact
 package versions, and for the machine the driver, the card, the clock and compute-mode policy, the GPU lock file and
@@ -135,7 +141,9 @@ python bench/gemm/python/perf_report.py install --run /data/bench-runs/<run>
 `install` requires the run's manifest. It refuses a smoke run, an incomplete run, and a run with drift unless
 `--accept-drift`. It writes the provenance of each installed baseline file into
 `tests/baselines/provenance/<machine>.json`, and `render_perf_docs.py` renders the "Environments of record" block
-of `docs/perf/README.md` from it.
+of `docs/perf/README.md` from it. `--groups moe,shared,…` installs only the files that those table groups produced;
+the other files keep their installed numbers and provenance. Use it when a run also re-measured kernels whose machine
+code did not change, so that their tables stay those of the run that first measured that code.
 
 **Acceptance rule.** A change that can affect runtime performance is accepted only if every affected cell of the
 tables of record is faster than, or within ±1 % of, the committed baseline, measured with the same protocol on the

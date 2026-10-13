@@ -32,10 +32,13 @@ compute-mode policy, the GPU lock file and the bench environment), and the machi
    installed baselines, and saves both outputs (merge.txt, diff_vs_baselines.txt). It never installs anything.
 
 --smoke runs every step on the cells with M in {1, 64} only and marks the manifest smoke: true, so that
-perf_report.py install refuses the run. <run_dir>/manifest.json records the machine and host, the time window,
+perf_report.py install refuses the run. --ms LIST does the same with any M list, for analysis runs such as a serving
+stack's decode buckets. <run_dir>/manifest.json records the machine and host, the time window,
 the lock (an embedded copy and its sha256), the versions the preflight found and the drift list, the
 fish_scales_ops identity, the card, the clock policy and the observed clocks of every step, every step's command,
-window, row count and failures, and the commit of the tree that holds the benches.
+window, row count and failures, and the commit of the tree that holds the benches. Each step's clock summary also
+holds its busy power (mean, max, the card's limit), its mean busy SM clock and the share of busy samples that a
+power or thermal limiter held; a step whose busy samples hit the power cap gets a power flag (steps[].power_flags).
 
 Exit codes: 0 done (or a dry run that would proceed); 2 usage error; 3 refused by the preflight; 4 the GPU lock
 file stayed busy; 5 the card has a compute process; 6 the clock or compute-mode policy could not be applied or
@@ -88,6 +91,13 @@ REASON_HW_SLOWDOWN = 0x8
 REASON_SW_THERMAL = 0x20
 REASON_HW_THERMAL = 0x40
 REASON_HW_POWER_BRAKE = 0x80
+# The power and thermal limiters a step's summary counts, by name; POWER_CAP is what "hit the power cap" means.
+THROTTLE_REASONS = (("sw_power_cap", REASON_SW_POWER_CAP), ("hw_slowdown", REASON_HW_SLOWDOWN),
+                    ("sw_thermal", REASON_SW_THERMAL), ("hw_thermal", REASON_HW_THERMAL),
+                    ("hw_power_brake", REASON_HW_POWER_BRAKE))
+POWER_CAP = REASON_SW_POWER_CAP | REASON_HW_POWER_BRAKE
+THERMAL = REASON_SW_THERMAL | REASON_HW_THERMAL
+THROTTLE = POWER_CAP | THERMAL | REASON_HW_SLOWDOWN
 
 # A worker that found the card taken by someone else; the run stops rather than measure on a shared card.
 DEVICE_BUSY_TEXT = re.compile(r"busy or unavailable|DevicesUnavailable|all CUDA-capable devices are busy")
@@ -372,16 +382,19 @@ def validate_suite(machine, lock=None):
     return problems
 
 
-def resolve_plan(lock, run_dir, tables, smoke):
-    """The machine's steps in the selected table groups, each with its full command line."""
+def resolve_plan(lock, run_dir, tables, ms=None, smoke=False):
+    """The machine's steps in the selected table groups, each with its full command line. ``ms``: the M list of a
+    partial run (--ms), passed to every bench as --Ms; ``smoke`` is ``ms = "1,64"``; neither for a full run."""
+    if smoke:
+        ms = SMOKE_MS
     plan = []
     for s in perf_suite.SUITES[lock["machine"]]:
         if s["group"] not in tables:
             continue
         e = lock["environments"][s["env"]]
         argv = [e["python"], os.path.join(ROOT, s["script"])] + list(s["args"]) + ["--out", os.path.join(run_dir, s["out"])]
-        if smoke:
-            argv += SMOKE_ARGS
+        if ms:
+            argv += ["--Ms", ms]
         plan.append(dict(s, argv=argv))
     return plan
 
@@ -701,7 +714,7 @@ def bench_tree_identity():
 
 
 # ----------------------------------------------------------------------------- printing the plan
-def print_plan(lock, lock_file, lock_sha, plan, envs, run_dir, tables, smoke, fso_path, card, tree):
+def print_plan(lock, lock_file, lock_sha, plan, envs, run_dir, tables, ms, fso_path, card, tree):
     gpu = lock["gpu"]
     cp, cm = gpu["clock_policy"], gpu["compute_mode"]
     log(f"machine {lock['machine']} ({lock['arch']}, tables tagged sm{lock['sm']}); lock {rel(lock_file)} sha256 {lock_sha[:16]}")
@@ -709,7 +722,7 @@ def print_plan(lock, lock_file, lock_sha, plan, envs, run_dir, tables, smoke, fs
               "kit": f"test kit of commit {tree['commit']}"}.get(
         tree["source"], "neither a git work tree nor a kit with a commit; identified by the bench fingerprint only")
     log(f"tree {ROOT} ({origin}); bench fingerprint {tree['fingerprint'][:16]}")
-    smoke_text = "yes (M in {" + SMOKE_MS + "} only, never installable)" if smoke else "no"
+    smoke_text = "yes (M in {" + ms + "} only, never installable)" if ms else "no"
     log(f"run directory {run_dir}; tables {', '.join(tables)}; smoke {smoke_text}")
     log(f"fish_scales_ops path {fso_path or '(none: the environments must provide fish_scales_ops)'}")
     if card:
@@ -828,14 +841,21 @@ def is_busy(s):
     return s[5] is not None and not s[5] & REASON_IDLE
 
 
-def clock_stats(samples, policy, max_sm):
-    """Per-step clock statistics. The median, minimum and maximum SM clock and the power-capped share are taken
-    over the busy samples (is_busy); samples between cells, while a worker starts, are left out."""
+def clock_stats(samples, policy, max_sm, power_limit_w=None):
+    """Per-step clock and power statistics. The SM clock (median, minimum, mean, maximum), the busy power (mean,
+    maximum) and the throttle shares are taken over the busy samples (is_busy); samples between cells, while a
+    worker starts, are left out. power_w_max is the maximum over every sample of the step. A throttle share is the
+    fraction of busy samples whose clocks_event_reasons.active carries the reason: power (SW power cap, HW power
+    brake), thermal (SW, HW thermal) or any of those and HW slowdown (throttle_share_of_busy)."""
     busy = [s for s in samples if is_busy(s)]
     sms = [s[1] for s in busy if s[1] is not None]
+    watts = [s[2] for s in busy if s[2] is not None]
 
     def count(bit):
         return sum(1 for s in busy if s[5] is not None and s[5] & bit)
+
+    def share(bit):
+        return round(count(bit) / len(busy), 4) if busy else None
     st = {"samples": len(samples), "busy_samples": len(busy),
           "sm_mhz_median_busy": statistics.median(sms) if sms else None,
           "sm_mhz_min_busy": min(sms) if sms else None, "sm_mhz_max_busy": max(sms) if sms else None,
@@ -844,7 +864,17 @@ def clock_stats(samples, policy, max_sm):
           "hw_slowdown_busy_samples": count(REASON_HW_SLOWDOWN | REASON_HW_POWER_BRAKE),
           "thermal_busy_samples": count(REASON_SW_THERMAL | REASON_HW_THERMAL),
           "power_w_max": max((s[2] for s in samples if s[2] is not None), default=None),
-          "temperature_c_max": max((s[3] for s in samples if s[3] is not None), default=None)}
+          "temperature_c_max": max((s[3] for s in samples if s[3] is not None), default=None),
+          # power and throttling (2026-10-10): what a step drew, and how often a power or thermal limiter held it
+          "sm_mhz_mean_busy": round(statistics.fmean(sms), 1) if sms else None,
+          "power_w_mean_busy": round(statistics.fmean(watts), 1) if watts else None,
+          "power_w_max_busy": max(watts) if watts else None,
+          "power_limit_w": power_limit_w,
+          "power_cap_busy_samples": count(POWER_CAP),
+          "power_throttle_share_of_busy": share(POWER_CAP),
+          "thermal_throttle_share_of_busy": share(THERMAL),
+          "throttle_share_of_busy": share(THROTTLE),
+          "throttle_reason_busy_samples": {name: count(bit) for name, bit in THROTTLE_REASONS}}
     flags = []
     tol = policy["tolerance_mhz"]
     # A natural-clock card runs at its maximum clock unless a limiter holds it lower, so the busy samples that no
@@ -859,6 +889,21 @@ def clock_stats(samples, policy, max_sm):
     if not busy:
         flags.append("no busy sample in the step's window")
     return st, flags
+
+
+def power_flags(st):
+    """A step whose busy samples hit the power cap (clocks_event_reasons.active with the SW power cap or the HW
+    power brake), as one sentence with its share, the clock and the power it ran at; [] otherwise. Kept apart from
+    the clock flags, which say that the clock policy did not hold: a natural-clock card at its power cap is the
+    card's own limit, and its share is what to read the step's numbers against."""
+    n, busy = st.get("power_cap_busy_samples") or 0, st.get("busy_samples") or 0
+    if not n or not busy:
+        return []
+    limit = st.get("power_limit_w")
+    return [f"the power cap held the clock in {n} of {busy} busy samples ({n / busy * 100:.0f} %); busy SM clock "
+            f"min {st.get('sm_mhz_min_busy')} MHz, mean {st.get('sm_mhz_mean_busy')} MHz; busy power mean "
+            f"{st.get('power_w_mean_busy')} W, max {st.get('power_w_max_busy')} W"
+            + (f" of the {limit:g} W limit" if isinstance(limit, (int, float)) else "")]
 
 
 def count_rows(path):
@@ -1013,7 +1058,7 @@ def run(args, lock, lock_file, lock_sha, plan, envs, pre, tree, run_dir):
     card = pre["card"]
     man = {"schema": 1, "tool": "bench/run_perf.py", "machine": lock["machine"], "host": pre["host"],
            "run_dir": run_dir, "start_utc": iso(), "end_utc": None, "status": "running",
-           "smoke": bool(args.smoke), "smoke_ms": SMOKE_MS if args.smoke else None, "allow_drift": bool(args.allow_drift),
+           "smoke": bool(args.ms), "smoke_ms": args.ms, "allow_drift": bool(args.allow_drift),
            "tables": list(args.tables), "argv": sys.argv, "harness_python": sys.executable,
            "lock_file": lock_file, "lock_sha256": lock_sha, "lock": lock,
            "suite": {"file": rel(perf_suite.__file__), "sha256": sha256_file(perf_suite.__file__)},
@@ -1023,15 +1068,21 @@ def run(args, lock, lock_file, lock_sha, plan, envs, pre, tree, run_dir):
                                          "power_limit_w", "memory_total_mib")},
            "clock_policy": {}, "compute_mode": {}, "gpu_lock": {"file": lock["gpu"]["lock_file"]},
            "sampler": {"file": "clocks.csv", "interval_ms": SAMPLE_MS, "fields": "epoch," + Sampler.FIELDS,
-                       "busy": "a sample with utilization.gpu above 0; the per-step clock statistics use busy samples only"},
+                       "busy": "a sample with utilization.gpu above 0; the per-step clock statistics use busy samples only",
+                       "per_step": "steps[].clocks: SM clock median, min, mean and max and power mean and max over the "
+                                   "busy samples, the power limit, the share of busy samples whose clock-event reasons "
+                                   "carry a power limiter (SW power cap, HW power brake), a thermal limiter, or any of "
+                                   "them and HW slowdown, and the busy samples per reason; steps[].power_flags names a "
+                                   "step whose busy samples hit the power cap"},
            "environments": {n: {"python": lock["environments"][n]["python"], "set": sv, "removed": rm}
                             for n, (sv, rm) in envs.items()},
            "steps": [], "post": {}}
     mpath = os.path.join(run_dir, "manifest.json")
     write_json_atomic(mpath, man)
-    if args.smoke:
+    if args.ms:
         with open(os.path.join(run_dir, "SMOKE_RUN_NOT_INSTALLABLE"), "w") as f:
-            f.write("A --smoke run of bench/run_perf.py: M in {" + SMOKE_MS + "} only. perf_report.py install refuses it.\n")
+            f.write("A partial run of bench/run_perf.py (--smoke or --ms): M in {" + args.ms + "} only. "
+                    "perf_report.py install refuses it.\n")
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, _on_signal)
     code, release_clock, restore_mode, sampler, fd = 0, None, None, None, None
@@ -1067,17 +1118,21 @@ def run(args, lock, lock_file, lock_sha, plan, envs, pre, tree, run_dir):
             env, _, _ = step_environment(lock, s["env"], args.fso_path, card["uuid"])
             log(f"[{i}/{len(plan)}] start {s['name']} ({s['env']}): {shlex.join(s['argv'])}")
             rec, t0, t1 = run_step(s, env, run_dir, args.step_timeout)
-            stats, flags = clock_stats(sampler.window(t0, t1), lock["gpu"]["clock_policy"], card["clocks_max_sm_mhz"])
+            stats, flags = clock_stats(sampler.window(t0, t1), lock["gpu"]["clock_policy"], card["clocks_max_sm_mhz"],
+                                       card.get("power_limit_w"))
+            pflags = power_flags(stats)
             entry = {k: s[k] for k in ("name", "group", "env", "script", "args", "out")}
             entry.update(command=s["argv"], **rec)
-            entry.update(clocks=stats, clock_flags=flags)
+            entry.update(clocks=stats, clock_flags=flags, power_flags=pflags)
             man["steps"].append(entry)
             write_json_atomic(mpath, man)
             log(f"[{i}/{len(plan)}] end {s['name']}: exit {rec['exit_code']}{' (timed out)' if rec['timed_out'] else ''}, "
                 f"{rec['rows']} rows ({rec['timed_rows']} timed, {rec['error_rows']} with an error), "
                 f"{rec['failure_lines']} failure lines, {rec['seconds']} s; SM median {stats['sm_mhz_median_busy']} "
-                f"min {stats['sm_mhz_min_busy']} MHz, power-capped {stats['power_capped_share_of_busy']} of busy samples"
-                + "".join(f"; FLAG {x}" for x in flags))
+                f"min {stats['sm_mhz_min_busy']} mean {stats['sm_mhz_mean_busy']} MHz; power mean "
+                f"{stats['power_w_mean_busy']} max {stats['power_w_max_busy']} W; power-capped "
+                f"{stats['power_capped_share_of_busy']}, power or thermal limited {stats['throttle_share_of_busy']} "
+                f"of busy samples" + "".join(f"; FLAG {x}" for x in flags) + "".join(f"; POWER {x}" for x in pflags))
             if rec["device_busy_lines"]:
                 raise Refused(EXIT_ABORTED, f"step {s['name']} reported the device busy or unavailable; the run stops")
         man["status"] = "complete"
@@ -1122,7 +1177,8 @@ def run(args, lock, lock_file, lock_sha, plan, envs, pre, tree, run_dir):
     if man["steps"]:
         for name, cmd in zip(("merge", "diff"), post_commands(lock, run_dir)):
             out_name = "merge.txt" if name == "merge" else "diff_vs_baselines.txt"
-            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
+                               env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))   # nothing written into the tree
             with open(os.path.join(run_dir, out_name), "w") as f:
                 f.write(p.stdout)
             man["post"][name] = {"command": cmd, "exit_code": p.returncode, "output": out_name}
@@ -1131,7 +1187,7 @@ def run(args, lock, lock_file, lock_sha, plan, envs, pre, tree, run_dir):
     failed = [s["name"] for s in man["steps"] if s["exit_code"] != 0]
     log(f"run {man['status']}: {len(man['steps'])} of {len(plan)} step(s) ran"
         + (f", {len(failed)} exited non-zero ({', '.join(failed)})" if failed else "")
-        + f"; manifest {mpath}" + (" (smoke: never installable)" if args.smoke else ""))
+        + f"; manifest {mpath}" + (" (partial M list: never installable)" if args.ms else ""))
     return code
 
 
@@ -1144,6 +1200,9 @@ def parse_args(argv=None):
     ap.add_argument("--tables", default="all", help=f"comma list of table groups ({', '.join(GROUPS)}) or 'all'")
     ap.add_argument("--fso-path", help="directory put first on PYTHONPATH; it holds the fish_scales_ops package to measure")
     ap.add_argument("--smoke", action="store_true", help=f"every step on M in {{{SMOKE_MS}}} only; never installable")
+    ap.add_argument("--ms", default=None,
+                    help="every step on these M only (comma list, e.g. a serving stack's decode buckets), for analysis; "
+                         "like --smoke, never installable")
     ap.add_argument("--dry-run", action="store_true", help="print the plan and the preflight result, then stop")
     ap.add_argument("--allow-drift", action="store_true", help="proceed despite drift and record it in the manifest")
     ap.add_argument("--gpu", help="the UUID to use when the lock lists several cards")
@@ -1179,7 +1238,12 @@ def main(argv=None):
     if not args.dry_run and os.path.exists(args.out) and (not os.path.isdir(args.out) or os.listdir(args.out)):
         print(f"run directory {args.out} exists and is not empty; a run needs its own directory", file=sys.stderr)
         return EXIT_USAGE
-    plan = resolve_plan(lock, args.out, args.tables, args.smoke)
+    if args.smoke and args.ms:
+        print("--smoke and --ms exclude each other", file=sys.stderr)
+        return EXIT_USAGE
+    if args.smoke:
+        args.ms = SMOKE_MS
+    plan = resolve_plan(lock, args.out, args.tables, args.ms)
     if not plan:
         print(f"no step of machine {lock['machine']} is in the tables {args.tables}", file=sys.stderr)
         return EXIT_USAGE
@@ -1191,7 +1255,7 @@ def main(argv=None):
     for s in plan:
         if s["env"] not in envs:
             envs[s["env"]] = step_environment(lock, s["env"], args.fso_path, cvd)[1:]
-    print_plan(lock, lock_file, lock_sha, plan, envs, args.out, args.tables, args.smoke, args.fso_path, pre["card"], tree)
+    print_plan(lock, lock_file, lock_sha, plan, envs, args.out, args.tables, args.ms, args.fso_path, pre["card"], tree)
     ok = print_preflight(pre, args.allow_drift)
     if args.dry_run:
         log("preflight (json): " + json.dumps(pre, default=str, sort_keys=True))

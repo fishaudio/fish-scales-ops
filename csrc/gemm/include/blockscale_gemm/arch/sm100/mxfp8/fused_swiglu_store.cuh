@@ -86,6 +86,20 @@ struct FusedSwiGluArgs
     long long sf_group_words = 0;  // pad(m_cap,128) * (I/128)
 };
 
+// The same destinations on the COMPACT activation layout (0.2.1): one group of
+// R = 128 * B_alloc rows in which expert g owns the 128-row blocks starting at
+// block blk0[g]. Group g's rows therefore start at row blk0[g] * 128 instead of
+// g * m_cap, and its scale atoms at atom blk0[g] of the one-group slab instead of
+// g * pad(m_cap,128) / 128. A separate type (and, through the generator, a
+// separate epilogue class) rather than a field of FusedSwiGluArgs, so the masked
+// fused kernels keep exactly the code they had.
+struct FusedSwiGluCompactArgs
+{
+    void* ptr_h = nullptr;          // __nv_fp8_e4m3 base of [R, I]
+    void* ptr_sfh = nullptr;        // int32 base of the one-group atom slab, R * I/128 words
+    int const* blk0 = nullptr;      // [G + 1] first 128-row block of each expert
+};
+
 // ---- vendored from csrc/gemm/ops/quant_kernels.cu -------------------------
 // e8m0_from_amax<true> (UE8M0). Derives the descale via 448/amax -> 1/qs rather
 // than amax * (1/448): the two differ by up to one ULP and pick different bytes
@@ -224,6 +238,103 @@ CUTLASS_DEVICE void fused_swiglu_mxfp8_store(cute::Tensor<AccEngine, AccLayout> 
         }
 
         int const j = (n0 >> 1) + blk * 32; // output element index, a multiple of 32
+        uint4* dst = reinterpret_cast<uint4*>(hrow + j);
+        dst[0] = make_uint4(w[0], w[1], w[2], w[3]);
+        dst[1] = make_uint4(w[4], w[5], w[6], w[7]);
+
+        int const kp = j >> 7;
+        int const b = (j >> 5) & 3;
+        sfbase[4ll * (word_row + static_cast<long long>(kp) * 128) + b] = byte_v;
+    }
+}
+
+// The compact-layout form of the store above. Everything but the two addresses
+// is the masked store, instruction for instruction, so a live row's fp8 bytes
+// and scale byte are the bytes the masked store writes for the same accumulator.
+//
+// Addressing. Expert `l_coord`'s row m is compact row r = blk0[l] * 128 + m of
+// the one-group slab, and the one-group atom index of (r, kp) is
+//     word = (r/128 * num_kp + kp) * 128 + (r%32)*4 + (r%128)/32,
+// i.e. the masked formula with the group term dropped and r in place of m.
+// blk0[l] * 128 is a multiple of 128, so r%128 == m%128 and r/128 ==
+// blk0[l] + m/128: the expert's atoms simply start at atom blk0[l].
+//
+// Bounds. Rows at or past the expert's routed count M (= cnt[l], the problem
+// shape's row extent) return before any store, exactly as in the masked store,
+// so a store never reaches the rows of the next expert, whose block starts at
+// blk0[l+1] >= blk0[l] + ceil(M/128).
+template <class AccEngine, class AccLayout, class CoordEngine, class CoordLayout>
+CUTLASS_DEVICE void fused_swiglu_mxfp8_store(cute::Tensor<AccEngine, AccLayout> const& acc_frag,
+    cute::Tensor<CoordEngine, CoordLayout> const& coord_frag, FusedSwiGluCompactArgs const& f, int M, int N,
+    int l_coord)
+{
+    using namespace cute;
+    auto acc = coalesce(acc_frag);
+    auto crd = coalesce(coord_frag);
+    constexpr int kRun = CUTE_STATIC_V(size(acc));
+    static_assert(kRun % 64 == 0,
+        "fused SwiGLU epilogue: a thread's accumulator run must be a whole number of 64-column gate/up pairs "
+        "(64 interleaved weight rows -> 32 outputs -> exactly one 1x32 scale block)");
+    static_assert(kRun == CUTE_STATIC_V(size(crd)), "fused SwiGLU epilogue: coordinate/accumulator size mismatch");
+
+    auto c0 = crd(_0{});
+    int const m = get<0>(c0);
+    int const n0 = get<1>(c0);
+
+#if FSO_FUSED_SWIGLU_CHECK_FRAG
+    if ((n0 & 63) != 0)
+        __trap();
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < kRun; ++i)
+    {
+        auto ci = crd(i);
+        if (get<0>(ci) != m || get<1>(ci) != n0 + i)
+            __trap();
+    }
+#endif
+
+    if (m >= M)
+        return;
+    if (n0 + kRun > N)
+        return;
+
+    int const I = N >> 1;
+    int const num_kp = I >> 7;
+
+    long long const row = static_cast<long long>(f.blk0[l_coord]) * 128 + m;
+    __nv_fp8_e4m3* hrow = reinterpret_cast<__nv_fp8_e4m3*>(f.ptr_h) + row * I;
+    unsigned char* sfbase = reinterpret_cast<unsigned char*>(f.ptr_sfh);
+
+    int const r = static_cast<int>(row & 127);
+    long long const word_row = (row >> 7) * num_kp * 128 + static_cast<long long>((r & 31) * 4 + (r >> 5));
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int blk = 0; blk < kRun / 64; ++blk)
+    {
+        float h[32];
+        float ax = 0.f;
+        CUTLASS_PRAGMA_UNROLL
+        for (int t = 0; t < 32; ++t)
+        {
+            float const g = acc(blk * 64 + 2 * t);
+            float const u = acc(blk * 64 + 2 * t + 1);
+            float const v = fso_silu(g) * u;
+            h[t] = v;
+            ax = fmaxf(ax, fabsf(v));
+        }
+        ax = fmaxf(ax, 1e-10f);
+        float qs;
+        unsigned char byte_v;
+        fso_e8m0_from_amax(ax, qs, byte_v);
+
+        unsigned int w[8];
+        CUTLASS_PRAGMA_UNROLL
+        for (int p = 0; p < 8; ++p)
+        {
+            w[p] = fso_fp8x4(h[4 * p] * qs, h[4 * p + 1] * qs, h[4 * p + 2] * qs, h[4 * p + 3] * qs);
+        }
+
+        int const j = (n0 >> 1) + blk * 32;
         uint4* dst = reinterpret_cast<uint4*>(hrow + j);
         dst[0] = make_uint4(w[0], w[1], w[2], w[3]);
         dst[1] = make_uint4(w[4], w[5], w[6], w[7]);

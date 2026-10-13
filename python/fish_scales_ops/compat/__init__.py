@@ -14,7 +14,7 @@ What this namespace promises:
   are format-specific: the caller picks block-FP8 or MXFP8, and the scale
   tensors they take and return are architecture-native handles whose layout the
   caller has to respect (``docs/api/compat.md``, *Scale layouts*).
-* The thirty-four MoE pieces are the building blocks of the ``fso.moe`` chains.
+* The forty MoE pieces are the building blocks of the ``fso.moe`` chains.
   Their arguments follow the kernels: arguments, layouts and architecture
   coverage change when a kernel or a route changes. They are public so that a
   benchmark, a test or a caller composing its own chain can reach them.
@@ -43,6 +43,7 @@ Groups:
   ``moe_layer_transient_bytes_mxfp8``, ``moe_layer_fused_combine_engages_sm120``;
 * the MoE router: ``moe_router_topk``, ``moe_topk_from_logits``;
 * the MoE routing builders and combines: ``moe_build_routing``,
+  ``moe_build_routing_compact`` (the compact 128-row-block layout),
   ``moe_build_sorted``, ``moe_combine``, ``moe_combine_sorted``;
 * the sm_90 block-FP8 grouped chain: ``linear_fp8_grouped_masked``,
   ``linear_fp8_grouped_contiguous``, ``linear_fp8_grouped_contiguous_swapab``,
@@ -53,11 +54,19 @@ Groups:
   ``MOE_SWAP_BLOCK_N_CASCADE``, ``moe_swap_ab_block_n``, ``moe_swap_ab_max_m``;
 * the MXFP8 grouped chain of sm_100/103 and sm_120/121:
   ``linear_mxfp8_grouped_masked``, ``linear_mxfp8_grouped_masked_swiglu``,
-  ``linear_mxfp8_grouped_masked_combine``, ``quantize_1x32_grouped_gather_fp8``,
+  ``linear_mxfp8_grouped_masked_combine``, the compact-layout GEMMs
+  ``linear_mxfp8_grouped_compact`` and ``linear_mxfp8_grouped_compact_swiglu``,
+  ``quantize_1x32_grouped_gather_fp8``,
   ``silu_chunk_mul_quantize_1x32_grouped_fp8``, ``quantize_moe_weights_1x32_fp8``,
   ``interleave_w13_fp8`` and the route queries
   ``mxfp8_grouped_swiglu_fused_route``, ``mxfp8_grouped_swiglu_available``,
-  ``mxfp8_grouped_slot_possible``, ``mxfp8_grouped_problem_shapes_consumed``.
+  ``mxfp8_grouped_slot_possible``, ``mxfp8_grouped_problem_shapes_consumed``;
+* the MXFP8 grouped chain on the compact activation layout (0.2.1; one group of
+  128-row blocks instead of the masked slab, every op writing into the caller's
+  buffers): ``linear_mxfp8_grouped_compact``, ``linear_mxfp8_grouped_compact_swiglu``,
+  ``linear_mxfp8_grouped_compact_combine``, ``quantize_1x32_grouped_gather_out_fp8``,
+  ``silu_chunk_mul_quantize_1x32_grouped_out_fp8``. These names are new in 0.2.1, so
+  ``fish_scales_ops.gemm`` (the pre-0.2.0 path) does not carry them.
 """
 from ..gemm.bf16 import linear_bf16
 from ..gemm.fp8 import (
@@ -85,11 +94,15 @@ from ..gemm.fp8 import (
 from ..gemm.mxfp8 import (
     interleave_w13_fp8,
     linear_mxfp8,
+    linear_mxfp8_grouped_compact,
+    linear_mxfp8_grouped_compact_combine,
+    linear_mxfp8_grouped_compact_swiglu,
     linear_mxfp8_grouped_masked,
     linear_mxfp8_grouped_masked_combine,
     linear_mxfp8_grouped_masked_swiglu,
     moe_block_mxfp8_sm120,
     moe_build_routing,
+    moe_build_routing_compact,
     moe_build_sorted,
     moe_combine,
     moe_combine_sorted,
@@ -104,9 +117,11 @@ from ..gemm.mxfp8 import (
     mxfp8_grouped_swiglu_fused_route,
     quantize_1x32_fp8,
     quantize_1x32_grouped_gather_fp8,
+    quantize_1x32_grouped_gather_out_fp8,
     quantize_moe_weights_1x32_fp8,
     silu_chunk_mul_quantize_1x32_fp8,
     silu_chunk_mul_quantize_1x32_grouped_fp8,
+    silu_chunk_mul_quantize_1x32_grouped_out_fp8,
 )
 
 __all__ = [
@@ -137,6 +152,7 @@ __all__ = [
     "moe_topk_from_logits",
     # MoE: routing builders and combines
     "moe_build_routing",
+    "moe_build_routing_compact",
     "moe_build_sorted",
     "moe_combine",
     "moe_combine_sorted",
@@ -156,6 +172,8 @@ __all__ = [
     "linear_mxfp8_grouped_masked",
     "linear_mxfp8_grouped_masked_swiglu",
     "linear_mxfp8_grouped_masked_combine",
+    "linear_mxfp8_grouped_compact",
+    "linear_mxfp8_grouped_compact_swiglu",
     "quantize_1x32_grouped_gather_fp8",
     "silu_chunk_mul_quantize_1x32_grouped_fp8",
     "quantize_moe_weights_1x32_fp8",
@@ -164,4 +182,8 @@ __all__ = [
     "mxfp8_grouped_swiglu_available",
     "mxfp8_grouped_slot_possible",
     "mxfp8_grouped_problem_shapes_consumed",
+    # MoE: MXFP8 grouped chain on the compact activation layout (0.2.1)
+    "linear_mxfp8_grouped_compact_combine",
+    "quantize_1x32_grouped_gather_out_fp8",
+    "silu_chunk_mul_quantize_1x32_grouped_out_fp8",
 ]

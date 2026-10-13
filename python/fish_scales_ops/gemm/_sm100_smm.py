@@ -78,7 +78,9 @@ def wave_tile_owns(m: int, n: int) -> bool:
     a second wave, and then accepts the pick only if all four measured bounds
     hold: 64 <= M <= 1024, the pick is one of the N-tile widths added on
     2026-09-17 (64 or 192), the grid busies at least half the SMs, a 64-wide
-    pick is not used above M = 128, and the 2-SM 192-wide form is never used.
+    pick is not used above M = 256 (where one 256-row cluster row no longer
+    covers the problem; from M = 129 to 256 the cascade takes it in its 2-SM
+    256x64 form), and the 2-SM 192-wide form is never used.
 
     Both tier 1 (cuBLAS ``scaled_mm``) and tier 2 (the CuTe-DSL persistent
     kernel) decline a cell the rule owns: neither can be asked for a narrower N
@@ -98,7 +100,7 @@ def wave_tile_owns(m: int, n: int) -> bool:
         return False
     if 2 * best_ctas < sms:
         return False
-    if best_n == 64 and m > 128:
+    if best_n == 64 and m > 256:
         return False
     if best_rows == 256 and best_n == 192:
         return False
@@ -146,7 +148,13 @@ def should_route(m: int, n: int, k: int) -> bool:
     Small-M bounds are unchanged from the per-GEMM bench of 2026-07-07:
     * Wide-N (tiles_n ≥ 40) M ≤ 1024: route to cuBLAS.
     * Narrow-N (tiles_n ≤ 32, i.e. down/wo class) M ≤ 128 with K ≥ 4096:
-      decline, so FSO's split-K double-kernel scheme takes the cell.
+      decline, so the C++ cascade takes the cell (its two-kernel split-K, or
+      from M = 64 its wave-rule tile where ``wave_tile_owns`` already
+      declined the cell above; for K ≥ 8192 the split ends at M = 104).
+      From M = 129 to 256 ``wave_tile_owns`` also claims the N = 2560
+      projections (``wo``, ``down``), so this tier declines them and the
+      cascade runs its 2-SM 256x64 tile (80 CTAs) instead of this tier's
+      40-CTA grid.
     * K % 128 alignment required by scaled_mm.
 
     The large-M rules (M > 1024) come from the per-projection sweep in

@@ -13,6 +13,10 @@
     perf_report.py drops M = 96 from its geomeans, while a summary takes every M where fso and the comparator both
     have a value; the two agree because no comparator file has an M = 96 row. A comparator row at M = 96 would make
     this test fail, on purpose: decide then whether the summary should drop that row too.
+  - The serving-shaped block of a layer page exists only while the device has serving-shaped baseline files: from
+    synthetic files beside a copy of the installed baselines it is appended to the page, a second rendering leaves
+    it unchanged, its ratios divide the files' µs by the page's uniform rows, a comparator the family does not
+    serve is named under its table, and once the files are gone the page renders back to the installed one.
 
 Runs with any Python 3.8+ and no third-party package, directly or under pytest:
   python3 tests/bench/test_render_perf_summary.py
@@ -160,6 +164,56 @@ def test_every_summary_row_matches_the_raw_cells():
                 where = f"sm_{sm} Family {letter} {r['key']} against {r['against']}"
                 assert [rpd.fx(g) for g in r["bands"]] == [rpd.fx(g) for g in bands], where
                 assert [M for M, _ in r["faster"]] == faster, where
+
+
+def test_serving_block_from_files():
+    """Independent of what is installed: the scratch baselines are the installed ones minus every serving-shaped
+    file, so the reference page is the page without the block, whether or not the tree has serving baselines."""
+    import json
+    import shutil
+    import tempfile
+    rel = LAYER_PAGES[90]
+    tags = tuple(f"_{t}_" for t in rpd.serving_cases.TAGS.values())
+    tmp = tempfile.mkdtemp(prefix="render_serving_")
+    saved = rpd.BASE
+    try:
+        for n in os.listdir(saved):
+            if n.endswith(".jsonl") and not any(t in n for t in tags):
+                shutil.copy(os.path.join(saved, n), tmp)
+        rpd.BASE = tmp
+        page = _render(rel, _read(rel))
+        assert rpd.SERVING_BEGIN not in page, "without serving-shaped files the page must have no serving block"
+        uni = {M: r["us"] for (i, M), r in rpd.moe_rows("perf_moe_qwen3_35a3_h200.jsonl").items() if i == "fso_bsfp8_layer"}
+        meta = {"kind": "meta", "device": "NVIDIA H200"}
+        files = {
+            "perf_moe_qwen3_35a3_skew_h200.jsonl": [dict(impl="fso_bsfp8_layer", proj="layer", M=1024, routing="skew", h=3.5,
+                                                         active_experts=250, us=300.0)],
+            "ref_moe_qwen3_35a3_skew_h200.jsonl": [dict(impl="triton_fp8b", proj="layer", M=1024, routing="skew", us=330.0)],
+            "perf_moe_qwen3_35a3_padded_h200.jsonl": [dict(impl="fso_bsfp8_layer", proj="layer", M=256, live=8, routing="padded",
+                                                           active_experts=50, us=1.5 * uni[8])],
+            "perf_moe_qwen3_30a3_ep2_h200.jsonl": [dict(impl="fso_bsfp8_layer", proj="layer", M=64, routing="ep", ep_size=2,
+                                                        active_experts=60, us=100.0)]}
+        for n, rows in files.items():
+            with open(os.path.join(tmp, n), "w") as f:
+                f.writelines(json.dumps(r) + "\n" for r in [meta] + rows)
+        once = _render(rel, page)
+        assert once.startswith(page.rstrip("\n")) and rpd.SERVING_BEGIN in once and rpd.SERVING_END in once, "block not appended"
+        assert _render(rel, once) == once, "a second rendering changed the serving-shaped block"
+        lines = once.split("\n")
+        rows = [[c.strip() for c in l.strip().strip("|").split("|")] for l in lines if l.startswith("| C ")]
+        skew = next(r for r in rows if r[1] == "1024" and r[2] == "3.50")
+        tri = rpd.moe_rows("ref_moe_qwen3_35a3_h200.jsonl")[("triton_fp8b", 1024)]["us"]
+        assert skew[3:] == ["250", "300.0", f"{300.0 / uni[1024]:.2f}", "330.0", f"{330.0 / 300.0:.2f}",
+                            f"{tri / uni[1024]:.2f}"], skew
+        padded = next(r for r in rows if r[1:3] == ["256", "8"])
+        assert padded[5] == "+50.0 %", padded
+        assert any(l.startswith("- sglang triton FP8 w8a8-block: n/a.") for l in lines), "the n/a reason is missing"
+        for n in files:
+            os.remove(os.path.join(tmp, n))
+        assert _render(rel, once) == page, "the block was not removed with its files"
+    finally:
+        rpd.BASE = saved
+        shutil.rmtree(tmp)
 
 
 if __name__ == "__main__":

@@ -121,6 +121,22 @@ inline bool read_print_tile_info() noexcept
     return s_cache != 0;
 }
 
+// Programmatic dependent launch of the dense CUTLASS GEMMs (2026-10-11). True when the translation unit that
+// includes this header compiled CUTLASS with grid dependency control (FSO_SM100_DENSE_GDC, see
+// mxfp8_sm100_kernel.cu) and PDL is not switched off (FSO_DISABLE_PDL=1, the one global switch). The Stream-K
+// variants (force codes only) keep their plain launch: their workspace initialisation is a separate
+// stream-ordered operation in front of the GEMM.
+#if defined(FSO_SM100_DENSE_GDC)
+inline constexpr bool kDenseGdcCompiled = true;
+#else
+inline constexpr bool kDenseGdcCompiled = false;
+#endif
+
+inline bool dense_gemm_pdl() noexcept
+{
+    return kDenseGdcCompiled && tensorrt_llm::kernels::blockscale_gemm::fso_pdl_enabled();
+}
+
 // Multiprocessor count of the current device, read once. The rule below is
 // written against the count the driver reports rather than the 148 of a whole
 // B300, so a MIG slice gets its own answer.
@@ -171,14 +187,25 @@ inline int grid_ctas(int M, int N, int cluster_rows, int ctas_per_cluster, int t
 //     144 CTAs on the machine; the very narrow Family C projections
 //     (N = 1024, N = 2048) would get a 32- or 64-CTA grid, outside the range
 //     this rule was calibrated on.
-//   * TileN = 64 only while the problem is a single 128-row M-tile (M <= 128).
-//     At M = 256 the 64-wide tile is a tie with tier 1 on the isolated GEMM
-//     (`wo` 8.27 against 8.26, `down` 14.39 against 14.40) and 3.5 % SLOWER on
-//     the Family A MLP layer cell, where `down` runs straight after the SwiGLU
-//     quantize. At M = 512 with N = 2048 it doubles the CTA count to 128 and is
-//     still 10 % slower than tier 1, so the rate penalty of the narrow atom is
-//     not always repaid. The 192-wide tile has no such counter-example up to
-//     M = 1024.
+//   * TileN = 64 only while one 256-row cluster row covers the problem
+//     (M <= 256). Above a single 128-row M-tile (128 < M <= 256) the 1-SM and
+//     the 2-SM 64-wide tiles launch the same number of CTAs, and the equal-CTA
+//     tie-break below always takes the 2-SM 256x64 form there; on the tables
+//     this adds `wo` and `down` (N = 2560) at 128 < M <= 256. The two forms
+//     differ in how often they stream the weight: the 1-SM tile makes one pass
+//     per 128-row M-tile, and at M = 256 it tied with tier 1 on the isolated
+//     GEMM (`wo` 8.27 against 8.26, `down` 14.39 against 14.40) and was 3.5 %
+//     SLOWER on the Family A MLP layer cell, where `down` runs straight after
+//     the SwiGLU quantize (2026-09-17, when this bound was M <= 128). The 2-SM
+//     tile makes one pass, and with cold weights it beats tier 1, whose kernel
+//     puts 40 CTAs on these shapes, at every M from 144 to 256: alone `wo` by
+//     4 to 5 % and `down` by 5 to 6 % (MXFP8 and BSFP8 alike), and the Family A
+//     MXFP8 MLP block by 1.5 to 2.7 % (run fso_0.2.1_20261010/P1b, e4_gemm64 and
+//     e1_band2). Above M = 256 a 64-wide tile needs two cluster rows or three
+//     128-row tiles, which this rule has no measurement for, and at M = 512
+//     with N = 2048 it doubles the CTA count to 128 and is still 10 % slower
+//     than tier 1, so the rate penalty of the narrow atom is not always repaid.
+//     The 192-wide tile has no such counter-example up to M = 1024.
 //   * The 2-SM 192-wide form is not shipped. The only cells where it is the
 //     CTA-maximising pick are Family C `gdn.in_proj` (N = 12288) at M = 64 and
 //     M = 128, and there it measured 1.3x SLOWER than tier 1 even though it
@@ -222,8 +249,8 @@ inline int pick_wave_tile(int M, int N) noexcept
         return 0;                 // the pick is a tile the cascade already had
     if (2 * best_ctas < sms)
         return 0;                 // narrowing would still leave the machine half idle
-    if (best_n == 64 && M > 128)
-        return 0;                 // tie at M = 256, loses at M = 512
+    if (best_n == 64 && M > 256)
+        return 0;                 // 64-wide only while one 256-row cluster row covers M
     if (best_m == 256 && best_n == 192)
         return 0;                 // measured counter-example at gdn.in_proj M = 64 / 128
     // Equal-CTA tie-break, applied after the guards above so that each of their
@@ -232,7 +259,10 @@ inline int pick_wave_tile(int M, int N) noexcept
     // passes over the weight matrix explained in the comment above. The test is
     // an equality on CTA counts, so it can only fire above M = 128 (below it a
     // 2-SM tile always doubles the count) and it never changes which cells the
-    // rule owns -- only which tile an already-owned cell gets.
+    // rule owns -- only which tile an already-owned cell gets. A 64-wide cell
+    // with 128 < M <= 256 always ties here (one 256-row cluster row against two
+    // 128-row tiles), so it always leaves with the 2-SM 256x64 tile, never with
+    // the 1-SM 128x64 tile that lost at M = 256.
     if (best_m == 128 && grid_ctas(M, N, 256, 2, best_n) == best_ctas)
         best_m = 256;
     return best_m * 1000 + best_n;
@@ -509,7 +539,12 @@ cudaError_t launch_sm100_mxfp8_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, 
         s_smem_configured = true;
     }
 
-    return Gemm::run(kernel_params, stream) == cutlass::Status::kSuccess ? cudaSuccess : cudaErrorLaunchFailure;
+    // Programmatic dependent launch when GDC is compiled in (detail::dense_gemm_pdl): the kernel waits on its
+    // parent grid before its first global access, so it may start while the activation quantize in front of
+    // it drains, and it releases its own dependent once its MMAs are issued.
+    bool const pdl = !UseStreamK && detail::dense_gemm_pdl();
+    return Gemm::run(kernel_params, stream, nullptr, pdl) == cutlass::Status::kSuccess ? cudaSuccess
+                                                                                     : cudaErrorLaunchFailure;
 }
 
 // ---------------------------------------------------------------------------
@@ -554,16 +589,16 @@ cudaError_t launch_sm100_mxfp8_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, 
 // ordering the data dependency requires is therefore unchanged; only the
 // launch and the prologue overlap.
 //
-// The producer is a CUTLASS kernel we do not modify, so its completion signal
-// is the implicit one at kernel exit. That is the safe case: fso does not
-// build CUTLASS with CUTLASS_ENABLE_GDC_FOR_SM100, so the
-// `cutlass::arch::launch_dependent_grids()` call that sits between the CUTLASS
-// mainloop and its epilogue stores compiles to nothing and cannot release the
-// reduce before the partials have landed.
+// The producer is the CUTLASS kernel. Since 2026-10-11 mxfp8_sm100_kernel.cu builds it with
+// CUTLASS_ENABLE_GDC_FOR_SM100, so the `cutlass::arch::launch_dependent_grids()` call that sits between the
+// CUTLASS mainloop and its epilogue stores releases the reduce before the partials have landed. That is
+// safe for the same reason as above: the release only creates the reduce's CTAs, and
+// `cudaGridDependencySynchronize()` holds every one of them until the GEMM has completed.
 //
-// The reduce deliberately does not call cudaTriggerProgrammaticLaunchCompletion():
-// it writes the caller's D buffer throughout its own execution, so there is no
-// earlier point at which it could safely signal a future dependent.
+// The reduce calls cudaTriggerProgrammaticLaunchCompletion() right after its wait (2026-10-11). It writes the
+// caller's D buffer throughout its own execution, but a trigger does not hand D over: a programmatic
+// dependent still waits, in griddepcontrol.wait, for this grid to complete and its writes to be visible
+// before it touches global memory. The trigger only lets the dependent's CTAs be created early.
 //
 // FSO_DISABLE_PDL=1 restores the plain serialised launch (the same variable
 // the sm_120 MoE chain reads, so one knob disables PDL everywhere).
@@ -584,6 +619,13 @@ static __global__ void sm100_mxfp8_splitk_reduce_kernel(
     float4 const* __restrict__ partials, ushort4* __restrict__ out, int splits, long mn4, bool pdl)
 {
     sm100_pdl_wait(pdl);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030)
+    // Release the next kernel's launch (2026-10-11). A programmatic dependent waits for this grid's COMPLETION,
+    // memory included, before it touches global memory (griddepcontrol.wait), so releasing it here only lets
+    // its CTAs be created and run their prologue while this reduce still writes D; it cannot read D early.
+    if (pdl && threadIdx.x == 0)
+        cudaTriggerProgrammaticLaunchCompletion();
+#endif
     long const stride = static_cast<long>(gridDim.x) * blockDim.x;
     for (long i = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x; i < mn4; i += stride)
     {
@@ -773,7 +815,10 @@ cudaError_t launch_sm100_mxfp8_gemm_splitk(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* 
         s_smem_configured = true;
     }
 
-    if (Gemm::run(kernel_params, stream) != cutlass::Status::kSuccess)
+    // The batched split-K GEMM carries PDL too (detail::dense_gemm_pdl): it waits on its parent before it reads,
+    // and releases the reduce after its MMAs, so the reduce's launch overlaps the partial-sum epilogue (the
+    // reduce still waits for this grid's completion before it reads a partial).
+    if (Gemm::run(kernel_params, stream, nullptr, detail::dense_gemm_pdl()) != cutlass::Status::kSuccess)
         return cudaErrorLaunchFailure;
 
     // Reduce: N is a multiple of 128 on this surface, so M*N % 4 == 0.
@@ -940,8 +985,18 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3
     //     15.7 M=128) but wo K=4096 loses (10.3→13.9) → K ≥ 8192.
     //   * Deeper splits lose (down M=1: S=19 14.9 vs S=4 12.9) — the ≤ 8
     //     cap plus largest-divisor pick in pick_splits is the sweet spot.
+    //   * The long-K clause ends at M = 104 (2026-10-11; it ended at 128).
+    //     Above it the wave rule's one-kernel 2-SM 256x64 tile (the same 80
+    //     CTAs, full K, no FP32 partials, no reduce) beats the split: the
+    //     partials (S * M * N * 4 bytes written and read back) and the reduce
+    //     grow with M while the wave tile's cost does not. Measured on the
+    //     Qwen3-4B `down` (N = 2560, K = 9728) with cold weights inside the MLP
+    //     block, split-K against the wave tile: M = 96 -1.0 %, 104 -0.7 %,
+    //     112 +1.0 %, 120 +2.2 %, 128 +2.9 % (split-K slower), and alone
+    //     M = 96 -3.5 %, 128 +6.5 % (run fso_0.2.1_20261010/P1, ab5_dnband and
+    //     ab6_gemmprobe). Only `down` among the dense table shapes has K >= 8192.
     if (tiles_n <= 32 && (K % 128) == 0
-        && ((M <= 32 && K >= 4096) || (M <= 128 && K >= 8192)))
+        && ((M <= 32 && K >= 4096) || (M <= 104 && K >= 8192)))
     {
         int const tiles = ((M + 127) / 128) * tiles_n;
         int const ks = detail::pick_splits(tiles, K / 128);

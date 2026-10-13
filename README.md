@@ -14,8 +14,8 @@ engine starts with the integration guide, [`docs/guide.md`](docs/guide.md).
 
 | feature | H200 (sm_90) | B200 / B300 (sm_100 / sm_103) | RTX 5090 (sm_120) |
 |---|---|---|---|
-| dense linear, `fso.dense` | block-FP8 1×128 | MXFP8 1×32; block-FP8 checkpoints are requantized to MXFP8 at load | MXFP8 1×32; block-FP8 checkpoints are requantized to MXFP8 at load |
-| MoE layer, `fso.moe` | block-FP8 experts | MXFP8 (block-FP8 or bf16 experts) | MXFP8 (block-FP8 or bf16 experts) |
+| dense linear, `fso.dense` | block-FP8 1×128 | MXFP8 1×32; MXFP8 checkpoints load as stored, block-FP8 checkpoints are requantized to MXFP8 at load | MXFP8 1×32; MXFP8 checkpoints load as stored, block-FP8 checkpoints are requantized to MXFP8 at load |
+| MoE layer, `fso.moe` | block-FP8 experts | MXFP8 (MXFP8, block-FP8 or bf16 experts) | MXFP8 (MXFP8, block-FP8 or bf16 experts) |
 | attention, `fso.attention` | torch SDPA | torch SDPA | MXFP8 prefill, paged prefill and paged decode; torch SDPA |
 
 `fso.dense.linear` and `fso.moe.layer` take and return bf16 and quantize the
@@ -56,11 +56,14 @@ import fish_scales_ops as fso
 
 # Dense linear, every architecture: prepare once per weight at load time, then one call per batch.
 weight = fso.dense.prepare_weight(w_fp8, format="bsfp8", scale=w_scale)  # a block-FP8 checkpoint
+# weight = fso.dense.prepare_weight(w_fp8, format="mxfp8", scale=w_ue8m0)  # an MXFP8 checkpoint, as stored (Blackwell)
 # weight = fso.dense.prepare_weight(w_bf16, format="mxfp8")             # a bf16 weight, as MXFP8 (Blackwell)
 y = fso.dense.linear(x, weight)              # bf16 [..., K] -> bf16 [..., N]
 
 # MoE layer, every architecture: prepare once per layer at load time, then one call per batch.
-experts = fso.moe.prepare_experts(w13, w2, format="bsfp8", sw13=sw13, sw2=sw2)  # or format="mxfp8" (bf16 experts)
+experts = fso.moe.prepare_experts(w13, w2, format="bsfp8", sw13=sw13, sw2=sw2)  # a block-FP8 checkpoint
+# experts = fso.moe.prepare_experts(w13, w2, format="mxfp8", sw13=sw13, sw2=sw2)  # an MXFP8 checkpoint (Blackwell)
+# experts = fso.moe.prepare_experts(w13, w2, format="mxfp8")                      # bf16 experts, as MXFP8 (Blackwell)
 out = fso.moe.layer(hidden, experts, topk_ids, topk_w)
 reserve = fso.moe.transient_bytes(experts, max_tokens, topk)   # bytes one call allocates
 
@@ -114,44 +117,59 @@ in [`docs/perf/`](docs/perf/README.md).
 
 | family            | op                                             | shape                                                        | M / S  | dtype           |     µs | TFLOPS |
 |-------------------|------------------------------------------------|--------------------------------------------------------------|--------|-----------------|-------:|-------:|
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | block-FP8 1×128 |  17.40 |      6 |
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 373.12 |   1094 |
-| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | block-FP8 1×128 |   21.9 |    3.4 |
-| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | block-FP8 1×128 |  326.2 |  474.0 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | block-FP8 1×128 |   30.7 |    1.8 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | block-FP8 1×128 |  374.8 |  309.4 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | block-FP8 1×128 |  17.38 |      6 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 333.39 |   1224 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | block-FP8 1×128 |   20.1 |    3.8 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | block-FP8 1×128 |  331.7 |  466.1 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | block-FP8 1×128 |   27.6 |    2.1 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | block-FP8 1×128 |  360.4 |  321.8 |
 
 ### sm_120 — NVIDIA RTX 5090 (170 SMs, 2400 MHz locked)
 
 | family            | op                                             | shape                                                        | M / S  | dtype           |     µs | TFLOPS |
 |-------------------|------------------------------------------------|--------------------------------------------------------------|--------|-----------------|-------:|-------:|
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | MXFP8 1×32      |  35.66 |      3 |
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | MXFP8 1×32      | 663.23 |    615 |
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 648.54 |    629 |
-| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | MXFP8 1×32      |   32.4 |    2.3 |
-| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | MXFP8 1×32      |  564.5 |  273.9 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | MXFP8 1×32      |   38.6 |    1.5 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | MXFP8 1×32      |  711.9 |  162.9 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | MXFP8 1×32      |  35.69 |      3 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | MXFP8 1×32      | 661.10 |    617 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 645.76 |    632 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | MXFP8 1×32      |   32.7 |    2.3 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | MXFP8 1×32      |  546.4 |  283.0 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | MXFP8 1×32      |   39.4 |    1.4 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | MXFP8 1×32      |  703.0 |  165.0 |
 
 ## TODO
 
-Open items after 0.2.0: the known issues of [`CHANGELOG.md`](CHANGELOG.md),
+Open items after 0.2.1: the known issues of [`CHANGELOG.md`](CHANGELOG.md),
 whose measured gaps are in the summaries of [`docs/perf/`](docs/perf/README.md),
-and two build items.
+two planned items, and two build items.
 
-- **H200 MoE layer at some decode batch sizes**, against sglang's Triton FP8 MoE layer
-  ([`docs/perf/layer/sm90.md`](docs/perf/layer/sm90.md), Families B and C).
-- **H200 dense MLP block at M = 64–256 and from M = 1024 up**, against sglang's block-FP8 linear (DeepGEMM)
-  ([`docs/perf/layer/sm90.md`](docs/perf/layer/sm90.md), Family A).
-- **B300 MoE layer at middle batch sizes**, against TensorRT-LLM's trtllm-gen MoE
-  ([`docs/perf/layer/sm100.md`](docs/perf/layer/sm100.md), Families B and C).
-- **RTX 5090 Family C MoE layer at M = 1024**, against the Triton FP8 MoE layers of vLLM and sglang
-  ([`docs/perf/layer/sm120.md`](docs/perf/layer/sm120.md), Family C).
-- **Blackwell dense MLP block at some batch sizes**, against sglang's DeepGEMM linear on the B300 and vLLM's on the
-  RTX 5090 ([`docs/perf/layer/sm100.md`](docs/perf/layer/sm100.md),
-  [`docs/perf/layer/sm120.md`](docs/perf/layer/sm120.md), Family A).
+- **H200 dense MLP block at M = 96, 160 and 192 (6–12 %) and at M = 64, 128, 256, 1024 and 8192 (1–3 %)**, against
+  sglang's block-FP8 linear (DeepGEMM) ([`docs/perf/layer/sm90.md`](docs/perf/layer/sm90.md), Family A).
+  Candidates: a fused SwiGLU and 1×128 quantize kernel, and a DeepGEMM tile order whose L2 traffic does not depend
+  on the SMs that the early-started GEMM's thread blocks land on.
+- **H200 MoE layer under one-EP-rank routing at M = 2048 (Family B) and M = 8192 (Family C)**, against 0.2.0
+  ([`CHANGELOG.md`](CHANGELOG.md), 0.2.1 known issues).
+- **RTX 5090 Family C MoE layer at M = 64**, against vLLM's Triton FP8 MoE layer, and at M = 1024 under skewed
+  routing against sglang's ([`docs/perf/layer/sm120.md`](docs/perf/layer/sm120.md), Family C).
+- **RTX 5090 Family C MoE at M = 1 and 2 against 0.2.0**: the routed layer at M = 2 and the block with the shared
+  expert added after the routed layer at M = 1 ([`CHANGELOG.md`](CHANGELOG.md), 0.2.1 known issues).
+- **Blackwell dense MLP block at one batch size each**: M = 96 on the B300 against sglang's DeepGEMM linear, M = 1024
+  on the RTX 5090 against vLLM's ([`docs/perf/layer/sm100.md`](docs/perf/layer/sm100.md),
+  [`docs/perf/layer/sm120.md`](docs/perf/layer/sm120.md), Family A). On the B300 the 2560-wide down projection at
+  96–112 tokens needs a swap-AB kernel with small token tiles, or a split-K that reduces inside the cluster.
+- **The direct block-FP8 GEMM on Blackwell** (`fso.compat.linear_fp8`), against sglang's DeepGEMM linear on the
+  B300 (16–21 % from M = 32 to M = 192) and vLLM's on the RTX 5090 (5–14 % from M = 512). `fso.dense` serves
+  block-FP8 checkpoints through the MXFP8 path there; this item concerns callers who pass block-FP8 operands
+  themselves. Candidates on the B300: the path's own 1×128 activation quantizer and its cuBLAS launches.
+- **MoE layer transient memory at decode batch sizes.** On Blackwell the compact layout reserves a whole 128-row
+  block for every expert that can receive a row, so at decode-band M one call's transient
+  (`fso.moe.transient_bytes`) is several times that of trtllm-gen's and Triton's MoE layers. Candidates: store the
+  down projection's rows at their token positions without block padding, and gather the activation rows inside the
+  first grouped GEMM instead of keeping a gathered copy.
+- **Cross-rank reduction fused with the MoE GEMM / combine (#6)**, for tensor- and expert-parallel serving over
+  PCIe or NVLink: all-reduce and reduce-scatter forms behind a communicator prepared once. Planned for the next
+  release.
 - **Pin the PTX at build time.** Compile the kernels to PTX once with a pinned front end and turn that PTX into SASS
-  with one pinned `ptxas`, so that a toolkit update changes only that last step. 0.2.0 compiles everything with the
+  with one pinned `ptxas`, so that a toolkit update changes only that last step. 0.2.1 compiles everything with the
   CUDA 13.0 that torch 2.13.0+cu130 uses.
 - **Byte-identical rebuilds.** nvcc puts temporary file names into the extension's local symbol names, so two builds
   of one commit hold the same code but are different files ([`docs/harness.md`](docs/harness.md) §1).
@@ -173,7 +191,9 @@ measured.
 
 Apache-2.0 (declared in `python/pyproject.toml`). Vendored upstream files under
 `csrc/gemm/.../jit/deep_gemm/` keep their original Apache-2.0 NVIDIA copyright
-headers.
+headers. Its subdirectories `comm/`, `common/`, `epilogue/`, `impls/`, `mma/`,
+`ptx/` and `scheduler/` are DeepGEMM v2's dense sm_90 kernel from
+sgl-project/DeepGEMM v0.2.0 under the MIT License (`deep_gemm/LICENSE.DeepGEMM`).
 
 ## Acknowledgments
 
@@ -183,7 +203,9 @@ upstream copyright headers keep them.
 
 - **[DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)** — the sm_90 block-FP8
   path derives from DeepGEMM's WGMMA kernels and its JIT driver, and the sm_90
-  dense GEMM's output store follows DeepGEMM's `sm90_fp8_gemm_1d2d`.
+  dense GEMM runs DeepGEMM v2's `sm90_fp8_gemm_1d2d` kernel (vendored from
+  sgl-project/DeepGEMM v0.2.0) at DeepGEMM's own configuration for the tiles
+  fish-scales-ops' kernel cannot run.
 - **[TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM)** — the compat shim
   under `csrc/common/compat/include/tensorrt_llm/` is a minimal vendored subset
   of TRT-LLM's common headers, and the block-scaled GEMM runner follows its

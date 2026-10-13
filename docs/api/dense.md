@@ -39,9 +39,12 @@ weight = fso.dense.prepare_weight(w_fp8, format="bsfp8", scale=w_scale)
 # A bf16 weight, quantized here: block-FP8 on sm_90, MXFP8 1x32 on sm_100/103
 # and sm_120/121.
 weight = fso.dense.prepare_weight(w_bf16, format="bsfp8")
-# An MXFP8 checkpoint (sm_100/103, sm_120/121): float8_e4m3fn [N, K] with the
-# int32 scale fso.compat.quantize_1x32_fp8 returned for it on this architecture,
-# as it came out of the quantizer or after a safetensors round trip.
+# An MXFP8 checkpoint (sm_100/103, sm_120/121): float8_e4m3fn [N, K] with uint8
+# UE8M0 scales [N, K/32], one byte per 32 elements along K, as the checkpoint
+# stores them; the same bytes load on every MXFP8 architecture.
+weight = fso.dense.prepare_weight(w_fp8, format="mxfp8", scale=w_scale_u8)
+# Or with the int32 scale fso.compat.quantize_1x32_fp8 returned for it on this
+# architecture, as it came out of the quantizer or after a safetensors round trip.
 weight = fso.dense.prepare_weight(w_fp8, format="mxfp8", scale=w_scale)
 
 # ---- per call ------------------------------------------------------------------
@@ -59,7 +62,7 @@ and what to use instead, and nothing falls back.
 | `format` | what the caller holds | sm_90 (H200) | sm_100 / sm_103 (B200, B300) | sm_120 / sm_121 (RTX 5090) |
 |---|---|---|---|---|
 | `"bsfp8"` | a float8_e4m3fn weight with fp32 128×128 block scales `[ceil(N/128), K/128]`, weight = fp8 value × block scale; or a bf16 weight and no scale | a checkpoint is kept as it is (made contiguous if it is not); a bf16 weight is quantized with `quantize_128x128_fp8` and its sm_90 default, fp32 scales `amax / 448`. Kind `"bsfp8"` | a checkpoint is dequantized block by block (fp8 value × its block scale in fp32, rounded once to bf16) and requantized to MXFP8 1×32; a bf16 weight is quantized to MXFP8 1×32 directly. Kind `"mxfp8"` | same as sm_100/103 |
-| `"mxfp8"` | a bf16 weight and no scale; or a float8_e4m3fn weight with the int32 scale `quantize_1x32_fp8` returned for it on this architecture | `NotImplementedError`: sm_90 has no MXFP8 hardware; use `"bsfp8"` | a bf16 weight is quantized to MXFP8 1×32; a checkpoint is kept as it is. Kind `"mxfp8"` | same as sm_100/103; a checkpoint's scale is restored to the K-major layout the GEMM reads (below) |
+| `"mxfp8"` | a bf16 weight and no scale; or a float8_e4m3fn weight with its scale, either the uint8 UE8M0 bytes `[N, K/32]` an MXFP8 checkpoint stores (one byte per 32 elements along K, row-major, byte `b` meaning 2^(b − 127)) or the int32 scale `quantize_1x32_fp8` returned for it on this architecture | `NotImplementedError`: sm_90 has no MXFP8 hardware, whatever the dtypes; use `"bsfp8"` | a bf16 weight is quantized to MXFP8 1×32; a checkpoint keeps its weight bytes, and a uint8 scale is packed into the atom layout. Kind `"mxfp8"` | same as sm_100/103; a uint8 scale is packed into, and an int32 one restored to, the K-major layout the GEMM reads (below) |
 | anything else (`"bf16"`, `"int8"`, `"nvfp4"`, …) | — | `NotImplementedError` for a known dialect, `ValueError` for an unknown string | same | same |
 
 Constraints: `K % 128 == 0` on every architecture (one scale per 128 elements
@@ -95,7 +98,22 @@ A handle is valid only on the architecture family it was prepared on, and
 `linear` refuses a handle from another family. The scale layouts are listed
 under *Scale layouts* in [`compat.md`](compat.md).
 
-**MXFP8 checkpoints and the scale's stride.** On sm_120/sm_121,
+**MXFP8 checkpoints: the uint8 scale.** The portable form of an MXFP8 scale is
+the one an MXFP8 checkpoint stores: uint8 `[N, K/32]`, one UE8M0 byte per 32
+elements along K, in the row-major order of the weight, byte `b` meaning the
+scale 2^(b − 127). The bytes are the same on every MXFP8 architecture.
+`prepare_weight` packs each row's bytes four to an int32 word (the lowest K block
+in the lowest byte) and writes the words in this architecture's layout: the
+K-major `[N, K/128]` tensor with strides `(1, N)` on sm_120/sm_121, the 1-D atom
+layout on sm_100/sm_103. The result is exactly the tensor `quantize_1x32_fp8`
+returns for the same scales there. Only bytes move, so codes and scales that no
+load-time rule would produce are served as written. A uint8 tensor's element
+order says which byte is which, so any strides are accepted (a transposed copy,
+a slice of a larger buffer) and there is no stride hazard of the kind the int32
+form has. A `float8_e8m0fnu` tensor holds the same bytes and is accepted after
+`.view(torch.uint8)`.
+
+**MXFP8 checkpoints and the int32 scale's stride.** On sm_120/sm_121,
 `quantize_1x32_fp8` returns the weight scale as an int32 `[N, K/128]` tensor with
 the strides `(1, N)`: the scale words of one 128-wide K block are adjacent
 across rows, which is the order in which the GEMM reads the bytes through a raw
@@ -120,7 +138,7 @@ against one call). A bf16 weight is quantized into a new weight and scale, and
 nothing else is allocated. A checkpoint that needs no conversion is kept as the
 caller's own tensors (made contiguous if it is not): the block-FP8 checkpoint on
 sm_90, and the MXFP8 checkpoint on sm_100/sm_103 and sm_120/sm_121, whose scale
-alone is copied when it arrives in the row-major form. Freeing the source
+alone is new when it arrives as uint8 bytes or in the row-major int32 form. Freeing the source
 parameters of such a checkpoint afterwards releases no memory; a converted or
 quantized weight is a new tensor.
 
@@ -162,6 +180,10 @@ sm_120/121 to `quantize_1x32_fp8` + `linear_mxfp8`, for a bf16 weight, for an
 MXFP8 checkpoint in both scale stride forms, and for a block-FP8 checkpoint
 against the same dequantize and requantize steps done by hand. It covers the
 Qwen3-4B projections at `M` in {1, 7, 64, 1000}.
+`tests/gemm/unit/test_prequant_mxfp8.py` adds the uint8 scale: the handle it
+gives equals the handles of both int32 forms and of the bf16 weight for the same
+bytes, random codes and scale bytes reach the handle unchanged, and `linear` is
+`torch.equal` across all of them.
 
 ### torch.compile
 

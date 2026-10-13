@@ -10,10 +10,10 @@
     "select": {
       "by": "uuid",
       "uuids": [
-        "GPU-e87af6ea-2a7f-af85-f89f-e5a17e644ff1"
+        "GPU-9860e51e-04ef-c66a-f09f-e3d4680ea4df"
       ]
     },
-    "lock_file": "/data/bench-runs/.gpu0.lock",
+    "lock_file": "/data/bench-runs/.gpu3.lock",
     "l2_bytes": 62914560,
     "clock_policy": {
       "mode": "natural",
@@ -57,6 +57,7 @@
     "The environment, the CUDA_HOME and the unset knobs are those of the chains that produced the 2026-10-01 tables: /data/bench-runs/fso_release_perf_20261001/h200/scripts/run_stage1.sh and /data/bench-runs/h200_moe_tables_20261001/scripts/run_chain.sh.",
     "The sm_90 kernels are compiled by the NVRTC bundled with fish_scales_ops (since 9cf0a46), never by the copy torch loads. Since 2026-10-05 the bundled NVRTC is 13.0.88, the same version the torch 2.13.0+cu130 wheel depends on, so jit_compiler_sm90() must name NVRTC 13.0 and the bundled path.",
     "2026-10-05: the card is GPU 0 (PCI 8F:00.0, GPU-e87af6ea), granted for the 0.2.0 tables measured from the release wheel. The card of the 2026-10-01 runs, GPU 6 (PCI CB:00.0, GPU-f7556d6e), has run another tenant's service since 2026-10-01, and the harness refuses a card with a compute process.",
+    "2026-10-12: the card is GPU 3 (PCI 97:00.0, GPU-9860e51e), granted for the 0.2.1 tables. GPU 0 runs another session's service, so every H200 table of 0.2.1, fso and comparators alike, is measured on GPU 3, and no table compares cells from two cards.",
     "2026-10-05: The sglang Triton comparators read their MoE tile configs from SGLANG_MOE_CONFIG_DIR, a pinned copy of apex's own config tree (apex-fish-inference cfed1d25, sglang_fish/sglang_fish/layers/moe/moe_runner/triton_utils/configs; 370 files, MANIFEST.md5 sha256 prefix 366a34a36d026df0), so the comparator column runs the configs apex serves with when it does not use fso. Each comparator row records the file sglang resolved for the gate_up and the down GEMM (moe_config)."
   ],
   "suite": {

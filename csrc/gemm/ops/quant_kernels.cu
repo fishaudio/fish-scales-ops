@@ -11,6 +11,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <cstdlib>
 #include <type_traits>
 
 namespace blockscale_gemm
@@ -22,7 +23,120 @@ namespace detail
 void fp8bs_quantize_1x128_fp32_fast(__nv_fp8_e4m3* x_q, float* fp32_scales,
     __nv_bfloat16 const* x, int M, int K, cudaStream_t stream, bool use_ue8m0);
 
-static inline bool fso_pdl_enabled();
+// PDL launch helper for the MoE glue chain: launches with the programmatic-stream-serialization attribute so a
+// downstream kernel's launch and prologue overlap this one (both sides carry griddepcontrol wait/trigger).
+// FSO_DISABLE_PDL=1 restores plain serialised launches. Read once per process.
+static inline bool fso_pdl_enabled()
+{
+    static bool v = []
+    {
+        char const* e = std::getenv("FSO_DISABLE_PDL");
+        return !(e && e[0] == '1');
+    }();
+    return v;
+}
+
+template <typename KernelT, typename... Args>
+static inline void fso_pdl_launch(KernelT kernel, dim3 grid, dim3 block, cudaStream_t stream, bool pdl, Args... args)
+{
+    cudaLaunchConfig_t cfg{};
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = pdl ? 1 : 0;
+    cfg.gridDim = grid;
+    cfg.blockDim = block;
+    cfg.dynamicSmemBytes = 0;
+    cfg.stream = stream;
+    cfg.attrs = attrs;
+    cfg.numAttrs = 1;
+    cudaLaunchKernelEx(&cfg, kernel, args..., pdl);
+}
+
+// Multiprocessor count of the current device, queried once. This translation
+// unit has no ATen, so the CUDA runtime attribute is the available source; the
+// query happens at the first launch (eager warm-up) and never inside a graph
+// capture. Single-device assumption, the same one fso_pdl_enabled makes.
+static inline int fso_device_sm_count()
+{
+    static int const v = []
+    {
+        int dev = 0;
+        int n = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess
+            && cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && n > 0)
+        {
+            return n;
+        }
+        return 1;
+    }();
+    return v;
+}
+
+// Compute capability major of the current device, queried once (same source and timing as fso_device_sm_count). The
+// token-scatter gather-quantize kernels are compiled for compute capability 10.0 and above only, so the launcher asks
+// this before it selects them.
+static inline int fso_device_cc_major()
+{
+    static int const v = []
+    {
+        int dev = 0;
+        int major = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess
+            && cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess)
+        {
+            return major;
+        }
+        return 0;
+    }();
+    return v;
+}
+
+// One wave of a glue kernel instantiation: the CTAs of it that are resident on the device at once, i.e. the SM count
+// times its occupancy at `kThreads` threads and no dynamic shared memory (queried once per instantiation).
+template <auto kKernel, int kThreads>
+static inline int64_t fso_glue_wave()
+{
+    static int const per_sm = []
+    {
+        int n = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, kKernel, kThreads, 0) != cudaSuccess || n < 1)
+        {
+            (void) cudaGetLastError();
+            n = 1;
+        }
+        return n;
+    }();
+    return static_cast<int64_t>(fso_device_sm_count()) * per_sm;
+}
+
+// The bound that lets every glue launch carry PDL at every size. A glue kernel's one-item-per-warp form (the code it
+// always had) runs whenever its grid fits in kFsoGlueFlatWaves of its waves; above that, a grid-stride form of the
+// same per-item work runs on kFsoGlueWaves waves, so that no token count can queue an unbounded number of waiting
+// CTAs. Sixteen waves keep the one-item form at every token count of the tables but one: the sm_120 pair-space gather
+// (one warp per routed pair and 256-K chunk, 64 waves at M = 8192 on the RTX 5090) takes the grid-stride form from
+// M = 2048, as it did in run fso_0.2.1_20261010/S8b with no loss. Measured there: a one-wave cap cost the H200 loop
+// kernels 5-16 % standalone, and a four-wave grid-stride form matched the unbounded grid where it ran. The sm_100
+// token-scatter gather switches to its grid-stride form already beyond kFsoGlueWaves waves, because that form is also
+// the one that releases its dependent GEMM only at exit (fp8bs_quantize_1x32_packed_grouped_scatter_stride_kernel).
+constexpr int kFsoGlueFlatWaves = 16;
+constexpr int kFsoGlueWaves = 4;
+
+// Launch `kFlat` on `ctas` CTAs (one item per warp) if they fit in kFlatWaves of its waves, else `kStride` on
+// kFsoGlueWaves of its waves; both with PDL when `pdl` is set (the global switch). `args` are both kernels' arguments
+// but the trailing pdl flag, which fso_pdl_launch appends.
+template <auto kFlat, auto kStride, int kThreads, int kFlatWaves = kFsoGlueFlatWaves, typename... Args>
+static inline void fso_glue_launch(int64_t ctas, cudaStream_t stream, bool pdl, Args... args)
+{
+    if (ctas < 1)
+        ctas = 1;
+    if (ctas <= fso_glue_wave<kFlat, kThreads>() * kFlatWaves)
+    {
+        fso_pdl_launch(kFlat, dim3(static_cast<unsigned>(ctas)), dim3(kThreads), stream, pdl, args...);
+        return;
+    }
+    int64_t const cap = fso_glue_wave<kStride, kThreads>() * kFsoGlueWaves;
+    fso_pdl_launch(kStride, dim3(static_cast<unsigned>(ctas < cap ? ctas : cap)), dim3(kThreads), stream, pdl, args...);
+}
 
 void fp8bs_quantize_1x128(__nv_fp8_e4m3* x_q, float* scales, __nv_bfloat16 const* x, int M, int K, cudaStream_t stream,
     bool use_ue8m0)
@@ -386,9 +500,215 @@ __global__ void fp8bs_quantize_1x32_packed_kernel(
 
 } // anonymous namespace
 
+// ----- sm_100/sm_103 dense activation quantizers: wide form with PDL (2026-10-11) --------------------------
+//
+// The SM1XX_ATOM (sm_100/sm_103) cases of fp8bs_quantize_1x32_packed and
+// fp8bs_silu_chunk_mul_quantize_1x32_packed run these two kernels. They sit on the critical path of the dense
+// MLP block at every M (quantize -> gate_up -> SwiGLU + quantize -> down), and the narrow kernels above spend
+// their time on issue and launch, not on bytes: one warp per 256 K-elements with an 8-byte load per lane put
+// 1280 CTAs on the machine to quantize a 1024 x 2560 activation in 5.9 us (about 1.3 TB/s), and a plain launch
+// let neither kernel overlap the GEMM on either side of it.
+//
+// Thread map: one thread owns 16 consecutive K-elements of one row (two 16-byte loads for the plain quantize,
+// four for the SwiGLU form: gate and up), two threads own one 32-element scale block (one shuffle completes
+// the block's amax), eight threads own one int32 scale word (4 blocks = 128 K-elements; three width-8
+// shuffles gather its bytes), and a thread's 16 FP8 bytes leave in one 16-byte store. An 8-thread group never
+// straddles a row because K % 128 == 0, and the grid is exactly M_pad * (K/128) * 8 threads.
+//
+// Numerics: identical bytes to the narrow kernels. Each block's amax is the fmaxf of the same 32 values (fmaxf
+// is exact and order-free), floored at the same 1e-10f, and goes through the same e8m0_from_amax; every FP8
+// byte is the same fp32 product converted by the same fp8x4_from_floats; the SwiGLU form applies the same
+// bf16x2 silu2_mul to the same elements (it is elementwise, so the pairing does not matter); the scale words
+// land at the same sf_word_index and the padded rows get the same zero words.
+//
+// PDL: launched with programmatic stream serialization unless FSO_DISABLE_PDL=1. Every thread waits on the
+// parent grid (cudaGridDependencySynchronize) before its first global access, read or write, and thread 0 of
+// every CTA then releases the dependent launch, so the GEMM that consumes the output can be created and run
+// its prologue while this kernel still runs; that GEMM waits for this grid's completion before it reads.
+namespace
+{
+
+constexpr int kWideQuantThreads = 256;
+
+__device__ __forceinline__ void bf16x8_to_floats(uint4 const& w, float* f)
+{
+    __nv_bfloat162 const* p = reinterpret_cast<__nv_bfloat162 const*>(&w);
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+        float2 const t = __bfloat1622float2(p[i]);
+        f[2 * i] = t.x;
+        f[2 * i + 1] = t.y;
+    }
+}
+
+__device__ __forceinline__ void silu_bf16x8_to_floats(uint4 const& g, uint4 const& u, float* f)
+{
+    __nv_bfloat162 const* g2 = reinterpret_cast<__nv_bfloat162 const*>(&g);
+    __nv_bfloat162 const* u2 = reinterpret_cast<__nv_bfloat162 const*>(&u);
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+        float2 const t = __bfloat1622float2(silu2_mul(g2[i], u2[i]));
+        f[2 * i] = t.x;
+        f[2 * i + 1] = t.y;
+    }
+}
+
+// The thread's 16 values -> its 16 FP8 bytes (one 16-byte store) and, from lane 0 of its 8-thread group, the
+// group's int32 scale word.
+template <bool USE_UE8M0>
+__device__ __forceinline__ void quantize16_store(float const (&v)[16], __nv_fp8_e4m3* out16, int32_t* sf_word,
+    unsigned group_mask, int j)
+{
+    float ax = fabsf(v[0]);
+#pragma unroll
+    for (int i = 1; i < 16; ++i)
+        ax = fmaxf(ax, fabsf(v[i]));
+    ax = fmaxf(ax, __shfl_xor_sync(group_mask, ax, 1, 8));   // the other half of the 32-element block
+    ax = fmaxf(ax, 1e-10f);
+
+    float qs;
+    uint8_t byte_v;
+    e8m0_from_amax<USE_UE8M0>(ax, qs, byte_v);
+
+    uint4 o;
+    o.x = fp8x4_from_floats(v[0] * qs, v[1] * qs, v[2] * qs, v[3] * qs);
+    o.y = fp8x4_from_floats(v[4] * qs, v[5] * qs, v[6] * qs, v[7] * qs);
+    o.z = fp8x4_from_floats(v[8] * qs, v[9] * qs, v[10] * qs, v[11] * qs);
+    o.w = fp8x4_from_floats(v[12] * qs, v[13] * qs, v[14] * qs, v[15] * qs);
+    *reinterpret_cast<uint4*>(out16) = o;
+
+    // Threads 2b and 2b+1 of the group hold block b's byte; lane 0 packs blocks 0..3 into the word.
+    uint32_t const b0 = byte_v;
+    uint32_t const b1 = __shfl_sync(group_mask, b0, 2, 8);
+    uint32_t const b2 = __shfl_sync(group_mask, b0, 4, 8);
+    uint32_t const b3 = __shfl_sync(group_mask, b0, 6, 8);
+    if (j == 0)
+        *sf_word = static_cast<int32_t>(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+}
+
+template <bool USE_UE8M0>
+__global__ void __launch_bounds__(kWideQuantThreads) fp8bs_quantize_1x32_packed_wide_kernel(
+    __nv_fp8_e4m3* __restrict__ out_fp8, int32_t* __restrict__ out_packed,
+    __nv_bfloat16 const* __restrict__ input, int M, int K, int M_pad, bool pdl)
+{
+    if (pdl)
+    {
+        cudaGridDependencySynchronize();
+        if (threadIdx.x == 0)
+            cudaTriggerProgrammaticLaunchCompletion();
+    }
+    int const num_kp = K >> 7;
+    int64_t const t = static_cast<int64_t>(blockIdx.x) * kWideQuantThreads + threadIdx.x;
+    int64_t const word = t >> 3;
+    if (word >= static_cast<int64_t>(M_pad) * num_kp)
+        return;   // whole 8-thread groups only; the launcher sizes the grid exactly
+    int const j = static_cast<int>(t & 7);
+    int const m = static_cast<int>(word / num_kp);
+    int const kp = static_cast<int>(word - static_cast<int64_t>(m) * num_kp);
+    int32_t* const sf_word = out_packed + sf_word_index<MxSfLayout::SM1XX_ATOM>(m, kp, M_pad, num_kp);
+    if (m >= M)
+    {
+        if (j == 0)
+            *sf_word = 0;
+        return;
+    }
+    int64_t const off = static_cast<int64_t>(m) * K + kp * 128 + j * 16;
+    uint4 const w0 = *reinterpret_cast<uint4 const*>(input + off);
+    uint4 const w1 = *reinterpret_cast<uint4 const*>(input + off + 8);
+    float v[16];
+    bf16x8_to_floats(w0, v);
+    bf16x8_to_floats(w1, v + 8);
+    quantize16_store<USE_UE8M0>(v, out_fp8 + off, sf_word, 0xFFu << (threadIdx.x & 24), j);
+}
+
+template <bool USE_UE8M0>
+__global__ void __launch_bounds__(kWideQuantThreads) silu_chunk_mul_quantize_1x32_packed_wide_kernel(
+    __nv_fp8_e4m3* __restrict__ out_fp8, int32_t* __restrict__ out_packed,
+    __nv_bfloat16 const* __restrict__ gu, int M, int K, int M_pad, bool pdl)
+{
+    if (pdl)
+    {
+        cudaGridDependencySynchronize();
+        if (threadIdx.x == 0)
+            cudaTriggerProgrammaticLaunchCompletion();
+    }
+    int const num_kp = K >> 7;
+    int64_t const t = static_cast<int64_t>(blockIdx.x) * kWideQuantThreads + threadIdx.x;
+    int64_t const word = t >> 3;
+    if (word >= static_cast<int64_t>(M_pad) * num_kp)
+        return;
+    int const j = static_cast<int>(t & 7);
+    int const m = static_cast<int>(word / num_kp);
+    int const kp = static_cast<int>(word - static_cast<int64_t>(m) * num_kp);
+    int32_t* const sf_word = out_packed + sf_word_index<MxSfLayout::SM1XX_ATOM>(m, kp, M_pad, num_kp);
+    if (m >= M)
+    {
+        if (j == 0)
+            *sf_word = 0;
+        return;
+    }
+    // gu row m: gate at [0, K), up at [K, 2K).
+    int64_t const in = static_cast<int64_t>(m) * (2 * static_cast<int64_t>(K)) + kp * 128 + j * 16;
+    uint4 const g0 = *reinterpret_cast<uint4 const*>(gu + in);
+    uint4 const g1 = *reinterpret_cast<uint4 const*>(gu + in + 8);
+    uint4 const u0 = *reinterpret_cast<uint4 const*>(gu + in + K);
+    uint4 const u1 = *reinterpret_cast<uint4 const*>(gu + in + K + 8);
+    float v[16];
+    silu_bf16x8_to_floats(g0, u0, v);
+    silu_bf16x8_to_floats(g1, u1, v + 8);
+    int64_t const off = static_cast<int64_t>(m) * K + kp * 128 + j * 16;
+    quantize16_store<USE_UE8M0>(v, out_fp8 + off, sf_word, 0xFFu << (threadIdx.x & 24), j);
+}
+
+// The wide kernels' 16-byte accesses need 16-byte-aligned bases; K % 128 == 0 keeps every row start aligned.
+inline bool wide_quant_aligned(void const* a, void const* b)
+{
+    return ((reinterpret_cast<uintptr_t>(a) | reinterpret_cast<uintptr_t>(b)) & 15u) == 0;
+}
+
+template <bool kSilu>
+void launch_quantize_1x32_wide(__nv_fp8_e4m3* x_q, int32_t* packed_scales, __nv_bfloat16 const* in, int M, int K,
+    cudaStream_t stream, bool use_ue8m0)
+{
+    int const m_pad = ((M + 127) / 128) * 128;
+    int64_t const threads = static_cast<int64_t>(m_pad) * (K / 128) * 8;
+    if (threads == 0)
+        return;
+    dim3 const grid(static_cast<unsigned>((threads + kWideQuantThreads - 1) / kWideQuantThreads));
+    bool const pdl = fso_pdl_enabled();
+    if (kSilu)
+    {
+        if (use_ue8m0)
+            fso_pdl_launch(silu_chunk_mul_quantize_1x32_packed_wide_kernel<true>, grid, dim3(kWideQuantThreads),
+                stream, pdl, x_q, packed_scales, in, M, K, m_pad);
+        else
+            fso_pdl_launch(silu_chunk_mul_quantize_1x32_packed_wide_kernel<false>, grid, dim3(kWideQuantThreads),
+                stream, pdl, x_q, packed_scales, in, M, K, m_pad);
+    }
+    else
+    {
+        if (use_ue8m0)
+            fso_pdl_launch(fp8bs_quantize_1x32_packed_wide_kernel<true>, grid, dim3(kWideQuantThreads), stream,
+                pdl, x_q, packed_scales, in, M, K, m_pad);
+        else
+            fso_pdl_launch(fp8bs_quantize_1x32_packed_wide_kernel<false>, grid, dim3(kWideQuantThreads), stream,
+                pdl, x_q, packed_scales, in, M, K, m_pad);
+    }
+}
+
+} // anonymous namespace
+
 void fp8bs_quantize_1x32_packed(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
     __nv_bfloat16 const* x, int M, int K, cudaStream_t stream, bool use_ue8m0, bool sm1xx_sf_layout)
 {
+    // sm_100/sm_103: the wide kernel with PDL (see the block above); sm_120 keeps the narrow kernel below.
+    if (sm1xx_sf_layout && wide_quant_aligned(x, x_q))
+    {
+        launch_quantize_1x32_wide<false>(x_q, packed_scales, x, M, K, stream, use_ue8m0);
+        return;
+    }
     // K_BLOCKS_PER_WARP = 8 (256 K-elements/warp, 2 int32 outputs/warp) when
     // K is a multiple of 256 — fewer CTAs, better amortisation of launch
     // overhead. Falls back to 4 when K % 256 != 0 (e.g. shapes where K is
@@ -551,6 +871,13 @@ void fp8bs_silu_chunk_mul_quantize_1x32_packed(
     __nv_fp8_e4m3* x_q, int32_t* packed_scales,
     __nv_bfloat16 const* gu, int M, int K, cudaStream_t stream, bool use_ue8m0, bool sm1xx_sf_layout)
 {
+    // sm_100/sm_103: the wide kernel with PDL (see fp8bs_quantize_1x32_packed_wide_kernel); sm_120 keeps the
+    // narrow kernel below.
+    if (sm1xx_sf_layout && wide_quant_aligned(gu, x_q))
+    {
+        launch_quantize_1x32_wide<true>(x_q, packed_scales, gu, M, K, stream, use_ue8m0);
+        return;
+    }
     // See fp8bs_quantize_1x32_packed for the sm1xx_sf_layout contract.
     int const m_pad = sm1xx_sf_layout ? ((M + 127) / 128) * 128 : ((M + 3) / 4) * 4;
     constexpr int kThreadsPerBlock = 256;
@@ -704,8 +1031,17 @@ __global__ void fp8bs_quantize_1x128_fp32_sorted_gather_pair_kernel(
     float* __restrict__ out_sfa,          // [K/128, sfa_ld] = ColMajor[sfa_ld, K/128]
     __nv_bfloat16 const* __restrict__ input,   // [M, K]
     int32_t const* __restrict__ flat_to_sorted, // [R]: pair -> sorted row
-    int n_pairs, int topk, int sfa_ld, int K)
+    int n_pairs, int topk, int sfa_ld, int K, bool pdl)
 {
+    // PDL: every global read below waits for the parent (moe_build_sorted writes flat_to_sorted), then thread 0
+    // releases this kernel's dependent (the FC1), as in every other glue kernel of the MoE chain. Before any early
+    // return, so no CTA can finish before its parent has.
+    if (pdl)
+    {
+        cudaGridDependencySynchronize();
+        if (threadIdx.x == 0)
+            cudaTriggerProgrammaticLaunchCompletion();
+    }
     int const warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     int const lane_id = threadIdx.x & 31;
     int const Kb = K / 128;
@@ -760,104 +1096,126 @@ __global__ void fp8bs_quantize_1x128_fp32_sorted_gather_pair_kernel(
 // steps, and at the smallest token counts the token's pairs are split across warps too (one pair per warp at M = 1,
 // the 0.2.0 kernel's parallelism there), so that enough warps exist to cover the latency. The number of steps a warp
 // loads ahead is a template parameter, so the small-M launches run a short kernel.
-template <bool kVec16, int kInFlight> // kInFlight: steps loaded ahead per warp (1, 2, 4 or 8)
+// kStride selects the form: one item per warp (the launch for every grid up to kFsoGlueFlatWaves waves, i.e. every
+// token count of the tables), or grid-stride over the items on a grid of kFsoGlueWaves waves beyond that.
+template <bool kVec16, int kInFlight, bool kStride> // kInFlight: steps loaded ahead per warp (1, 2, 4 or 8)
 __global__ void fp8bs_quantize_1x128_fp32_sorted_gather_kernel(
     __nv_fp8_e4m3* __restrict__ out_fp8,  // [P_max, K]
     float* __restrict__ out_sfa,          // [K/128, sfa_ld] = ColMajor[sfa_ld, K/128]
     __nv_bfloat16 const* __restrict__ input,   // [M, K]
     int32_t const* __restrict__ flat_to_sorted, // [R]: pair -> sorted row
     int n_pairs, int topk, int sfa_ld, int K, int steps_per_chunk, int log2_chunks, int pairs_per_group,
-    int log2_groups, int n_items)
+    int log2_groups, int n_items, bool pdl)
 {
+    // PDL entry (see the per-pair kernel above): wait for moe_build_sorted, then release the FC1.
+    if (pdl)
+    {
+        cudaGridDependencySynchronize();
+        if (threadIdx.x == 0)
+            cudaTriggerProgrammaticLaunchCompletion();
+    }
+    int const lane = threadIdx.x & 31;
     // item = (token, chunk, group), the chunk and group counts powers of two, so the split is shifts: a runtime
     // division here sat on the path to the first load and cost the M = 1 launch about 0.2 us.
-    int const item = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    int const lane = threadIdx.x & 31;
-    if (item >= n_items)
-        return;
-    int const group = item & ((1 << log2_groups) - 1);
-    int const chunk = (item >> log2_groups) & ((1 << log2_chunks) - 1);
-    int const token = item >> (log2_groups + log2_chunks);
-    int const n_steps = (K + 255) / 256;
-    int const step_begin = chunk * steps_per_chunk;
-    int const step_end = min(n_steps, step_begin + steps_per_chunk);
-    int const p_begin = group * pairs_per_group;
-    int const p_end = min(topk, p_begin + pairs_per_group);
-    if (step_begin >= step_end || p_begin >= p_end) // a chunk or group past the end of a power-of-two split
-        return;
-
-    // This warp's pairs of the token: p_begin .. p_end - 1 of its topk. Lane j holds the sorted row of pair
-    // token * topk + p_begin + j (-1: skipped, or past n_pairs).
-    int const pair0 = token * topk;
-    int my_row = -1;
-    if (lane < p_end - p_begin && pair0 + p_begin + lane < n_pairs)
-        my_row = flat_to_sorted[pair0 + p_begin + lane];
-
-    int const half = lane >> 4; // which 128-K block of the step this lane quantizes
-    __nv_bfloat16 const* const xrow = input + static_cast<int64_t>(token) * K;
-
-    for (int s0 = step_begin; s0 < step_end; s0 += kInFlight)
+    auto const do_item = [&](int item)
     {
-        uint4 v[kInFlight];
-#pragma unroll
-        for (int j = 0; j < kInFlight; ++j)
+        int const group = item & ((1 << log2_groups) - 1);
+        int const chunk = (item >> log2_groups) & ((1 << log2_chunks) - 1);
+        int const token = item >> (log2_groups + log2_chunks);
+        int const n_steps = (K + 255) / 256;
+        int const step_begin = chunk * steps_per_chunk;
+        int const step_end = min(n_steps, step_begin + steps_per_chunk);
+        int const p_begin = group * pairs_per_group;
+        int const p_end = min(topk, p_begin + pairs_per_group);
+        if (step_begin >= step_end || p_begin >= p_end) // a chunk or group past the end of a power-of-two split
+            return;
+
+        // This warp's pairs of the token: p_begin .. p_end - 1 of its topk. Lane j holds the sorted row of pair
+        // token * topk + p_begin + j (-1: skipped, or past n_pairs).
+        int const pair0 = token * topk;
+        int my_row = -1;
+        if (lane < p_end - p_begin && pair0 + p_begin + lane < n_pairs)
+            my_row = flat_to_sorted[pair0 + p_begin + lane];
+
+        int const half = lane >> 4; // which 128-K block of the step this lane quantizes
+        __nv_bfloat16 const* const xrow = input + static_cast<int64_t>(token) * K;
+
+        for (int s0 = step_begin; s0 < step_end; s0 += kInFlight)
         {
-            int const k = (s0 + j) * 256 + lane * 8;
-            v[j] = make_uint4(0u, 0u, 0u, 0u);
-            if (s0 + j < step_end && k < K)
+            uint4 v[kInFlight];
+#pragma unroll
+            for (int j = 0; j < kInFlight; ++j)
             {
-                if constexpr (kVec16)
+                int const k = (s0 + j) * 256 + lane * 8;
+                v[j] = make_uint4(0u, 0u, 0u, 0u);
+                if (s0 + j < step_end && k < K)
                 {
-                    v[j] = *reinterpret_cast<uint4 const*>(xrow + k);
+                    if constexpr (kVec16)
+                    {
+                        v[j] = *reinterpret_cast<uint4 const*>(xrow + k);
+                    }
+                    else
+                    {
+                        uint2 const lo = *reinterpret_cast<uint2 const*>(xrow + k);
+                        uint2 const hi = *reinterpret_cast<uint2 const*>(xrow + k + 4);
+                        v[j] = make_uint4(lo.x, lo.y, hi.x, hi.y);
+                    }
                 }
-                else
+            }
+#pragma unroll
+            for (int j = 0; j < kInFlight; ++j)
+            {
+                int const s = s0 + j;
+                if (s >= step_end) // uniform across the warp
+                    break;
+                int const k = s * 256 + lane * 8;
+                bool const valid = k < K;
+                __nv_bfloat162 const* const xv = reinterpret_cast<__nv_bfloat162 const*>(&v[j]);
+                float2 const f0 = __bfloat1622float2(xv[0]);
+                float2 const f1 = __bfloat1622float2(xv[1]);
+                float2 const f2 = __bfloat1622float2(xv[2]);
+                float2 const f3 = __bfloat1622float2(xv[3]);
+                float my_ax = fmaxf(fmaxf(fmaxf(fabsf(f0.x), fabsf(f0.y)), fmaxf(fabsf(f1.x), fabsf(f1.y))),
+                    fmaxf(fmaxf(fabsf(f2.x), fabsf(f2.y)), fmaxf(fabsf(f3.x), fabsf(f3.y))));
+                // |max| over the sixteen lanes of this half (one 128-K block)
+#pragma unroll
+                for (int off = 8; off > 0; off >>= 1)
+                    my_ax = fmaxf(my_ax, __shfl_xor_sync(0xFFFFFFFFu, my_ax, off));
+                my_ax = fmaxf(my_ax, 1e-10f);
+                float const qs = 448.f / my_ax;
+                float const dequant = my_ax * (1.f / 448.f);
+                uint2 const w = make_uint2(fp8x4_from_floats(f0.x * qs, f0.y * qs, f1.x * qs, f1.y * qs),
+                    fp8x4_from_floats(f2.x * qs, f2.y * qs, f3.x * qs, f3.y * qs));
+                int const kb = 2 * s + half;
+                for (int p = 0; p < p_end - p_begin; ++p)
                 {
-                    uint2 const lo = *reinterpret_cast<uint2 const*>(xrow + k);
-                    uint2 const hi = *reinterpret_cast<uint2 const*>(xrow + k + 4);
-                    v[j] = make_uint4(lo.x, lo.y, hi.x, hi.y);
+                    // Rows of pairs 32.. of the group (more than 32 pairs) are read here, the same address in
+                    // every lane.
+                    int const r = p < 32 ? __shfl_sync(0xFFFFFFFFu, my_row, p)
+                                         : (pair0 + p_begin + p < n_pairs ? flat_to_sorted[pair0 + p_begin + p] : -1);
+                    if (r < 0) // skipped pair (uniform across the warp)
+                        continue;
+                    if (valid)
+                    {
+                        *reinterpret_cast<uint2*>(&out_fp8[static_cast<int64_t>(r) * K + k]) = w;
+                        if ((lane & 15) == 0)
+                            out_sfa[static_cast<int64_t>(kb) * sfa_ld + r] = dequant;
+                    }
                 }
             }
         }
-#pragma unroll
-        for (int j = 0; j < kInFlight; ++j)
-        {
-            int const s = s0 + j;
-            if (s >= step_end) // uniform across the warp
-                break;
-            int const k = s * 256 + lane * 8;
-            bool const valid = k < K;
-            __nv_bfloat162 const* const xv = reinterpret_cast<__nv_bfloat162 const*>(&v[j]);
-            float2 const f0 = __bfloat1622float2(xv[0]);
-            float2 const f1 = __bfloat1622float2(xv[1]);
-            float2 const f2 = __bfloat1622float2(xv[2]);
-            float2 const f3 = __bfloat1622float2(xv[3]);
-            float my_ax = fmaxf(fmaxf(fmaxf(fabsf(f0.x), fabsf(f0.y)), fmaxf(fabsf(f1.x), fabsf(f1.y))),
-                fmaxf(fmaxf(fabsf(f2.x), fabsf(f2.y)), fmaxf(fabsf(f3.x), fabsf(f3.y))));
-            // |max| over the sixteen lanes of this half (one 128-K block)
-#pragma unroll
-            for (int off = 8; off > 0; off >>= 1)
-                my_ax = fmaxf(my_ax, __shfl_xor_sync(0xFFFFFFFFu, my_ax, off));
-            my_ax = fmaxf(my_ax, 1e-10f);
-            float const qs = 448.f / my_ax;
-            float const dequant = my_ax * (1.f / 448.f);
-            uint2 const w = make_uint2(fp8x4_from_floats(f0.x * qs, f0.y * qs, f1.x * qs, f1.y * qs),
-                fp8x4_from_floats(f2.x * qs, f2.y * qs, f3.x * qs, f3.y * qs));
-            int const kb = 2 * s + half;
-            for (int p = 0; p < p_end - p_begin; ++p)
-            {
-                // Rows of pairs 32.. of the group (more than 32 pairs) are read here, the same address in every lane.
-                int const r = p < 32 ? __shfl_sync(0xFFFFFFFFu, my_row, p)
-                                     : (pair0 + p_begin + p < n_pairs ? flat_to_sorted[pair0 + p_begin + p] : -1);
-                if (r < 0) // skipped pair (uniform across the warp)
-                    continue;
-                if (valid)
-                {
-                    *reinterpret_cast<uint2*>(&out_fp8[static_cast<int64_t>(r) * K + k]) = w;
-                    if ((lane & 15) == 0)
-                        out_sfa[static_cast<int64_t>(kb) * sfa_ld + r] = dequant;
-                }
-            }
-        }
+    };
+    int const first = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) / 32);
+    if constexpr (kStride)
+    {
+        // Several items per warp, in the order a larger grid would have spread them over its warps.
+        int const n_warps = static_cast<int>((gridDim.x * blockDim.x) / 32);
+        for (int item = first; item < n_items; item += n_warps)
+            do_item(item);
+    }
+    else if (first < n_items)
+    {
+        do_item(first);
     }
 }
 
@@ -910,15 +1268,19 @@ void fp8bs_quantize_1x128_fp32_sorted_gather(__nv_fp8_e4m3* x_q, float* sfa,
 {
     if (n_pairs <= 0 || topk <= 0)
         return;
-    // Below kSortedGatherMinTokens tokens the 0.2.0 per-pair kernel; both write the same bytes and scales.
+    // Both kernels are launched with PDL (unless FSO_DISABLE_PDL=1), like the routing builder before them and the
+    // grouped GEMM after them.
+    bool const pdl = fso_pdl_enabled();
+    // Below kSortedGatherMinTokens tokens the 0.2.0 per-pair kernel; both write the same bytes and scales. Its grid,
+    // one warp per (pair, 128-K block) of fewer than kSortedGatherMinTokens tokens, is bounded by that token count.
     constexpr int kSortedGatherMinTokens = 32;
     if ((n_pairs + topk - 1) / topk < kSortedGatherMinTokens)
     {
         constexpr int kPairThreads = 256, kPairWarps = kPairThreads / 32;
         int64_t const total_warps = static_cast<int64_t>(n_pairs) * (K / 128);
         int const pair_grid = static_cast<int>((total_warps + kPairWarps - 1) / kPairWarps);
-        fp8bs_quantize_1x128_fp32_sorted_gather_pair_kernel<<<pair_grid, kPairThreads, 0, stream>>>(
-            x_q, sfa, x, flat_to_sorted, n_pairs, topk, sfa_ld, K);
+        fso_pdl_launch(fp8bs_quantize_1x128_fp32_sorted_gather_pair_kernel, dim3(pair_grid), dim3(kPairThreads),
+            stream, pdl, x_q, sfa, x, flat_to_sorted, n_pairs, topk, sfa_ld, K);
         return;
     }
     constexpr int kThreads = 128, kWarps = kThreads / 32;
@@ -940,13 +1302,15 @@ void fp8bs_quantize_1x128_fp32_sorted_gather(__nv_fp8_e4m3* x_q, float* sfa,
         ++log2_groups;
     int const pairs_per_group = ceil_div(topk, 1 << log2_groups);
     int64_t const n_items = static_cast<int64_t>(n_tokens) << (log2_chunks + log2_groups);
-    int const grid = static_cast<int>((n_items + kWarps - 1) / kWarps);
     bool const vec16 = (reinterpret_cast<uintptr_t>(x) & 15u) == 0u; // 16-byte loads, else two 8-byte loads
     auto launch = [&](auto vec16T, auto inFlightT)
     {
-        fp8bs_quantize_1x128_fp32_sorted_gather_kernel<decltype(vec16T)::value, decltype(inFlightT)::value>
-            <<<grid, kThreads, 0, stream>>>(x_q, sfa, x, flat_to_sorted, n_pairs, topk, sfa_ld, K, steps_per_chunk,
-                log2_chunks, pairs_per_group, log2_groups, static_cast<int>(n_items));
+        // One warp per item up to kFsoGlueFlatWaves waves, else the grid-stride form (fso_glue_launch).
+        fso_glue_launch<fp8bs_quantize_1x128_fp32_sorted_gather_kernel<decltype(vec16T)::value,
+                            decltype(inFlightT)::value, false>,
+            fp8bs_quantize_1x128_fp32_sorted_gather_kernel<decltype(vec16T)::value, decltype(inFlightT)::value, true>,
+            kThreads>((n_items + kWarps - 1) / kWarps, stream, pdl, x_q, sfa, x, flat_to_sorted, n_pairs, topk, sfa_ld,
+            K, steps_per_chunk, log2_chunks, pairs_per_group, log2_groups, static_cast<int>(n_items));
     };
     auto launch_depth = [&](auto vec16T)
     {
@@ -1029,6 +1393,19 @@ void fp8bs_silu_chunk_mul_quantize_1x128_fp32_grouped(__nv_fp8_e4m3* x_q, float*
 namespace
 {
 
+// Minimum resident 256-thread CTAs per SM that __launch_bounds__ asks of the grid-stride MXFP8 glue kernels below: as
+// many as the SM's thread limit holds (2048 threads on sm_90 and sm_100/103, 1536 on sm_120/121). It caps them at the
+// registers they used before the grid-stride loop (32, or 40 on sm_120), so their occupancy is what it was (the loop
+// alone would let the compiler take up to 43).
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+#define FSO_GLUE_MIN_CTAS_256 6
+#else
+#define FSO_GLUE_MIN_CTAS_256 8
+#endif
+// The token-scatter kernel (sm_100/103 only) used up to 40 registers before the loop (the compile-time-topk form holds
+// the topk slots in registers), i.e. 6 resident CTAs per SM; a 32-register bound would spill it.
+#define FSO_GLUE_MIN_CTAS_SCATTER 6
+
 __device__ __forceinline__ int sf_word_index_grouped(int m_in, int kp, int m_cap, int num_kp, int g)
 {
     return g * (num_kp * m_cap) + kp * m_cap + m_in;
@@ -1070,7 +1447,9 @@ __global__ void fp8bs_quantize_1x32_packed_grouped_gather_kernel(
     constexpr int kNumIters = K_BLOCKS_PER_WARP / kIterKBlocks;
 
     // PDL: order the slot_of_flat / input reads behind the parent, then
-    // release the dependent's prologue. Armed only for small grids.
+    // release the dependent's prologue. Every launch carries it: the launcher
+    // runs this one-warp-per-item form up to kFsoGlueFlatWaves waves and the
+    // grid-stride form below beyond them, so the grid is always bounded.
     if (pdl)
     {
         cudaGridDependencySynchronize();
@@ -1158,6 +1537,116 @@ __global__ void fp8bs_quantize_1x32_packed_grouped_gather_kernel(
     }
 }
 
+// Grid-stride form of the kernel above, for grids beyond kFsoGlueFlatWaves waves (fso_glue_launch): the same
+// per-(pair, K-chunk) work, several items per warp, on a grid of kFsoGlueWaves waves. Its loop lets the compiler
+// take more registers than the one-item form, so __launch_bounds__ holds it at that form's budget.
+template <bool USE_UE8M0, int K_BLOCKS_PER_WARP, bool SM1XX_SF = false>
+__global__ void __launch_bounds__(256, FSO_GLUE_MIN_CTAS_256) fp8bs_quantize_1x32_packed_grouped_gather_stride_kernel(
+    __nv_fp8_e4m3* __restrict__ out_fp8, int32_t* __restrict__ out_packed,
+    __nv_bfloat16 const* __restrict__ input, int32_t const* __restrict__ slot_of_flat,
+    int n_pairs, int topk, int m_cap, int K, bool pdl)
+{
+    static_assert(K_BLOCKS_PER_WARP == 4 || K_BLOCKS_PER_WARP == 8,
+        "K_BLOCKS_PER_WARP must be 4 (1 int32/warp) or 8 (2 int32/warp).");
+
+    constexpr int kVec = kMxFp8VecSize;
+    constexpr int kIterKBlocks = 4;
+    constexpr int kNumIters = K_BLOCKS_PER_WARP / kIterKBlocks;
+
+    // PDL: order the slot_of_flat / input reads behind the parent, then
+    // release the dependent's prologue. Every launch carries it (the grid is
+    // bounded, see fso_glue_launch).
+    if (pdl)
+    {
+        cudaGridDependencySynchronize();
+        if (threadIdx.x == 0)
+        {
+            cudaTriggerProgrammaticLaunchCompletion();
+        }
+    }
+    // Flat-pair indexing: one warp per (routed pair, K-chunk). The padded
+    // G*m_cap iteration space this kernel used at first cost a 94%-dead
+    // warp scan at M=512 (65k CTAs, ~27 us of pure early-outs); the pair
+    // space is exactly the valid work and is host-static. Grid-stride over
+    // the (pair, K-chunk) items: above the cap every warp takes several.
+    int const lane_id = threadIdx.x & 31;
+    int const k_groups = K / (kVec * K_BLOCKS_PER_WARP);
+    int const n_work = n_pairs * k_groups;
+    int const n_warps = static_cast<int>((gridDim.x * blockDim.x) / 32);
+    for (int warp_id = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) / 32); warp_id < n_work;
+         warp_id += n_warps)
+    {
+        int const i = warp_id / k_groups;   // routed pair index
+        int const kg = warp_id % k_groups;
+        int const slot = slot_of_flat[i];   // g * m_cap + m_in, or -1 for a skipped pair
+        // A skipped pair (expert id outside [0, G): a graph padding row, or an expert
+        // another rank owns under expert parallelism) has no slot in the activation
+        // slab. The quantize below still runs on its source row -- the stores are what
+        // is suppressed -- so the slot load never stands in front of the input loads.
+        bool const store = slot >= 0;
+        int const g = slot / m_cap;
+        int const m_in = slot % m_cap;
+        int const src = i / topk;           // source token row
+
+        int const kp_base = kg * (K_BLOCKS_PER_WARP / 4);
+        int const num_kp = K / 128;
+
+        int packed_words[K_BLOCKS_PER_WARP / 4] = {};
+
+#pragma unroll
+        for (int it = 0; it < kNumIters; ++it) {
+            int const kb_base = kg * K_BLOCKS_PER_WARP + it * kIterKBlocks;
+            int const k_base  = kb_base * kVec;
+
+            uint64_t const xword = *reinterpret_cast<uint64_t const*>(
+                &input[static_cast<int64_t>(src) * K + k_base + lane_id * 4]);
+            __nv_bfloat16 const* xv = reinterpret_cast<__nv_bfloat16 const*>(&xword);
+            float const x0 = __bfloat162float(xv[0]);
+            float const x1 = __bfloat162float(xv[1]);
+            float const x2 = __bfloat162float(xv[2]);
+            float const x3 = __bfloat162float(xv[3]);
+
+            float my_ax = fmaxf(fmaxf(fabsf(x0), fabsf(x1)),
+                                fmaxf(fabsf(x2), fabsf(x3)));
+#pragma unroll
+            for (int off = 4; off > 0; off >>= 1) {
+                my_ax = fmaxf(my_ax, __shfl_xor_sync(0xFFFFFFFFu, my_ax, off));
+            }
+            my_ax = fmaxf(my_ax, 1e-10f);
+
+            float qs;
+            uint8_t byte_v;
+            e8m0_from_amax<USE_UE8M0>(my_ax, qs, byte_v);
+
+            uint32_t const fp_word = fp8x4_from_floats(x0 * qs, x1 * qs, x2 * qs, x3 * qs);
+            if (store)
+            {
+                *reinterpret_cast<uint32_t*>(
+                    &out_fp8[static_cast<int64_t>(slot) * K + k_base + lane_id * 4]) = fp_word;
+            }
+
+            uint32_t const b0 = byte_v;
+            uint32_t const b1 = __shfl_sync(0xFFFFFFFFu, byte_v, 8);
+            uint32_t const b2 = __shfl_sync(0xFFFFFFFFu, byte_v, 16);
+            uint32_t const b3 = __shfl_sync(0xFFFFFFFFu, byte_v, 24);
+            if (lane_id == 0) {
+                packed_words[it] = static_cast<int>(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+            }
+        }
+
+        if (store && lane_id == 0) {
+#pragma unroll
+            for (int p = 0; p < K_BLOCKS_PER_WARP / 4; ++p) {
+                if constexpr (SM1XX_SF) {
+                    out_packed[sf_word_index_grouped_atom(m_in, kp_base + p, m_cap, num_kp, g)] = packed_words[p];
+                } else {
+                    out_packed[sf_word_index_grouped(m_in, kp_base + p, m_cap, num_kp, g)] = packed_words[p];
+                }
+            }
+        }
+    }
+}
+
 // Token-space form of the kernel above: quantize each token ONCE and scatter
 // the result to all of its topk destination slots.
 //
@@ -1198,10 +1687,12 @@ __global__ void fp8bs_quantize_1x32_packed_grouped_gather_kernel(
 // loads can be hoisted above the arithmetic and the store loop fully unrolled;
 // TOPK_STATIC == 0 keeps the runtime loop for any other topk.
 //
-// Architecture. This is an sm_100/103 path: the launcher only selects it when
-// the sm_100 scale-factor layout was requested, and the body below is compiled
-// out on every other architecture so the sm_90 and sm_120 SASS passes emit an
-// empty stub (the same technique the sm_90 fatbin uses for sm_120-only code).
+// Architecture. This is an MXFP8 path of the Blackwell arches: sm_100/103 with the
+// Sm1xx atom scale layout (SM1XX_SF) and, since 0.2.1 (run fso_0.2.1_20261010/P3),
+// sm_120/121 with the K-major word layout. The launcher selects it only on a
+// device of compute capability 10 or above, and the body below is compiled out
+// of the sm_90 SASS pass, which emits an empty stub (the same technique the
+// sm_90 fatbin uses for sm_120-only code).
 template <bool USE_UE8M0, int K_BLOCKS_PER_WARP, bool SM1XX_SF, int TOPK_STATIC>
 __global__ void fp8bs_quantize_1x32_packed_grouped_scatter_kernel(
     __nv_fp8_e4m3* __restrict__ out_fp8, int32_t* __restrict__ out_packed,
@@ -1212,7 +1703,7 @@ __global__ void fp8bs_quantize_1x32_packed_grouped_scatter_kernel(
         "K_BLOCKS_PER_WARP must be 4 (1 int32/warp) or 8 (2 int32/warp).");
     static_assert(TOPK_STATIC >= 0, "TOPK_STATIC must be 0 (runtime) or a positive topk.");
 
-#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200)
+#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 1000)
     constexpr int kVec = kMxFp8VecSize;
     constexpr int kIterKBlocks = 4;
     constexpr int kNumIters = K_BLOCKS_PER_WARP / kIterKBlocks;
@@ -1329,6 +1820,152 @@ __global__ void fp8bs_quantize_1x32_packed_grouped_scatter_kernel(
         for (int t = 0; t < topk; ++t)
         {
             store_slot(slot_of_flat[src * topk + t]);
+        }
+    }
+#else
+    (void) out_fp8; (void) out_packed; (void) input; (void) slot_of_flat;
+    (void) num_tokens; (void) topk; (void) m_cap; (void) K; (void) pdl;
+#endif
+}
+
+// Grid-stride form of the token-scatter kernel above, for grids beyond kFsoGlueWaves waves of it (see the pair-space
+// kernel's stride form), on kFsoGlueWaves waves of its own. Same per-item work, same bytes; the one difference
+// besides the loop is where it releases its dependent (below).
+template <bool USE_UE8M0, int K_BLOCKS_PER_WARP, bool SM1XX_SF, int TOPK_STATIC>
+__global__ void __launch_bounds__(256, FSO_GLUE_MIN_CTAS_SCATTER)
+fp8bs_quantize_1x32_packed_grouped_scatter_stride_kernel(
+    __nv_fp8_e4m3* __restrict__ out_fp8, int32_t* __restrict__ out_packed,
+    __nv_bfloat16 const* __restrict__ input, int32_t const* __restrict__ slot_of_flat,
+    int num_tokens, int topk, int m_cap, int K, bool pdl)
+{
+    static_assert(K_BLOCKS_PER_WARP == 4 || K_BLOCKS_PER_WARP == 8,
+        "K_BLOCKS_PER_WARP must be 4 (1 int32/warp) or 8 (2 int32/warp).");
+    static_assert(TOPK_STATIC >= 0, "TOPK_STATIC must be 0 (runtime) or a positive topk.");
+
+#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 1000)
+    constexpr int kVec = kMxFp8VecSize;
+    constexpr int kIterKBlocks = 4;
+    constexpr int kNumIters = K_BLOCKS_PER_WARP / kIterKBlocks;
+
+    // PDL entry: wait for the parent like every glue kernel, but release the dependent only at exit (the implicit
+    // trigger), not at CTA start. This form runs when the grid exceeds kFsoGlueWaves waves of the one-item form
+    // (M > 3552 tokens at K = 2048 on the B300), and the dependent there is the FC1 grouped GEMM: one persistent
+    // 384-thread CTA per SM, which can only be placed on an SM this kernel has left. Released at CTA start, the GEMM's
+    // CTAs were placed while this kernel drained SM by SM, and the GEMM's own time after this kernel grew by 6 %
+    // on Family B (12 us at M = 8192, 9.5 us at M = 6144) and 2 % on Family C; released at exit, it is unchanged
+    // against a launch without PDL (per-stage nsys, run fso_0.2.1_20261010/S8b2). The one-item form keeps its start
+    // trigger, which hides the GEMM's launch (up to 2 us) at the token counts it serves.
+    if (pdl)
+    {
+        cudaGridDependencySynchronize();
+    }
+    // Token-space indexing: one warp per (token row, K-chunk), grid-stride
+    // over them (the grid is capped as the pair-space kernel's).
+    int const lane_id = threadIdx.x & 31;
+    int const k_groups = K / (kVec * K_BLOCKS_PER_WARP);
+    int const n_work = num_tokens * k_groups;
+    int const n_warps = static_cast<int>((gridDim.x * blockDim.x) / 32);
+    for (int warp_id = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) / 32); warp_id < n_work;
+         warp_id += n_warps)
+    {
+        int const src = warp_id / k_groups;   // source token row
+        int const kg = warp_id % k_groups;
+
+        int const kp_base = kg * (K_BLOCKS_PER_WARP / 4);
+        int const num_kp = K / 128;
+
+        // Destination slots are pure address material: issue their loads before
+        // the arithmetic so the scattered-store addresses are already resolved
+        // when the amax reduction finishes.
+        constexpr int kSlotRegs = TOPK_STATIC > 0 ? TOPK_STATIC : 1;
+        int slots[kSlotRegs];
+        if constexpr (TOPK_STATIC > 0)
+        {
+#pragma unroll
+            for (int t = 0; t < TOPK_STATIC; ++t)
+            {
+                slots[t] = slot_of_flat[src * TOPK_STATIC + t];
+            }
+        }
+
+        uint32_t fp_words[kNumIters] = {};
+        int packed_words[K_BLOCKS_PER_WARP / 4] = {};
+
+#pragma unroll
+        for (int it = 0; it < kNumIters; ++it) {
+            int const kb_base = kg * K_BLOCKS_PER_WARP + it * kIterKBlocks;
+            int const k_base  = kb_base * kVec;
+
+            uint64_t const xword = *reinterpret_cast<uint64_t const*>(
+                &input[static_cast<int64_t>(src) * K + k_base + lane_id * 4]);
+            __nv_bfloat16 const* xv = reinterpret_cast<__nv_bfloat16 const*>(&xword);
+            float const x0 = __bfloat162float(xv[0]);
+            float const x1 = __bfloat162float(xv[1]);
+            float const x2 = __bfloat162float(xv[2]);
+            float const x3 = __bfloat162float(xv[3]);
+
+            float my_ax = fmaxf(fmaxf(fabsf(x0), fabsf(x1)),
+                                fmaxf(fabsf(x2), fabsf(x3)));
+#pragma unroll
+            for (int off = 4; off > 0; off >>= 1) {
+                my_ax = fmaxf(my_ax, __shfl_xor_sync(0xFFFFFFFFu, my_ax, off));
+            }
+            my_ax = fmaxf(my_ax, 1e-10f);
+
+            float qs;
+            uint8_t byte_v;
+            e8m0_from_amax<USE_UE8M0>(my_ax, qs, byte_v);
+
+            fp_words[it] = fp8x4_from_floats(x0 * qs, x1 * qs, x2 * qs, x3 * qs);
+
+            uint32_t const b0 = byte_v;
+            uint32_t const b1 = __shfl_sync(0xFFFFFFFFu, byte_v, 8);
+            uint32_t const b2 = __shfl_sync(0xFFFFFFFFu, byte_v, 16);
+            uint32_t const b3 = __shfl_sync(0xFFFFFFFFu, byte_v, 24);
+            if (lane_id == 0) {
+                packed_words[it] = static_cast<int>(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+            }
+        }
+
+        // One destination: the same stores the pair-space kernel performs for the
+        // pair that owns this slot, from values that were computed once.
+        auto store_slot = [&](int slot) {
+            if (slot < 0) // skipped pair: no slot in the activation slab
+                return;
+#pragma unroll
+            for (int it = 0; it < kNumIters; ++it) {
+                int const k_base = (kg * K_BLOCKS_PER_WARP + it * kIterKBlocks) * kVec;
+                *reinterpret_cast<uint32_t*>(
+                    &out_fp8[static_cast<int64_t>(slot) * K + k_base + lane_id * 4]) = fp_words[it];
+            }
+            if (lane_id == 0) {
+                int const g = slot / m_cap;
+                int const m_in = slot % m_cap;
+#pragma unroll
+                for (int p = 0; p < K_BLOCKS_PER_WARP / 4; ++p) {
+                    if constexpr (SM1XX_SF) {
+                        out_packed[sf_word_index_grouped_atom(m_in, kp_base + p, m_cap, num_kp, g)] = packed_words[p];
+                    } else {
+                        out_packed[sf_word_index_grouped(m_in, kp_base + p, m_cap, num_kp, g)] = packed_words[p];
+                    }
+                }
+            }
+        };
+
+        if constexpr (TOPK_STATIC > 0)
+        {
+#pragma unroll
+            for (int t = 0; t < TOPK_STATIC; ++t)
+            {
+                store_slot(slots[t]);
+            }
+        }
+        else
+        {
+            for (int t = 0; t < topk; ++t)
+            {
+                store_slot(slot_of_flat[src * topk + t]);
+            }
         }
     }
 #else
@@ -1477,43 +2114,136 @@ __global__ void silu_chunk_mul_quantize_1x32_packed_grouped_kernel(
     }
 }
 
+// Grid-stride form of the SwiGLU requantize above, for grids beyond kFsoGlueFlatWaves waves (see the gather's stride
+// form).
+template <bool USE_UE8M0, int K_BLOCKS_PER_WARP, bool SM1XX_SF = false, bool PAIRWISE = false>
+__global__ void __launch_bounds__(256, FSO_GLUE_MIN_CTAS_256) silu_chunk_mul_quantize_1x32_packed_grouped_stride_kernel(
+    __nv_fp8_e4m3* __restrict__ out_fp8, int32_t* __restrict__ out_packed,
+    __nv_bfloat16 const* __restrict__ gu, int32_t const* __restrict__ slot_of_flat,
+    int n_pairs, int m_cap, int K, bool pdl)
+{
+    static_assert(K_BLOCKS_PER_WARP == 4 || K_BLOCKS_PER_WARP == 8,
+        "K_BLOCKS_PER_WARP must be 4 (1 int32/warp) or 8 (2 int32/warp).");
+
+    constexpr int kVec = kMxFp8VecSize;
+    constexpr int kIterKBlocks = 4;
+    constexpr int kNumIters = K_BLOCKS_PER_WARP / kIterKBlocks;
+
+    // PDL entry (see gather kernel above).
+    if (pdl)
+    {
+        cudaGridDependencySynchronize();
+        if (threadIdx.x == 0)
+        {
+            cudaTriggerProgrammaticLaunchCompletion();
+        }
+    }
+    // Flat-pair indexing over the valid routed rows (see gather kernel),
+    // grid-stride over the (pair, K-chunk) items.
+    int const lane_id = threadIdx.x & 31;
+    int const k_groups = K / (kVec * K_BLOCKS_PER_WARP);
+    int const n_work = n_pairs * k_groups;
+    int const n_warps = static_cast<int>((gridDim.x * blockDim.x) / 32);
+    for (int warp_id = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) / 32); warp_id < n_work;
+         warp_id += n_warps)
+    {
+        int const i = warp_id / k_groups;
+        int const kg = warp_id % k_groups;
+        int const slot = slot_of_flat[i];
+        if (slot < 0) // skipped pair (see moe_build_routing): no slot was written by the FC1
+            continue;
+        int const g = slot / m_cap;
+        int const m_in = slot % m_cap;
+
+        int const kp_base = kg * (K_BLOCKS_PER_WARP / 4);
+        int const num_kp = K / 128;
+        int64_t const stride_m_gu = 2 * static_cast<int64_t>(K);
+
+        int packed_words[K_BLOCKS_PER_WARP / 4] = {};
+
+#pragma unroll
+        for (int it = 0; it < kNumIters; ++it) {
+            int const kb_base = kg * K_BLOCKS_PER_WARP + it * kIterKBlocks;
+            int const k_base  = kb_base * kVec;
+
+            // Both branches end at the same two float2s, and the PAIRWISE=false
+            // branch holds the original expressions unchanged so its machine code
+            // is unchanged.
+            float2 f01, f23;
+            if constexpr (PAIRWISE)
+            {
+                // Eight consecutive bf16 = [g0,u0,g1,u1,g2,u2,g3,u3], 16-byte
+                // aligned because the element offset is a multiple of 8 (k_base is
+                // a multiple of 32 and the lane stride is 8).
+                uint4 const w = *reinterpret_cast<uint4 const*>(
+                    &gu[slot * stride_m_gu + 2 * (k_base + lane_id * 4)]);
+                // Each 32-bit word is one (gate, up) pair, gate in the low half.
+                // __byte_perm picks bytes from two sources: nibble values 0-3 index
+                // the first operand's bytes, 4-7 the second's, least significant
+                // nibble first. 0x5410 therefore builds (a.lo, b.lo) = (gate, gate)
+                // and 0x7632 builds (a.hi, b.hi) = (up, up).
+                uint32_t const p0 = __byte_perm(w.x, w.y, 0x5410);
+                uint32_t const p1 = __byte_perm(w.x, w.y, 0x7632);
+                uint32_t const p2 = __byte_perm(w.z, w.w, 0x5410);
+                uint32_t const p3 = __byte_perm(w.z, w.w, 0x7632);
+                f01 = __bfloat1622float2(silu2_mul(*reinterpret_cast<__nv_bfloat162 const*>(&p0),
+                    *reinterpret_cast<__nv_bfloat162 const*>(&p1)));
+                f23 = __bfloat1622float2(silu2_mul(*reinterpret_cast<__nv_bfloat162 const*>(&p2),
+                    *reinterpret_cast<__nv_bfloat162 const*>(&p3)));
+            }
+            else
+            {
+                uint64_t const gate_word = *reinterpret_cast<uint64_t const*>(
+                    &gu[slot * stride_m_gu + 0 + k_base + lane_id * 4]);
+                uint64_t const up_word = *reinterpret_cast<uint64_t const*>(
+                    &gu[slot * stride_m_gu + K + k_base + lane_id * 4]);
+                __nv_bfloat162 const* gv2 = reinterpret_cast<__nv_bfloat162 const*>(&gate_word);
+                __nv_bfloat162 const* uv2 = reinterpret_cast<__nv_bfloat162 const*>(&up_word);
+
+                f01 = __bfloat1622float2(silu2_mul(gv2[0], uv2[0]));
+                f23 = __bfloat1622float2(silu2_mul(gv2[1], uv2[1]));
+            }
+            float const h0 = f01.x, h1 = f01.y, h2 = f23.x, h3 = f23.y;
+
+            float my_ax = fmaxf(fmaxf(fabsf(h0), fabsf(h1)), fmaxf(fabsf(h2), fabsf(h3)));
+#pragma unroll
+            for (int off = 4; off > 0; off >>= 1) {
+                my_ax = fmaxf(my_ax, __shfl_xor_sync(0xFFFFFFFFu, my_ax, off));
+            }
+            my_ax = fmaxf(my_ax, 1e-10f);
+
+            float qs;
+            uint8_t byte_v;
+            e8m0_from_amax<USE_UE8M0>(my_ax, qs, byte_v);
+
+            uint32_t const fp_word = fp8x4_from_floats(h0 * qs, h1 * qs, h2 * qs, h3 * qs);
+            *reinterpret_cast<uint32_t*>(
+                &out_fp8[static_cast<int64_t>(slot) * K + k_base + lane_id * 4]) = fp_word;
+
+            uint32_t const b0 = byte_v;
+            uint32_t const b1 = __shfl_sync(0xFFFFFFFFu, byte_v, 8);
+            uint32_t const b2 = __shfl_sync(0xFFFFFFFFu, byte_v, 16);
+            uint32_t const b3 = __shfl_sync(0xFFFFFFFFu, byte_v, 24);
+            if (lane_id == 0) {
+                packed_words[it] = static_cast<int>(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+            }
+        }
+
+        if (lane_id == 0) {
+#pragma unroll
+            for (int p = 0; p < K_BLOCKS_PER_WARP / 4; ++p) {
+                if constexpr (SM1XX_SF) {
+                    out_packed[sf_word_index_grouped_atom(m_in, kp_base + p, m_cap, num_kp, g)] = packed_words[p];
+                } else {
+                    out_packed[sf_word_index_grouped(m_in, kp_base + p, m_cap, num_kp, g)] = packed_words[p];
+                }
+            }
+        }
+    }
+}
+
 } // anonymous namespace
 
-
-// PDL launch helper for the grouped MoE glue chain: launches with the
-// programmatic-stream-serialization attribute so a downstream kernel's
-// launch/prologue overlaps this one (both sides carry griddepcontrol
-// wait/trigger). FSO_DISABLE_PDL=1 restores plain serialised launches.
-static inline bool fso_pdl_enabled()
-{
-    static bool v = []
-    {
-        char const* e = std::getenv("FSO_DISABLE_PDL");
-        return !(e && e[0] == '1');
-    }();
-    return v;
-}
-
-// Grids beyond this many CTAs launch without PDL: a huge programmatic
-// dependent floods every SM with waiting CTAs and throttles the parent's
-// tail (measured +46 us on the M=512 layer before this gate).
-constexpr unsigned kFsoPdlMaxGridCtas = 4096;
-
-template <typename KernelT, typename... Args>
-static inline void fso_pdl_launch(KernelT kernel, dim3 grid, dim3 block, cudaStream_t stream, bool pdl, Args... args)
-{
-    cudaLaunchConfig_t cfg{};
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = pdl ? 1 : 0;
-    cfg.gridDim = grid;
-    cfg.blockDim = block;
-    cfg.dynamicSmemBytes = 0;
-    cfg.stream = stream;
-    cfg.attrs = attrs;
-    cfg.numAttrs = 1;
-    cudaLaunchKernelEx(&cfg, kernel, args..., pdl);
-}
 
 // ----- Token-scatter selection for the grouped gather-quantize -------------
 //
@@ -1548,26 +2278,6 @@ static inline bool fso_gather_quant_topk_static()
     {
         char const* e = std::getenv("FSO_GATHER_QUANT_TOPK_STATIC");
         return !(e && e[0] == '0');
-    }();
-    return v;
-}
-
-// Multiprocessor count of the current device, queried once. This translation
-// unit has no ATen, so the CUDA runtime attribute is the available source; the
-// query happens at the first launch (eager warm-up) and never inside a graph
-// capture. Single-device assumption, the same one fso_pdl_enabled makes.
-static inline int fso_device_sm_count()
-{
-    static int const v = []
-    {
-        int dev = 0;
-        int n = 0;
-        if (cudaGetDevice(&dev) == cudaSuccess
-            && cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && n > 0)
-        {
-            return n;
-        }
-        return 1;
     }();
     return v;
 }
@@ -1609,10 +2319,13 @@ static inline bool fso_gather_quant_use_scatter(int num_tokens, int topk, int k_
 // Two kernels implement this call and produce byte-identical output on every
 // defined row: the pair-space kernel (one warp per routed pair) and the
 // token-scatter kernel (one warp per token, result scattered to the topk
-// slots). The scatter form is offered on the sm_100/103 layout only and is
-// selected by fso_gather_quant_use_scatter; sm_120 and sm_90 always take the
-// pair-space kernel, exactly as before. Applying the same idea on sm_120 is a
-// separate exercise: the arch is first-class, it is deferred, not dismissed.
+// slots). The scatter form is offered on both Blackwell scale layouts (sm_100/103
+// atoms and, since 0.2.1, the sm_120/121 K-major words) and is selected by
+// fso_gather_quant_use_scatter; sm_90 (no MXFP8) never takes it. On sm_120/121 it is
+// taken only in its one-item form (see the launch below). On the RTX 5090 the Family C
+// routed layer gains 0.5 / 0.8 / 1.4 / 1.2 % at M = 256 / 512 / 1024 / 2048 from it
+// (layer cell, 3 passes against FSO_GATHER_QUANT_ONCE=0, run fso_0.2.1_20261010/P3);
+// the output is byte-identical (test_mxfp8_grouped's quant-once cases, the layer dumps).
 void fp8bs_quantize_1x32_packed_grouped_gather(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
     __nv_bfloat16 const* x, int32_t const* slot_of_flat, int n_pairs, int topk,
     int m_cap, int K, cudaStream_t stream, bool use_ue8m0, bool sm1xx_sf_layout)
@@ -1623,39 +2336,72 @@ void fp8bs_quantize_1x32_packed_grouped_gather(__nv_fp8_e4m3* x_q, int32_t* pack
     auto launch = [&](auto kBlocksPerWarpT, auto ue8m0T, auto sfAtomT) {
         constexpr int kBlocksPerWarp = decltype(kBlocksPerWarpT)::value;
         int const k_groups = K / (kMxFp8VecSize * kBlocksPerWarp);
-        // Token-scatter form, sm_100/103 scale layout only. The pair space is
+        // Token-scatter form, both Blackwell scale layouts (the kernel's body is
+        // compiled for compute capability 10.0 and above only, hence the device
+        // check). The pair space is
         // dense and token-major (n_pairs = num_tokens * topk), which is what
         // lets a token's topk destinations be read as one contiguous run of
         // slot_of_flat; if a caller ever passes a ragged pair space the
         // equality below fails and the pair-space kernel is used.
-        if constexpr (decltype(sfAtomT)::value) {
+        // Every form launches with PDL (unless FSO_DISABLE_PDL=1) on a bounded grid (fso_glue_launch): the
+        // pair-space kernel in its one-item-per-warp form up to kFsoGlueFlatWaves waves and its grid-stride form
+        // beyond; the token-scatter kernel switches already beyond kFsoGlueWaves waves, to the grid-stride form that
+        // releases the FC1 GEMM at exit (see that kernel).
+        bool const pdl = fso_pdl_enabled();
+        {
+            constexpr bool kSm1xxSf = decltype(sfAtomT)::value;
             int const num_tokens = topk > 0 ? n_pairs / topk : 0;
             bool const dense = topk > 0 && num_tokens * topk == n_pairs;
-            if (dense && fso_gather_quant_use_scatter(num_tokens, topk, k_groups, kWarpsPerBlock)) {
+            if (dense && fso_device_cc_major() >= 10
+                && fso_gather_quant_use_scatter(num_tokens, topk, k_groups, kWarpsPerBlock)) {
                 int64_t const warps = static_cast<int64_t>(num_tokens) * k_groups;
-                int const grid = static_cast<int>((warps + kWarpsPerBlock - 1) / kWarpsPerBlock);
-                bool const pdl = fso_pdl_enabled() && static_cast<unsigned>(grid) <= kFsoPdlMaxGridCtas;
-                if (topk == 8 && fso_gather_quant_topk_static()) {
-                    fso_pdl_launch(fp8bs_quantize_1x32_packed_grouped_scatter_kernel<decltype(ue8m0T)::value,
-                                       kBlocksPerWarp, true, 8>,
-                        dim3(grid), dim3(kThreadsPerBlock), stream, pdl, x_q, packed_scales, x, slot_of_flat,
-                        num_tokens, topk, m_cap, K);
-                } else {
-                    fso_pdl_launch(fp8bs_quantize_1x32_packed_grouped_scatter_kernel<decltype(ue8m0T)::value,
-                                       kBlocksPerWarp, true, 0>,
-                        dim3(grid), dim3(kThreadsPerBlock), stream, pdl, x_q, packed_scales, x, slot_of_flat,
-                        num_tokens, topk, m_cap, K);
+                int64_t const ctas = (warps + kWarpsPerBlock - 1) / kWarpsPerBlock;
+                // The sm_120/121 (K-major) layout takes the token-scatter form in its one-item-per-warp kernel
+                // only, within kFsoGlueFlatWaves waves of it (the bound the pair-space kernel's one-item form has),
+                // and the pair-space kernel keeps any larger call. Every gather launch on this arch therefore
+                // releases its dependent at CTA start, as it did before 0.2.1. Run fso_0.2.1_20261010/P3 (RTX 5090,
+                // f0f0364 base, 2 alternating passes, M = 4096 / 8192): the scatter's grid-stride form, which
+                // releases the FC1 only at exit (the sm_100/103 design, see that kernel), cost the Family C routed +
+                // shared block +1.4 % at M = 8192; the one-item form up to 16 waves gives routed layer C -2.3 / -0.8 %,
+                // B -3.0 / -2.3 %, one expert-parallel rank C -5.8 / -5.8 %, B -5.2 / -5.8 %, and the C block -1.7 /
+                // +0.5 %. FSO_GATHER_QUANT_ONCE=1 forces the token-scatter form at every size (A/B knob).
+                bool const one_item_only = !kSm1xxSf && fso_gather_quant_once_mode() != 1;
+                bool const topk8 = topk == 8 && fso_gather_quant_topk_static();
+                int64_t const one_item_cap = kFsoGlueFlatWaves
+                    * (topk8 ? fso_glue_wave<fp8bs_quantize_1x32_packed_grouped_scatter_kernel<
+                                                 decltype(ue8m0T)::value, kBlocksPerWarp, kSm1xxSf, 8>,
+                                   kThreadsPerBlock>()
+                             : fso_glue_wave<fp8bs_quantize_1x32_packed_grouped_scatter_kernel<
+                                                 decltype(ue8m0T)::value, kBlocksPerWarp, kSm1xxSf, 0>,
+                                   kThreadsPerBlock>());
+                if (!one_item_only || ctas <= one_item_cap) {
+                    constexpr int kScatterFlatWaves = kSm1xxSf ? kFsoGlueWaves : kFsoGlueFlatWaves;
+                    if (topk8) {
+                        fso_glue_launch<fp8bs_quantize_1x32_packed_grouped_scatter_kernel<decltype(ue8m0T)::value,
+                                            kBlocksPerWarp, kSm1xxSf, 8>,
+                            fp8bs_quantize_1x32_packed_grouped_scatter_stride_kernel<decltype(ue8m0T)::value,
+                                kBlocksPerWarp, kSm1xxSf, 8>,
+                            kThreadsPerBlock, kScatterFlatWaves>(ctas, stream, pdl, x_q, packed_scales, x,
+                            slot_of_flat, num_tokens, topk, m_cap, K);
+                    } else {
+                        fso_glue_launch<fp8bs_quantize_1x32_packed_grouped_scatter_kernel<decltype(ue8m0T)::value,
+                                            kBlocksPerWarp, kSm1xxSf, 0>,
+                            fp8bs_quantize_1x32_packed_grouped_scatter_stride_kernel<decltype(ue8m0T)::value,
+                                kBlocksPerWarp, kSm1xxSf, 0>,
+                            kThreadsPerBlock, kScatterFlatWaves>(ctas, stream, pdl, x_q, packed_scales, x,
+                            slot_of_flat, num_tokens, topk, m_cap, K);
+                    }
+                    return;
                 }
-                return;
             }
         }
         int64_t const total_warps = static_cast<int64_t>(n_pairs) * k_groups;
-        int const grid = static_cast<int>((total_warps + kWarpsPerBlock - 1) / kWarpsPerBlock);
-        bool const pdl = fso_pdl_enabled() && static_cast<unsigned>(grid) <= kFsoPdlMaxGridCtas;
-        fso_pdl_launch(fp8bs_quantize_1x32_packed_grouped_gather_kernel<decltype(ue8m0T)::value, kBlocksPerWarp,
-                           decltype(sfAtomT)::value>,
-            dim3(grid), dim3(kThreadsPerBlock), stream, pdl, x_q, packed_scales, x, slot_of_flat,
-            n_pairs, topk, m_cap, K);
+        fso_glue_launch<fp8bs_quantize_1x32_packed_grouped_gather_kernel<decltype(ue8m0T)::value, kBlocksPerWarp,
+                            decltype(sfAtomT)::value>,
+            fp8bs_quantize_1x32_packed_grouped_gather_stride_kernel<decltype(ue8m0T)::value, kBlocksPerWarp,
+                decltype(sfAtomT)::value>,
+            kThreadsPerBlock>((total_warps + kWarpsPerBlock - 1) / kWarpsPerBlock, stream, pdl, x_q, packed_scales, x,
+            slot_of_flat, n_pairs, topk, m_cap, K);
     };
     auto launch_k = [&](auto ue8m0T, auto sfAtomT) {
         if (K % 256 == 0) launch(std::integral_constant<int, 8>{}, ue8m0T, sfAtomT);
@@ -1680,12 +2426,13 @@ void fp8bs_silu_chunk_mul_quantize_1x32_packed_grouped(__nv_fp8_e4m3* x_q, int32
         constexpr int kBlocksPerWarp = decltype(kBlocksPerWarpT)::value;
         int const k_groups = K / (kMxFp8VecSize * kBlocksPerWarp);
         int64_t const total_warps = static_cast<int64_t>(n_pairs) * k_groups;
-        int const grid = static_cast<int>((total_warps + kWarpsPerBlock - 1) / kWarpsPerBlock);
-        bool const pdl = fso_pdl_enabled() && static_cast<unsigned>(grid) <= kFsoPdlMaxGridCtas;
-        fso_pdl_launch(silu_chunk_mul_quantize_1x32_packed_grouped_kernel<decltype(ue8m0T)::value, kBlocksPerWarp,
-                           decltype(sfAtomT)::value, decltype(pairT)::value>,
-            dim3(grid), dim3(kThreadsPerBlock), stream, pdl, x_q, packed_scales, gu, slot_of_flat,
-            n_pairs, m_cap, K);
+        // PDL at every size (unless FSO_DISABLE_PDL=1) on a bounded grid (fso_glue_launch).
+        fso_glue_launch<silu_chunk_mul_quantize_1x32_packed_grouped_kernel<decltype(ue8m0T)::value, kBlocksPerWarp,
+                            decltype(sfAtomT)::value, decltype(pairT)::value>,
+            silu_chunk_mul_quantize_1x32_packed_grouped_stride_kernel<decltype(ue8m0T)::value, kBlocksPerWarp,
+                decltype(sfAtomT)::value, decltype(pairT)::value>,
+            kThreadsPerBlock>((total_warps + kWarpsPerBlock - 1) / kWarpsPerBlock, stream, fso_pdl_enabled(), x_q,
+            packed_scales, gu, slot_of_flat, n_pairs, m_cap, K);
     };
     auto launch_k = [&](auto ue8m0T, auto sfAtomT, auto pairT) {
         if (K % 256 == 0) launch(std::integral_constant<int, 8>{}, ue8m0T, sfAtomT, pairT);

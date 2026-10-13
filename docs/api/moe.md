@@ -34,15 +34,17 @@ import torch, fish_scales_ops as fso
 # Once per layer at load time, on the serving device: the rank's local experts as
 # the checkpoint stores them, w13 [E, 2I, H] with the gate rows first and
 # w2 [E, H, I]. "bsfp8" = fp8 weights with fp32 128x128 block scales, "mxfp8" =
-# bf16 weights (quantized here). The arch dispatch is inside the op.
+# bf16 weights (quantized here) or fp8 weights with uint8 UE8M0 scales as an MXFP8
+# checkpoint stores them (kept as stored). The arch dispatch is inside the op.
 experts = fso.moe.prepare_experts(w13, w2, format="bsfp8", sw13=sw13, sw2=sw2)
+experts = fso.moe.prepare_experts(w13_fp8, w2_fp8, format="mxfp8", sw13=sw13_u8, sw2=sw2_u8)
 # Per call. topk_ids (int32 or int64) may carry ids outside [0, E) for padded
 # graph rows and for experts another expert-parallel rank owns; they are skipped.
 out = fso.moe.layer(hidden, experts, topk_ids, topk_w)
 ```
 
 `fso.moe.layer` runs the architecture's chain: `moe_layer_fp8_sm90` on sm_90, and
-the masked-slab MXFP8 chain behind `moe_layer_mxfp8_sm120` on sm_120/121 and
+the compact-layout MXFP8 chain behind `moe_layer_mxfp8_sm120` on sm_120/121 and
 sm_100/103. Both are in `fso.compat` with the per-step ops they compose
 ([`compat.md`](compat.md), *MoE per-step pieces*).
 `bench/gemm/python/bench_moe_qwen3_30a3.py` (`fso_mxfp8_layer`) drives the steps
@@ -55,7 +57,7 @@ its fused FC1 and its slot-bound decode route, was developed.
 each layer's local experts once, on the device that will serve them, and then
 makes one call per batch; the architecture dispatch happens inside a torch
 custom op, so the caller never names an architecture and nothing falls back.
-The per-arch entries — `moe_layer_fp8_sm90` and the masked-slab MXFP8 chain
+The per-arch entries — `moe_layer_fp8_sm90` and the compact-layout MXFP8 chain
 behind `moe_layer_mxfp8_sm120` — are the implementation behind it and live in
 `fso.compat` ([`compat.md`](compat.md), *MoE per-step pieces*), where their names
 keep working and their arguments follow the kernels.
@@ -78,7 +80,7 @@ with it.
 | `format` | what the caller holds | sm_90 (H200) | sm_100 / sm_103 (B200, B300) | sm_120 / sm_121 (RTX 5090) |
 |---|---|---|---|---|
 | `"bsfp8"` | float8_e4m3fn weights with fp32 128×128 block scales `sw13 [E, 2I/128, H/128]` and `sw2 [E, H/128, I/128]`, weight = fp8 value × block scale (the `bsgemm-moe` dialect) | kept as they are (validated, made contiguous if they are not); kind `"bsfp8"` | each expert dequantized block by block to bf16 and requantized to MXFP8 1×32 with the FC1 rows interleaved; kind `"mxfp8"` | same as sm_100 |
-| `"mxfp8"` | bf16 weights (the `mxfp8` dialect keeps its experts bf16 in the checkpoint) | `NotImplementedError`: sm_90 has no MXFP8 hardware | quantized to MXFP8 1×32 with the FC1 rows interleaved; kind `"mxfp8"` | same as sm_100 |
+| `"mxfp8"` | bf16 weights and no scales (the `mxfp8` dialect keeps its experts bf16 in the checkpoint); or an MXFP8 checkpoint as it is stored: float8_e4m3fn weights with uint8 UE8M0 scales `sw13 [E, 2I, H/32]` and `sw2 [E, H, I/32]`, one byte per 32 elements along K, row-major, byte `b` meaning the scale 2^(b − 127), weight = fp8 value × scale | `NotImplementedError`: sm_90 has no MXFP8 hardware, whatever the dtypes | bf16 weights are quantized to MXFP8 1×32; an MXFP8 checkpoint keeps its weight bytes and its scale bytes are packed into this architecture's int32 layout, nothing requantized. The FC1 rows are interleaved either way; kind `"mxfp8"` | same as sm_100 |
 | anything else (bf16 experts, int8, fp4, …) | — | `NotImplementedError` for a known dialect, `ValueError` for an unknown string; no fallback | same | same |
 
 It returns an `fso.moe.MoeExperts`, a frozen handle with the fields `kind`,
@@ -109,7 +111,33 @@ the shape, which it does unless `FSO_FC1_FUSED=0`; the handle's
 runs a few experts at a time under a fixed scratch budget, so preparing a layer
 never holds a second full copy of its weights. On sm_90 the handle keeps the
 caller's own block-FP8 tensors, so freeing the source parameters afterwards
-releases no memory there; on the MXFP8 architectures it does.
+releases no memory there; on the MXFP8 architectures it does, except for an
+MXFP8 checkpoint (below).
+
+**MXFP8 checkpoints as stored.** An MXFP8 checkpoint holds the 1×32 encoding
+itself: float8_e4m3fn weights and one UE8M0 scale byte per 32 elements along K,
+as uint8 `sw13 [E, 2I, H/32]` and `sw2 [E, H, I/32]` in the same row-major order
+as the weights, byte `b` meaning the scale 2^(b − 127). These are the same bytes
+on every MXFP8 architecture, so one checkpoint serves sm_100/103 and sm_120/121.
+`prepare_experts(w13_fp8, w2_fp8, format="mxfp8", sw13=sw13_u8, sw2=sw2_u8)`
+takes them as they are: it packs each row's scale bytes four to an int32 word
+(the lowest K block in the lowest byte) and writes the words in the order this
+architecture's kernels read, and it re-orders the FC1 weight rows and their scale
+rows together when the handle is interleaved. It computes nothing from the
+values, so codes and scales that no load-time rule would produce (a calibrated
+checkpoint's, for instance) are served exactly as written, and there is no bf16
+transient. The handle keeps the caller's `w2` tensor, and its `w13` too when the
+FC1 rows are not interleaved; the interleaved `w13` and the scale handles are
+new tensors. A scale in another form is refused with a `ValueError` that names
+the expected dtype and shape: the int32 scale handle of
+`quantize_moe_weights_1x32_fp8` (it is architecture-specific), fp32 scales, a
+`float8_e8m0fnu` tensor (pass `.view(torch.uint8)`, the same bytes), a wrong
+shape, a scale on another device, scales with bf16 weights, fp8 weights without
+scales, and one weight of each dtype.
+`tests/gemm/unit/test_prequant_mxfp8.py` checks that a handle prepared this way
+from the bytes of a bf16-prepared handle equals that handle tensor for tensor,
+that random codes and scale bytes reach the handle unchanged, and that the
+layer outputs are bit-identical.
 
 **The layer.** `layer(hidden, experts, topk_ids, topk_w, *, bias=None, bias_scale=None)`
 computes, for every token `t`,
@@ -149,14 +177,19 @@ GEMMs and the `[tokens, H]` result, for the route the layer takes at that token
 count on this device (the layer and the query read one host-side plan). Each
 tensor is charged as the caching allocator can charge it — 512-byte blocks, and up
 to 1 MiB more for a tensor above 1 MiB that a cached block serves without splitting
-— so the figure is an upper bound, tight to about 1 MiB per large tensor. It does not count the inputs,
+— so the figure is an upper bound, tight to about 1 MiB per large tensor. The gathered activation (with its
+scales, and the gate/up output when the FC1 is not fused) and the down-projection output are never live at the
+same time, so they share one allocation, which the figure counts once. It does not count the inputs,
 the weights, a `bias` or the library's persistent pools. The intermediates are
 freed when the call returns, so one reservation for the largest bucket a forward
-can carry covers every MoE layer of a model. The two layouts scale differently:
-sm_90's expert-sorted layout grows with `tokens · topk` plus per-expert padding,
-while the masked slab of sm_100/103 and sm_120/121 grows with `E_local · tokens`,
-which is the larger of the two whenever `E_local` exceeds `topk`. A bucket whose
-tensors do not fit raises the allocator's out-of-memory error.
+can carry covers every MoE layer of a model. Both layouts grow with the routed rows:
+sm_90's expert-sorted layout with `tokens · topk` plus per-expert padding to its
+tile, and the compact layout of sm_100/103 and sm_120/121 with `tokens · topk` plus
+at most 127 rows for every local expert that holds one, because each expert's rows
+sit in whole 128-row blocks. With `FSO_MOE_COMPACT=0` the Blackwell layer runs
+0.2.0's masked slab instead, which gives every local expert `align(tokens, 4)` rows
+and grows with `E_local · tokens`. A bucket whose tensors do not fit raises the
+allocator's out-of-memory error.
 
 **The op and its dispatch.** `layer` validates the arguments against the handle
 and calls `torch.ops.fish_scales_ops.moe_layer(hidden, w13, sw13, w2, sw2,
@@ -167,21 +200,20 @@ device's architecture:
 | kind | architecture | what runs |
 |---|---|---|
 | `"bsfp8"` | sm_90 | `moe_layer_fp8_sm90` (the expert-sorted contiguous layout, swap-AB or non-swap picked from `M`), then the bias fold above |
-| `"mxfp8"` | sm_120 / sm_121 | the masked-slab chain of `moe_layer_mxfp8_sm120`, unchanged, with `w13_interleaved` from the handle and the fused combine allowed (see below); one call per bucket |
-| `"mxfp8"` | sm_100 / sm_103 | the same chain, with the routing kernel asked for exactly the tensors this architecture's grouped routes read: per GEMM, `mxfp8_grouped_slot_possible` and `mxfp8_grouped_problem_shapes_consumed` (the FC1 asked under the kernel it will run) choose between the packed active-expert list for the slot-bound decode route and the per-group problem shapes for the pointer-array cascade, which is the composition `bench/gemm/python/bench_moe_qwen3_30a3.py` (`fso_mxfp8_layer`) drives. The fused FC1 is taken where `mxfp8_grouped_swiglu_fused_route` says so and there is no fused combine; one call per bucket |
+| `"mxfp8"` | sm_120 / sm_121 | the compact-layout chain of `moe_layer_mxfp8_sm120` (`moe_build_routing_compact`, the out-style gather, the compact grouped GEMMs, `moe_combine`), with `w13_interleaved` from the handle and the fused combine allowed (see below); one call per bucket |
+| `"mxfp8"` | sm_100 / sm_103 | the same chain, with the routing kernel asked for exactly the tensors this architecture's grouped routes read (and, for the pointer-array cascade, the per-call activation pointer arrays): per GEMM, `mxfp8_grouped_slot_possible` and `mxfp8_grouped_problem_shapes_consumed` (the FC1 asked under the kernel it will run, and every query under the layout the layer runs: `compact=True` on the compact layout, whose slot route has its own rule) choose between the packed active-expert list for the slot-bound decode route (with, past a row capacity of 64, its packed list of live token tiles) and the per-group problem shapes for the pointer-array cascade, which is the composition `bench/gemm/python/bench_moe_qwen3_30a3.py` (`fso_mxfp8_layer`) drives. The fused FC1 is taken where `mxfp8_grouped_swiglu_fused_route` says so and there is no fused combine; one call per bucket |
 | anything else | any | `NotImplementedError` naming the architecture and the format to use instead, or `ValueError` for an unknown kind |
 
 *The fused combine.* On sm_120/121 the fused-combine FC2 adds each routed row
 into its token's output row with atomic reductions instead of storing the
-down-projection slab for a separate combine kernel. Where
-`moe_layer_fused_combine_engages_sm120` takes it (the buckets whose slab would
-dominate the layer's transient memory) the slab is never allocated, but the
+down-projection rows for a separate combine kernel. Where
+`moe_layer_fused_combine_engages_sm120` takes it those rows are never allocated, but the
 order of the adds follows the order in which the CTAs finish, so those buckets
 are stable in aggregate and not bit-reproducible run to run.
 `fso.moe.layer` therefore keeps it opt-in, the same default as
 `moe_layer_mxfp8_sm120`: `FSO_MOE_FUSED_COMBINE=1` allows it and the engagement
-rule then decides per bucket; unset, every bucket keeps the slab and the combine
-kernel and is reproducible. `fso.moe.transient_bytes` follows the setting, so a
+rule then decides per bucket; unset, every bucket keeps the down-projection rows
+and the combine kernel and is reproducible. `fso.moe.transient_bytes` follows the setting, so a
 caller that allows the fused combine reserves less for the buckets that take it.
 
 *Capture and compile.* The op can be captured into a CUDA graph after one eager
@@ -221,7 +253,7 @@ The per-architecture entries behind `fso.moe.layer` (`moe_layer_fp8_sm90`,
 `moe_layer_mxfp8_sm120` and the whole-block `moe_block_mxfp8_sm120`), the grouped
 GEMMs of both layouts, the routing builders and combines, the router, the memory
 planners and the route queries are `fso.compat.<name>`. Their contracts — the
-masked slab and expert-sorted layouts, the fused FC1 and the fused combine, the
+compact, masked-slab and expert-sorted layouts, the fused FC1 and the fused combine, the
 slot-bound decode route and the routing-supplied problem shapes of sm_100/103,
 the multi-CTA routing builder — are in [`compat.md`](compat.md), *MoE per-step
 pieces*.

@@ -16,6 +16,7 @@
  */
 
 #pragma once
+#include <algorithm>
 #include <climits>
 #include <cstdint>
 #include <cstdio>
@@ -24,6 +25,7 @@
 #include <dlfcn.h>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <nvrtc.h>
 #include <string>
 #include <system_error>
@@ -437,9 +439,10 @@ GemmConfig get_best_gemm_config(uint32_t shape_m, uint32_t shape_n, uint32_t sha
 }
 
 // Tile choice of the dense GEMM (gemm_dispatch_sm90: GemmType::Normal, one problem). It starts from
-// get_best_gemm_config's pick, which every grouped (MoE) path keeps using unchanged, and applies two rules measured
-// on the H200 (132 SMs) on 2026-10-05 against today's pick, with outputs bitwise identical for every tile (each output
-// element is accumulated by one CTA in the same order whatever the tile):
+// get_best_gemm_config's pick, which every grouped (MoE) path keeps using unchanged, and applies the four rules below,
+// measured on the H200 (132 SMs) against the previous pick (rules 1-3 on 2026-10-05, rule 4 on 2026-10-11), with
+// outputs bitwise identical for every tile (each output element is accumulated by one CTA in the same order whatever
+// the tile). The dispatcher may still hand the GEMM to DeepGEMM v2's kernel instead (use_dg2_dense, below):
 //
 // 1. Main path. A 128-row tile 104, 112 or 120 wide straddles the 128-row weight-scale blocks, so every promotion
 //    step selects between two weight scales per accumulator group, and it keeps the store whose completion the CTA
@@ -463,6 +466,12 @@ GemmConfig get_best_gemm_config(uint32_t shape_m, uint32_t shape_n, uint32_t sha
 //    output area per CTA, cut the rows each CTA loads per k-block from 128 + block_n to 64 + 2 x block_n and double
 //    the WGMMA width (0.95-0.97 of the time with the 128-row tile on the five family cells where the rule applies,
 //    M = 128; multicast stays off at these M).
+// 4. Main path, 64-row tiles with a 24-wide pick (M <= 64 on the narrow outputs, N about 2100-3200 on 132 SMs). A
+//    24-wide tile straddles the 128-row weight-scale blocks and caps the pipeline at 6 stages; when a 32-wide tile
+//    needs the same number of waves it is taken: one weight scale per k-block, up to 8 stages, and a quarter fewer
+//    CTAs re-reading the same activation rows (0.93-0.95 of the time with the 24-wide tile on Family A `wo` and
+//    `down` at M = 64, P2 of the 0.2.1 round; `down`, K = 9728, now runs DeepGEMM v2's 64 x 32 tile instead, see
+//    use_dg2_dense).
 //
 // The stage count is recomputed for the new tile with get_best_gemm_config's rule (the deepest of 8..4, or 6..4
 // when block_n does not divide 128, that fits the shared memory) and so is the multicast of rule 1 (2 when
@@ -508,6 +517,11 @@ inline GemmConfig get_dense_gemm_config(
             block_n *= 2;
             restage();
         }
+        if (block_m == 64 && block_n < 32 && 128 % block_n != 0 && num_waves(64, 32) == num_waves(64, block_n))
+        {
+            block_n = 32;
+            restage();
+        }
     }
     else
     {
@@ -519,5 +533,231 @@ inline GemmConfig get_dense_gemm_config(
         }
     }
     return std::make_tuple(block_m, block_n, num_stages, num_tma_multicast, smem_size);
+}
+
+// ------------------------------------------------------------------------------------------------------------------
+// DeepGEMM v2's dense block-FP8 kernel (deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh, vendored from sgl-project/DeepGEMM
+// v0.2.0, MIT): its configuration for one dense GEMM, and the rule that decides when the dense dispatcher runs it
+// instead of fp8_gemm_kernel.
+//
+// The two kernels compute every output element in one CTA, accumulate each 128-wide K block of WGMMA results in FP32
+// and promote it with the same A-scale x B-scale product in the same K order, so their outputs are bitwise identical
+// whatever the tile (checked on every dense family cell, 2026-10-11); choosing between them is a tile choice. The v2
+// kernel adds what fp8_gemm_kernel cannot run: 256-row tiles (two 128-row WGMMA waves per k-block), 144- to 192-wide
+// tiles (a compile-time dispatch of the weight-scale split point), multicast on either operand with a per-block
+// fallback for an odd tail, a stage ring that runs on across k-blocks and tiles (any stage count up to 16, no padded
+// rounds), and the swizzled D store for every width.
+struct Dg2DenseConfig
+{
+    uint32_t block_m = 0;
+    uint32_t block_n = 0;
+    uint32_t num_stages = 0;
+    uint32_t cluster_m = 1; // DeepGEMM's layout: cluster_m > 1 pairs two M blocks, which share B (multicast on B)
+    uint32_t cluster_n = 1; // cluster_n > 1 pairs two N blocks, which share A (multicast on A)
+    uint32_t swizzle_d = 0; // the D staging swizzle in bytes (128, 64, 32, or 16 = none)
+    uint32_t smem_size = 0;
+    uint32_t shape_n = 0;   // N compiled into the kernel (DeepGEMM's specialize_n), or 0 for a runtime N
+    uint32_t num_sms = 0;
+    int num_waves = 0;
+    int64_t num_cycles = 0;
+
+    uint32_t cluster_size() const
+    {
+        return cluster_m * cluster_n;
+    }
+
+    bool multicast_on_a() const
+    {
+        return cluster_n > 1;
+    }
+
+    uint32_t num_math_threads() const
+    {
+        return block_m <= 64 ? 128 : 256;
+    }
+};
+
+// heuristics/utils.hpp get_swizzle_mode: the widest swizzle (128, 64, 32 or 16 bytes, 16 meaning none) that divides
+// one row of the block.
+inline uint32_t dg2_swizzle_mode(uint32_t block_size, uint32_t elem_size)
+{
+    for (uint32_t mode : {128u, 64u, 32u, 16u})
+        if ((block_size * elem_size) % mode == 0)
+            return mode;
+    return 16u;
+}
+
+// heuristics/sm90.hpp get_pipeline_config for the 1D2D kernel (FP8 A/B, BF16 D, no accumulation): the shared memory
+// left after D, the barriers and the B scales holds as many stages as fit, at most 16. Returns the stage count and
+// writes the total shared memory.
+inline int dg2_num_stages(uint32_t block_m, uint32_t block_n, uint32_t shape_k, uint32_t& smem_size)
+{
+    constexpr int kCapacity = 232448;
+    constexpr int kMaxStages = 16;
+    auto align = [](int x, int a) { return (x + a - 1) / a * a; };
+    int const smem_cd = align(static_cast<int>(block_m * block_n * 2), 1024);
+    int const smem_barriers = kMaxStages * 8 * 2;
+    int const smem_a = static_cast<int>(block_m) * 128;
+    int const smem_b = static_cast<int>(block_n) * 128;
+    int const smem_sfa = align(static_cast<int>(block_m) * 4, 128);
+    int const uniform_sfb = (128 % block_n == 0) ? 1 : 2;
+    int const smem_extra_sfb = align(div_up(static_cast<int>(shape_k), 128) * 4 * uniform_sfb, 8);
+    int const extra = smem_cd + smem_barriers + smem_extra_sfb;
+    int const per_stage = smem_a + smem_b + smem_sfa;
+    int const stages = std::min((kCapacity - extra) / per_stage, kMaxStages);
+    smem_size = static_cast<uint32_t>(extra + stages * per_stage);
+    return stages;
+}
+
+// DeepGEMM v2's configuration for a dense GEMM (heuristics/sm90.hpp, SM90ArchSpec: get_layout_candidates,
+// get_layout_info and compare, in DeepGEMM's enumeration order, ties keeping the earlier candidate), so that the
+// vendored kernel runs exactly the tile, cluster, swizzle and stage count sglang's DeepGEMM runs for the shape.
+// Candidates: block_m 64 and 128 (plus 16 at M <= 16 and 32 at M <= 32) and 256; block_n 16 to 192 in steps of 16
+// that satisfy the 1D2D kernel's weight-scale split (block_n <= 128, or block_n - 128 dividing block_n or 128); not
+// both block sizes above 128; clusters 1x1, 1x2 (multicast on A) and 2x1 (multicast on B); at least 3 stages, 4 for
+// tiles smaller than 128x192. Cost: L1 and L2 bytes per block over the SMs' bandwidth, divided by the wave
+// efficiency; a cluster with only one wave is never chosen.
+inline Dg2DenseConfig get_dg2_dense_config(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_sms)
+{
+    std::vector<int> block_ms = {64, 128};
+    if (shape_m <= 16)
+        block_ms.push_back(16);
+    if (shape_m <= 32)
+        block_ms.push_back(32);
+    block_ms.push_back(256);
+    std::vector<int> block_ns;
+    for (int bn = 16; bn <= 192; bn += 16)
+        block_ns.push_back(bn);
+    constexpr int block_k = 128;
+
+    Dg2DenseConfig best;
+    bool have = false;
+    for (int cluster_m = 1; cluster_m <= 2; ++cluster_m)
+    {
+        for (int cluster_n = 1; cluster_n <= 2; ++cluster_n)
+        {
+            if (cluster_m * cluster_n > 2 || num_sms % (cluster_m * cluster_n) != 0)
+                continue;
+            for (int bm : block_ms)
+            {
+                for (int bn : block_ns)
+                {
+                    if (bn > block_k && (bn % (bn - block_k) != 0 && block_k % (bn - block_k) != 0))
+                        continue;
+                    if (bm > 128 && bn > 128)
+                        continue;
+                    uint32_t smem = 0;
+                    int const stages = dg2_num_stages(bm, bn, shape_k, smem);
+                    if (stages < 3 || (bm * bn < 128 * 192 && stages < 4))
+                        continue;
+
+                    // get_layout_info
+                    int64_t const num_blocks = static_cast<int64_t>(div_up(static_cast<int>(shape_m), bm))
+                        * div_up(static_cast<int>(shape_n), bn);
+                    int64_t const num_waves = (num_blocks + num_sms - 1) / num_sms;
+                    int64_t const l2_bw = static_cast<int64_t>(std::min(64. * num_sms, 8e6 / 1.3e3));
+                    int64_t const l1_bw = 128 * static_cast<int64_t>(num_sms);
+                    int64_t const k = shape_k;
+                    int64_t const l2_ab = k * (bm / cluster_n + bn / cluster_m);
+                    int64_t const l1_ab = k * (bm + bn);
+                    int64_t const l1_tc = k * (std::max(64, bm) + bn) + static_cast<int64_t>(bm) * bn * 2;
+                    int64_t const cd = static_cast<int64_t>(bm) * bn * 2;
+                    int64_t const l2_cycles = (l2_ab + cd) * num_blocks / l2_bw;
+                    int64_t const l1_cycles = (l1_ab + l1_tc + cd) * num_blocks / l1_bw;
+                    float const wave_eff = static_cast<float>(num_blocks) / static_cast<float>(num_waves * num_sms);
+                    int64_t cycles = static_cast<int64_t>(static_cast<float>(std::max(l1_cycles, l2_cycles)) / wave_eff);
+                    if (cluster_m * cluster_n > 1 && num_waves <= 1)
+                        cycles = std::numeric_limits<int64_t>::max();
+
+                    if (!have || cycles < best.num_cycles)
+                    {
+                        have = true;
+                        best.block_m = bm;
+                        best.block_n = bn;
+                        best.num_stages = stages;
+                        best.cluster_m = cluster_m;
+                        best.cluster_n = cluster_n;
+                        best.smem_size = smem;
+                        best.num_waves = static_cast<int>(num_waves);
+                        best.num_cycles = cycles;
+                    }
+                }
+            }
+        }
+    }
+    best.swizzle_d = dg2_swizzle_mode(best.block_n, 2);
+    best.num_sms = static_cast<uint32_t>(num_sms);
+    // sm90_fp8_gemm_1d2d.hpp: "A known N keeps wide single-CTA SM90 tiles free of register spills."
+    best.shape_n = (best.block_m == 128 && best.block_n > 128 && best.cluster_size() == 1) ? shape_n : 0u;
+    return best;
+}
+
+// get_dg2_dense_config behind a small per-thread direct-mapped cache keyed by the shape, so that an eager call pays
+// one lookup instead of the ~180-candidate enumeration.
+inline Dg2DenseConfig get_dg2_dense_config_cached(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_sms)
+{
+    struct Entry
+    {
+        uint32_t m = 0, n = 0, k = 0;
+        int sms = -1;
+        Dg2DenseConfig cfg;
+    };
+    thread_local Entry table[256];
+    uint64_t const h = (static_cast<uint64_t>(shape_m) * 0x9E3779B97F4A7C15ull) ^ (static_cast<uint64_t>(shape_n) << 20)
+        ^ (static_cast<uint64_t>(shape_k) << 40) ^ static_cast<uint64_t>(num_sms);
+    Entry& e = table[(h ^ (h >> 29)) & 255u];
+    if (e.sms != num_sms || e.m != shape_m || e.n != shape_n || e.k != shape_k)
+    {
+        e.cfg = get_dg2_dense_config(shape_m, shape_n, shape_k, num_sms);
+        e.m = shape_m;
+        e.n = shape_n;
+        e.k = shape_k;
+        e.sms = num_sms;
+    }
+    return e.cfg;
+}
+
+// Whether the dense dispatcher runs DeepGEMM v2's kernel at its configuration (`dg2`) instead of fp8_gemm_kernel at
+// get_dense_gemm_config's pick, on the main (non-swap-AB) path. The v2 kernel is taken for exactly the tile classes
+// fp8_gemm_kernel cannot run and that measured faster on the H200 against fso's pick wherever DeepGEMM chose them
+// (H1, /data/bench-runs/sm90_dg2_dense_20261005/phase2/runs/remaining/report.md; P2 of the 0.2.1 round,
+// /data/bench-runs/fso_0.2.1_20261010/P2):
+//   - 256 x 128 with multicast on A: 0.86-0.99 of fso's time on 23 cells (M >= 1024 on the wide outputs, M >= 4096
+//     on the narrow ones);
+//   - 128 x 160 and 128 x 192, with or without multicast on B: 0.70-0.96 on 16 cells (M = 128-2048);
+// and only from M = 512 on, where the MLP block gains 4-11 % from M = 1024. At M = 128 and M = 256 these tiles do not
+// pay inside the block: at M = 128 the 128 x 160 gate_up runs 1.2 us longer inside the quantize -> GEMM -> SwiGLU ->
+// quantize -> GEMM chain than fso's 128 x 80 (20.4 against 19.2 us, two traced runs) although it is 1 us faster in a
+// graph of back-to-back GEMMs, and at M = 256 the block is level within noise.
+// Two decode-band classes are taken as well (the serving buckets M = 32-192 weigh most, stone 2026-10-12):
+//   - every DeepGEMM pick at 128 < M < 256 except its 80-wide tiles. There fp8_gemm_kernel's pick is a 128-row tile
+//     whose second M block is only partly filled, and it runs far slower than at M = 256 with the same tiles: at
+//     M = 160 the MLP block's gate_up takes 38.6 us and its down 36.0 us against 28.0 and 19.7 us at M = 256.
+//     DeepGEMM's picks there (128 x 160 with multicast on B for gate_up; 64 x 32 to 64 x 144 and 128 x 144 to 128 x
+//     192 for the others) take every dense family GEMM to 0.53-0.87 of its time at M = 144-192 and the Family A block
+//     from 81.5 to 55.4 us at M = 160 and from 72.3 to 51.9 us at M = 192. At M = 208-240 DeepGEMM picks 80-wide
+//     tiles for the narrow outputs (64 x 80, 128 x 80), which are 8-14 % slower than fso's pick there (its kernel is
+//     weak at 80-wide tiles, H1), so those keep fp8_gemm_kernel;
+//   - DeepGEMM's 64-row tiles at M <= 128 when K >= 8192 and M fills whole 64-row blocks. Each CTA then owns one
+//     output tile and streams at least 64 k-blocks; fp8_gemm_kernel restarts its stage ring per round and caps a tile
+//     whose width does not divide 128 at 6 stages, where v2 keeps up to 16 in flight. In the MLP block (the down
+//     projection, K = 9728) 64 x 48 with 15 stages takes 14.9 us against fp8_gemm_kernel's 16.2 us at M = 128 (the
+//     block 3.8 % less), and 64 x 32 with 16 stages gains 0.3 us at M = 64. With a partly filled last 64-row block
+//     (M = 96) it is 0.4 us slower than fp8_gemm_kernel, and at K = 2048-4096 the same tiles gain nothing or lose
+//     (1.0-1.06 timed alone), so those keep fp8_gemm_kernel.
+// Every other v2 pick keeps fso's kernel: 256-row tiles narrower than 128 (256 x 112: 1.04-1.29), 256 x 128 without
+// multicast (one wave: 1.9-2.3), 128 x 144 (mixed), the 64-row mid-band tiles (1.03-1.22 on most cells) and the
+// 16- and 32-row small-M tiles, where fso's swap-AB kernel is faster.
+inline bool use_dg2_dense(Dg2DenseConfig const& dg2, uint32_t shape_m, uint32_t shape_k)
+{
+    if (shape_m > 128 && shape_m < 256)
+        return dg2.block_n != 80;
+    if (shape_m < 512)
+        return dg2.block_m == 64 && shape_m % 64 == 0 && shape_m <= 128 && shape_k >= 8192 && dg2.block_n >= 32;
+    if (dg2.block_m == 256)
+        return dg2.block_n == 128 && dg2.cluster_size() == 2 && dg2.multicast_on_a();
+    if (dg2.block_m == 128)
+        return dg2.block_n == 160 || dg2.block_n == 192;
+    return false;
 }
 } // namespace deep_gemm::jit

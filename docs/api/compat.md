@@ -1,7 +1,8 @@
 # `fish_scales_ops.compat` — the explicit ops and the MoE per-step pieces
 
 `fso.compat` keeps, under the names existing callers use, the eleven explicit
-dense ops and the thirty-four MoE per-step pieces. New code uses the two stable
+dense ops and the thirty-nine MoE per-step pieces (thirty-four since 0.2.0, five
+since 0.2.1 for the compact activation layout). New code uses the two stable
 entries instead. Each runs the architecture dispatch inside one torch custom op
 and never hands the caller a scale layout: `fso.dense` for a dense linear
 ([`dense.md`](dense.md)) and `fso.moe` for an MoE layer ([`moe.md`](moe.md)).
@@ -19,9 +20,10 @@ What this namespace promises:
 Before fish-scales-ops 0.2.0 these names were exported from `fso.gemm`.
 `fso.gemm.<name>` still resolves to the same object as `fso.compat.<name>` and
 raises one `DeprecationWarning` per name per process, naming the new home;
-fish-scales-ops 0.3.0 removes `fso.gemm`. The implementation modules stay where
-they were (`python/fish_scales_ops/gemm/{fp8,mxfp8,bf16}.py`), and importing them
-by their module path raises no warning.
+fish-scales-ops 0.3.0 removes `fso.gemm`. The five names added in 0.2.1 never
+lived there and are reachable through `fso.compat` only. The implementation modules
+stay where they were (`python/fish_scales_ops/gemm/{fp8,mxfp8,bf16}.py`), and
+importing them by their module path raises no warning.
 
 This file also holds the reference sections that every GEMM and MoE op shares,
 `fso.dense` and `fso.moe` included: the constraints, the generated `torch.ops`
@@ -176,6 +178,7 @@ opaque scale byte layout differs (see the two `grouped MXFP8 … scales` rows in
 | unified entry (sm_120/121) | `moe_layer_mxfp8_sm120(hidden, w13_fp8, sw13, w2_fp8, sw2, topk_ids, topk_w, *, bias=None, bias_scale=None, out=None, join=None, w13_interleaved=False, fused_combine=False)` | bf16 `[M, HIDDEN]`, per-expert fp8 weights with their opaque int32 scales, int32 or int64 `[M, topk]`, fp32 `[M, topk]` → bf16 `[M, HIDDEN]`; runs the six kernels below with every host-side decision taken from the argument shapes, so one call captures per graph bucket. `bias` / `bias_scale` are `moe_combine`'s; `out` is a caller-owned bf16 `[M, HIDDEN]` destination, returned when given; `join` is an internal hook of the block entry. See *the composed sm_120 layer* below for the expert-parallel id contract, the `m_cap` rule and the memory a caller reserves |
 | memory to reserve (sm_100/103, sm_120/121) | `moe_layer_transient_bytes_mxfp8(tokens, num_experts, topk, hidden, inter, *, w13_interleaved, fused_combine=False)` (`w13_interleaved` is required) | the exact device bytes one masked-slab layer call allocates for a bucket of `tokens` rows on this device; `fso.moe.transient_bytes` calls it for an `"mxfp8"` handle |
 | routing | `moe_build_routing(topk_ids, num_groups, m_cap, *, with_slots=False, problem_shapes_for=None, topk_w=None)` | int32 `[M, topk]` → (`masked_m [G]`, `row_map [G*m_cap]`, `slot_of_flat [M*topk]`), plus `slot_to_expert [G]` when `with_slots=True`, plus a list of int32 `[G, 3]` per-group `(rows, N, K)` tensors, one per `(N, K)` pair in `problem_shapes_for` (at most four), plus `weight_of_slot` fp32 `[G*m_cap]` (each valid slot's combine weight, what the sm_120 fused-combine FC2 reads) when `topk_w` is given, in that order; `topk_w` and `problem_shapes_for` are mutually exclusive; `G <= 1024`, `m_cap % 4 == 0`, `m_cap >= M`. An entry of `topk_ids` outside [0, `num_groups`) is skipped: no group counts it, it takes no slab row, and its `slot_of_flat` entry is −1, which the gather-quantize, the SwiGLU requantize and the combine all read as "no routed row". Ask for `with_slots` only when `mxfp8_grouped_slot_possible(…)` says a GEMM of this layer's shape would take the sm_100/103 slot route, which is the list's only reader, and for `problem_shapes_for` only the pairs for which `mxfp8_grouped_problem_shapes_consumed(…)` answers `True` (see *the slot-bound decode route* and *routing-supplied problem shapes* below) |
+| routing, compact layout (0.2.1) | `moe_build_routing_compact(topk_ids, num_groups, num_blocks=None, *, with_slots=False, with_row_map=False, topk_w=None, problem_shapes_for=None, ptr_bases=None, ptr_strides=None, with_tiles=False)` | int32 `[M, topk]` → (`masked_m [G]`, `blk0 [G+1]`, `slot_of_flat [M*topk]`, `slot_to_expert [G or 0]`, `problem_shapes [P, G, 3]`, `ptr_arrays [P or 0, 3, G]` int64, `row_map [num_blocks*128 or 0]`, `weight_of_slot [num_blocks*128 or 0]` fp32, `slot_sched [2 or 0]`, `slot_tiles [T+1 or 0]`), always all ten. Expert `g` owns the `ceil(masked_m[g] / 128)` 128-row blocks from block `blk0[g]` (`blk0[G]` = blocks in use); its routed rows are `blk0[g]*128 + r`, `r < masked_m[g]`, in no particular order, and `slot_of_flat` holds each pair's row (−1 for an id outside [0, `num_groups`), skipped as in `moe_build_routing`). `num_blocks` defaults to `max(1, (M*topk + 127*min(G, M*topk)) // 128)`, the bound that holds for any routing, and a smaller value is refused. `problem_shapes` holds `(masked_m[g], N, K)` per `(N, K)` pair (not clamped); with `ptr_bases` (three tensors per pair: A data, A scales, D data; only `data_ptr()` is read) and `ptr_strides` (A bytes per row, A-scale bytes per 128-row block, D bytes per row) `ptr_arrays[p]` holds each expert's A, A-scale and D address at its first block. `row_map` (row → token) and `weight_of_slot` (row → the pair's weight, with `topk_w`) are written at live rows only. `slot_sched` (with `with_slots`) is the sm_100/103 compact slot route's work-stealing counter, zeroed: the compact GEMMs that land on the slot route take their tiles from it and leave it zero, so the slot GEMMs of one call share it in stream order; pass it to them as `slot_sched`. `slot_tiles` (with `with_tiles`, which needs `with_slots` and `num_blocks <= 8192`) is the sm_100/103 compact slot route's packed list of live 64-row token tiles, which the compact GEMMs read on the slot route past a row capacity of 64: `T = max(1, (M*topk + 63*min(G, M*topk)) // 64)` entries, the first `count` of them the token tiles in ascending expert order (the k-th tile of expert `g`, its rows `64k` to `64k + 63`, packed as `(2*blk0[g] + k) | g << 14 | (r - 1) << 24` with `r = min(64, masked_m[g] - 64k)`), the rest −1, and entry `T` the count; pass it to them as `slot_tiles`. A call that asks for pointer arrays or for `slot_tiles` never takes the decode launch shape (up to 128 routed pairs). The slot-addressed glue (`quantize_1x32_grouped_gather_fp8`, `silu_chunk_mul_quantize_1x32_grouped_fp8`, `moe_combine`) runs on the compact buffer with `num_groups = 1` and `m_cap = num_blocks * 128`. One launch, no persistent device memory, any number of graph captures |
 | gather + quantize | `quantize_1x32_grouped_gather_fp8(x, slot_of_flat, topk, num_groups, m_cap)` | bf16 `[M, K]` → (fp8 `[G, m_cap, K]`, int32 `[G, K/128, m_cap]`) |
 | gate_up | `linear_mxfp8_grouped_masked(a_fp8, w_fp8, sa, sw, masked_m, expected_m, max_active_groups=0, slot_to_expert=None, problem_shapes=None)` with the gathered activation as `a_fp8, sa` and the FC1 weights `w13` as `w_fp8, sw` | → bf16 `[G, m_cap, 2*INTER]` |
 | SwiGLU + quantize | `silu_chunk_mul_quantize_1x32_grouped_fp8(gu, slot_of_flat, pairwise=False)` | → (fp8 `[G, m_cap, INTER]`, int32 `[G, INTER/128, m_cap]`); `pairwise=True` reads gate/up-interleaved rows (*the fused FC1* below) |
@@ -485,9 +488,11 @@ epilogue.
 Ask for the list only where it will be read. `with_slots=True` makes the
 routing kernel compact the per-expert histogram it already holds into that
 list, and this route is the only consumer, so
-`mxfp8_grouped_slot_possible(m_cap, n_w, k, num_groups, max_active_groups=0, fused_swiglu=False)`
+`mxfp8_grouped_slot_possible(m_cap, n_w, k, num_groups, max_active_groups=0, fused_swiglu=False, compact=False)`
 answers — from the dispatcher's own route rule, under the same
-`FSO_GROUPED_SLOT` setting — whether a GEMM of that shape would take it; a
+`FSO_GROUPED_SLOT` setting — whether a GEMM of that shape would take it
+(`compact=True` asks for the compact-layout ops, which have their own rule; see
+*Compact activation layout* below); a
 layer passes `with_slots=` the disjunction of the query over its two GEMMs and
 so pays for the list on the decode band only. Passing the list where the answer
 is `False` is wasteful but never wrong, and withholding it where the answer is
@@ -509,11 +514,11 @@ arena, then reused by every call that presents the same addresses and shapes;
 the key is compared on the host, and nothing reads device memory to decide.
 Both ops take the argument; a layer asks
 `mxfp8_grouped_problem_shapes_consumed(m_cap, n_w, k, num_groups,
-max_active_groups=0, fused_swiglu=False)` per GEMM — the complement of
+max_active_groups=0, fused_swiglu=False, compact=False)` per GEMM — the complement of
 `mxfp8_grouped_slot_possible`, from the same route rule — and requests the
 shapes for the GEMMs that consume them, which is what the benches and the
 layer test do. The two queries are complements only when both are asked with
-the same `fused_swiglu` flag, because the fused-SwiGLU FC1 leaves the slot
+the same `fused_swiglu` flag (and the same `compact` flag), because the fused-SwiGLU FC1 leaves the slot
 route one step earlier than the plain grouped GEMM (see *the slot-bound
 decode route* above): a layer asks both for its FC1 with the flag set to
 whether it will call the fused op, and for its FC2 with it clear, and then
@@ -566,9 +571,11 @@ live tile assigned to a CTA whose first tile happens to be dead.
 Two things a caller must know. First, the route is only taken when
 `max_active_groups` is supplied; with the default `0` the call always goes to
 the pointer-array kernel, so existing callers are unaffected. Second, the route
-is correct only while the whole row capacity fits one token tile
-(`m_cap <= 64`); the dispatcher enforces that as a hard check and the op raises
-rather than running the kernel outside it. `FSO_GROUPED_SLOT` switches the
+of the masked ops is correct only while the whole row capacity fits one token
+tile (`m_cap <= 64`); the dispatcher enforces that as a hard check and the op
+raises rather than running the kernel outside it (the compact ops' slot kernel
+has no such bound: past one token tile it walks the live token-tile list, see
+*the compact route rule* below). `FSO_GROUPED_SLOT` switches the
 route: `0` never takes it, unset or `1` applies the dispatcher's rule, `force`
 takes it whenever it is legal and raises when it is not, and `force@<N>` forces
 it only for the GEMM whose `N` it names and sends every other shape to the
@@ -613,6 +620,8 @@ route up to `M = 32` and `down` up to `M = 64`, and for Qwen3.5-35B-A3B
 (`G = 256`, top-8, `N = 1024` and `2048`) the fused FC1 takes it up to `M = 32`
 while `down` stops at `M = 16`. Ask `mxfp8_grouped_slot_possible` with
 `fused_swiglu=True` for the FC1 that will run the fused op, as the benches do.
+This is the rule of the masked ops; the compact-layout ops have their own (see
+*Compact activation layout* below).
 
 **sm_100/103 — the fused FC1.** On the pointer-array route the first grouped
 GEMM can also do the SwiGLU and the MXFP8 requantize in its own epilogue, which
@@ -625,7 +634,7 @@ removes both the bf16 `[G, m_cap, 2*INTER]` intermediate and the separate
 | weights (offline) | `quantize_moe_weights_1x32_fp8(w13, w13_interleave=True)` | as above, with the FC1 rows re-ordered |
 | weights (already quantized) | `interleave_w13_fp8(w13_fp8, sw13)` | → the same bytes in the interleaved row order |
 | load-time router | `mxfp8_grouped_swiglu_available(n_w, k)` | → bool: can this shape use the fused FC1 at all? |
-| per-call router | `mxfp8_grouped_swiglu_fused_route(m_cap, n_w, k, num_groups, max_active_groups=0)` | → bool: does this call take it? |
+| per-call router | `mxfp8_grouped_swiglu_fused_route(m_cap, n_w, k, num_groups, max_active_groups=0, compact=False)` | → bool: does this call take it? (`compact=True` for `linear_mxfp8_grouped_compact_swiglu`) |
 
 **`linear_mxfp8_grouped_masked_swiglu` requires the FC1 weight rows to be
 gate/up interleaved — row `2j` is `gate_j`, row `2j+1` is `up_j`, not the usual
@@ -658,7 +667,8 @@ Two decisions, both host-static, both taken by the library so a caller never
 restates the rule. `mxfp8_grouped_swiglu_available(n_w, k)` is the load-time
 one: a model holds one weight layout, so it decides how `w13` is quantized.
 `mxfp8_grouped_swiglu_fused_route(m_cap, n_w, k, num_groups,
-max_active_groups=0)` is the per-call one. On sm_100/103 both grouped routes
+max_active_groups=0, compact=False)` is the per-call one (asked with `compact=True`
+for the compact layout's fused op). On sm_100/103 both grouped routes
 carry a fused FC1, so with the knob unset it answers yes on both sides of the
 route boundary; what it really decides, through the same `slot_route` the
 unfused FC1 asks, is WHICH fused kernel the call lands on. On sm_120/121, which
@@ -694,6 +704,103 @@ fused FC1. The cap exists because a wide BF16 direct store stops being cheap
 once the rows pile up; the fused store writes about a quarter of those bytes,
 so the wave arithmetic is allowed to decide at every `expected_m`.
 
+**Compact activation layout (MXFP8, 0.2.1; sm_100/103 and sm_120/121).** The masked slab gives every expert
+`m_cap` rows of every activation-side tensor, so it grows with
+`num_experts * M`. The compact layout packs the routed rows into **one group of
+`R = 128 * B` rows made of 128-row blocks**: expert `g` owns the blocks from
+`blk0[g]` on (`blk0` int32 `[G + 1]`, the exclusive prefix of
+`ceil(masked_m[g] / 128)`), so its rows are `[blk0[g] * 128, blk0[g] * 128 +
+masked_m[g])`. A compact row index is exactly the slot of a masked slab with one
+group of `m_cap = R` rows, so the gather-quantize, the SwiGLU requantize and
+`moe_combine` run on it unchanged with `num_groups = 1`, `m_cap = R` and a
+`slot_of_flat` that holds compact rows (`moe_combine` reads the down output as
+`dn.view(1, R, HIDDEN)`). Only the GEMMs see two index spaces: the weights by
+expert, the activations by compact row. Every op of this layout writes into
+buffers the caller allocated, and none writes a row no routed pair owns (every
+store of the GEMMs is bounded by `masked_m[g]`). The GEMMs take the masked
+layout's host-static hints unchanged (`m_cap = align(M, 4)`, `expected_m`,
+`max_active_groups`), so wherever both take the pointer-array route a compact
+call runs the tile the masked call of the same shape runs, and its live rows are
+bit-identical to the masked call's on either route. On sm_100/103 the compact
+ops have their own slot-route rule (below).
+A caller sizes `B` from the host-static bound
+`B_max = max(1, (M * topk + 127 * min(G, M * topk)) // 128)` plus one block of
+slack (`R = 128 * (B_max + 1)`).
+
+| step | function | in → out (sm_120/121 scale shapes; on sm_100/103 each scale tensor is the one-group atom slab of `R` rows) |
+|---|---|---|
+| gather + quantize | `quantize_1x32_grouped_gather_out_fp8(x, slot_of_flat, topk, num_groups, m_cap, x_q, packed)` | bf16 `[M, K]` → the caller's fp8 `x_q` (`num_groups * m_cap * K` elements) and int32 `packed` (`[num_groups, K/128, m_cap]`; sm_100/103 the atom slab); the compact layout passes `num_groups=1, m_cap=R`. Writes exactly the bytes `quantize_1x32_grouped_gather_fp8` returns, at the routed rows only |
+| gate_up | `linear_mxfp8_grouped_compact(a_fp8, w_fp8, sa, sw, masked_m, blk0, m_cap, expected_m, max_active_groups, slot_to_expert=None, problem_shapes=None, ptr_arrays=None, *, d, slot_sched=None, slot_tiles=None)` | fp8 `[R, K]` + int32 `[1, K/128, R]` × the FC1 weights → the caller's bf16 `d` `[R, 2*INTER]` at the live rows; the five optional tensors are the sm_100/103 routes' and are refused on sm_120/121. `slot_sched` is `moe_build_routing_compact`'s zeroed work-stealing counter (int32, ≥ 2 entries, zero on entry, left zero, never shared by two calls running at the same time); a call that lands on the slot route without it takes a zeroed one from the caching allocator (one fill kernel). `slot_tiles` is `moe_build_routing_compact`'s packed live token-tile list (`with_tiles=True`; at most `2 * R / 128` entries plus the count), read only on the slot route with `m_cap > 64`; such a call without it builds the list itself from `masked_m` and `blk0` (a `2 * R / 128 + 1`-entry tensor from the caching allocator and one small kernel) |
+| SwiGLU + quantize | `silu_chunk_mul_quantize_1x32_grouped_out_fp8(gu, slot_of_flat, dq, sd, pairwise=False)` | bf16 `[R, 2*INTER]` (or a masked `[G, m_cap, 2*INTER]`) → the caller's fp8 `dq` `[R, INTER]` and int32 `sd` `[1, INTER/128, R]`; writes exactly the bytes `silu_chunk_mul_quantize_1x32_grouped_fp8` returns |
+| gate_up + SwiGLU + quantize | `linear_mxfp8_grouped_compact_swiglu(a_fp8, w13_fp8, sa, sw13, masked_m, blk0, m_cap, expected_m, max_active_groups, slot_to_expert=None, problem_shapes=None, ptr_arrays=None, *, dq, sd, slot_sched=None, slot_tiles=None)` | → the caller's fp8 `dq` `[R, INTER]` and int32 `sd` `[1, INTER/128, R]`; INTERLEAVED FC1 weight rows, as for `linear_mxfp8_grouped_masked_swiglu` |
+| down | `linear_mxfp8_grouped_compact(...)` with `dq, sd` and the FC2 weights | → the caller's bf16 `d` `[R, HIDDEN]`, which `moe_combine(d.view(1, R, HIDDEN), slot_of_flat, topk_w, ...)` reads |
+| down + combine, fused (sm_120/121) | `linear_mxfp8_grouped_compact_combine(a_fp8, w2_fp8, sa, sw2, masked_m, blk0, row_map, weight_of_slot, m_cap, expected_m, max_active_groups, out)` | adds each live row, scaled by `weight_of_slot[row]`, into `out[row_map[row]]` (both indexed by compact row, at least `R - 128` entries); `out` is pre-filled, and the result is not bit-reproducible run to run, as for `linear_mxfp8_grouped_masked_combine` |
+
+The torch ops behind these wrappers (`quantize_1x32_grouped_gather_out`,
+`silu_chunk_mul_quantize_1x32_grouped_out`, `linear_mxfp8_grouped_compact`,
+`linear_mxfp8_grouped_compact_swiglu`, `linear_mxfp8_grouped_compact_combine`)
+return nothing; their schemas are listed under *Lower-level interface* below.
+
+On sm_100/103 (the CUTLASS slot and pointer-array routes): `slot_to_expert` is the packed active-expert list (the slot route reads it).
+`problem_shapes` (int32 `[G, 3]`, `(masked_m[g], N, K)`) and `ptr_arrays` (int64
+`[3, G]`: the address of the expert's first activation row, of its first scale
+atom and of its first output row) are the routing op's per-call arrays for this
+GEMM; give both or neither. With them the pointer-array route launches nothing but
+the GEMM. The rest of its argument arrays (the weight pointers, the strides and
+both scale-factor layouts) are a function of the weights and `(G, N, K)` alone and
+are built once per weight set into a per-thread block, so a serving process holds
+two blocks per layer whatever the number of graph captures, and a capture never
+aborts for lack of space. The activation scale layout of those blocks carries a
+constant row extent of 2^20 rows, so `R` must be at most 2^20 and `K` below 65536;
+the op checks both.
+
+The compact route rule (sm_100/103). The compact slot kernel draws its tiles
+from a work-stealing counter over the live tiles and bounds its stores by each
+expert's routed rows, and past a row capacity of 64 it walks the routing op's
+packed list of live 64-row token tiles (`slot_tiles`), so an expert that spans
+several token tiles and several 128-row blocks runs on it too, bit-identical to
+the pointer-array route. The masked rule's two clauses (the fused-SwiGLU slot
+kernel only up to `m_cap = 32`, and the live tiles at most fourteen waves) were
+re-measured for it at the layer level, each GEMM forced onto the slot route on
+its own against both on the pointer-array route. Every measured cell was faster
+on the slot route — the plain FC1, the fused FC1 and the FC2 of Qwen3-30B-A3B and
+Qwen3.5-35B-A3B at every `M` measured from 16 to 512 (below that the masked rule
+already takes the slot route). Past `M = 512` both GEMMs forced onto the slot
+route against the pointer-array route showed one crossover, at the same place in
+both models: the slot route is faster while an expert holds at most one 64-row
+token tile on average, `expected_m = max(1, ceil(M * topk / G)) <= 64`, and slower
+from 96 rows per expert on, under uniform and skewed routing alike. So the compact
+rule takes the slot route wherever it is legal (a slot bound) while
+`expected_m <= 64` — the `expected_m` the compact ops receive — and the live tile
+space `max_active_groups * ceil(N / 128)` is at most 28 waves of the device's SMs,
+for all three kernels alike. The 28 waves are the edge of the measurement
+(Qwen3.5-35B-A3B `down`, 4096 tiles on 148 SMs), not a crossover; a larger tile
+space stays on the pointer-array kernel. For Qwen3.5-35B-A3B (G = 256, top-8) that
+means the slot route through `M = 2048`, for Qwen3-30B-A3B (G = 128) through
+`M = 1024`, and the pointer-array kernel above. Ask the route queries with
+`compact=True` and `expected_m=` (`mxfp8_grouped_slot_possible`,
+`mxfp8_grouped_problem_shapes_consumed`, `mxfp8_grouped_swiglu_fused_route`) when
+composing these ops, as `fso.moe.layer` does: without `compact` they answer for
+the masked ops, and without `expected_m` (0, unknown) they answer with the compact
+rule's previous bound, `m_cap <= 512`, which is then not necessarily the route the
+compact op takes (the op always has its `expected_m`; a caller that withholds the
+slot list or the token-tile list where the op takes the slot route gets correct
+results at the cost of the op's own preparation kernels). A caller composing them asks
+`moe_build_routing_compact` for `with_tiles=True` where a GEMM lands on the slot
+route with `m_cap > 64`, and passes `slot_tiles` to both GEMMs. `FSO_GROUPED_SLOT`
+steers both rules alike; `force` takes the compact slot route at any row capacity
+(the masked ops still refuse it past `m_cap = 64`).
+
+Stores stay inside each expert's rows: both routes write the routed rows only
+(the slot route bounds its stores by each expert's routed row count). The slot
+route hands out its tiles from a per-call work-stealing counter over the live
+tiles (`slot_sched`, see `moe_build_routing_compact`); a call that lands on it
+without one takes a zeroed counter from the caching allocator. A 256-row tile (the 2-SM codes of
+`FSO_FORCE_TILE` and the two-CTA cluster code 11) reads the activation scale atoms
+of one 128-row block past the last expert's region, so the caller allocates the
+activation scale tensor with one block of slack: `B_alloc = B_max + 1` with
+`B_max = (M*topk + 127*min(G, M*topk)) // 128`.
+
 **sm_90 — expert-sorted contiguous layout (block-FP8).** The `M * topk` routed
 pairs are sorted by expert into one compact list, each expert's run padded to
 the GEMM block size, so the scheduler enumerates active padded blocks rather
@@ -717,7 +824,6 @@ The sm_90 masked-layout variant (`linear_fp8_grouped_masked`,
 `moe_combine`) is still public; the unified layer entry uses the contiguous
 layout. `moe_build_routing`, `moe_build_sorted`, `moe_combine` and
 `moe_combine_sorted` are arch-agnostic glue kernels.
-
 ## Constraints
 
 - `K % 128 == 0` for every op on every arch. The former `K % 512` requirement
@@ -842,13 +948,19 @@ linear_mxfp8_grouped_masked(Tensor a_fp8, Tensor w_fp8, Tensor sa_int32, Tensor 
 quantize_1x32_grouped_gather(Tensor x, Tensor slot_of_flat, int topk, int num_groups, int m_cap, bool use_ue8m0=True) -> (Tensor, Tensor)
 silu_chunk_mul_quantize_1x32_grouped(Tensor gu, Tensor slot_of_flat, bool use_ue8m0=True, bool pairwise=False) -> (Tensor, Tensor)
 linear_mxfp8_grouped_masked_swiglu(Tensor a_fp8, Tensor w13_fp8, Tensor sa_int32, Tensor sw13_int32, Tensor masked_m, int expected_m, int max_active_groups=0, Tensor? slot_to_expert=None, Tensor? problem_shapes=None) -> (Tensor, Tensor)
-mxfp8_grouped_swiglu_fused_route(int m_cap, int n_w, int k, int num_groups, int max_active_groups) -> bool
+mxfp8_grouped_swiglu_fused_route(int m_cap, int n_w, int k, int num_groups, int max_active_groups, bool compact=False, int expected_m=0) -> bool
 mxfp8_grouped_swiglu_available(int n_w, int k) -> bool
-mxfp8_grouped_slot_possible(int m_cap, int n_w, int k, int num_groups, int max_active_groups, bool fused_swiglu=False) -> bool
-mxfp8_grouped_problem_shapes_consumed(int m_cap, int n_w, int k, int num_groups, int max_active_groups, bool fused_swiglu=False) -> bool
+mxfp8_grouped_slot_possible(int m_cap, int n_w, int k, int num_groups, int max_active_groups, bool fused_swiglu=False, bool compact=False, int expected_m=0) -> bool
+mxfp8_grouped_problem_shapes_consumed(int m_cap, int n_w, int k, int num_groups, int max_active_groups, bool fused_swiglu=False, bool compact=False, int expected_m=0) -> bool
 moe_build_routing(Tensor topk_ids, int num_groups, int m_cap, bool with_slots=False, int[] problem_shapes_nk=[], Tensor? topk_w=None) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)
+moe_build_routing_compact(Tensor topk_ids, int num_groups, int num_blocks, bool with_slots=False, bool with_row_map=False, Tensor? topk_w=None, int[] problem_shapes_nk=[], Tensor[]? ptr_bases=None, int[] ptr_strides=[], bool with_tiles=False) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)
 linear_mxfp8_grouped_masked_combine(Tensor a_fp8, Tensor w2_fp8, Tensor sa_int32, Tensor sw2_int32, Tensor masked_m, Tensor row_map, Tensor weight_of_slot, Tensor(a!) out, int expected_m, int max_active_groups=0) -> Tensor(a!)
 moe_combine(Tensor dn, Tensor slot_of_flat, Tensor topk_w, Tensor? bias=None, Tensor? bias_scale=None, Tensor? out=None) -> Tensor
+quantize_1x32_grouped_gather_out(Tensor x, Tensor slot_of_flat, int topk, int num_groups, int m_cap, bool use_ue8m0, Tensor(a!) x_q, Tensor(b!) packed) -> ()
+linear_mxfp8_grouped_compact(Tensor a, Tensor b, Tensor sa, Tensor sb, Tensor masked_m, Tensor blk0, int m_cap, int expected_m, int max_active_groups, Tensor? slot_to_expert, Tensor? problem_shapes, Tensor? ptr_arrays, Tensor(a!) d, Tensor(c!)? slot_sched=None, Tensor? slot_tiles=None) -> ()
+linear_mxfp8_grouped_compact_swiglu(Tensor a, Tensor b, Tensor sa, Tensor sb, Tensor masked_m, Tensor blk0, int m_cap, int expected_m, int max_active_groups, Tensor? slot_to_expert, Tensor? problem_shapes, Tensor? ptr_arrays, Tensor(a!) dq, Tensor(b!) sd, Tensor(c!)? slot_sched=None, Tensor? slot_tiles=None) -> ()
+linear_mxfp8_grouped_compact_combine(Tensor a, Tensor b, Tensor sa, Tensor sb, Tensor masked_m, Tensor blk0, Tensor row_map, Tensor weight_of_slot, int m_cap, int expected_m, int max_active_groups, Tensor(a!) out) -> ()
+silu_chunk_mul_quantize_1x32_grouped_out(Tensor gu, Tensor slot_of_flat, bool use_ue8m0, bool pairwise, Tensor(a!) dq, Tensor(b!) sd) -> ()
 moe_topk_from_logits(Tensor logits, int topk, bool renormalize=True, bool with_shared_gate=False, Tensor? num_token_non_padded=None, Tensor? expert_map=None) -> (Tensor, Tensor, Tensor)
 moe_build_sorted(Tensor topk_ids, int num_groups, int block_m) -> (Tensor, Tensor, Tensor)
 moe_combine_sorted(Tensor dn, Tensor flat_to_sorted, Tensor topk_w) -> Tensor
@@ -860,13 +972,13 @@ MoE: the sm_90 block-FP8 grouped GEMMs and quantizers, and the compiler query of
 linear_fp8_grouped_masked(Tensor a_fp8, Tensor w_fp8, Tensor sa, Tensor sw, Tensor masked_m, int expected_m) -> Tensor
 quantize_1x128_grouped_gather_sm90(Tensor x, Tensor slot_of_flat, int topk, int num_groups, int m_cap) -> (Tensor, Tensor)
 silu_chunk_mul_quantize_1x128_grouped_sm90(Tensor gu, Tensor slot_of_flat) -> (Tensor, Tensor)
-linear_fp8_grouped_contiguous(Tensor a_fp8, Tensor w_fp8, Tensor sa, Tensor sw, Tensor sorted_expert_ids, int block_m, int expected_m) -> Tensor
-linear_fp8_grouped_contiguous_swapab(Tensor a_fp8, Tensor w_fp8, Tensor sa, Tensor sw, Tensor sorted_expert_ids, int block_n, int expected_m) -> Tensor
+linear_fp8_grouped_contiguous(Tensor a_fp8, Tensor w_fp8, Tensor sa, Tensor sw, Tensor sorted_expert_ids, int block_m, int expected_m, Tensor(a!)? out=None) -> Tensor
+linear_fp8_grouped_contiguous_swapab(Tensor a_fp8, Tensor w_fp8, Tensor sa, Tensor sw, Tensor sorted_expert_ids, int block_n, int expected_m, Tensor(a!)? out=None) -> Tensor
 linear_fp8_grouped_contiguous_swapab_pair(Tensor a_fp8, Tensor w_fp8, Tensor sa, Tensor sw, Tensor sorted_expert_ids, int block_n, int expected_m) -> Tensor
 linear_fp8_grouped_contiguous_swapab_swiglu(Tensor a_fp8, Tensor w_fp8, Tensor sa, Tensor sw, Tensor sorted_expert_ids, int block_n, int expected_m) -> (Tensor, Tensor)
 linear_fp8_grouped_contiguous_2wg(Tensor a_fp8, Tensor w_fp8, Tensor sa, Tensor sw, Tensor sorted_expert_ids, int block_m, int expected_m) -> Tensor
 linear_fp8_grouped_contiguous_swiglu(Tensor a_fp8, Tensor w_fp8, Tensor sa, Tensor sw, Tensor sorted_expert_ids, int block_m, int expected_m) -> (Tensor, Tensor)
-quantize_1x128_sorted_gather_sm90(Tensor x, Tensor flat_to_sorted, int p_max, int topk) -> (Tensor, Tensor)
+quantize_1x128_sorted_gather_sm90(Tensor x, Tensor flat_to_sorted, int p_max, int topk, Tensor(a!)? x_q=None, Tensor(b!)? sa=None) -> (Tensor, Tensor)
 silu_chunk_mul_quantize_1x128_sorted_sm90(Tensor gu, Tensor flat_to_sorted) -> (Tensor, Tensor)
 jit_compiler_sm90() -> str
 ```
@@ -1028,12 +1140,13 @@ set them on purpose.
 
 | variable | scope | default | read | effect |
 |---|---|---|---|---|
-| `FSO_MOE_FUSED_COMBINE=1` | `fso.moe.layer` and `fso.moe.transient_bytes` on sm_120/121 | off | once (Python, at the first call of either) | on (the boolean rule above, e.g. `1`) allows the fused-combine FC2 for the buckets where `moe_layer_fused_combine_engages_sm120` takes it: those buckets neither allocate the bf16 `[G, m_cap, HIDDEN]` down-projection slab nor launch the combine kernel, and `transient_bytes` reports the smaller reservation. The FC2's atomic adds make those buckets not bit-reproducible run to run. Off (unset, empty or `0`) keeps the slab and the combine kernel at every token count, so every bucket is reproducible. This is the only way to enable the fused combine through `fso.moe.layer`; the `fso.compat` entries take `fused_combine=` per call instead. Other architectures ignore it ([`moe.md`](moe.md), *the fused combine*) |
+| `FSO_MOE_FUSED_COMBINE=1` | `fso.moe.layer` and `fso.moe.transient_bytes` on sm_120/121 | off | once (Python, at the first call of either) | on (the boolean rule above, e.g. `1`) allows the fused-combine FC2 for the buckets where `moe_layer_fused_combine_engages_sm120` takes it: those buckets neither allocate the bf16 down-projection rows nor launch the combine kernel, and `transient_bytes` reports the smaller reservation. The FC2's atomic adds make those buckets not bit-reproducible run to run. Off (unset, empty or `0`) keeps the slab and the combine kernel at every token count, so every bucket is reproducible. This is the only way to enable the fused combine through `fso.moe.layer`; the `fso.compat` entries take `fused_combine=` per call instead. Other architectures ignore it ([`moe.md`](moe.md), *the fused combine*) |
+| `FSO_MOE_COMPACT=0` | `fso.moe.layer`, `moe_layer_mxfp8_sm120`, `moe_block_mxfp8_sm120` and `fso.moe.transient_bytes` on sm_100/103 and sm_120/121 | on (the compact layout) | once (Python, at the first call) | `0` (any value starting with `0`) runs the MXFP8 layer on 0.2.0's masked slab (every local expert gets `align(tokens, 4)` rows of every intermediate) instead of the compact layout (each expert's routed rows in whole 128-row blocks); `transient_bytes` sizes whichever layout runs. Both layouts give bit-identical outputs and run the same kernels per bucket; the slab exists as the A/B arm. Other architectures ignore it |
 | `FSO_FC1_FUSED={0,1}` | sm_100/103 and sm_120/121 grouped MoE FC1, and the FC1 row order `fso.moe.prepare_experts` chooses; on sm_90 the FC1 of `moe_layer_fp8_sm90` on every route | unset: the rule | once (inside the extension for sm_100/103 and sm_120/121, in Python for sm_90) | `0` never uses the fused FC1 (and `mxfp8_grouped_swiglu_available` then answers false, so a caller keeps the `[gate; up]` weight layout too), unset applies the router, `1` uses it wherever it is legal. On sm_90 the rule is the legality: every route, the swap-AB GEMMs at each activation tile and the non-swap path alike, runs the gate_up GEMM with the SwiGLU + 1x128 requantize in its epilogue whenever `2 * INTER % 256 == 0` and `HIDDEN % 128 == 0` (the weights stay `[gate; up]`), and `0` restores the GEMM + SwiGLU kernel pair on every route. A value whose first character is `0` means `0`; any other value means `1`. Set it before `fso.moe.prepare_experts` runs, because it decides the weight layout the handle holds; the handle records that layout in `w13_interleaved` and `fso.moe.layer` follows the record, so a handle is always served in the layout it was prepared with |
 | `FSO_MOE_BLOCK_OVERLAP=0` | `moe_block_mxfp8_sm120` (sm_120/121) | on (also when empty) | once (Python, at the first block call) | `0` (any value starting with `0`) runs the block's shared expert on the current stream, sequentially with the routed path, instead of on a side stream; the per-call `overlap_shared=` argument overrides it either way. The output is bit-identical in both modes. With the overlap on, the first block call of the process creates the side stream and has to be eager: a first call inside a capture raises `RuntimeError` naming this variable |
 | `FSO_DISABLE_DECODE_DSL=1` | sm_100/103 `linear_mxfp8`, and `linear_fp8` and `fso.dense.linear`, which run on it there | the decode row serves M ≤ 64 wherever the vendored kernels import, `nvidia-cutlass-dsl` ≥ 4.5.0 is installed and `FSO_DISABLE_DSL` is unset | once (at the first call that reaches the row) | skip the M ≤ 64 decode row and leave those cells to the tiers behind it. The row's eager launch path rebuilds descriptors and marshals its arguments in Python on every call (*Constraints*), which a captured caller does once, at capture; a caller that runs the op eagerly one token at a time can set this to keep the previous tiers. Boolean rule above: `1` disables the row, `0` leaves it on |
 | `FSO_STREAMK_POOL_MB=<n>` | sm_120/121 dense `linear_fp8`, `linear_mxfp8` and `fso.dense.linear` wherever the cascade splits K (Stream-K) | 64 MB, or the first Stream-K call's need when that is larger | once, at the first Stream-K launch of the process | size of the process-wide BF16 partial-sum scratch, allocated once and never grown, because a re-allocation would invalidate captured graphs. A later Stream-K call that needs more prints `StreamKPool capacity exhausted … Bump FSO_STREAMK_POOL_MB` and **aborts the process** (`std::abort`). Size it for the largest Stream-K shape the process will run, or make that shape's call the first one. A value that does not parse to a positive integer keeps the default |
-| `FSO_GROUPED_ARG_POOL_MB=<n>` | sm_100/103 grouped GEMMs called with `problem_shapes` (`fso.moe.layer` passes them) | 128 MB per host thread (at least 1) | once per process; each host thread allocates its own arena on its first eager grouped call | capacity of the per-thread static-array arena. Every distinct (capture, GEMM) pair pins one block of it for the life of the process (*routing-supplied problem shapes* under *MoE per-step pieces* above). A capture that finds the arena full **aborts the process** with a message naming the variable, and so does a thread's first such call when it is made inside a capture; an eager call that finds the arena full falls back to the per-launch preparation kernel and warns once |
+| `FSO_GROUPED_ARG_POOL_MB=<n>` | sm_100/103 grouped GEMMs called with `problem_shapes` (`fso.moe.layer` passes them) | 128 MB per host thread (at least 1) | once per process; each host thread allocates its own arena on its first eager grouped call | capacity of the per-thread static-array arena. Every distinct (capture, GEMM) pair pins one block of it for the life of the process (*routing-supplied problem shapes* under *MoE per-step pieces* above). A capture that finds the arena full **aborts the process** with a message naming the variable, and so does a thread's first such call when it is made inside a capture; an eager call that finds the arena full falls back to the per-launch preparation kernel and warns once. This describes the masked ops. The compact ops (`linear_mxfp8_grouped_compact{,_swiglu}`) keep their weight-keyed blocks in a separate per-thread arena that grows in chunks as needed (also inside a capture) and never aborts; for it the value is only the point past which blocks that no capture uses may be reused |
 | `FSO_JIT_INCLUDE_DIRS=a:b:c` | sm_90 (the deep_gemm NVRTC JIT) | a wheel: `_jit_include/` next to the extension, one include root with the deep_gemm, CUTLASS and CUDA 13.0.3 headers. An in-place build: the directories baked in at build time, which are the CUTLASS headers, the repository's deep_gemm headers and the build host's CUDA headers | once, at the first JIT compile | colon-separated include directories for the JIT, used in place of the default. Needed when an in-place build's source tree has moved. With `FSO_JIT_DEBUG=1` the choice is logged as `sm_90 JIT include directories (<origin>): <list>` |
 | `FSO_JIT_NVRTC_LIB=<path>` | sm_90 (the deep_gemm NVRTC JIT) | the NVRTC 13.0.88 bundled with the package (the version torch 2.13.0+cu130 ships): `_nvrtc/libnvrtc.so.13` next to the extension, which `scripts/build.sh` unpacks for an sm_90 build (`scripts/vendor_nvrtc.py`) | once, at the first JIT compile or the first `jit_compiler_sm90` call | the `libnvrtc.so` file the JIT compiles with, in place of the bundled one; a relative path is taken from the working directory. The extension does not link NVRTC: it loads this one library privately (`RTLD_LOCAL`), so the `libnvrtc.so.13` that torch loads, whose version depends on the torch build, compiles no sm_90 kernel unless this variable names that very file. Nothing else is tried either: when the library cannot be loaded, the first sm_90 GEMM raises `RuntimeError` naming the path, the loader's message and the remedy (run `python scripts/vendor_nvrtc.py`, or set this variable to a CUDA 13.0 `libnvrtc.so.13`). A build made with `FSO_SKIP_NVRTC_VENDOR=1` has no bundled copy and needs this variable. A library whose version is not 13.0 is used as given and prints one line on stderr, because the sm_90 kernels are validated and measured with NVRTC 13.0 and other NVRTC versions emit different code. `torch.ops.fish_scales_ops.jit_compiler_sm90()` returns the compiler in use (`NVRTC 13.0 (<path>)`, or `nvcc <path>` under `FSO_JIT_USE_NVCC`), and on sm_90 the last line of `fso.dense.describe()` and `fso.moe.describe()` repeats it |
 
@@ -1052,7 +1165,9 @@ or complete deployment, and the cascades already encode the measured picks.
 | `FSO_FORCE_SCHED_GROUP=<n>` | sm_120/121 MXFP8 dense, with `FSO_FORCE_TILE=16,…` | unset | once | persistent-scheduler swizzle group size |
 | `FSO_DISABLE_OVERRIDES=1` | sm_120/121 block-FP8 and MXFP8 dense cascades | off | once | skip the shape-specific single-launch overrides, cascade table only |
 | `FSO_DISABLE_STREAMK=1` | sm_120/121 dense, both formats | off | once | single launch everywhere; the Stream-K pool is then never allocated |
-| `FSO_DISABLE_PDL=1` | the MoE glue on every architecture (`moe_build_routing` in both builders, `moe_build_sorted`, `moe_combine`, `moe_combine_sorted`) and the router `moe_topk_from_logits`; the MXFP8 grouped gather-quantize and SwiGLU requantize (sm_100/103, sm_120/121); every sm_120/121 MXFP8 GEMM launch, dense and grouped; on sm_90 the dense chain, that is the 1×128 activation quantize with FP32 scales (`quantize_1x128_fp8(use_ue8m0=False)` and the quantize inside `linear_qx`, which `fso.dense.linear` runs) and the dense block-FP8 GEMM of `linear_fp8` / `linear_qx`; on sm_100/103 the dense parallel split-K reduce, the grouped argument-preparation kernel, the pointer-array grouped GEMM and the slot-route kernels | off: PDL on | once (each translation unit caches its own copy of the same variable) | drop the programmatic-dependent-launch attribute from those launches; the kernel-side waits become no-ops and the result is unchanged. Because the glue kernels are shared, an sm_90 A/B run that sets it changes the sm_90 layer's routing builder and combine too. The sm_120/121 block-FP8 GEMM always launches with PDL, and the sm_90 grouped (MoE) deep_gemm GEMMs never do; neither reads the variable. The glue and quantize kernels whose grid exceeds 4096 CTAs launch without PDL whatever the setting; the sm_90 dense quantize's grid is at most one wave of resident CTAs, so it always follows the setting. A value whose first character is `1` disables |
+| `FSO_DISABLE_PDL=1` | the MoE glue on every architecture (`moe_build_routing` in both builders, `moe_build_routing_compact`, `moe_build_sorted`, `moe_combine`, `moe_combine_sorted`) and the router `moe_topk_from_logits`; the sm_90 expert-sorted gather-quantize (`quantize_1x128_sorted_gather_sm90`, the activation quantize of the sm_90 layer); the MXFP8 grouped gather-quantize and SwiGLU requantize (sm_100/103, sm_120/121); every sm_120/121 MXFP8 GEMM launch, dense and grouped; on sm_90 the dense chain, that is the 1×128 activation quantize with FP32 scales (`quantize_1x128_fp8(use_ue8m0=False)` and the quantize inside `linear_qx`, which `fso.dense.linear` runs) and the dense block-FP8 GEMM of `linear_fp8` / `linear_qx`, and every grouped (MoE) block-FP8 GEMM (masked and expert-sorted, swap-AB and non-swap, with or without the fused SwiGLU epilogue); on sm_100/103 the dense parallel split-K reduce, the grouped argument-preparation kernel, the pointer-array grouped GEMM and the slot-route kernels | off: PDL on | once (each translation unit caches its own copy of the same variable) | drop the programmatic-dependent-launch attribute from those launches; the kernel-side waits become no-ops and the result is unchanged. Because the glue kernels are shared, an sm_90 A/B run that sets it changes the sm_90 layer's routing builder, gather-quantize and combine too. The sm_120/121 block-FP8 GEMM always launches with PDL and does not read the variable. Every one of these launches follows the setting at every size: the grids of the glue and quantize kernels are bounded at a fixed number of waves of resident CTAs (beyond that the kernels loop over their rows), so no launch queues an unbounded number of waiting CTAs. A value whose first character is `1` disables |
+| `FSO_ROUTING_COMPACT_PATH={small,cta,cluster2,…,cluster8}` | `moe_build_routing_compact` on every architecture | unset: the decode kernel up to 128 routed pairs (unless pointer arrays are asked for), one CTA up to 4096, one cluster of 8 CTAs above | once | force one launch shape at every pair count (the test suite uses it to run both shapes on the whole grid); the output is the same layout, with the rows inside an expert in a different order; any other value is ignored |
+| `FSO_ROUTING_COMPACT_THREADS=<n>` | `moe_build_routing_compact`, the cta and cluster shapes | unset: about two pairs per thread, at least one thread per expert, at most 1024 | once | force the CTA width (a multiple of 32, 32–1024; never below one thread per expert) |
 | `FSO_MOE_ROUTING_MULTI={0,1}` | `moe_build_routing` on every architecture | the multi-CTA builder on sm_100/103 and sm_120/121 once `M · topk ≥ 4096`, the single-CTA builder otherwise | once | `0`, or any value that does not parse to a nonzero integer, restores the single-CTA builder on every architecture; a nonzero integer selects the multi-CTA builder on every architecture, sm_90 included, from the same 4096-pair threshold. The two builders order the slots inside a group differently and give the same layer output (*the multi-CTA builder* under *MoE per-step pieces* above); the multi-CTA builder needs one eager call per host thread before a capture |
 | `FSO_MOE_SCATTER_WARP=0` | sm_120/121 fused-combine FC2 | the store warps | every call | `0` scatters the weighted rows from the math warps instead of from the store warp plus the spare fourth TMA warp. The default overlaps the atomic adds with the next tile's mainloop the way the TMA store it replaces does; the result is unchanged either way, and the measurements are in [`../perf/layer/sm120.md`](../perf/layer/sm120.md) |
 | `-DFSO_PROLOGUE_TRACE` (build-time; runtime `FSO_PROLOGUE_TRACE_PTR`) | sm_120/121 grouped MXFP8 GEMM | not compiled | once (only in a build with the macro) | compile-time-optional prologue trace, off by default and zero code when off (the production kernels are SASS-identical): with the macro defined, the kernel writes `%globaltimer` / `%clock64` stamps at every prologue boundary (descriptor prefetch, barrier init, staging, prefix scan, PDL wait, first tile, per-warp exit) for CTA 0 and the last CTA into a device buffer whose address the dispatcher reads from `FSO_PROLOGUE_TRACE_PTR`. Built into a separate tree copy for attribution runs, never into a production build; the result is unchanged either way |
@@ -1063,6 +1178,9 @@ or complete deployment, and the cascades already encode the measured picks.
 | `FSO_SWAPAB_SPLIT=0\|1` | sm_90 composed MoE layer, the fused swap-AB FC1 of the 16-row route | unset: the rule, which splits each 128-column SwiGLU block between the two CTAs of a cluster when 4 × (activation tiles) × (I / 128) ≤ SMs and the SM count is even, and otherwise gives each block to one CTA | every call | `1` forces the split kernel (on an even SM count), `0` the one-CTA kernel. Both run the whole K and give bit-identical results; only the launch shape changes. The rule picks the split kernel only when the one-CTA kernel would leave most SMs idle (on the H200, Family C at M = 1). A value whose first character is `0` means `0`; any other non-empty value means `1`. Not combined with `FSO_SWAPAB_CTAS_PER_SM=2`. Set it before the first call and keep it between a capture and its replays |
 | `FSO_SWAP_STAGES=<n>` | sm_90 swap-AB grouped GEMM | at least 6 stages (the picker's count when it is deeper), lowered until the shared memory fits | every call | pipeline depth, honoured for 1 to 12 and ignored otherwise. The value is applied before the CTA count is chosen. In the two-CTA build it is a cap: the dispatcher lowers it until two CTAs fit and the count divides `K / 128`, and falls back to one CTA when no count of 2 or more does. In the single-CTA build it is applied again and clamped to the shared-memory budget |
 | `FSO_SWAPAB_CTAS_PER_SM=1\|2` | sm_90 swap-AB grouped GEMM | 2 when the sorted layout can feed two CTAs per SM (`(p_max / block_n) × (N / block_m) > 2 × SMs`), 1 otherwise | every call | resident CTAs per SM, honoured for `1` and `2` and ignored otherwise. Two CTAs run the math warp-groups on 96 registers and double the grid; one is the single persistent CTA with 232 registers. A default or requested 2 still falls back to 1 when no stage count of 2 or more that divides `K / 128` lets two CTAs fit, and when the compiled two-CTA kernel does not use exactly 80 registers |
+| `FSO_SWAPAB_EVICT_FIRST=0\|1` | sm_90 swap-AB grouped GEMM (the FC1 and FC2 of the composed MoE layer's swap-AB routes, the FC2 of its non-swap route) | unset: the rule, which loads the weight boxes evict-first in L2 with the 16- and 32-row activation tiles (the swap-AB routes, at most 24 routed rows per active expert) and evict-normal with the 64-row tile (the non-swap route's FC2, whose experts' weights several tiles read) | every call | `1` loads the weight boxes evict-first, `0` evict-normal, for A/B runs; a value whose first character is `0` means `0`, any other non-empty value `1`. The result is bit-identical either way; only the L2 replacement priority of the streamed weights changes. Set it before the first call and keep it between a capture and its replays |
+| `FSO_SM90_DENSE_DG2=0`, `1` or `all` | sm_90 dense block-FP8 GEMM (`linear_fp8`, `linear_qx`, `fso.dense.linear`) on the non-swap-AB path (M >= 32) | `1` | once | which dense GEMMs run DeepGEMM v2's `sm90_fp8_gemm_1d2d` kernel (vendored with the JIT headers, `deep_gemm/impls/`) at DeepGEMM's own configuration instead of `fp8_gemm_kernel`: `1` the configurations the dispatcher takes it for (256 x 128 tiles with multicast on A and 128 x 160 / 128 x 192 tiles from M = 512 on, every DeepGEMM configuration but its 80-wide tiles at 128 < M < 256, 64-row tiles at M = 64 and 128 with K >= 8192), `0` none (the 0.2.1 kernel choice), `all` every DeepGEMM configuration (for sweeps). The two kernels produce bitwise identical outputs at every tile, so the setting changes speed only |
+| `FSO_SM90_DENSE_DG2_K=<K>` | with `FSO_SM90_DENSE_DG2=all` | unset: every `K` | once | apply `all` only to the dense GEMMs whose `K` equals the value; the others follow the default rule. Lets a sweep inside an MLP block move one projection at a time, like `FSO_FORCE_TILE_K` |
 | `FSO_JIT_EXTRA_FLAGS="-DFOO=1 ..."` | sm_90 | none | at each JIT compile of a kernel not yet built in the process | extra NVRTC flags appended to every deep_gemm JIT compile (developer A/B of kernel-side `#if` switches). They are part of the disk cache's content key (see `FSO_JIT_CACHE_DIR`), so a cubin built under other flags is never loaded in their place |
 | `FSO_JIT_DEBUG=1`, `FSO_JIT_DUMP_CUBIN=1`, `FSO_JIT_USE_NVCC=1`, `FSO_JIT_NVCC_COMPILER=<path>` | sm_90 | off; nvcc from `$CUDA_HOME/bin`, else from `PATH` | once (the three switches when the library loads, the compiler path at the first nvcc compile) | deep_gemm JIT diagnostics: verbose compile and cache log on stderr, which names the NVRTC library and its version once; also write every compiled cubin to the disk cache and load from it; compile with nvcc instead of the bundled NVRTC (no NVRTC is loaded then, and `FSO_JIT_NVRTC_LIB` is not read; its cubins always go through the disk cache); the nvcc to run (default `$CUDA_HOME/bin/nvcc`, else `nvcc` on `PATH`). The TensorRT-LLM names `TRTLLM_DG_JIT_DEBUG`, `TRTLLM_DG_JIT_DUMP_CUBIN`, `TRTLLM_DG_JIT_USE_NVCC` and `TRTLLM_DG_NVCC_COMPILER` are deprecated aliases, honoured until fish-scales-ops 0.3.0 removes them: each is read only when its `FSO_JIT_*` name is unset, and prints a one-time notice on stderr when it supplies the value. The three switches accept `1` or `true` |
 | `FSO_JIT_CACHE_DIR=<dir>` | sm_90 | `${XDG_CACHE_HOME:-$HOME/.cache}/fish_scales_ops/jit` | once, at the first disk-cache access | root of the deep_gemm JIT disk cache. By default every kernel is compiled once per process with NVRTC and kept in memory, and the JIT neither reads nor writes the disk; the disk cache is used only with `FSO_JIT_DUMP_CUBIN=1` or `FSO_JIT_USE_NVCC=1`. Its root defaults to `${XDG_CACHE_HOME:-$HOME/.cache}/fish_scales_ops/jit` (`%LOCALAPPDATA%\fish_scales_ops\jit` on Windows, `<temp dir>/fish_scales_ops/jit` without a home directory). The cache is keyed by content: a cubin lives in `<root>/cache/<key>_<kernel name>/`, where `<key>` is 16 hex digits of a hash over the generated kernel source, the complete flag list (`FSO_JIT_EXTRA_FLAGS` and the include directories among them), the compiler (the NVRTC version, or the nvcc path) and every file in the `deep_gemm/` header directory the build compiles against. A header edit, a flag change or a compiler change therefore builds a new cubin instead of loading an old one, and cubins without a key (TensorRT-LLM's DeepGEMM cache, dumps of older fish_scales_ops builds) are never read. `TRTLLM_DG_CACHE_DIR` is the deprecated alias, same rule as above |
@@ -1072,9 +1190,9 @@ or complete deployment, and the cascades already encode the measured picks.
 | `FSO_DSL_KERNEL_PATH=<file>` | sm_100/103 | a wheel: its copy of the CUTLASS CuTe-DSL example in `fish_scales_ops/_dsl/`. An in-place build: the example under `3rdparty/cutlass` in the source tree | once (at the DSL tier's first use) | alternative DSL kernel source for the mid-band tier (the decode row's kernels are vendored in-tree and not overridable). When the file (given here or at the default place) does not exist, or loading it raises, the tier is skipped and the first call that reaches it prints one `fso:` line on stderr naming the tier, the reason and this variable; `FSO_DISABLE_DSL=1` skips the tier without the line |
 | `FSO_FORCE_SWIZZLE=<n>`, `FSO_FORCE_RASTER={1,2}`, `FSO_SK_NDET=1`, `FSO_SK_DECOMP={1,2,3}` | sm_100/103 C++ dense cascade | unset | once | scheduler raster swizzle size, raster direction (along M / along N), nondeterministic Stream-K reduction, decomposition mode — probe knobs, never wired into the cascade |
 | `FSO_PRINT_TILE_INFO=1` | sm_100/103 dense and grouped cascades, the slot route and the decode row | off | once per dispatcher; the decode row prints once per distinct `(M, N, K)` | make every kernel instantiation print, once, the mainloop stage count `StageCountAutoCarveout` derived for it and its shared-memory footprint. That is the quantity that says whether a narrower `TileN` bought pipeline depth or only extra CTAs, and it is the only way to see a stage collapse (a tile whose epilogue eats the carve-out and leaves one mainloop stage) without guessing. The decode row prints the tactic it picked instead, and the sm_100/103 dense cascade prints a line each time its per-thread split-K workspace grows. Boolean rule above, in the C++ dispatchers and the decode row alike |
-| `FSO_GROUPED_SLOT={0,1,force,force@<N>}` | sm_100/103 grouped MoE decode route | the dispatcher's rule | once | `0` never takes the slot-bound swap-orientation route, unset or `1` applies the dispatcher's rule, `force` takes it wherever it is legal and raises where it is not, `force@<N>` forces it for the GEMM whose `N` it names only (see *the slot-bound decode route* under *MoE per-step pieces* above; the `force` forms are A/B knobs) |
-| `FSO_GATHER_QUANT_ONCE={0,1}` | sm_100/103 grouped MoE gather-quantize | the launcher's rule | once | `0` always quantizes per routed (token, expert) pair, unset applies the launcher's rule (the token-space form once its grid covers one full wave of SMs), `1` always quantizes each token once and scatters the bytes to its top-k destinations |
-| `FSO_GATHER_QUANT_TOPK_STATIC=0` | sm_100/103 grouped gather-quantize, token-scatter form | on | once | `0` forbids the compile-time top-k = 8 instantiation of the token-scatter kernel, so the runtime-top-k loop runs instead. A measurement knob that only changes which instantiation runs |
+| `FSO_GROUPED_SLOT={0,1,force,force@<N>}` | sm_100/103 grouped MoE decode route, masked and compact ops | the dispatcher's rule (the masked ops' and the compact ops' own) | once | `0` never takes the slot-bound swap-orientation route, unset or `1` applies the dispatcher's rule of the op's layout, `force` takes it wherever it is legal and raises where it is not, `force@<N>` forces it for the GEMM whose `N` it names only (see *the slot-bound decode route* under *MoE per-step pieces* above; the `force` forms are A/B knobs) |
+| `FSO_GATHER_QUANT_ONCE={0,1}` | sm_100/103 and sm_120/121 grouped MoE gather-quantize | the launcher's rule | once | `0` always quantizes per routed (token, expert) pair, unset applies the launcher's rule (the token-space form once its grid covers one full wave of SMs), `1` always quantizes each token once and scatters the bytes to its top-k destinations |
+| `FSO_GATHER_QUANT_TOPK_STATIC=0` | sm_100/103 and sm_120/121 grouped gather-quantize, token-scatter form | on | once | `0` forbids the compile-time top-k = 8 instantiation of the token-scatter kernel, so the runtime-top-k loop runs instead. A measurement knob that only changes which instantiation runs |
 | `FSO_CHECK_PROBLEM_SHAPES=1` | sm_100/103 grouped GEMMs with `problem_shapes` | off | every call | copy the caller's `[G, 3]` tensor to the host on every call and verify that its `N` and `K` are this GEMM's and that every row count lies in `[0, m_cap]`; read on every call (not cached), debugging only |
 | `FSO_BENCH_WARM_MS=<ms>` | benches only | 0 | once per bench process | spin the GPU before each cell's timing (needed on unlocked devices, see `../perf/README.md`, What is measured) |
 

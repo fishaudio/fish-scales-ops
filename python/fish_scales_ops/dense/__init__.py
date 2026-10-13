@@ -17,9 +17,11 @@ one code path and never names an architecture or a scale layout::
 ``format`` names what the caller holds. ``"bsfp8"`` is a float8_e4m3fn weight
 with fp32 128x128 block scales (value = fp8 * scale), or a bf16 weight that is
 quantized to block-FP8 at load time. ``"mxfp8"`` is a bf16 weight that is
-quantized to MXFP8 1x32 at load time, or a float8_e4m3fn weight together with
-the int32 MXFP8 scales that :func:`fish_scales_ops.compat.quantize_1x32_fp8`
-produces on this architecture.
+quantized to MXFP8 1x32 at load time, or a float8_e4m3fn weight with its MXFP8
+scales: either the uint8 UE8M0 bytes ``[N, K/32]`` an MXFP8 checkpoint stores (the
+same bytes on every architecture, packed here into this device's layout), or the
+int32 scales that :func:`fish_scales_ops.compat.quantize_1x32_fp8` produces on
+this architecture.
 
 sm_90 serves ``"bsfp8"`` as block-FP8: every call runs ``linear_qx``, which
 quantizes the activation to 1x128 inside the GEMM op. sm_90 has no MXFP8
@@ -42,7 +44,7 @@ import torch
 
 from .._arch import sm_major
 from ..gemm.fp8 import quantize_128x128_fp8
-from ..gemm.mxfp8 import linear_mxfp8, quantize_1x32_fp8
+from ..gemm.mxfp8 import _ue8m0_scale_handle, linear_mxfp8, quantize_1x32_fp8
 # One architecture probe and one parser of the ``arch`` argument, shared with fso.moe,
 # and the sm_90 JIT compiler line both describe() functions end with.
 from ..moe import _arch_label, _arch_major, _build_line, _device_arch, _sm90_jit_compiler_line
@@ -126,17 +128,19 @@ def describe() -> str:
             9: "not served: sm_90 has no MXFP8 hardware; serve a block-FP8 checkpoint or a bf16 "
                "weight with format 'bsfp8' instead",
             10: "served: a bf16 weight is quantized to MXFP8 1x32 at load time and an MXFP8 checkpoint "
-                "is kept as it is; every call runs the 1x32 activation quantize and the MXFP8 router",
+                "keeps its bytes, uint8 UE8M0 scales packed into the atom layout; every call runs the "
+                "1x32 activation quantize and the MXFP8 router",
             12: "served: a bf16 weight is quantized to MXFP8 1x32 at load time and an MXFP8 checkpoint "
-                "is kept as it is, its scale restored to the K-major layout the GEMM reads; every call "
-                "runs the 1x32 activation quantize and the CUTLASS MXFP8 cascade",
+                "keeps its bytes, its scale packed or restored to the K-major layout the GEMM reads; "
+                "every call runs the 1x32 activation quantize and the CUTLASS MXFP8 cascade",
         },
     }
     heads = {
         "bsfp8": "format 'bsfp8': a float8_e4m3fn weight with fp32 128x128 block scales, or a bf16 "
                  "weight quantized at load time",
         "mxfp8": "format 'mxfp8': a bf16 weight quantized to MXFP8 1x32 at load time, or a "
-                 "float8_e4m3fn weight with the int32 MXFP8 scales of quantize_1x32_fp8 on this "
+                 "float8_e4m3fn weight with uint8 UE8M0 scales [N, K/32] as an MXFP8 checkpoint "
+                 "stores them, or with the int32 MXFP8 scales of quantize_1x32_fp8 on this "
                  "architecture",
     }
     lines = [f"fish_scales_ops.dense: one dense linear for every architecture; this device is "
@@ -207,13 +211,13 @@ def _format_error(format, where: str) -> Exception:
             f"fso.dense.prepare_weight: format {format!r} is not served by fish_scales_ops on any "
             f"architecture, and {here}. A bf16 weight is quantized at load time with format='bsfp8' "
             f"or, on sm_100/sm_103 and sm_120/sm_121, format='mxfp8'; a block-FP8 checkpoint is "
-            f"format='bsfp8' and an MXFP8 checkpoint format='mxfp8'. Otherwise serve this weight "
-            f"with another GEMM.")
+            f"format='bsfp8' and an MXFP8 checkpoint (float8_e4m3fn with uint8 UE8M0 scales) "
+            f"format='mxfp8'. Otherwise serve this weight with another GEMM.")
     return ValueError(
         f"fso.dense.prepare_weight: unknown format {format!r} on {where}; the formats are 'bsfp8' "
         f"(a float8_e4m3fn weight with fp32 128x128 block scales, or a bf16 weight) and 'mxfp8' (a "
-        f"bf16 weight, or a float8_e4m3fn weight with the MXFP8 scales of quantize_1x32_fp8), and "
-        f"{here}.")
+        f"bf16 weight, or a float8_e4m3fn weight with uint8 UE8M0 scales or the MXFP8 scales of "
+        f"quantize_1x32_fp8), and {here}.")
 
 
 def _arch_error(fmt: str, arch: int) -> NotImplementedError:
@@ -263,12 +267,17 @@ def _mxfp8_scale(scale, n: int, k: int, device, major: int, ctx: str) -> torch.T
     """
     kb = k // 128
     if not isinstance(scale, torch.Tensor):
-        raise ValueError(f"{ctx}: scale must be the int32 tensor fso.compat.quantize_1x32_fp8 returns "
-                         f"for the weight on this architecture, got {type(scale).__name__}")
+        raise ValueError(f"{ctx}: scale must be the checkpoint's uint8 UE8M0 scale [N, K/32] = [{n}, "
+                         f"{k // 32}] or the int32 tensor fso.compat.quantize_1x32_fp8 returns for the "
+                         f"weight on this architecture, got {type(scale).__name__}")
     if scale.dtype != torch.int32:
-        raise ValueError(f"{ctx}: the MXFP8 scale must be the int32 tensor fso.compat.quantize_1x32_fp8 "
-                         f"returns for the weight on this architecture (four UE8M0 bytes per word), "
-                         f"got {scale.dtype}")
+        e8m0 = getattr(torch, "float8_e8m0fnu", None)
+        hint = ("; a float8_e8m0fnu tensor holds the same bytes, pass scale.view(torch.uint8)"
+                if e8m0 is not None and scale.dtype == e8m0 else "")
+        raise ValueError(f"{ctx}: the MXFP8 scale must be the checkpoint's uint8 UE8M0 scale [N, K/32] = "
+                         f"[{n}, {k // 32}] (one byte per 32 elements along K, row-major, byte b = "
+                         f"2^(b - 127)) or the int32 tensor fso.compat.quantize_1x32_fp8 returns for the "
+                         f"weight on this architecture (four UE8M0 bytes per word), got {scale.dtype}{hint}")
     if scale.device != device:
         raise ValueError(f"{ctx}: scale is on {scale.device} and the weight on {device}; both must be "
                          f"on the serving device")
@@ -299,6 +308,39 @@ def _mxfp8_scale(scale, n: int, k: int, device, major: int, ctx: str) -> torch.T
         raise ValueError(f"{ctx}: the MXFP8 scale has stride {tuple(s.stride())}; it must be the "
                          f"contiguous 1-D tensor quantize_1x32_fp8 returns")
     return s
+
+
+def _ue8m0_scale(scale: torch.Tensor, n: int, k: int, device, major: int, ctx: str) -> torch.Tensor:
+    """Validate the uint8 UE8M0 scale of an MXFP8 [N, K] checkpoint as it is stored and
+    pack it into the layout the GEMM reads.
+
+    The checkpoint form is one byte per 32 elements along K, row-major, ``[N, K/32]``,
+    byte ``b`` meaning the scale ``2^(b - 127)``: the same bytes on every architecture.
+    Any strides are accepted, because a uint8 tensor's element order says which byte is
+    which. The bytes are packed by ``_ue8m0_scale_handle`` (the packer of
+    ``fso.moe.prepare_experts``) into exactly the tensor ``quantize_1x32_fp8`` returns
+    for the same scales on this architecture: int32 ``[N, K/128]`` with strides
+    ``(1, N)`` on sm_120/sm_121, a 1-D int32 tensor in the CUTLASS block-scaled atom
+    layout on sm_100/sm_103. Nothing is requantized.
+    """
+    want = (n, k // 32)
+    if tuple(scale.shape) != want:
+        raise ValueError(f"{ctx}: the uint8 UE8M0 scale of an [N, K] = [{n}, {k}] weight is [N, K/32] = "
+                         f"{list(want)} (one byte per 32 elements along K, row-major, byte b = "
+                         f"2^(b - 127)), got uint8 {list(scale.shape)}")
+    if scale.device != device:
+        raise ValueError(f"{ctx}: scale is on {scale.device} and the weight on {device}; both must be "
+                         f"on the serving device")
+    packed = _ue8m0_scale_handle(scale.detach().unsqueeze(0))[0]
+    if major != 12:
+        return packed
+    # sm_120/sm_121: allocate exactly the [N, K/128] tensor with strides (1, N) that
+    # quantize_1x32_fp8 allocates. Taking the transpose of the packed words instead gives
+    # the same bytes, but at K/128 == 1 torch treats the stride of the size-1 dimension as
+    # free and the result would not carry the quantizer's strides.
+    out = torch.empty_strided((n, k // 128), (1, n), dtype=torch.int32, device=packed.device)
+    out.copy_(packed.t())
+    return out
 
 
 def _dequantize_block_fp8(wq: torch.Tensor, scale: torch.Tensor, r0: int, r1: int) -> torch.Tensor:
@@ -357,9 +399,14 @@ def prepare_weight(w, *, format, scale=None) -> DenseWeight:
               ``scale [ceil(N/128), K/128]`` (value = fp8 * scale), the block-FP8
               checkpoint dialect; or a bf16 weight and no scale, quantized here.
             * ``"mxfp8"``: a bf16 weight and no scale, quantized here to MXFP8
-              1x32; or a float8_e4m3fn weight with the int32 scale that
-              :func:`fish_scales_ops.compat.quantize_1x32_fp8` returns for it on
-              this architecture. That scale is accepted in the K-major form the
+              1x32; or a float8_e4m3fn weight with its MXFP8 scale, in one of two
+              forms. The portable form is the one an MXFP8 checkpoint stores:
+              uint8 ``[N, K/32]``, one UE8M0 byte per 32 elements along K,
+              row-major, byte ``b`` meaning the scale ``2^(b - 127)``, the same
+              bytes on every architecture; it is packed here into this device's
+              layout. The arch-native form is the int32 scale that
+              :func:`fish_scales_ops.compat.quantize_1x32_fp8` returns for the
+              weight on this architecture, accepted in the K-major form the
               quantizer returns and in the ``.contiguous()`` form a safetensors
               round trip produces; the latter is rewritten to the layout the GEMM
               reads.
@@ -377,8 +424,9 @@ def prepare_weight(w, *, format, scale=None) -> DenseWeight:
       ``fso.moe.prepare_experts``; that is a second quantization of already
       quantized weights. A bf16 weight is quantized to MXFP8 directly. Kind
       ``"mxfp8"``.
-    * sm_100/sm_103 and sm_120/sm_121, ``"mxfp8"``: served natively. Kind
-      ``"mxfp8"``.
+    * sm_100/sm_103 and sm_120/sm_121, ``"mxfp8"``: served natively; a bf16 weight
+      is quantized, and a float8_e4m3fn weight keeps its bytes, with only its scale
+      packed or restored to the layout the GEMM reads. Kind ``"mxfp8"``.
     * sm_90 with ``"mxfp8"``, any other architecture and any other format raise
       (``NotImplementedError`` for what is not served, ``ValueError`` for a
       malformed argument), naming the architecture; nothing falls back.
@@ -392,7 +440,10 @@ def prepare_weight(w, *, format, scale=None) -> DenseWeight:
     conversion never holds a second full-precision copy of the weight. The other
     routes allocate only the prepared weight and its scale. On sm_90 a
     block-FP8 checkpoint is kept as the caller's own tensors, so freeing the
-    source parameters afterwards releases no memory there.
+    source parameters afterwards releases no memory there. An MXFP8 checkpoint on
+    sm_100/sm_103 and sm_120/sm_121 keeps the caller's weight tensor as well; its
+    scale is a new tensor when it arrives as uint8 bytes or in the row-major int32
+    form.
 
     Returns:
         :class:`DenseWeight`.
@@ -434,12 +485,16 @@ def prepare_weight(w, *, format, scale=None) -> DenseWeight:
     is_fp8 = w.dtype == torch.float8_e4m3fn
     if is_fp8 and scale is None:
         need = ("fp32 128x128 block scales [ceil(N/128), K/128]" if fmt == "bsfp8"
-                else "the int32 MXFP8 scale quantize_1x32_fp8 returns for it")
+                else f"the checkpoint's uint8 UE8M0 scale [N, K/32] = [{n}, {k // 32}] or the int32 "
+                     f"MXFP8 scale quantize_1x32_fp8 returns for it")
         raise ValueError(f"{ctx}: a float8_e4m3fn weight needs its scale, {need}; a bf16 weight is "
                          f"quantized here and takes none")
     if not is_fp8 and scale is not None:
+        takes = ("fp32 128x128 block scales [ceil(N/128), K/128]" if fmt == "bsfp8"
+                 else f"its uint8 UE8M0 scale [N, K/32] = [{n}, {k // 32}] or the int32 scale of "
+                      f"quantize_1x32_fp8")
         raise ValueError(f"{ctx}: a bf16 weight is quantized here and takes no scale; pass scale "
-                         f"only with a float8_e4m3fn weight")
+                         f"only with a float8_e4m3fn weight, which takes {takes}")
     wd = w.detach()
 
     if fmt == "bsfp8":
@@ -456,7 +511,10 @@ def prepare_weight(w, *, format, scale=None) -> DenseWeight:
         return DenseWeight("mxfp8", fmt, arch, k, n, q, sq)
 
     if is_fp8:
-        sq = _mxfp8_scale(scale, n, k, w.device, major, ctx)
+        if isinstance(scale, torch.Tensor) and scale.dtype == torch.uint8:
+            sq = _ue8m0_scale(scale, n, k, w.device, major, ctx)
+        else:
+            sq = _mxfp8_scale(scale, n, k, w.device, major, ctx)
         return DenseWeight("mxfp8", fmt, arch, k, n, wd.contiguous(), sq)
     q, sq = quantize_1x32_fp8(wd)
     return DenseWeight("mxfp8", fmt, arch, k, n, q, sq)

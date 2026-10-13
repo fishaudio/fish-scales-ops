@@ -20,10 +20,13 @@ fp32 128x128 block scales (the ``bsgemm-moe`` dialect); sm_90 serves them as the
 are through the expert-sorted block-FP8 layer, and sm_100/sm_103 and sm_120/sm_121
 dequantize them block by block at load time and requantize them to MXFP8 1x32,
 because the grouped MXFP8 kernels are the only grouped path those architectures
-have. ``"mxfp8"`` is bf16 experts (the ``mxfp8`` dialect keeps its experts bf16 in
-the checkpoint), quantized to MXFP8 1x32 at load time on sm_100/sm_103 and
-sm_120/sm_121; sm_90 has no MXFP8 hardware and refuses it. Every other format,
-bf16 experts included, raises: there is no fallback of any kind.
+have. ``"mxfp8"`` is either bf16 experts (the ``mxfp8`` dialect that keeps its experts
+bf16 in the checkpoint), quantized to MXFP8 1x32 at load time, or an MXFP8 checkpoint
+as it is stored: float8_e4m3fn experts with uint8 UE8M0 scales, one byte per 32
+elements along K, whose bytes are kept and whose scales are only repacked into this
+device's layout. Both are served on sm_100/sm_103 and sm_120/sm_121; sm_90 has no
+MXFP8 hardware and refuses the format. Every other format, bf16 experts included,
+raises: there is no fallback of any kind.
 
 Every bucket runs as one layer call. The transient memory a call needs is the
 caller's to reserve, and :func:`transient_bytes` gives the exact figure for the
@@ -45,6 +48,8 @@ from .._env import env_flag
 from ..gemm.fp8 import moe_layer_fp8_sm90, moe_layer_transient_bytes_sm90
 from ..gemm.mxfp8 import (
     _moe_layer_mxfp8,
+    _ue8m0_scale_handle,
+    _w13_interleave_perm,
     moe_layer_transient_bytes_mxfp8,
     mxfp8_grouped_swiglu_available,
     quantize_moe_weights_1x32_fp8,
@@ -196,24 +201,27 @@ def describe() -> str:
             9: "served: the checkpoint's block-FP8 tensors are kept as they are and run "
                "through the expert-sorted block-FP8 layer (moe_layer_fp8_sm90)",
             10: "served: dequantized block by block at load time, requantized to MXFP8 1x32 "
-                "with the FC1 rows interleaved, run through the masked-slab MXFP8 layer",
+                "with the FC1 rows interleaved, run through the compact MXFP8 layer",
             12: "served: dequantized block by block at load time, requantized to MXFP8 1x32 "
-                "with the FC1 rows interleaved, run through the masked-slab MXFP8 layer",
+                "with the FC1 rows interleaved, run through the compact MXFP8 layer",
         },
         "mxfp8": {
             9: "not served: sm_90 has no MXFP8 hardware; serve block-FP8 experts with "
                "format 'bsfp8' instead",
-            10: "served: quantized to MXFP8 1x32 at load time with the FC1 rows interleaved, "
-                "run through the masked-slab MXFP8 layer",
-            12: "served: quantized to MXFP8 1x32 at load time with the FC1 rows interleaved, "
-                "run through the masked-slab MXFP8 layer",
+            10: "served: bf16 experts are quantized to MXFP8 1x32 at load time, an MXFP8 "
+                "checkpoint keeps its bytes and has its scales repacked; the FC1 rows are "
+                "interleaved, run through the compact MXFP8 layer",
+            12: "served: bf16 experts are quantized to MXFP8 1x32 at load time, an MXFP8 "
+                "checkpoint keeps its bytes and has its scales repacked; the FC1 rows are "
+                "interleaved, run through the compact MXFP8 layer",
         },
     }
     heads = {
         "bsfp8": "format 'bsfp8': float8_e4m3fn experts with fp32 128x128 block scales "
                  "(the bsgemm-moe dialect)",
-        "mxfp8": "format 'mxfp8': bf16 experts, quantized to MXFP8 1x32 at load time "
-                 "(the mxfp8 dialect)",
+        "mxfp8": "format 'mxfp8': bf16 experts quantized to MXFP8 1x32 at load time (the mxfp8 "
+                 "dialect), or float8_e4m3fn experts with uint8 UE8M0 scales [E, N, K/32] as an "
+                 "MXFP8 checkpoint stores them",
     }
     lines = [f"fish_scales_ops.moe: one MoE layer for every architecture; this device is "
              f"{_arch_label(arch)}{name}.", _build_line()]
@@ -283,12 +291,14 @@ def _format_error(format, where: str) -> Exception:
         return NotImplementedError(
             f"fso.moe.prepare_experts: format {format!r} is not served by fish_scales_ops on any "
             f"architecture, and {here}. bf16 experts can be quantized at load time with "
-            f"format='mxfp8' on sm_100/sm_103 and sm_120/sm_121; block-FP8 experts are "
+            f"format='mxfp8' on sm_100/sm_103 and sm_120/sm_121, which also takes MXFP8 "
+            f"experts as stored (float8_e4m3fn with uint8 UE8M0 scales); block-FP8 experts are "
             f"format='bsfp8'. Otherwise serve this checkpoint with another MoE backend.")
     return ValueError(
         f"fso.moe.prepare_experts: unknown format {format!r} on {where}; the formats are "
         f"'bsfp8' (float8_e4m3fn experts with fp32 128x128 block scales) and 'mxfp8' "
-        f"(bf16 experts quantized to MXFP8 1x32 at load time), and {here}.")
+        f"(bf16 experts quantized to MXFP8 1x32 at load time, or float8_e4m3fn experts with "
+        f"uint8 UE8M0 scales as an MXFP8 checkpoint stores them), and {here}.")
 
 
 def _arch_error(fmt: str, arch: int) -> NotImplementedError:
@@ -386,6 +396,77 @@ def _dequantize_block_fp8(wq: torch.Tensor, scale: torch.Tensor, e0: int, e1: in
     return w.to(torch.bfloat16)
 
 
+def _mxfp8_checkpoint_form(w13, w2, sw13, sw2, e: int, h: int, i: int, where: str) -> bool:
+    """Which of the two ``"mxfp8"`` forms the caller holds, after validating it.
+
+    ``False``: bf16 experts and no scales, quantized at load time. ``True``: an MXFP8
+    checkpoint as it is stored, float8_e4m3fn experts with uint8 UE8M0 scales
+    ``sw13 [E, 2I, H/32]`` and ``sw2 [E, H, I/32]``. Any mixture of the two (bf16 with
+    scales, float8_e4m3fn without them, one weight of each dtype) and any scale that is
+    not the uint8 tensor of that shape on the weights' device raises ``ValueError``.
+    """
+    ctx = f"fso.moe.prepare_experts (format 'mxfp8', {where})"
+    want = {"sw13": (e, 2 * i, h // 32), "sw2": (e, h, i // 32)}
+    forms = (f"bf16 experts and no scales (quantized here), or float8_e4m3fn experts with "
+             f"uint8 UE8M0 scales sw13 {list(want['sw13'])} and sw2 {list(want['sw2'])} "
+             f"(one byte per 32 elements along K, byte b = 2^(b - 127), as an MXFP8 checkpoint "
+             f"stores them)")
+    fp8 = torch.float8_e4m3fn
+    for name, t in (("w13", w13), ("w2", w2)):
+        if t.dtype not in (torch.bfloat16, fp8):
+            raise ValueError(f"{ctx}: {name} is {t.dtype}; format 'mxfp8' takes {forms}. Block-FP8 "
+                             f"experts with fp32 128x128 scales are format='bsfp8'")
+    if w13.dtype != w2.dtype:
+        raise ValueError(f"{ctx}: w13 is {w13.dtype} and w2 {w2.dtype}; format 'mxfp8' takes {forms}, "
+                         f"the same dtype for both")
+    if w13.dtype == torch.bfloat16:
+        if sw13 is not None or sw2 is not None:
+            raise ValueError(f"{ctx}: bf16 experts are quantized here and take no scales; sw13/sw2 go "
+                             f"with float8_e4m3fn experts (uint8 sw13 {list(want['sw13'])}, sw2 "
+                             f"{list(want['sw2'])}), and fp32 128x128 block scales with format='bsfp8'")
+        return False
+    e8m0 = getattr(torch, "float8_e8m0fnu", None)
+    for name, t in (("sw13", sw13), ("sw2", sw2)):
+        need = (f"uint8 {list(want[name])}, one UE8M0 byte per 32 elements along K, row-major, "
+                f"byte b = 2^(b - 127)")
+        if t is None:
+            raise ValueError(f"{ctx}: float8_e4m3fn experts need their scales; {name} is missing and "
+                             f"must be {need}")
+        if not isinstance(t, torch.Tensor):
+            raise ValueError(f"{ctx}: {name} must be a tensor, {need}; got {type(t).__name__}")
+        if t.dtype != torch.uint8 or tuple(t.shape) != want[name]:
+            hint = ""
+            if e8m0 is not None and t.dtype == e8m0:
+                hint = f"; a float8_e8m0fnu tensor holds the same bytes, pass {name}.view(torch.uint8)"
+            elif t.dtype == torch.int32:
+                hint = ("; the int32 scale handle quantize_moe_weights_1x32_fp8 returns is "
+                        "architecture-specific and not taken here, pass the checkpoint's uint8 bytes")
+            elif t.dtype == torch.float32:
+                hint = "; fp32 128x128 block scales are format='bsfp8'"
+            raise ValueError(f"{ctx}: {name} must be {need}; got {t.dtype} {list(t.shape)}{hint}")
+        if t.device != w13.device:
+            raise ValueError(f"{ctx}: {name} is on {t.device} and the weights on {w13.device}; both "
+                             f"must be on the serving device")
+    return True
+
+
+def _prepare_mxfp8_checkpoint(w13, w2, sw13, sw2, arch: int, e: int, h: int, i: int) -> MoeExperts:
+    """The handle of an MXFP8 checkpoint as it is stored (validated by
+    :func:`_mxfp8_checkpoint_form`): the weight bytes are kept, the FC1 rows re-ordered
+    when the handle is interleaved (the rule :func:`prepare_experts` applies to bf16
+    experts), and the uint8 scales packed into this device's int32 layout by
+    ``_ue8m0_scale_handle``, with the FC1 scale rows following the weight rows. Nothing
+    is quantized."""
+    interleave = bool(mxfp8_grouped_swiglu_available(2 * i, h))
+    perm = _w13_interleave_perm(2 * i, w13.device) if interleave else None
+    w13_d = w13.detach()
+    w13_q = w13_d.index_select(1, perm) if interleave else w13_d.contiguous()
+    s13_q = _ue8m0_scale_handle(sw13.detach(), row_perm=perm)
+    w2_q = w2.detach().contiguous()
+    s2_q = _ue8m0_scale_handle(sw2.detach())
+    return MoeExperts("mxfp8", arch, e, h, i, w13_q, s13_q, w2_q, s2_q, interleave)
+
+
 def prepare_experts(w13, w2, *, format, sw13=None, sw2=None) -> MoeExperts:
     """Prepare one MoE layer's local experts for this device, once, at load time.
 
@@ -396,9 +477,13 @@ def prepare_experts(w13, w2, *, format, sw13=None, sw2=None) -> MoeExperts:
         format: what the caller holds. ``"bsfp8"``: float8_e4m3fn weights with fp32
             128x128 block scales ``sw13 [E_local, 2 * I_local / 128, H / 128]`` and
             ``sw2 [E_local, H / 128, I_local / 128]`` (value = fp8 * scale).
-            ``"mxfp8"``: bf16 weights, no scales.
-        sw13, sw2: the block scales of a ``"bsfp8"`` layer; must be omitted for
-            ``"mxfp8"``.
+            ``"mxfp8"``: bf16 weights and no scales; or an MXFP8 checkpoint as it is
+            stored, float8_e4m3fn weights with uint8 UE8M0 scales
+            ``sw13 [E_local, 2 * I_local, H / 32]`` and ``sw2 [E_local, H, I_local / 32]``,
+            one byte per 32 elements along K, row-major, byte ``b`` meaning the scale
+            ``2^(b - 127)`` (value = fp8 * scale), the same bytes on every architecture.
+        sw13, sw2: the scales of a float8_e4m3fn layer, in the form ``format`` names;
+            omitted for bf16 experts.
 
     What happens per architecture:
 
@@ -408,8 +493,11 @@ def prepare_experts(w13, w2, *, format, sw13=None, sw2=None) -> MoeExperts:
       block by block (fp8 value times its block scale in fp32, rounded to bf16) and
       requantized to MXFP8 1x32, which is a second quantization of already
       quantized weights; the handle's kind is ``"mxfp8"``.
-    * sm_100/sm_103 and sm_120/sm_121 with ``"mxfp8"``: the bf16 experts are
-      quantized to MXFP8 1x32; kind ``"mxfp8"``.
+    * sm_100/sm_103 and sm_120/sm_121 with ``"mxfp8"``: bf16 experts are quantized to
+      MXFP8 1x32. float8_e4m3fn experts with uint8 scales are not quantized at all:
+      their weight bytes are kept (only the FC1 rows are re-ordered when they are
+      interleaved) and their scale bytes are packed into this device's int32 scale
+      layout. Kind ``"mxfp8"`` either way.
     * sm_90 with ``"mxfp8"``, any other architecture, and any other format raise
       (``NotImplementedError`` for what is not served, ``ValueError`` for a
       malformed argument), naming the architecture; nothing falls back.
@@ -419,7 +507,10 @@ def prepare_experts(w13, w2, *, format, sw13=None, sw2=None) -> MoeExperts:
     FC1 can serve the shape, which it does unless ``FSO_FC1_FUSED=0``; the
     handle's ``w13_interleaved`` records the choice. The conversion runs a few
     experts at a time, so its transient memory is bounded by a fixed budget
-    rather than by a second copy of the layer.
+    rather than by a second copy of the layer. An MXFP8 checkpoint needs no
+    conversion: the handle keeps the caller's ``w2`` (made contiguous if it is not),
+    and the caller's ``w13`` too unless the FC1 rows are interleaved, in which case
+    the interleaved ``w13`` is a new tensor; the scale handles are always new.
 
     Constraints: ``H % 128 == 0``, ``I_local % 128 == 0``, ``1 <= E_local <= 1024``,
     and the router draws its top-k without replacement.
@@ -476,15 +567,8 @@ def prepare_experts(w13, w2, *, format, sw13=None, sw2=None) -> MoeExperts:
         def src2(e0, e1):
             return _dequantize_block_fp8(w2_c, s2_c, e0, e1)
     else:
-        if sw13 is not None or sw2 is not None:
-            raise ValueError(
-                f"fso.moe.prepare_experts (format 'mxfp8', {where}): the mxfp8 dialect holds bf16 "
-                f"experts and no scales; pass sw13/sw2 only with format='bsfp8'")
-        for name, t in (("w13", w13), ("w2", w2)):
-            if t.dtype != torch.bfloat16:
-                raise ValueError(
-                    f"fso.moe.prepare_experts (format 'mxfp8', {where}): {name} must be bf16, got "
-                    f"{t.dtype}; block-FP8 experts are format='bsfp8'")
+        if _mxfp8_checkpoint_form(w13, w2, sw13, sw2, e, h, i, where):
+            return _prepare_mxfp8_checkpoint(w13, w2, sw13, sw2, arch, e, h, i)
         w13_d = w13.detach()
         w2_d = w2.detach()
 
@@ -691,14 +775,15 @@ def transient_bytes(experts, tokens, topk) -> int:
     * sm_90, kind ``"bsfp8"``: the expert-sorted layout, sized by the routed rows
       (``tokens * topk`` plus per-expert padding), see
       :func:`fish_scales_ops.compat.moe_layer_transient_bytes_sm90`;
-    * sm_100/103 and sm_120/121, kind ``"mxfp8"``: the masked slab, sized by
-      ``num_experts * align(tokens, 4)`` rows, with the fused FC1 when the handle's
+    * sm_100/103 and sm_120/121, kind ``"mxfp8"``: the compact layout, sized by the
+      routed rows (``tokens * topk`` plus at most 127 rows for every expert that holds
+      one, in whole 128-row blocks), with the fused FC1 when the handle's
       ``w13_interleaved`` and the route query allow it and, on sm_120/121, the fused
       combine where ``FSO_MOE_FUSED_COMBINE=1`` allows it and its engagement rule
       takes it, see :func:`fish_scales_ops.compat.moe_layer_transient_bytes_mxfp8`.
 
-    Inputs, weights, a ``bias`` and the library's persistent pools (routing scratch,
-    the sm_100/103 argument arena) are not counted.
+    Inputs, weights, a ``bias`` and the library's persistent pool (the sm_100/103
+    argument arena, two blocks per layer) are not counted.
 
     Args:
         experts: the :class:`MoeExperts` handle from :func:`prepare_experts`.

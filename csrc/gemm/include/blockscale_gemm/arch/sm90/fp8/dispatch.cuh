@@ -29,6 +29,47 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels::blockscale_gemm
 {
 
+// FSO_SM90_DENSE_DG2, read once per process: which dense (non-swap-AB) GEMMs run DeepGEMM v2's kernel. Unset or "1":
+// the tile classes deep_gemm::jit::use_dg2_dense accepts (the default); "0": none, every dense GEMM runs
+// fp8_gemm_kernel at get_dense_gemm_config's pick (0.2.1's behaviour); "all": every DeepGEMM v2 pick (for sweeps).
+// The outputs are bitwise identical in all three settings.
+enum class Sm90DenseDg2Mode
+{
+    kRule,
+    kOff,
+    kAll
+};
+
+inline Sm90DenseDg2Mode sm90_dense_dg2_mode()
+{
+    static Sm90DenseDg2Mode const mode = []
+    {
+        char const* e = std::getenv("FSO_SM90_DENSE_DG2");
+        if (e == nullptr || e[0] == '\0' || std::string(e) == "1")
+            return Sm90DenseDg2Mode::kRule;
+        if (std::string(e) == "0")
+            return Sm90DenseDg2Mode::kOff;
+        if (std::string(e) == "all")
+            return Sm90DenseDg2Mode::kAll;
+        std::fprintf(stderr, "[fish_scales_ops] FSO_SM90_DENSE_DG2=%s is not 0, 1 or all; using the default (1)\n", e);
+        return Sm90DenseDg2Mode::kRule;
+    }();
+    return mode;
+}
+
+// FSO_SM90_DENSE_DG2_K=<K>, read once per process: with FSO_SM90_DENSE_DG2=all, apply "all" only to GEMMs whose K
+// equals the value (the others follow the default rule), so that a sweep inside an MLP block can move one projection
+// at a time. 0 (unset): every K.
+inline uint32_t sm90_dense_dg2_k()
+{
+    static uint32_t const k = []
+    {
+        char const* e = std::getenv("FSO_SM90_DENSE_DG2_K");
+        return e != nullptr ? static_cast<uint32_t>(std::strtoul(e, nullptr, 10)) : 0u;
+    }();
+    return k;
+}
+
 inline void gemm_dispatch_sm90(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, int ld_d, float* scales_a,
     float* scales_b, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, cudaStream_t stream,
     int num_device_sms = kNumDeviceSMs)
@@ -54,6 +95,26 @@ inline void gemm_dispatch_sm90(void* mat_a, int ld_a, void* mat_b, int ld_b, voi
     // quantize runs and waits on it with griddepcontrol.wait after its prologue (fp8_gemm_impl.cuh). On for every
     // shape, off for every shape with FSO_DISABLE_PDL=1.
     bool const pdl = fso_pdl_enabled();
+
+    // Main path: DeepGEMM v2's kernel at DeepGEMM's own configuration where that configuration is one of the tile
+    // classes deep_gemm::jit::use_dg2_dense accepts (256 x 128 with multicast on A and 128 x 160 / 192 from M = 512 on;
+    // every configuration but 80-wide tiles at 128 < M < 256; 64-row tiles at M = 64 / 128 with K >= 8192), else
+    // fp8_gemm_kernel. Both kernels compute the same bits; the choice depends on (M, N, K) and the SM count only.
+    if (!use_swap_ab && sm90_dense_dg2_mode() != Sm90DenseDg2Mode::kOff)
+    {
+        deep_gemm::jit::Dg2DenseConfig const dg2
+            = deep_gemm::jit::get_dg2_dense_config_cached(shape_m, shape_n, shape_k, num_device_sms);
+        bool const all = sm90_dense_dg2_mode() == Sm90DenseDg2Mode::kAll
+            && (sm90_dense_dg2_k() == 0 || sm90_dense_dg2_k() == shape_k);
+        if (all || deep_gemm::jit::use_dg2_dense(dg2, shape_m, shape_k))
+        {
+            auto runtime = deep_gemm::jit::getGlobalCompiler().buildDg2(dg2);
+            auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
+            deep_gemm::runGemmDg2(kernel, mat_a, ld_a, mat_b, ld_b, mat_d, ld_d, scales_a, scales_b, shape_m, shape_n,
+                shape_k, dg2, stream, pdl);
+            return;
+        }
+    }
 
     // Tile rules of the dense GEMM on top of the shared picker: deep_gemm::jit::get_dense_gemm_config.
     if (!use_swap_ab)
@@ -113,9 +174,14 @@ inline void gemm_dispatch_sm90_grouped_masked(void* mat_a, void* mat_b, void* ma
     auto runtime = deep_gemm::jit::getGlobalCompiler().build(
         shape_n, shape_k, bm, bn, block_k, num_groups, ns, ntm, deep_gemm::GemmType::GroupedMasked);
     auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
+    // Programmatic dependent launch, as for the dense GEMM: every grouped kernel waits on its predecessor (the
+    // gather-quantize ahead of an FC1, the FC1 ahead of an FC2) with griddepcontrol.wait after its prologue
+    // (fp8_gemm_impl.cuh), so its launch and prologue overlap the predecessor's tail. On for every grouped GEMM of
+    // this file, whatever the route and the shape, and off for all of them with FSO_DISABLE_PDL=1.
     deep_gemm::runGemm(kernel, mat_a, static_cast<int>(shape_k), mat_b, static_cast<int>(shape_k), mat_d,
         static_cast<int>(shape_n), scales_a, scales_b, m_cap, shape_n, shape_k, bm, bn, block_k, num_groups, ntm,
-        deep_gemm::GemmType::GroupedMasked, masked_m, stream, num_device_sms, static_cast<uint32_t>(smem));
+        deep_gemm::GemmType::GroupedMasked, masked_m, stream, num_device_sms, static_cast<uint32_t>(smem),
+        fso_pdl_enabled());
 }
 
 // Grouped (MoE, contiguous/sorted) block-scale FP8 on sm_90 — H4. Consumes the
@@ -166,7 +232,7 @@ inline void gemm_dispatch_sm90_grouped_contiguous(void* mat_a, void* mat_b, void
     deep_gemm::runGemm(kernel, mat_a, static_cast<int>(shape_k), mat_b, static_cast<int>(shape_k), mat_d,
         static_cast<int>(shape_n), scales_a, scales_b, p_max, shape_n, shape_k, bm, bn, block_k, num_groups, ntm,
         deep_gemm::GemmType::GroupedContiguous, sorted_expert_ids, stream, num_device_sms,
-        static_cast<uint32_t>(smem));
+        static_cast<uint32_t>(smem), fso_pdl_enabled());
 }
 
 // Contiguous grouped FC1 on sm_90, non-swap, with two math warp-groups split along N (fused-FC1 step 1,
@@ -246,7 +312,7 @@ inline void gemm_dispatch_sm90_grouped_contiguous_2wg(void* mat_a, void* mat_b, 
 
     deep_gemm::runGemm2wg(kernel, mat_a, static_cast<int>(shape_k), mat_b, static_cast<int>(shape_k), mat_d,
         static_cast<int>(shape_n), scales_a, scales_b, p_max, shape_n, shape_k, bm, bn, block_k, num_groups,
-        sorted_expert_ids, stream, num_device_sms, smem);
+        sorted_expert_ids, stream, num_device_sms, smem, fso_pdl_enabled());
 }
 
 // Contiguous grouped FC1 on sm_90, non-swap, with the SwiGLU + 1x128 FP8 requantize fused into the epilogue (fused-FC1
@@ -302,7 +368,7 @@ inline void gemm_dispatch_sm90_grouped_contiguous_swiglu(void* mat_a, void* mat_
 
     deep_gemm::runGemm2wgSwiglu(kernel, mat_a, static_cast<int>(shape_k), mat_b, static_cast<int>(shape_k), mat_dq,
         mat_sd, sd_ld, scales_a, scales_b, p_max, shape_n, shape_k, bm, bn, block_k, num_groups, sorted_expert_ids,
-        stream, num_device_sms, smem);
+        stream, num_device_sms, smem, fso_pdl_enabled());
 }
 
 // Two-CTA swap-AB builds (fp8_gemm_kernel_swapAB and the gate/up pair kernel below) rebalance their registers 40 / 96
@@ -362,6 +428,34 @@ inline uint32_t sm90_env_swapab_ctas()
     return (v == 1 || v == 2) ? static_cast<uint32_t>(v) : 0u;
 }
 
+// Whether a grouped-contiguous swap-AB GEMM loads its weight boxes evict-first in L2 instead of evict-normal
+// (fp8_gemm_impl.cuh, kWeightEvictFirst): with the 16- and 32-row activation tiles, i.e. the FC1 and FC2 of the swap-AB
+// routes of moe_layer_fp8_sm90 (at most 24 routed rows per active expert), but not with the 64-row tile, the FC2 of the
+// non-swap route. On the swap-AB routes an expert's weight blocks are read by one activation tile, or by two that run
+// side by side, so marking them evict-first loses no reuse; it stops the weight stream (hundreds of MB per call against
+// the H200's 60 MB L2) from pushing the layer's own intermediates out of L2 between the kernel that writes them and the
+// one that reads them: the gathered activation (read once per SwiGLU block by the FC1), the SwiGLU output (read by the
+// FC2) and the down output (read by the combine). On the non-swap route the experts' weight blocks are read by several
+// 64-row tiles at different times and the same hint throws that reuse away. Measured on the H200 layer (P4, 2026-10-12,
+// /data/bench-runs/fso_0.2.1_20261010/P4/expA_*, expB_*; e705c8b, cold weights, 2 passes): 16-row tile -0.9 ... -4.4 %
+// at Family C M = 2 ... 384 and -2.8 ... -4.2 % at Family B M = 1 ... 192; 32-row tile -1.4 / -1.7 % at Family B
+// M = 384 / 256 and +0.1 / +0.3 % at Family C M = 768 / 512; 64-row tile +1.4 ... +5.3 % (Family B M = 512 ... 8192,
+// Family C M = 1024 ... 8192). The rule was set with the layer's down output sharing one allocation with the gathered
+// activation (moe_layer_fp8_sm90, _sm90_region): before that, on the same card, the 32-row tile lost 1.7 % (Family B
+// M = 256) and 1.2 % (Family C M = 512) with the hint, so re-measure the rule if that sharing changes (P4 s15dep).
+// FSO_SWAPAB_EVICT_FIRST=0|1 forces the policy off or on for every swap-AB grouped GEMM,
+// for A/B runs; unset (or empty) applies the rule. Read on every call, like FSO_SWAPAB_SPLIT: set it before the first
+// call and keep it between a capture and its replays. The output is bit-identical either way.
+inline bool sm90_swapab_weight_evict_first(uint32_t block_n)
+{
+    if (char const* e = std::getenv("FSO_SWAPAB_EVICT_FIRST"))
+    {
+        if (e[0] != '\0')
+            return e[0] != '0';
+    }
+    return block_n <= 32u;
+}
+
 // Contiguous grouped block-scale FP8 on sm_90, swap-AB — H4b. For M >= 8 the
 // non-swap path pads each active expert's few rows to block_m = 64 (heavy
 // padding that tips the GEMM compute-bound). Swap-AB tiles the activation rows
@@ -385,6 +479,7 @@ inline void gemm_dispatch_sm90_grouped_contiguous_swapab(void* mat_a_wgt, void* 
     (void) expected_m;
     if (block_n != 16u && block_n != 32u && block_n != 64u)
         TLLM_THROW("swap-AB grouped GEMM: block_n must be 16, 32 or 64 (= the moe_build_sorted padding), got %u", block_n);
+    bool const evict_first = sm90_swapab_weight_evict_first(block_n);
 
     // Picker chooses block_m (weight-N tiling) + num_stages for the swap-AB
     // shape; we then force block_n to the caller's activation tiling / padding
@@ -477,7 +572,7 @@ inline void gemm_dispatch_sm90_grouped_contiguous_swapab(void* mat_a_wgt, void* 
         }
     }
     auto runtime = deep_gemm::jit::getGlobalCompiler().build(shape_n, shape_k, bm, bn, block_k, num_groups, ns, ntm,
-        deep_gemm::GemmType::GroupedContiguous, true, ctas);
+        deep_gemm::GemmType::GroupedContiguous, true, ctas, false, false, false, false, evict_first);
     auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
     if (ctas == 2u)
     {
@@ -497,14 +592,14 @@ inline void gemm_dispatch_sm90_grouped_contiguous_swapab(void* mat_a_wgt, void* 
                 smem = fits(ns);
             }
             runtime = deep_gemm::jit::getGlobalCompiler().build(shape_n, shape_k, bm, bn, block_k, num_groups, ns,
-                ntm, deep_gemm::GemmType::GroupedContiguous, true, 1u);
+                ntm, deep_gemm::GemmType::GroupedContiguous, true, 1u, false, false, false, false, evict_first);
             kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
         }
     }
     deep_gemm::runGemmSwapAB(kernel, mat_a_wgt, static_cast<int>(shape_k), mat_b_act, static_cast<int>(shape_k), mat_d,
         static_cast<int>(shape_n), sfb_wgt, sfa_act, shape_n, p_max, shape_k, bm, bn, block_k, num_groups, ntm,
         deep_gemm::GemmType::GroupedContiguous, sorted_expert_ids, stream, static_cast<int>(num_device_sms * ctas),
-        static_cast<uint32_t>(smem));
+        static_cast<uint32_t>(smem), fso_pdl_enabled());
 }
 
 // Contiguous grouped FC1 on sm_90, swap-AB, with one CTA per (activation tile, 128-column SwiGLU block) (fused-FC1
@@ -630,6 +725,7 @@ inline void gemm_dispatch_sm90_grouped_contiguous_swapab_pair(void* mat_a_wgt, v
     if (block_n != 16u && block_n != 32u && block_n != 64u)
         TLLM_THROW("swap-AB gate/up pair FC1: block_n must be 16, 32 or 64 (= the moe_build_sorted padding), got %u",
             block_n);
+    bool const evict_first = sm90_swapab_weight_evict_first(block_n);
     if (shape_n % (2u * bm) != 0u || shape_k % block_k != 0u)
         TLLM_THROW("swap-AB gate/up pair FC1: N must be a multiple of 256 (2I, I % 128 == 0) and K of 128, "
                    "got N=%u K=%u",
@@ -638,7 +734,8 @@ inline void gemm_dispatch_sm90_grouped_contiguous_swapab_pair(void* mat_a_wgt, v
     auto build = [&](Sm90SwapAbPairPlan const& plan)
     {
         auto runtime = deep_gemm::jit::getGlobalCompiler().build(shape_n, shape_k, bm, block_n, block_k, num_groups,
-            plan.stages, 1u, deep_gemm::GemmType::GroupedContiguous, true, plan.ctas, false, false, true);
+            plan.stages, 1u, deep_gemm::GemmType::GroupedContiguous, true, plan.ctas, false, false, true, false,
+            evict_first);
         return reinterpret_cast<cudaKernel_t>(runtime->getKernel());
     };
     Sm90SwapAbPairPlan plan
@@ -655,7 +752,7 @@ inline void gemm_dispatch_sm90_grouped_contiguous_swapab_pair(void* mat_a_wgt, v
     deep_gemm::runGemmSwapAB(kernel, mat_a_wgt, static_cast<int>(shape_k), mat_b_act, static_cast<int>(shape_k), mat_d,
         static_cast<int>(shape_n), sfb_wgt, sfa_act, shape_n, p_max, shape_k, bm, block_n, block_k, num_groups, 1u,
         deep_gemm::GemmType::GroupedContiguous, sorted_expert_ids, stream,
-        static_cast<int>(num_device_sms * plan.ctas), plan.smem);
+        static_cast<int>(num_device_sms * plan.ctas), plan.smem, fso_pdl_enabled());
 }
 
 // FSO_SWAPAB_SPLIT=0|1 forces the cluster-split fused swap-AB FC1 off or on, for A/B runs; unset (or empty) applies
@@ -755,6 +852,7 @@ inline void gemm_dispatch_sm90_grouped_contiguous_swapab_swiglu(void* mat_a_wgt,
     if (block_n != 16u && block_n != 32u && block_n != 64u)
         TLLM_THROW("fused SwiGLU swap-AB FC1: block_n must be 16, 32 or 64 (= the moe_build_sorted padding), got %u",
             block_n);
+    bool const evict_first = sm90_swapab_weight_evict_first(block_n);
     if (shape_n % (2u * bm) != 0u || shape_k % block_k != 0u)
         TLLM_THROW("fused SwiGLU swap-AB FC1: N must be a multiple of 256 (2I, I % 128 == 0) and K of 128, "
                    "got N=%u K=%u",
@@ -765,14 +863,14 @@ inline void gemm_dispatch_sm90_grouped_contiguous_swapab_swiglu(void* mat_a_wgt,
     {
         uint32_t const stages = sm90_swapab_split_stages(shape_k, block_n);
         auto runtime = deep_gemm::jit::getGlobalCompiler().build(shape_n, shape_k, bm, block_n, block_k, num_groups,
-            stages, 1u, deep_gemm::GemmType::GroupedContiguous, true, 1u, false, true, true, true);
+            stages, 1u, deep_gemm::GemmType::GroupedContiguous, true, 1u, false, true, true, true, evict_first);
         auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
         if (sm90_swapab_split_build_ok(kernel))
         {
             deep_gemm::runGemmSwapABSwigluSplit(kernel, mat_a_wgt, static_cast<int>(shape_k), mat_b_act,
                 static_cast<int>(shape_k), mat_dq, mat_sd, sd_ld_split, sfb_wgt, sfa_act, shape_n, p_max, shape_k,
                 block_n, block_k, num_groups, sorted_expert_ids, stream, num_device_sms,
-                deep_gemm::sm90_swapab_split_smem::total_bytes(block_n, stages));
+                deep_gemm::sm90_swapab_split_smem::total_bytes(block_n, stages), fso_pdl_enabled());
             return;
         }
     }
@@ -780,7 +878,8 @@ inline void gemm_dispatch_sm90_grouped_contiguous_swapab_swiglu(void* mat_a_wgt,
     auto build = [&](Sm90SwapAbPairPlan const& plan)
     {
         auto runtime = deep_gemm::jit::getGlobalCompiler().build(shape_n, shape_k, bm, block_n, block_k, num_groups,
-            plan.stages, 1u, deep_gemm::GemmType::GroupedContiguous, true, plan.ctas, false, true, true);
+            plan.stages, 1u, deep_gemm::GemmType::GroupedContiguous, true, plan.ctas, false, true, true, false,
+            evict_first);
         return reinterpret_cast<cudaKernel_t>(runtime->getKernel());
     };
     Sm90SwapAbPairPlan plan
@@ -797,7 +896,7 @@ inline void gemm_dispatch_sm90_grouped_contiguous_swapab_swiglu(void* mat_a_wgt,
     uint32_t const sd_ld = (p_max + 3u) / 4u * 4u;
     deep_gemm::runGemmSwapABSwiglu(kernel, mat_a_wgt, static_cast<int>(shape_k), mat_b_act, static_cast<int>(shape_k),
         mat_dq, mat_sd, sd_ld, sfb_wgt, sfa_act, shape_n, p_max, shape_k, bm, block_n, block_k, num_groups,
-        sorted_expert_ids, stream, static_cast<int>(num_device_sms * plan.ctas), plan.smem);
+        sorted_expert_ids, stream, static_cast<int>(num_device_sms * plan.ctas), plan.smem, fso_pdl_enabled());
 }
 
 } // namespace kernels::blockscale_gemm

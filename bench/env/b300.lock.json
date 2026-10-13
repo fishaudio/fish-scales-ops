@@ -5,7 +5,7 @@
   "sm": 100,
   "arch": "sm_103",
   "device_name": "NVIDIA B300 SXM6 AC",
-  "driver": "595.84",
+  "driver": "595.91.07",
   "gpu": {
     "select": {
       "by": "index",
@@ -31,7 +31,7 @@
   "environments": {
     "main": {
       "python": "/home/fish-dev/bench-runs/drama_pcg_b300_2026-09-26/env0520/venv/bin/python",
-      "python_version": "3.12.13",
+      "python_version": "3.12.15",
       "packages": {
         "torch": "2.13.0+cu130",
         "triton": "3.7.1",
@@ -64,6 +64,7 @@
   "notes": [
     "Filled on 2026-10-01 from the pod itself (pip list of the interpreter, nvidia-smi).",
     "The card is selected by index 0, the pod's only GPU, and checked by name: its UUID and PCI id change whenever the pod is rescheduled (06:00.0 and 66:00.0 on earlier days, 16:00.0 on 2026-10-01 evening). The harness pins CUDA_VISIBLE_DEVICES to the UUID it finds and records UUID and PCI id in the manifest.",
+    "2026-10-12: the pod was rescheduled overnight to a node with driver 595.91.07 (card PCI 86:00.0), and the main environment's interpreter now reads Python 3.12.15; every pinned package is unchanged. Every B300 table of 0.2.1 is measured on this node, fso and comparators alike.",
     "Compute mode: DEFAULT for the run and the mode found before the run restored after it, as /data/bench-runs/fso_release_perf_20261001/b300/run_stage1.sh did (it found Exclusive_Process); when the card is already in Default mode the restore is a no-op.",
     "The PYTHONPATH overlay holds only expecttest 0.3.0 (pip install --no-deps --target): env0520 lacks it, and torch.testing._internal imports it for the reference MXFP8 quantize of the dense bench's cuBLAS columns and of the torch scaled_grouped_mm comparators. The overlay lives in the 2026-10-01 run directory; the preflight checks that expecttest resolves to 0.3.0 through it, so a moved or deleted overlay is a refusal, not a silent loss of those columns.",
     "Package keys are distribution names: deep_gemm is the sgl-deep-gemm distribution. Every package of the harness's list that the environment has installed is pinned (sglang, deep_gemm and FlashInfer are installed but no B300 table uses them), plus nvidia-cublas, nvidia-cuda-nvrtc and the expecttest overlay.",

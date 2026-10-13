@@ -48,6 +48,14 @@ COMPAT_MOE = {
     "interleave_w13_fp8", "mxfp8_grouped_swiglu_fused_route", "mxfp8_grouped_swiglu_available",
     "mxfp8_grouped_slot_possible", "mxfp8_grouped_problem_shapes_consumed"}
 COMPAT = set(COMPAT_DENSE) | COMPAT_MOE
+# Names fso.compat gained in 0.2.1 (the compact activation layout's routing, glue and GEMM ops). They never
+# lived in fso.gemm, so the deprecated path keeps the 45 names above and does not carry these.
+COMPAT_021 = {
+    "moe_build_routing_compact",
+    "linear_mxfp8_grouped_compact", "linear_mxfp8_grouped_compact_swiglu",
+    "linear_mxfp8_grouped_compact_combine", "quantize_1x32_grouped_gather_out_fp8",
+    "silu_chunk_mul_quantize_1x32_grouped_out_fp8"}
+COMPAT_NEW = COMPAT_021
 ATTENTION = {"flash_attn_fwd", "FlashAttnDispatch", "mxfp8_fwd", "pre_quantize_q",
              "pre_quantize_k", "pre_quantize_v", "mxfp8_paged_prefill_fwd", "plan_paged_prefill",
              "PrefillPagedPlan", "quantize_q_ragged", "mxfp8_decode_paged_fwd", "plan_decode_paged",
@@ -107,11 +115,21 @@ def deprecation_checks(failures):
     check(fso.gemm.__all__ == COMPAT_DENSE, "fso.gemm.__all__ is the eleven dense names, in their former order",
           failures)
     check(COMPAT <= set(dir(fso.gemm)), "dir(fso.gemm) lists the 45 deprecated names", failures)
+    check(COMPAT_021.isdisjoint(dir(fso.gemm)), "the names new in 0.2.1 are not on the deprecated fso.gemm path",
+          failures)
     try:
         fso.gemm.no_such_name
         check(False, "an unknown fso.gemm name raises AttributeError", failures)
     except AttributeError:
         check(True, "an unknown fso.gemm name raises AttributeError", failures)
+    for name in sorted(COMPAT_NEW):
+        try:
+            getattr(fso.gemm, name)
+            check(False, f"fso.gemm.{name} does not exist (a name added to fso.compat after fso.gemm was frozen)",
+                  failures)
+        except AttributeError:
+            check(True, f"fso.gemm.{name} does not exist (a name added to fso.compat after fso.gemm was frozen)",
+                  failures)
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
         mods = [importlib.import_module(f"fish_scales_ops.gemm.{m}") for m in ("fp8", "mxfp8", "bf16")]
@@ -156,7 +174,8 @@ def main():
                                         f"of the installed wheel ({built})", failures)
     else:
         print(f"  skip: neither pyproject.toml nor BUILD_INFO.json next to the package; __version__ {fso.__version__}")
-    for mod, want in ((fso.dense, DENSE), (fso.moe, MOE), (fso.compat, COMPAT), (fso.attention, ATTENTION)):
+    for mod, want in ((fso.dense, DENSE), (fso.moe, MOE), (fso.compat, COMPAT | COMPAT_021),
+                      (fso.attention, ATTENTION)):
         got = set(mod.__all__)
         check(got == want and len(mod.__all__) == len(got),
               f"{mod.__name__}.__all__ ({len(got)} names)"

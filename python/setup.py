@@ -183,6 +183,8 @@ def _gemm_sources() -> list[str]:
         _rel(base / "ops" / "fp8.cu"),
         _rel(base / "ops" / "mxfp8.cu"),
         _rel(base / "ops" / "mxfp8_kernel.cu"),
+        _rel(base / "ops" / "mxfp8_compact.cu"),
+        _rel(base / "ops" / "mxfp8_compact_kernel.cu"),
         _rel(base / "ops" / "mxfp8_sm100_kernel.cu"),
         _rel(GROUPED_TU),
         _rel(SLOT_TU),

@@ -179,6 +179,28 @@ inline uint64_t* buffer_from_env()
     } while (0)
 #endif
 
+// The kernel parameters only the compact-layout instantiations carry (CompactActs,
+// see below). Every other instantiation derives from the empty primary template, so
+// its Params -- the kernel's parameter block -- keeps the layout and the size it had.
+template <bool CompactActs>
+struct CompactActsParams
+{
+};
+
+template <>
+struct CompactActsParams<true>
+{
+    // [G + 1] int32, the routing's exclusive prefix of ceil(masked_m[g] / 128): expert
+    // g's activation rows are rows [blk0[g] * 128, blk0[g] * 128 + masked_m[g]) of the
+    // one-group A / SFA / D tensors.
+    int32_t const* blk0 = nullptr;
+    // R, the row count of those tensors (128 * the blocks the caller allocated).
+    int act_rows = 0;
+    // Rv = min(m_cap, 128), the row extent of the block view of A (kBlockView instances only; see
+    // SM120BlockScaledKernel::kBlockView).
+    int view_rows = 0;
+};
+
 // FusedSwiGLUEpi turns the epilogue into the MoE layer's FC1 tail: instead of
 // staging the bf16 tile for a TMA store into a [G, m_cap, 2*INTER] slab, the math
 // warps read the staged tile back, compute silu(gate) * up, requantize to MXFP8
@@ -193,8 +215,30 @@ inline uint64_t* buffer_from_env()
 // arch/sm120/mxfp8/fused_combine_epi.cuh for the request-width measurement that
 // decides the shape, and for what the caller owes (a pre-filled output, and no
 // expectation of bit-reproducibility).
+//
+// CompactActs selects the compact activation layout of the MoE layer (0.2.1, charter
+// decision D1) instead of the masked slab. The masked slab gives every expert m_cap
+// rows of A / SFA / D, and the tensors carry the expert as their batch index L. The
+// compact layout packs the experts' rows into ONE group of R rows made of 128-row
+// blocks: expert g owns the blocks from blk0[g] on, so its rows start at row
+// blk0[g] * 128. The weights B / SFB keep the expert as their batch index. The kernel
+// therefore sees two index spaces:
+//   * the scheduler is unchanged: it walks (expert, m-block, n-block) tiles from
+//     masked_m with the problem shape (m_cap, N, K, G), m_cap being only the
+//     host-static hint the cascade and the grid bound read;
+//   * the A, SFA and D descriptors are built over (R, ., 1), and every tile shifts
+//     its row coordinate by blk0[g] * 128 (cute::domain_offset on the TMA coordinate
+//     tensor, the technique of the varlen kernels), with batch index 0. A 128-row
+//     block boundary has no meaning to TMA, so any TileM works, 96 and 160 included:
+//     an expert's rows and its K-major scale words are both contiguous runs.
+// A tile that runs past an expert's live rows READS the next expert's rows (or
+// padding); GEMM rows are independent, so the live rows are unaffected. Every STORE
+// is bounded by masked_m[g]: the grouped plain epilogue (store_rows) writes a whole
+// tile with TMA only when all of its rows are live and writes a partial tile row by
+// row, and the two fused epilogues write live rows only. With the flag false every
+// line below is what it was, and the masked instantiations compile to the same code.
 template <typename KT, bool FusedSwiGLUEpi = false, bool ScatterCombineEpi = false,
-    bool ScatterInStoreWarp = false>
+    bool ScatterInStoreWarp = false, bool CompactActs = false>
 struct SM120BlockScaledKernel
 {
     static_assert(!(FusedSwiGLUEpi && ScatterCombineEpi),
@@ -202,6 +246,9 @@ struct SM120BlockScaledKernel
     static_assert(!(FusedSwiGLUEpi || ScatterCombineEpi) || KT::kSeparateSmemD,
         "the fused SwiGLU epilogue reads the staged tile after the mainloop has moved on, so the "
         "instance needs its own D buffer (SeparateSmemD) rather than one aliasing the A/B stages");
+    static_assert(!CompactActs || KT::kGroupedLayoutSmem,
+        "the compact activation layout is a grouped (MoE) form: it needs the grouped scheduler path, "
+        "whose plain epilogue (store_rows) bounds every store by masked_m");
     static constexpr int kNumTMAThreads = 128;
     static constexpr int kNumScatterThreads = 64;   // store warp + the spare 4th TMA warp
     static constexpr int kScatterBarrierId = 1;     // 0 belongs to the math warps
@@ -227,7 +274,61 @@ struct SM120BlockScaledKernel
 
     using ProblemShape = typename KT::ProblemShape;
 
-    struct Params
+    // The problem shape the activation tensors A, SFA and D are built over: the
+    // scheduler's shape itself, or with the compact layout one group of R rows.
+    CUTE_HOST_DEVICE static auto act_problem_shape(ProblemShape const& problem_shape, int act_rows)
+    {
+        if constexpr (CompactActs)
+        {
+            return ProblemShape(act_rows, cute::get<1>(problem_shape), cute::get<2>(problem_shape), 1);
+        }
+        else
+        {
+            return problem_shape;
+        }
+    }
+
+    // The block view of the activation operand A (compact instances whose TileM divides 128).
+    //
+    // The one-group view reads A as one tensor of R rows, so a tile that runs past its expert's live rows READS
+    // those rows: they are in bounds. The masked slab's (m_cap, K, G) tensor ends each group at m_cap, so the
+    // same rows are out of bounds there and TMA zero-fills them without touching memory. At decode that
+    // difference was nearly the whole extra cost of the compact FC1 (run fso_0.2.1_20261010/S4b): a 16-row tile
+    // over an expert with one to a few live rows fetched 16 rows of A per k-tile instead of m_cap = 4, and the
+    // masked kernel run on a slab padded to 16 rows reproduced the compact gap almost exactly (+0.32 against
+    // +0.38 us at Family C M = 4 for the fused FC1, +0.59 against +0.64 at M = 8), while staging blk0 in shared
+    // memory did not move it. FC2 (K = 512) over-reads a quarter as many bytes per tile, which is why it barely
+    // showed the gap.
+    //
+    // So these instances read A as the rank-3 tensor [blocks, Rv rows, K] (row stride K, block stride 128 * K)
+    // with Rv = min(m_cap, 128): rows Rv..127 of every block are out of bounds and zero-filled, exactly as rows
+    // past m_cap are in the masked slab. A tile of expert g at m-block m is block blk0[g] + m * TileM / 128, rows
+    // (m * TileM) % 128 + [0, TileM): since TileM divides 128 and an expert starts on a block boundary, no tile
+    // crosses a block. Correct at every M: below 128 tokens an expert holds at most m_cap rows, all in its one
+    // block; from 128 on Rv = 128 and every row of every block is visible (the over-read is then a sliver of a
+    // compute-bound tile). Precondition, the masked GEMM's own: masked_m[g] <= m_cap.
+    //
+    // The scale words (SFA) keep the one-group view. Giving them the same block view was measured too (run
+    // S4c): it reads a quarter of A's over-read bytes away but splits every scale box into four 16-byte pieces,
+    // and was slower than this A-only form at nearly every decode cell. The 96- and 160-row instances keep the
+    // one-group view for A as well (their tiles cross blocks), and stores keep it everywhere (they are bounded by
+    // masked_m already). The compact buffer itself (charter D1) does not change; only A's read addressing does.
+    static constexpr bool kBlockView = CompactActs && (128 % KT::kTileM == 0);
+
+    CUTE_HOST_DEVICE static int block_view_rows(int m_cap)
+    {
+        return m_cap < 128 ? m_cap : 128;
+    }
+
+    // The block view's (m-tile, block) of the tile whose expert starts at row act_row0 (a multiple of 128).
+    CUTE_DEVICE static void block_view_coord(int act_row0, int m_block, int& m_tile, int& block)
+    {
+        int const row = act_row0 + m_block * KT::kTileM;
+        m_tile = (row & 127) / KT::kTileM;
+        block = row >> 7;
+    }
+
+    struct Params : CompactActsParams<CompactActs>
     {
         typename KT::TMA_A tma_load_a;
         typename KT::TMA_B tma_load_b;
@@ -286,15 +387,37 @@ struct SM120BlockScaledKernel
         float const* weight_of_slot = nullptr;
         int group_perm = 1;
         int group_block = 1;
+        // Compact layout only (CompactActs): the routing's block prefix and the row
+        // count R of the one-group activation tensors. Host-side; ignored otherwise.
+        int32_t const* blk0 = nullptr;
+        int act_rows = 0;
     };
 
     static constexpr Params to_underlying_arguments(ProblemShape const& problem_shape, Arguments const& args)
     {
-        auto M = cute::get<0>(problem_shape);
         auto N = cute::get<1>(problem_shape);
         auto K = cute::get<2>(problem_shape);
         auto L = cute::get<3>(problem_shape);
-        auto tensor_A = make_tensor(make_gmem_ptr(args.ptr_A), make_layout(make_shape(M, K, L), args.dA));
+        // A, SFA and D are built over the activation shape: the problem shape itself for
+        // the masked layout, one group of R rows for the compact one (M_a = R, L_a = 1).
+        // B and SFB always keep the problem shape's (N, K, L).
+        auto const act_shape = act_problem_shape(problem_shape, args.act_rows);
+        auto M_a = cute::get<0>(act_shape);
+        auto L_a = cute::get<3>(act_shape);
+        auto tensor_A = [&]
+        {
+            if constexpr (kBlockView)
+            {
+                int64_t const ld = cute::get<0>(args.dA);
+                return make_tensor(make_gmem_ptr(args.ptr_A),
+                    make_layout(make_shape(block_view_rows(cute::get<0>(problem_shape)), K, args.act_rows / 128),
+                        make_stride(ld, Int<1>{}, ld * 128)));
+            }
+            else
+            {
+                return make_tensor(make_gmem_ptr(args.ptr_A), make_layout(make_shape(M_a, K, L_a), args.dA));
+            }
+        }();
         typename KT::TMA_A tma_load_a
             = make_tma_copy(SM90_TMA_LOAD{}, tensor_A, typename KT::SmemLayoutA{}(_, _, Int<0>{}),
                 make_shape(shape<0>(typename KT::TileShape{}), shape<2>(typename KT::TileShape{})), _1{});
@@ -304,7 +427,7 @@ struct SM120BlockScaledKernel
             = make_tma_copy(SM90_TMA_LOAD{}, tensor_B, typename KT::SmemLayoutB{}(_, _, Int<0>{}),
                 make_shape(shape<1>(typename KT::TileShape{}), shape<2>(typename KT::TileShape{})), _1{});
 
-        auto sfa_layout = KT::deduce_sfa_layout(problem_shape);
+        auto sfa_layout = KT::deduce_sfa_layout(act_shape);
         auto sfb_layout = KT::deduce_sfb_layout(problem_shape);
 
         auto tensor_sfa = make_tensor(make_gmem_ptr(args.ptr_SFA), sfa_layout);
@@ -318,12 +441,22 @@ struct SM120BlockScaledKernel
             = make_tma_copy(SM90_TMA_LOAD{}, tensor_sfb, typename KT::SmemLayoutSFB{}(_, _, Int<0>{}),
                 make_shape(shape<1>(typename KT::ScaleTileShape{}), shape<2>(typename KT::ScaleTileShape{})), _1{});
 
-        auto tensor_d = make_tensor(make_gmem_ptr(args.ptr_D), make_layout(make_shape(M, N, L), args.dD));
+        auto tensor_d = make_tensor(make_gmem_ptr(args.ptr_D), make_layout(make_shape(M_a, N, L_a), args.dD));
         auto tma_store_d = make_tma_copy_C_sm90(
             typename KT::CopyOpS2G{}, tensor_d, take<0, 2>(typename KT::SmemLayoutD{}), typename KT::EpilogueTile_MN{});
-        return {tma_load_a, tma_load_b, tma_load_sfa, tma_load_sfb, tma_store_d, problem_shape, args.grouped_layout,
-            args.out_fp8, args.out_sf, args.m_cap, args.inter, args.out_tokens, args.row_map, args.weight_of_slot,
-            args.group_perm, args.group_block, args.ptr_D, cute::get<0>(args.dD), cute::get<2>(args.dD)};
+        // The leading {} initialises the CompactActsParams base (empty for every
+        // non-compact instantiation).
+        Params params{{}, tma_load_a, tma_load_b, tma_load_sfa, tma_load_sfb, tma_store_d, problem_shape,
+            args.grouped_layout, args.out_fp8, args.out_sf, args.m_cap, args.inter, args.out_tokens, args.row_map,
+            args.weight_of_slot, args.group_perm, args.group_block, args.ptr_D, cute::get<0>(args.dD),
+            cute::get<2>(args.dD)};
+        if constexpr (CompactActs)
+        {
+            params.blk0 = args.blk0;
+            params.act_rows = args.act_rows;
+            params.view_rows = block_view_rows(cute::get<0>(problem_shape));
+        }
+        return params;
     }
 
     static dim3 get_grid_shape(Params const& params)
@@ -408,19 +541,51 @@ struct SM120BlockScaledKernel
             ab_full_mbar, ab_empty_mbar, sf_full_mbar, sf_empty_mbar, store_full_mbar, store_empty_mbar);
     }
 
+    // The activation operand's TMA coordinate tensor, ready to be tiled: the masked
+    // layout's (M, ., L) tensor, or with the compact layout the one-group (R, ., 1)
+    // tensor shifted by `act_row0` rows -- the first row of this tile's expert, so
+    // that m-tile m of expert g covers rows act_row0 + m * TileM. Only the coordinate
+    // origin moves; the descriptor's bounds stay the whole tensor's.
+    template <class TmaTensor>
+    CUTE_DEVICE static auto act_coord_tensor(TmaTensor const& t, [[maybe_unused]] int act_row0)
+    {
+        if constexpr (CompactActs)
+        {
+            return cute::domain_offset(cute::make_coord(act_row0, _0{}, _0{}), t);
+        }
+        else
+        {
+            return t;
+        }
+    }
+
     // One tile's scale-factor spans. `first_tile` is set for the launch's first tile
     // only: load_sfb_first() has then already armed span 0's full barrier for both
     // halves and issued its SFB copy before the PDL wait, so only SFA remains here.
+    // `act_row0` is the compact layout's first activation row of the tile's expert
+    // (unused otherwise).
     template <class BlkCoord>
     CUTE_DEVICE static void load_sf(Params const& params, SharedStorage& shared_storage, BlkCoord const& blk_coord,
-        int32_t sf_tile_count, uint32_t& phase, uint32_t& store_phase, bool first_tile = false)
+        int32_t sf_tile_count, uint32_t& phase, uint32_t& store_phase, bool first_tile = false, int act_row0 = 0)
     {
         using X = Underscore;
         auto M = cute::get<0>(params.problem_shape);
         auto N = cute::get<1>(params.problem_shape);
         auto K = cute::get<2>(params.problem_shape);
         auto L = cute::get<3>(params.problem_shape);
-        auto mSFA_mkl = params.tma_load_sfa.get_tma_tensor(shape(KT::deduce_sfa_layout(params.problem_shape)));
+        auto mSFA_mkl = [&]
+        {
+            if constexpr (CompactActs)
+            {
+                return act_coord_tensor(params.tma_load_sfa.get_tma_tensor(shape(KT::deduce_sfa_layout(
+                                            act_problem_shape(params.problem_shape, params.act_rows)))),
+                    act_row0);
+            }
+            else
+            {
+                return params.tma_load_sfa.get_tma_tensor(shape(KT::deduce_sfa_layout(params.problem_shape)));
+            }
+        }();
         auto mSFB_nkl = params.tma_load_sfb.get_tma_tensor(shape(KT::deduce_sfb_layout(params.problem_shape)));
 
         auto gSFA_mkl = local_tile(
@@ -435,7 +600,8 @@ struct SM120BlockScaledKernel
         auto n_coord = cute::get<1>(blk_coord);
         auto l_coord = cute::get<2>(blk_coord);
 
-        auto gSFA = gSFA_mkl(_, _, m_coord, _, l_coord);
+        // The compact layout's activations are one group: batch index 0.
+        auto gSFA = gSFA_mkl(_, _, m_coord, _, CompactActs ? 0 : l_coord);
         auto gSFB = gSFB_nkl(_, _, n_coord, _, l_coord);
 
         auto tAgSFA = block_tma_sfa.partition_S(gSFA); // (TMA,TMA_M,TMA_K,k)
@@ -497,9 +663,11 @@ struct SM120BlockScaledKernel
     // launch's first tile only: load_b_first() has then already armed the full
     // barriers of the first kPreWaitBStages stages for both halves and issued their B
     // copy before the PDL wait, so the first round issues only their A copy.
+    // `act_row0` is the compact layout's first activation row of the tile's expert
+    // (unused otherwise); the weights B keep the expert as their batch index.
     template <class BlkCoord>
     CUTE_DEVICE static void load_ab(Params const& params, SharedStorage& shared_storage, BlkCoord const& blk_coord,
-        int32_t k_tile_count, uint32_t& phase, uint32_t& store_phase, bool first_tile = false)
+        int32_t k_tile_count, uint32_t& phase, uint32_t& store_phase, bool first_tile = false, int act_row0 = 0)
     {
         using X = Underscore;
         auto M = cute::get<0>(params.problem_shape);
@@ -507,7 +675,21 @@ struct SM120BlockScaledKernel
         auto K = cute::get<2>(params.problem_shape);
         auto L = cute::get<3>(params.problem_shape);
 
-        auto mA_mkl = params.tma_load_a.get_tma_tensor(make_shape(M, K, L));
+        auto mA_mkl = [&]
+        {
+            if constexpr (kBlockView)
+            {
+                return params.tma_load_a.get_tma_tensor(make_shape(params.view_rows, K, params.act_rows / 128));
+            }
+            else if constexpr (CompactActs)
+            {
+                return act_coord_tensor(params.tma_load_a.get_tma_tensor(make_shape(params.act_rows, K, 1)), act_row0);
+            }
+            else
+            {
+                return params.tma_load_a.get_tma_tensor(make_shape(M, K, L));
+            }
+        }();
         auto mB_nkl = params.tma_load_b.get_tma_tensor(make_shape(N, K, L));
 
         // Make tiled views, defer the slice
@@ -523,7 +705,22 @@ struct SM120BlockScaledKernel
         auto n_coord = cute::get<1>(blk_coord);
         auto l_coord = cute::get<2>(blk_coord);
 
-        auto gA = gA_mkl(_, _, m_coord, _, l_coord);
+        // The compact layout's activations are one group (batch index 0), or in the block view the tile's
+        // (m-tile, block) inside it.
+        auto gA = [&]
+        {
+            if constexpr (kBlockView)
+            {
+                int m_sel;
+                int l_sel;
+                block_view_coord(act_row0, m_coord, m_sel, l_sel);
+                return gA_mkl(_, _, m_sel, _, l_sel);
+            }
+            else
+            {
+                return gA_mkl(_, _, m_coord, _, CompactActs ? 0 : l_coord);
+            }
+        }();
         auto gB = gB_nkl(_, _, n_coord, _, l_coord);
 
         auto tAgA = block_tma_a.partition_S(gA); // (TMA,TMA_M,TMA_K,k)
@@ -886,10 +1083,25 @@ struct SM120BlockScaledKernel
             int const rows_valid = params.grouped_layout != nullptr
                 ? params.grouped_layout[group]
                 : cute::get<0>(params.problem_shape);
-            fused_combine::store_tile<KT::kTileM, KT::kTileN, KT::kNumMathThreads>(sD_epi(_, _, Int<0>{}),
-                params.out_tokens, params.row_map, params.weight_of_slot, thread_idx, group,
-                m_block * KT::kTileM, n_block * KT::kTileN, rows_valid, params.m_cap,
-                cute::get<1>(params.problem_shape));
+            if constexpr (CompactActs)
+            {
+                // One-group view: row_map / weight_of_slot are indexed by compact row
+                // blk0[g] * 128 + m_in (group 0 of a slab of R = params.m_cap rows), and
+                // the rows valid for this expert end at blk0[g] * 128 + masked_m[g]. The
+                // blk0 load is issued beside the masked_m one, so it adds no latency.
+                int const act_row0 = params.blk0[group] * 128;
+                fused_combine::store_tile<KT::kTileM, KT::kTileN, KT::kNumMathThreads>(sD_epi(_, _, Int<0>{}),
+                    params.out_tokens, params.row_map, params.weight_of_slot, thread_idx, 0,
+                    act_row0 + m_block * KT::kTileM, n_block * KT::kTileN, act_row0 + rows_valid, params.m_cap,
+                    cute::get<1>(params.problem_shape));
+            }
+            else
+            {
+                fused_combine::store_tile<KT::kTileM, KT::kTileN, KT::kNumMathThreads>(sD_epi(_, _, Int<0>{}),
+                    params.out_tokens, params.row_map, params.weight_of_slot, thread_idx, group,
+                    m_block * KT::kTileM, n_block * KT::kTileN, rows_valid, params.m_cap,
+                    cute::get<1>(params.problem_shape));
+            }
             cutlass::arch::NamedBarrier::sync(KT::kNumMathThreads, 0);
         }
         else if constexpr (FusedSwiGLUEpi)
@@ -902,9 +1114,22 @@ struct SM120BlockScaledKernel
             int const rows_valid = params.grouped_layout != nullptr
                 ? params.grouped_layout[group]
                 : cute::get<0>(params.problem_shape);
-            fused_swiglu::store_tile<KT::kTileM, KT::kTileN, KT::kNumMathThreads>(sD_epi(_, _, Int<0>{}),
-                params.out_fp8, params.out_sf, thread_idx, group, m_block * KT::kTileM, n_block * KT::kTileN,
-                rows_valid, params.m_cap, params.inter);
+            if constexpr (CompactActs)
+            {
+                // One-group view: the FP8 rows and the K-major scale words of expert g
+                // are rows blk0[g] * 128 + m_in of a one-group slab of R = params.m_cap
+                // rows (word kp * R + row), valid up to blk0[g] * 128 + masked_m[g].
+                int const act_row0 = params.blk0[group] * 128;
+                fused_swiglu::store_tile<KT::kTileM, KT::kTileN, KT::kNumMathThreads>(sD_epi(_, _, Int<0>{}),
+                    params.out_fp8, params.out_sf, thread_idx, 0, act_row0 + m_block * KT::kTileM,
+                    n_block * KT::kTileN, act_row0 + rows_valid, params.m_cap, params.inter);
+            }
+            else
+            {
+                fused_swiglu::store_tile<KT::kTileM, KT::kTileN, KT::kNumMathThreads>(sD_epi(_, _, Int<0>{}),
+                    params.out_fp8, params.out_sf, thread_idx, group, m_block * KT::kTileM, n_block * KT::kTileN,
+                    rows_valid, params.m_cap, params.inter);
+            }
             cutlass::arch::NamedBarrier::sync(KT::kNumMathThreads, 0);
         }
         else
@@ -940,10 +1165,22 @@ struct SM120BlockScaledKernel
             = params.grouped_layout != nullptr ? params.grouped_layout[group] : cute::get<0>(params.problem_shape);
         int const scatter_tid
             = ((int(threadIdx.x) / 32 == KT::kNumMathWarps) ? 0 : 32) + (int(threadIdx.x) & 31);
-        fused_combine::store_tile<KT::kTileM, KT::kTileN, kNumScatterThreads>(sD_epi(_, _, Int<0>{}),
-            params.out_tokens, params.row_map, params.weight_of_slot, scatter_tid, group,
-            cute::get<0>(blk_coord) * KT::kTileM, cute::get<1>(blk_coord) * KT::kTileN, rows_valid, params.m_cap,
-            cute::get<1>(params.problem_shape));
+        if constexpr (CompactActs)
+        {
+            // One-group view, as in the math-warp form (see mma()).
+            int const act_row0 = params.blk0[group] * 128;
+            fused_combine::store_tile<KT::kTileM, KT::kTileN, kNumScatterThreads>(sD_epi(_, _, Int<0>{}),
+                params.out_tokens, params.row_map, params.weight_of_slot, scatter_tid, 0,
+                act_row0 + cute::get<0>(blk_coord) * KT::kTileM, cute::get<1>(blk_coord) * KT::kTileN,
+                act_row0 + rows_valid, params.m_cap, cute::get<1>(params.problem_shape));
+        }
+        else
+        {
+            fused_combine::store_tile<KT::kTileM, KT::kTileN, kNumScatterThreads>(sD_epi(_, _, Int<0>{}),
+                params.out_tokens, params.row_map, params.weight_of_slot, scatter_tid, group,
+                cute::get<0>(blk_coord) * KT::kTileM, cute::get<1>(blk_coord) * KT::kTileN, rows_valid, params.m_cap,
+                cute::get<1>(params.problem_shape));
+        }
         cutlass::arch::NamedBarrier::sync(kNumScatterThreads, kScatterBarrierId);
         if (threadIdx.x == KT::kNumMathThreads)
         {
@@ -1039,6 +1276,16 @@ struct SM120BlockScaledKernel
         // the PDL wait every warp has already passed.
         int const rows_valid = params.grouped_layout != nullptr ? params.grouped_layout[l_coord] : int(M);
         int const rows = rows_valid - m_coord * KT::kTileM;
+        // Compact layout: the first activation row of this tile's expert, loaded beside
+        // masked_m (a routing output as old as masked_m). Both store forms below write rows
+        // [act_row0 + m_coord * TileM, ...) of the one-group D, and neither writes a row
+        // at or past act_row0 + masked_m[g]: the TMA box only when every row is live,
+        // the row loop only `rows` rows.
+        int act_row0 = 0;
+        if constexpr (CompactActs)
+        {
+            act_row0 = params.blk0[l_coord] * 128;
+        }
         store_full_mbar[0].wait(phase);
         auto sD_epi_ = make_tensor(make_smem_ptr(shared_storage.tensors.store.smem_D.begin()),
             typename KT::SmemLayoutD{});                                     // (BLK_M,BLK_N,PIPE)
@@ -1048,10 +1295,21 @@ struct SM120BlockScaledKernel
             if (elected)
             {
                 using EpilogueTile = typename KT::EpilogueTile_MN;
-                auto mD_mnl = params.tma_store_d.get_tma_tensor(make_shape(M, N, L));
+                auto mD_mnl = [&]
+                {
+                    if constexpr (CompactActs)
+                    {
+                        return act_coord_tensor(
+                            params.tma_store_d.get_tma_tensor(make_shape(params.act_rows, N, 1)), act_row0);
+                    }
+                    else
+                    {
+                        return params.tma_store_d.get_tma_tensor(make_shape(M, N, L));
+                    }
+                }();
                 auto gD_mnl = local_tile(
                     mD_mnl, typename KT::TileShape{}, make_coord(_, _, _), Step<_1, _1, X>{}); // (BLK_M,BLK_N,m,n,l)
-                auto gD = gD_mnl(_, _, m_coord, n_coord, l_coord);
+                auto gD = gD_mnl(_, _, m_coord, n_coord, CompactActs ? 0 : l_coord);
                 auto gD_epi = flat_divide(gD, EpilogueTile{}); // (EPI_TILE_M,EPI_TILE_N,EPI_M,EPI_N)
                 auto block_tma_d = params.tma_store_d.get_slice(Int<0>{});
                 auto bSG_sD = block_tma_d.partition_S(sD_epi); // (TMA,TMA_M,TMA_K, PIP)
@@ -1078,8 +1336,10 @@ struct SM120BlockScaledKernel
             constexpr int kVecPerRow = KT::kTileN / kVec;
             static_assert(KT::kTileN % kVec == 0, "a tile row must be a whole number of 16-byte vectors");
             int const lane = int(threadIdx.x) & 31;
-            ElementD* const dst = params.ptr_d + int64_t(l_coord) * params.stride_d
-                + int64_t(m_coord * KT::kTileM) * params.ld_d + n_coord * KT::kTileN;
+            ElementD* const dst = CompactActs
+                ? params.ptr_d + int64_t(act_row0 + m_coord * KT::kTileM) * params.ld_d + n_coord * KT::kTileN
+                : params.ptr_d + int64_t(l_coord) * params.stride_d + int64_t(m_coord * KT::kTileM) * params.ld_d
+                    + n_coord * KT::kTileN;
             // The swizzle permutes whole 16-byte chunks within a 128-byte row, so the
             // kVec elements from a kVec-aligned column are contiguous in shared memory.
             for (int q = lane; q < rows * kVecPerRow; q += 32)
@@ -1411,6 +1671,19 @@ struct SM120BlockScaledKernel
 #if defined(FSO_PROLOGUE_TRACE)
                         prologue_trace::put(trc_det, prologue_trace::kLoadFirstNext);
 #endif
+                        // Compact layout: the first activation row of the tile's expert.
+                        // blk0 is a routing output, as old as masked_m, so the first tile's
+                        // value is loaded before the PDL wait like the prefix above, and its
+                        // latency does not delay the first A copy after the wait. Later
+                        // tiles load it before load_ab's first empty-barrier wait.
+                        int act_row0 = 0;
+                        if constexpr (CompactActs)
+                        {
+                            if (has)
+                            {
+                                act_row0 = params.blk0[scheduler.current_group_idx] * 128;
+                            }
+                        }
                         if constexpr (kPreWaitBStages > 0)
                         {
                             if (has)
@@ -1422,9 +1695,17 @@ struct SM120BlockScaledKernel
                         cudaGridDependencySynchronize();
                         for (bool first = true; has; has = scheduler.get_next_block(), first = false)
                         {
+                            if constexpr (CompactActs)
+                            {
+                                if (!first)
+                                {
+                                    act_row0 = params.blk0[scheduler.current_group_idx] * 128;
+                                }
+                            }
                             auto blk_coord = cute::make_coord(
                                 scheduler.m_block_idx, scheduler.n_block_idx, scheduler.current_group_idx);
-                            load_ab(params, shared_storage, blk_coord, k_tile_count, phase, store_phase, first);
+                            load_ab(params, shared_storage, blk_coord, k_tile_count, phase, store_phase, first,
+                                act_row0);
                         }
                     }
                     __syncwarp();
@@ -1437,6 +1718,15 @@ struct SM120BlockScaledKernel
                     {
                         auto scheduler = Scheduler(M, N, L, grouped_layout, layout_is_cumsum, params.group_perm, params.group_block);
                         bool has = scheduler.get_next_block();
+                        // Compact layout: as in the A/B-load warp above.
+                        int act_row0 = 0;
+                        if constexpr (CompactActs)
+                        {
+                            if (has)
+                            {
+                                act_row0 = params.blk0[scheduler.current_group_idx] * 128;
+                            }
+                        }
                         if constexpr (kPreWaitBStages > 0)
                         {
                             if (has)
@@ -1448,9 +1738,17 @@ struct SM120BlockScaledKernel
                         cudaGridDependencySynchronize();
                         for (bool first = true; has; has = scheduler.get_next_block(), first = false)
                         {
+                            if constexpr (CompactActs)
+                            {
+                                if (!first)
+                                {
+                                    act_row0 = params.blk0[scheduler.current_group_idx] * 128;
+                                }
+                            }
                             auto blk_coord = cute::make_coord(
                                 scheduler.m_block_idx, scheduler.n_block_idx, scheduler.current_group_idx);
-                            load_sf(params, shared_storage, blk_coord, sf_tile_count, phase, store_phase, first);
+                            load_sf(params, shared_storage, blk_coord, sf_tile_count, phase, store_phase, first,
+                                act_row0);
                         }
                     }
                     __syncwarp();

@@ -30,13 +30,17 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/torch.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
+#include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -44,6 +48,8 @@ namespace blockscale_gemm
 {
 namespace
 {
+
+namespace cg = cooperative_groups;
 
 constexpr int kMaxGroups = 1024;
 constexpr int kRoutingThreads = 512;
@@ -287,73 +293,20 @@ __global__ void moe_build_routing_ps_kernel(
 // sigmoid gate, which every other layout pays a separate elementwise pass for.
 // With kBias false the body is what it was, instruction for instruction, so the
 // layers that have no shared expert keep the kernel they had on every arch.
+// One (token t, 8 columns from h) item of the combine: out[t, h..h+7] = sum_j topk_w[t, j] * dn[slot_j, h..h+7] (+ the
+// bias row), j ascending. `slots` / `ws` hold the token's routing when `fast` (topk <= kMaxTopk); the slow path reads
+// it here.
+constexpr int kCombineVec = 8;     // 8 bf16 = 16 bytes per thread
+constexpr int kCombineMaxTopk = 8; // the unrolled fast path
+
 template <bool kBias>
-__global__ void moe_combine_kernel(
-    __nv_bfloat16 const* __restrict__ dn, // [G * m_cap, H]
-    int32_t const* __restrict__ slot_of_flat, // [M * topk]
-    float const* __restrict__ topk_w,     // [M, topk]
-    __nv_bfloat16* __restrict__ out,      // [M, H]
-    __nv_bfloat16 const* __restrict__ bias,   // [M, H] or nullptr (read iff kBias)
-    float const* __restrict__ bias_scale,     // [M] or nullptr: per-token factor on bias
-    int M, int topk, int H, bool pdl)
+__device__ __forceinline__ void moe_combine_item(__nv_bfloat16 const* __restrict__ dn,
+    int32_t const* __restrict__ slot_of_flat, float const* __restrict__ topk_w, __nv_bfloat16* __restrict__ out,
+    __nv_bfloat16 const* __restrict__ bias, float const* __restrict__ bias_scale, int t, int h, int topk, int H,
+    bool fast, int const (&slots)[kCombineMaxTopk], float (&ws)[kCombineMaxTopk])
 {
-    constexpr int kVec = 8; // 8 bf16 = 16 bytes per thread
-    int const tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int const num_hvec = H / kVec;
-    // A thread past the end has nothing to load and nothing to wait for. Thread 0
-    // of every CTA is in range (the grid is ceil(total / blockDim)), so every CTA
-    // still reaches the PDL trigger below.
-    if (tid >= M * num_hvec)
-        return;
-    int const t = tid / num_hvec;
-    int const h = (tid % num_hvec) * kVec;
-
-    // Prefetch all topk routed rows before reducing so the scattered LDG.128
-    // latencies overlap. At M=1 this kernel is a single latency-bound CTA and
-    // the old load->use-per-iteration chain serialised topk dependent loads.
-    // Fast path unrolls a fixed bound (covers the common MoE topk); larger topk
-    // falls back to the sequential loop.
-    constexpr int kMaxTopk = 8;
-    bool const fast = topk <= kMaxTopk;
-    float ws[kMaxTopk];
-    int slots[kMaxTopk];
-    if (fast)
-    {
-        // Three unrolled phases so the topk slot / weight loads, then the topk LDG.128 row loads, issue
-        // back-to-back (two memory round trips per thread, as before masked entries were supported: a
-        // branch or select inside a single loop cost +1.4-1.7 us at M = 8). A masked padded-row entry
-        // (sorted layout, flat_to_sorted = -1) reads row 0, always allocated, and is zeroed afterwards.
-        //
-        // The first phase runs BEFORE the PDL wait below. slot_of_flat and topk_w are routing outputs,
-        // written four launches upstream of this kernel in every MoE chain of this library, so they are
-        // grandparent-or-older data like everything a kernel of the chain reads before its wait; only
-        // the dn rows come from the parent (the FC2). A CTA that is resident before the FC2 ends, which
-        // the 128-thread launch in moe_combine() makes the common case at decode, has its first round
-        // trip done when the wait returns. Direct callers inherit the chain's precondition: neither
-        // input may be written by the kernel launched immediately before this one. Measured in run
-        // sm120_r2_p1_20260929 (REPORT.md, part 2).
-#pragma unroll
-        for (int j = 0; j < kMaxTopk; ++j)
-        {
-            if (j < topk)
-            {
-                slots[j] = slot_of_flat[t * topk + j];
-                ws[j] = topk_w[t * topk + j];
-            }
-        }
-    }
-
-    // PDL entry (see moe_build_routing_kernel): the wait orders every dn read behind the parent,
-    // and the trigger follows the wait as in every kernel of the chain.
-    if (pdl)
-    {
-        cudaGridDependencySynchronize();
-        if (threadIdx.x == 0)
-        {
-            cudaTriggerProgrammaticLaunchCompletion();
-        }
-    }
-
+    constexpr int kVec = kCombineVec;
+    constexpr int kMaxTopk = kCombineMaxTopk;
     float acc[kVec];
 #pragma unroll
     for (int v = 0; v < kVec; ++v)
@@ -439,8 +392,248 @@ __global__ void moe_combine_kernel(
 #pragma unroll
     for (int p = 0; p < kVec / 2; ++p)
         packed[p] = __floats2bfloat162_rn(acc[2 * p], acc[2 * p + 1]);
-    *reinterpret_cast<float4*>(&out[static_cast<int64_t>(t) * H + h])
-        = *reinterpret_cast<float4 const*>(&packed[0]);
+    *reinterpret_cast<float4*>(&out[static_cast<int64_t>(t) * H + h]) = *reinterpret_cast<float4 const*>(&packed[0]);
+}
+
+// The token's routing for the fast path: the topk slot / weight loads issue back to back, then (in
+// moe_combine_item) the topk LDG.128 row loads, two memory round trips per thread (a branch or select inside a single
+// loop cost +1.4-1.7 us at M = 8). A masked padded-row entry (sorted layout, flat_to_sorted = -1) reads row 0, always
+// allocated, and is zeroed afterwards.
+__device__ __forceinline__ void moe_combine_routing(int32_t const* __restrict__ slot_of_flat,
+    float const* __restrict__ topk_w, int t, int topk, int (&slots)[kCombineMaxTopk], float (&ws)[kCombineMaxTopk])
+{
+#pragma unroll
+    for (int j = 0; j < kCombineMaxTopk; ++j)
+    {
+        if (j < topk)
+        {
+            slots[j] = slot_of_flat[t * topk + j];
+            ws[j] = topk_w[t * topk + j];
+        }
+    }
+}
+
+// kStride = false: one (token, 8-column) item per thread, the straight-line kernel this file always had; moe_combine()
+// launches it whenever its grid fits in kFsoGlueFlatWaves waves. kStride = true: the same items, grid-stride, on a grid
+// of one wave when the items exceed that, every item reduced exactly as a thread of a larger grid would. Two
+// instantiations rather than one loop because the loop needs about 16 registers more than the straight-line body
+// (80-84 against 64): in one kernel the decode launches would pay them too, and at 64 registers a 128-thread CTA fits
+// beside the sm_120 decode FC2's two resident CTAs (see moe_combine), at 80 or more it does not; bounding the loop to
+// 64 registers spills instead.
+template <bool kBias, bool kStride>
+__global__ void moe_combine_kernel(
+    __nv_bfloat16 const* __restrict__ dn, // [G * m_cap, H]
+    int32_t const* __restrict__ slot_of_flat, // [M * topk]
+    float const* __restrict__ topk_w,     // [M, topk]
+    __nv_bfloat16* __restrict__ out,      // [M, H]
+    __nv_bfloat16 const* __restrict__ bias,   // [M, H] or nullptr (read iff kBias)
+    float const* __restrict__ bias_scale,     // [M] or nullptr: per-token factor on bias
+    int M, int topk, int H, bool pdl)
+{
+    if constexpr (!kStride)
+    {
+        // The one-item-per-thread kernel, exactly as it always was (its machine code is unchanged).
+        constexpr int kVec = 8; // 8 bf16 = 16 bytes per thread
+        int const tid = blockIdx.x * blockDim.x + threadIdx.x;
+        int const num_hvec = H / kVec;
+        // A thread past the end has nothing to load and nothing to wait for. Thread 0
+        // of every CTA is in range (the grid is ceil(total / blockDim)), so every CTA
+        // still reaches the PDL trigger below.
+        if (tid >= M * num_hvec)
+            return;
+        int const t = tid / num_hvec;
+        int const h = (tid % num_hvec) * kVec;
+
+        // Prefetch all topk routed rows before reducing so the scattered LDG.128
+        // latencies overlap. At M=1 this kernel is a single latency-bound CTA and
+        // the old load->use-per-iteration chain serialised topk dependent loads.
+        // Fast path unrolls a fixed bound (covers the common MoE topk); larger topk
+        // falls back to the sequential loop.
+        constexpr int kMaxTopk = 8;
+        bool const fast = topk <= kMaxTopk;
+        float ws[kMaxTopk];
+        int slots[kMaxTopk];
+        if (fast)
+        {
+            // Three unrolled phases so the topk slot / weight loads, then the topk LDG.128 row loads, issue
+            // back-to-back (two memory round trips per thread, as before masked entries were supported: a
+            // branch or select inside a single loop cost +1.4-1.7 us at M = 8). A masked padded-row entry
+            // (sorted layout, flat_to_sorted = -1) reads row 0, always allocated, and is zeroed afterwards.
+            //
+            // The first phase runs BEFORE the PDL wait below. slot_of_flat and topk_w are routing outputs,
+            // written four launches upstream of this kernel in every MoE chain of this library, so they are
+            // grandparent-or-older data like everything a kernel of the chain reads before its wait; only
+            // the dn rows come from the parent (the FC2). A CTA that is resident before the FC2 ends, which
+            // the 128-thread launch in moe_combine() makes the common case at decode, has its first round
+            // trip done when the wait returns. Direct callers inherit the chain's precondition: neither
+            // input may be written by the kernel launched immediately before this one. Measured in run
+            // sm120_r2_p1_20260929 (REPORT.md, part 2).
+#pragma unroll
+            for (int j = 0; j < kMaxTopk; ++j)
+            {
+                if (j < topk)
+                {
+                    slots[j] = slot_of_flat[t * topk + j];
+                    ws[j] = topk_w[t * topk + j];
+                }
+            }
+        }
+
+        // PDL entry (see moe_build_routing_kernel): the wait orders every dn read behind the parent,
+        // and the trigger follows the wait as in every kernel of the chain.
+        if (pdl)
+        {
+            cudaGridDependencySynchronize();
+            if (threadIdx.x == 0)
+            {
+                cudaTriggerProgrammaticLaunchCompletion();
+            }
+        }
+
+        float acc[kVec];
+#pragma unroll
+        for (int v = 0; v < kVec; ++v)
+            acc[v] = 0.f;
+
+        if (fast)
+        {
+            float4 raws[kMaxTopk];
+#pragma unroll
+            for (int j = 0; j < kMaxTopk; ++j)
+            {
+                if (j < topk)
+                {
+                    int const src = slots[j] < 0 ? 0 : slots[j];
+                    raws[j] = *reinterpret_cast<float4 const*>(&dn[static_cast<int64_t>(src) * H + h]);
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < kMaxTopk; ++j)
+            {
+                if (j < topk && slots[j] < 0)
+                {
+                    ws[j] = 0.f;
+                    raws[j].x = 0.f;
+                    raws[j].y = 0.f;
+                    raws[j].z = 0.f;
+                    raws[j].w = 0.f;
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < kMaxTopk; ++j)
+            {
+                if (j < topk)
+                {
+                    __nv_bfloat162 const* v2 = reinterpret_cast<__nv_bfloat162 const*>(&raws[j]);
+#pragma unroll
+                    for (int p = 0; p < kVec / 2; ++p)
+                    {
+                        float2 const f = __bfloat1622float2(v2[p]);
+                        acc[2 * p] += ws[j] * f.x;
+                        acc[2 * p + 1] += ws[j] * f.y;
+                    }
+                }
+            }
+        }
+        else
+        {
+            for (int j = 0; j < topk; ++j)
+            {
+                int const slot = slot_of_flat[t * topk + j];
+                bool const valid = slot >= 0; // masked padded-row entry (sorted layout): no routed row
+                float const wl = topk_w[t * topk + j];
+                float const w = valid ? wl : 0.f;
+                float4 const rawl = *reinterpret_cast<float4 const*>(
+                    &dn[static_cast<int64_t>(valid ? slot : 0) * H + h]);
+                float4 const raw = valid ? rawl : make_float4(0.f, 0.f, 0.f, 0.f);
+                __nv_bfloat162 const* v2 = reinterpret_cast<__nv_bfloat162 const*>(&raw);
+#pragma unroll
+                for (int p = 0; p < kVec / 2; ++p)
+                {
+                    float2 const f = __bfloat1622float2(v2[p]);
+                    acc[2 * p] += w * f.x;
+                    acc[2 * p + 1] += w * f.y;
+                }
+            }
+        }
+
+        if constexpr (kBias)
+        {
+            float const bs = (bias_scale != nullptr) ? bias_scale[t] : 1.f;
+            float4 const raw = *reinterpret_cast<float4 const*>(&bias[static_cast<int64_t>(t) * H + h]);
+            __nv_bfloat162 const* v2 = reinterpret_cast<__nv_bfloat162 const*>(&raw);
+#pragma unroll
+            for (int p = 0; p < kVec / 2; ++p)
+            {
+                float2 const f = __bfloat1622float2(v2[p]);
+                acc[2 * p] += bs * f.x;
+                acc[2 * p + 1] += bs * f.y;
+            }
+        }
+
+        __nv_bfloat162 packed[kVec / 2];
+#pragma unroll
+        for (int p = 0; p < kVec / 2; ++p)
+            packed[p] = __floats2bfloat162_rn(acc[2 * p], acc[2 * p + 1]);
+        *reinterpret_cast<float4*>(&out[static_cast<int64_t>(t) * H + h])
+            = *reinterpret_cast<float4 const*>(&packed[0]);
+    }
+    else
+    {
+        int const num_hvec = H / kCombineVec;
+        int tid = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+        // A thread past the end has nothing to load and nothing to wait for. Thread 0
+        // of every CTA is in range (the grid is at most ceil(total / blockDim)), so every CTA
+        // still reaches the PDL trigger below.
+        if (tid >= M * num_hvec)
+            return;
+
+        // Prefetch all topk routed rows before reducing so the scattered LDG.128
+        // latencies overlap. At M=1 this kernel is a single latency-bound CTA and
+        // the old load->use-per-iteration chain serialised topk dependent loads.
+        // Fast path unrolls a fixed bound (covers the common MoE topk); larger topk
+        // falls back to the sequential loop.
+        bool const fast = topk <= kCombineMaxTopk;
+        float ws[kCombineMaxTopk];
+        int slots[kCombineMaxTopk];
+        // The first item's routing is read BEFORE the PDL wait below. slot_of_flat and topk_w are routing outputs,
+        // written four launches upstream of this kernel in every MoE chain of this library, so they are
+        // grandparent-or-older data like everything a kernel of the chain reads before its wait; only
+        // the dn rows come from the parent (the FC2). A CTA that is resident before the FC2 ends, which
+        // the 128-thread launch in moe_combine() makes the common case at decode, has its first round
+        // trip done when the wait returns. Direct callers inherit the chain's precondition: neither
+        // input may be written by the kernel launched immediately before this one. Measured in run
+        // sm120_r2_p1_20260929 (REPORT.md, part 2). The items beyond the first read theirs after the wait.
+        if (fast)
+            moe_combine_routing(slot_of_flat, topk_w, tid / num_hvec, topk, slots, ws);
+
+        // PDL entry (see moe_build_routing_kernel): the wait orders every dn read behind the parent,
+        // and the trigger follows the wait as in every kernel of the chain.
+        if (pdl)
+        {
+            cudaGridDependencySynchronize();
+            if (threadIdx.x == 0)
+            {
+                cudaTriggerProgrammaticLaunchCompletion();
+            }
+        }
+
+        moe_combine_item<kBias>(dn, slot_of_flat, topk_w, out, bias, bias_scale, tid / num_hvec,
+            (tid % num_hvec) * kCombineVec, topk, H, fast, slots, ws);
+        if constexpr (kStride)
+        {
+            for (tid += static_cast<int>(gridDim.x * blockDim.x); tid < M * num_hvec;
+                 tid += static_cast<int>(gridDim.x * blockDim.x))
+            {
+                float ws_i[kCombineMaxTopk];
+                int slots_i[kCombineMaxTopk];
+                if (fast)
+                    moe_combine_routing(slot_of_flat, topk_w, tid / num_hvec, topk, slots_i, ws_i);
+                moe_combine_item<kBias>(dn, slot_of_flat, topk_w, out, bias, bias_scale, tid / num_hvec,
+                    (tid % num_hvec) * kCombineVec, topk, H, fast, slots_i, ws_i);
+            }
+        }
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -1170,7 +1363,9 @@ __device__ __forceinline__ float router_full_denom(float const (&v)[kSlots], int
     return acc;
 }
 
-template <typename TLogit, int kSlots>
+// kStride: one warp per token on a grid of up to kFsoGlueFlatWaves waves (the one-item form), or grid-stride over
+// the tokens on kFsoGlueWaves waves beyond that (moe_topk_from_logits, fso_glue_launch).
+template <typename TLogit, int kSlots, bool kStride>
 __global__ void moe_topk_from_logits_kernel(TLogit const* __restrict__ logits, // [M, ld]
     int32_t const* __restrict__ n_valid,                                       // [1] or nullptr
     int32_t const* __restrict__ expert_map,                                    // [E + 1] or nullptr
@@ -1179,44 +1374,685 @@ __global__ void moe_topk_from_logits_kernel(TLogit const* __restrict__ logits, /
     float* __restrict__ shared_gate,                                           // [M] or nullptr
     int M, int E, int ld, int topk, int sentinel, bool renormalize, bool pdl)
 {
+    if constexpr (!kStride)
+    {
+        // One warp per token, the kernel as it always was (its machine code is unchanged).
+        if (pdl)
+        {
+            cudaGridDependencySynchronize();
+            if (threadIdx.x == 0)
+            {
+                cudaTriggerProgrammaticLaunchCompletion();
+            }
+        }
+        int const lane = threadIdx.x & 31;
+        int const token = static_cast<int>(blockIdx.x) * (kRouterThreads >> 5) + static_cast<int>(threadIdx.x >> 5);
+        if (token >= M)
+            return;
+        int64_t const row = static_cast<int64_t>(token) * ld;
+        // The shared expert's gate is logit column E, when the caller concatenated
+        // that weight row onto the router's. A padded row still gets a value (the
+        // block multiplies it by a zero-valued shared output), so it is written
+        // before the mask check.
+        if (shared_gate != nullptr && lane == 0)
+        {
+            float const l = router_to_float(logits[row + E]);
+            shared_gate[token] = 1.f / (1.f + expf(-l));
+        }
+        bool const masked = (n_valid != nullptr) && (token >= *n_valid);
+        float v[kSlots];
+        float full_denom = 0.f;
+        if (!masked)
+        {
+#pragma unroll
+            for (int s = 0; s < kSlots; ++s)
+            {
+                int const e = lane + 32 * s;
+                v[s] = (e < E) ? router_to_float(logits[row + e]) : -INFINITY;
+            }
+            if (!renormalize)
+                full_denom = router_full_denom<kSlots>(v, E, lane);
+        }
+        router_select_topk<kSlots>(v, E, topk, renormalize, full_denom, lane, expert_map, masked, sentinel,
+            topk_ids + static_cast<int64_t>(token) * topk, topk_w + static_cast<int64_t>(token) * topk);
+    }
+    else
+    {
+        if (pdl)
+        {
+            cudaGridDependencySynchronize();
+            if (threadIdx.x == 0)
+            {
+                cudaTriggerProgrammaticLaunchCompletion();
+            }
+        }
+        int const lane = threadIdx.x & 31;
+        // One warp per token, grid-stride over the tokens (moe_topk_from_logits caps the grid at kFsoGlueWaves waves).
+        int const token_stride = static_cast<int>(gridDim.x) * (kRouterThreads >> 5);
+        for (int token = static_cast<int>(blockIdx.x) * (kRouterThreads >> 5) + static_cast<int>(threadIdx.x >> 5);
+             token < M; token += token_stride)
+        {
+            int64_t const row = static_cast<int64_t>(token) * ld;
+            // The shared expert's gate is logit column E, when the caller concatenated
+            // that weight row onto the router's. A padded row still gets a value (the
+            // block multiplies it by a zero-valued shared output), so it is written
+            // before the mask check.
+            if (shared_gate != nullptr && lane == 0)
+            {
+                float const l = router_to_float(logits[row + E]);
+                shared_gate[token] = 1.f / (1.f + expf(-l));
+            }
+            bool const masked = (n_valid != nullptr) && (token >= *n_valid);
+            float v[kSlots];
+            float full_denom = 0.f;
+            if (!masked)
+            {
+#pragma unroll
+                for (int s = 0; s < kSlots; ++s)
+                {
+                    int const e = lane + 32 * s;
+                    v[s] = (e < E) ? router_to_float(logits[row + e]) : -INFINITY;
+                }
+                if (!renormalize)
+                    full_denom = router_full_denom<kSlots>(v, E, lane);
+            }
+            router_select_topk<kSlots>(v, E, topk, renormalize, full_denom, lane, expert_map, masked, sentinel,
+                topk_ids + static_cast<int64_t>(token) * topk, topk_w + static_cast<int64_t>(token) * topk);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// Compact routing builder: the 128-row-block layout (0.2.1, D1 / D2).
+//
+// The masked slab gives every expert m_cap = align(M, 4) rows. The compact
+// layout gives expert g only nb[g] = ceil(cnt[g] / 128) whole blocks of 128
+// rows, starting at block blk0[g] (the exclusive prefix of nb over the experts
+// below g), so a buffer of B_max = (M*topk + 127*min(G, M*topk)) / 128 blocks
+// holds any routing. A compact row is exactly a slot of a masked slab with ONE
+// group of m_cap = R_max = 128 * B_max rows, which is why every glue kernel that
+// addresses rows by slot runs on it unchanged when called with num_groups = 1 and
+// m_cap = R_max (CHARTER D1, amended 2026-10-10).
+//
+// What makes it a different builder from moe_build_routing: a pair's row is
+// blk0[e]*128 + (its rank inside expert e), and blk0[e] is a prefix over the
+// FINAL counts of every expert below e, so no pair can be placed before every
+// pair has been counted. The builder is count -> scan -> place in one launch,
+// with no scratch memory, no zeroing launch and no grid-wide barrier, in three
+// launch shapes:
+//
+//   * up to kCompactSmallMaxPairs = 128 routed pairs (M <= 16 at top-8), the
+//     decode kernel moe_routing_compact_small_kernel: every active expert owns
+//     one block, so blk0 comes from a shared bitmap of the active experts and a
+//     per-warp shuffle scan of its words, with no block-wide prefix (below);
+//   * one CTA of moe_routing_compact_cta_kernel, up to kCompactCtaMaxPairs routed
+//     pairs (M <= 512 at top-8): a
+//     shared histogram whose atomics hand every pair its rank (kept in
+//     registers), a block-wide prefix with one thread per expert, placement;
+//   * above, one thread-block cluster of kCompactMaxCluster CTAs doing the same
+//     per CTA, the per-CTA counts exchanged through distributed shared memory
+//     behind one cluster barrier: a hardware barrier between co-scheduled CTAs
+//     instead of global counters (which would need zeroing every call) and a
+//     grid barrier (which would need every CTA co-resident).
+//
+// Measured against the alternatives in run fso_0.2.1_20261010/S3 (REPORT.md):
+// a register-only one-warp form (no barrier at all) was slower than the one-CTA
+// kernel at every pair count it could take, warp-aggregated atomics
+// (__match_any_sync) were slower than plain ones even on a hot-expert routing,
+// and a one-CTA per-warp private-histogram form is bound by one SM's bandwidth
+// (21 us at 65536 pairs, against 4.9 us for the cluster).
+//
+// The order of the rows inside an expert is free (the GEMM rows are
+// independent and the combine sums each token's top-k entries in a fixed
+// order), and differs between the launch shapes.
+constexpr int kCompactRows = 128;
+constexpr int kCompactRowShift = 7;
+constexpr int kCompactRegPairs = 8;      // pairs per thread kept in registers between counting and placing
+constexpr int kCompactMaxCluster = 8;    // portable cluster size: no cudaFuncSetAttribute, no capture hazard
+// The sm_100/103 compact slot route's work-stealing counter (tile draws, finished CTAs), emitted zeroed next to
+// the slot list (run fso_0.2.1_20261010/S10b-1; grouped_slot_dispatch.cuh / slot_work_stealing.cuh).
+constexpr int kCompactSlotSchedWords = 2;
+// The sm_100/103 compact slot route's packed list of live 64-row token tiles (run fso_0.2.1_20261010/S10b-3b):
+// entry = q | e << 14 | (r - 1) << 24 with q = 2 * block + half, e the expert, r in 1..64 its rows in the tile
+// (`pack_token_tile` in grouped_slot_dispatch.cuh, which this translation unit cannot include, and the
+// generated kernel's `fso_slot_live_compact` decode the same packing). A block index must stay below 2^13.
+constexpr int kCompactTileRows = 64;
+constexpr int kCompactTileMaxBlocks = 1 << 13;
+
+struct CompactRoutingArgs
+{
+    int32_t const* topk_ids; // [num_pairs]
+    float const* topk_w;     // [num_pairs], read iff weight_of_slot
+    int32_t* masked_m;       // [G]
+    int32_t* blk0;           // [G + 1]
+    int32_t* slot_of_flat;   // [num_pairs]
+    int32_t* slot_to_expert; // [G] or nullptr
+    int32_t* slot_sched;     // [kCompactSlotSchedWords] or nullptr: zeroed (the slot route's work-stealing counter)
+    int32_t* problem_shapes; // [P, G, 3] or nullptr
+    int64_t* ptr_arrays;     // [P, 3, G] or nullptr
+    int32_t* row_map;        // [num_blocks * 128] or nullptr
+    float* weight_of_slot;   // [num_blocks * 128] or nullptr
+    ProblemShapeList ps;     // P = ps.count GEMMs
+    uint64_t ptr_base[kMaxProblemShapeSets][3]; // A data, A scales, D data
+    uint64_t ptr_step[kMaxProblemShapeSets][3]; // bytes per 128-row block of each (the host scales the row strides)
+    int num_pairs;
+    int topk;
+    int num_groups;
+    // Appended last, so the kernels that do not write it keep the parameter layout they had.
+    int tiles_cap;           // with slot_tiles: its entry count (the count word sits at slot_tiles[tiles_cap])
+    int32_t* slot_tiles;     // [tiles_cap + 1] or nullptr: the live 64-row token tiles, -1, then their count
+};
+
+// The decode kernel's arguments: everything but the per-call pointer arrays, whose bases and steps make
+// CompactRoutingArgs about 330 bytes of kernel parameters. A call that asks for pointer arrays at a decode pair
+// count takes the one-CTA kernel instead (no layer plan does).
+struct CompactRoutingSmallArgs
+{
+    int32_t const* topk_ids;
+    float const* topk_w;
+    int32_t* masked_m;
+    int32_t* blk0;
+    int32_t* slot_of_flat;
+    int32_t* slot_to_expert;
+    int32_t* slot_sched;
+    int32_t* problem_shapes;
+    int32_t* row_map;
+    float* weight_of_slot;
+    ProblemShapeList ps;
+    int num_pairs;
+    int topk;
+    int num_groups;
+};
+
+template <class Args>
+constexpr bool compact_has_ptrs()
+{
+    return std::is_same_v<Args, CompactRoutingArgs>;
+}
+
+// Expert g's per-expert outputs: its routed row count, its first block, the
+// (cnt, N, K) triple of every requested GEMM and, when asked, the per-call
+// pointers of every pointer-array GEMM (written for empty experts too: such a
+// pointer lands on the next expert's first block and is never dereferenced).
+template <class Args>
+__device__ __forceinline__ void compact_emit_expert(Args const& a, int g, int cnt, int b0)
+{
+    int const G = a.num_groups;
+    a.masked_m[g] = cnt;
+    a.blk0[g] = b0;
+    if (a.problem_shapes != nullptr)
+    {
+        for (int q = 0; q < a.ps.count; ++q)
+        {
+            int32_t* d = a.problem_shapes + (static_cast<size_t>(q) * G + g) * 3;
+            d[0] = cnt;
+            d[1] = a.ps.n[q];
+            d[2] = a.ps.k[q];
+        }
+    }
+    if constexpr (compact_has_ptrs<Args>())
+    {
+        if (a.ptr_arrays != nullptr)
+        {
+            uint64_t const blocks = static_cast<uint64_t>(b0);
+            for (int q = 0; q < a.ps.count; ++q)
+            {
+                int64_t* d = a.ptr_arrays + static_cast<size_t>(q) * 3 * G + g;
+#pragma unroll
+                for (int j = 0; j < 3; ++j)
+                    d[j * G] = static_cast<int64_t>(a.ptr_base[q][j] + blocks * a.ptr_step[q][j]);
+            }
+        }
+    }
+}
+
+// The packed active-expert list (see fso_emit_slot_list): active expert g goes
+// to slot act_rank = the number of active experts below g, and every slot from
+// n_active on gets -1. The two write sets are disjoint (act_rank < n_active),
+// so the threads that write them need no ordering between them.
+template <class Args>
+__device__ __forceinline__ void compact_emit_slot(Args const& a, int g, int cnt, int act_rank, int n_active)
+{
+    if (a.slot_to_expert == nullptr)
+        return;
+    if (cnt > 0)
+        a.slot_to_expert[act_rank] = g;
+    if (g >= n_active)
+        a.slot_to_expert[g] = -1;
+}
+
+// Routed pair i lands on compact row `row`.
+template <class Args>
+__device__ __forceinline__ void compact_place_pair(Args const& a, int i, int row)
+{
+    a.slot_of_flat[i] = row;
+    if (a.row_map != nullptr)
+        a.row_map[row] = i / a.topk; // source token
+    if (a.weight_of_slot != nullptr)
+        a.weight_of_slot[row] = a.topk_w[i];
+}
+
+// Block-wide exclusive prefixes over the experts of ceil(cnt / 128) and of the
+// active flag, with thread t owning expert t (blockDim >= G; a thread past G
+// owns nothing and contributes zero). One warp shuffle scan, the per-warp
+// totals through shared memory, one barrier, then every thread adds the totals
+// of the warps below it: no serial pass over the experts anywhere. Returns, for
+// the calling thread's expert, its first block (b0) and its slot in the
+// active-expert list (a0), and for everyone the blocks in use and the active
+// count. Block-uniform: every thread of the block must call it.
+__device__ __forceinline__ void compact_block_scan(
+    int cnt, int2* s_wsum, int& b0, int& a0, int& blocks_total, int& active_total)
+{
+    int const lane = static_cast<int>(threadIdx.x) & 31;
+    int const warp = static_cast<int>(threadIdx.x) >> 5;
+    int const num_warps = static_cast<int>(blockDim.x) >> 5;
+    int const nb = (cnt + kCompactRows - 1) >> kCompactRowShift;
+    int const act = cnt > 0 ? 1 : 0;
+    int ib = nb;
+    int ia = act;
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1)
+    {
+        int const ub = __shfl_up_sync(0xffffffffu, ib, off);
+        int const ua = __shfl_up_sync(0xffffffffu, ia, off);
+        if (lane >= off)
+        {
+            ib += ub;
+            ia += ua;
+        }
+    }
+    if (lane == 31)
+        s_wsum[warp] = make_int2(ib, ia);
+    __syncthreads();
+    // Lane w of every warp holds warp w's totals; a second shuffle scan over them gives each warp the totals of the
+    // warps below it (lane `warp` of the exclusive scan) and the block totals (lane 31 of the inclusive one).
+    int2 const t = lane < num_warps ? s_wsum[lane] : make_int2(0, 0);
+    int wb = t.x;
+    int wa = t.y;
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1)
+    {
+        int const ub = __shfl_up_sync(0xffffffffu, wb, off);
+        int const ua = __shfl_up_sync(0xffffffffu, wa, off);
+        if (lane >= off)
+        {
+            wb += ub;
+            wa += ua;
+        }
+    }
+    int const pb = __shfl_sync(0xffffffffu, wb - t.x, warp);
+    int const pa = __shfl_sync(0xffffffffu, wa - t.y, warp);
+    int const tb = __shfl_sync(0xffffffffu, wb, 31);
+    int const ta = __shfl_sync(0xffffffffu, wa, 31);
+    b0 = pb + ib - nb;
+    a0 = pa + ia - act;
+    blocks_total = tb;
+    active_total = ta;
+}
+
+// Block-wide exclusive prefix of one int per thread (same two-level shuffle scan as compact_block_scan), for the
+// token-tile counts of the slot route's tile list. Block-uniform: every thread must call it.
+__device__ __forceinline__ void compact_block_scan1(int v, int* s_wsum, int& excl, int& total)
+{
+    int const lane = static_cast<int>(threadIdx.x) & 31;
+    int const warp = static_cast<int>(threadIdx.x) >> 5;
+    int const num_warps = static_cast<int>(blockDim.x) >> 5;
+    int iv = v;
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1)
+    {
+        int const u = __shfl_up_sync(0xffffffffu, iv, off);
+        if (lane >= off)
+            iv += u;
+    }
+    if (lane == 31)
+        s_wsum[warp] = iv;
+    __syncthreads();
+    int const t = lane < num_warps ? s_wsum[lane] : 0;
+    int w = t;
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1)
+    {
+        int const u = __shfl_up_sync(0xffffffffu, w, off);
+        if (lane >= off)
+            w += u;
+    }
+    int const pw = __shfl_sync(0xffffffffu, w - t, warp);
+    total = __shfl_sync(0xffffffffu, w, 31);
+    excl = pw + iv - v;
+}
+
+// Expert g's entries of the slot route's token-tile list: its k-th 64-row token tile (rows 64k .. 64k + 63 of the
+// expert) is half k % 2 of block b0 + k / 2, i.e. q = 2 * b0 + k, holding min(64, cnt - 64k) rows.
+__device__ __forceinline__ void compact_emit_tiles(CompactRoutingArgs const& a, int g, int cnt, int b0, int t0)
+{
+    int const nt = (cnt + kCompactTileRows - 1) / kCompactTileRows;
+    for (int k = 0; k < nt; ++k)
+    {
+        int const t = t0 + k;
+        int const left = cnt - k * kCompactTileRows;
+        int const r = left < kCompactTileRows ? left : kCompactTileRows;
+        if (t < a.tiles_cap)
+            a.slot_tiles[t] = (2 * b0 + k) | (g << 14) | ((r - 1) << 24);
+    }
+}
+
+__device__ __forceinline__ void compact_cluster_arrive()
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("barrier.cluster.arrive.release.aligned;\n" ::: "memory");
+#endif
+}
+
+__device__ __forceinline__ void compact_cluster_wait()
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("barrier.cluster.wait.acquire.aligned;\n" ::: "memory");
+#endif
+}
+
+// The decode shape: up to kCompactSmallMaxPairs = 128 routed pairs (M <= 16 at
+// top-8), one CTA, one pair per thread. No expert can then hold more than 128
+// rows, so every active expert owns exactly ONE block and blk0[g] is the number
+// of active experts below g. That count needs no prefix over the expert counts:
+// each pair also sets its expert's bit in a 1024-bit shared bitmap, and after
+// the counting barrier every warp reads the bitmap words (lane w holds word w)
+// and runs one shuffle scan of their popcounts over the ceil(G/32) words, which
+// gives it blk0 of any expert as excl[g/32] + popc(word[g/32] & bits below g).
+// Every warp computes that for itself, so the kernel has the two barriers of the
+// 0.2.0 builder (after zeroing, after counting) and nothing after the second:
+// the general one-CTA kernel's block-wide two-level scan and third barrier cost
+// 0.3 us per call on sm_120 at decode, where the layer is 24-70 us long (run
+// fso_0.2.1_20261010/S3b). The slot in the active-expert list equals blk0 here.
+// Two more things measured there: the kernel takes the slim CompactRoutingSmallArgs
+// (the pointer-array fields of CompactRoutingArgs are about 330 bytes of kernel
+// parameters, and dropping them took 0.04-0.12 us off each call), and zeroing the
+// counters before the PDL wait instead of after it was no faster at layer level
+// (0.0-0.08 us slower at M = 1-16), so the order is the existing builders'.
+constexpr int kCompactSmallMaxPairs = 128;
+
+__global__ void __launch_bounds__(1024) moe_routing_compact_small_kernel(CompactRoutingSmallArgs a, bool pdl)
+{
+    static_assert(kCompactSmallMaxPairs <= kCompactRows, "one block per active expert needs <= 128 pairs");
+    __shared__ int32_t s_cnt[kMaxGroups];
+    __shared__ uint32_t s_bits[kMaxGroups / 32];
+
+    int const tid = static_cast<int>(threadIdx.x); // blockDim >= max(G, P): thread t owns expert t and pair t
+    int const lane = tid & 31;
+    int const warp = tid >> 5;
+    int const G = a.num_groups;
     if (pdl)
     {
         cudaGridDependencySynchronize();
         if (threadIdx.x == 0)
-        {
             cudaTriggerProgrammaticLaunchCompletion();
-        }
     }
-    int const lane = threadIdx.x & 31;
-    int const token = static_cast<int>(blockIdx.x) * (kRouterThreads >> 5) + static_cast<int>(threadIdx.x >> 5);
-    if (token >= M)
-        return;
-    int64_t const row = static_cast<int64_t>(token) * ld;
-    // The shared expert's gate is logit column E, when the caller concatenated
-    // that weight row onto the router's. A padded row still gets a value (the
-    // block multiplies it by a zero-valued shared output), so it is written
-    // before the mask check.
-    if (shared_gate != nullptr && lane == 0)
+    if (tid < G)
+        s_cnt[tid] = 0;
+    if (tid < kMaxGroups / 32)
+        s_bits[tid] = 0u;
+    int const id = tid < a.num_pairs ? a.topk_ids[tid] : -1;
+    int const e = static_cast<unsigned>(id) < static_cast<unsigned>(G) ? id : -1;
+    __syncthreads();
+    int rank = 0;
+    if (e >= 0)
     {
-        float const l = router_to_float(logits[row + E]);
-        shared_gate[token] = 1.f / (1.f + expf(-l));
+        rank = atomicAdd(&s_cnt[e], 1);
+        atomicOr(&s_bits[e >> 5], 1u << (e & 31));
     }
-    bool const masked = (n_valid != nullptr) && (token >= *n_valid);
-    float v[kSlots];
-    float full_denom = 0.f;
-    if (!masked)
+    __syncthreads();
+
+    // Every warp: the exclusive prefix of the bitmap words' popcounts (lane w: word w, w < ceil(G/32)).
+    int const num_words = (G + 31) >> 5;
+    uint32_t const word = lane < num_words ? s_bits[lane] : 0u;
+    int const pc = __popc(word);
+    int incl = pc;
+    for (int off = 1; off < num_words; off <<= 1) // warp-uniform bound: log2 of the word count steps
     {
-#pragma unroll
-        for (int s = 0; s < kSlots; ++s)
+        int const v = __shfl_up_sync(0xffffffffu, incl, off);
+        if (lane >= off)
+            incl += v;
+    }
+    int const excl = incl - pc;
+    int const active = __shfl_sync(0xffffffffu, incl, num_words - 1); // = blocks in use
+
+    // The pair of this thread.
+    int const ew = e >= 0 ? (e >> 5) : 0;
+    uint32_t const word_e = __shfl_sync(0xffffffffu, word, ew);
+    int const excl_e = __shfl_sync(0xffffffffu, excl, ew);
+    if (tid < a.num_pairs)
+    {
+        if (e < 0)
+            a.slot_of_flat[tid] = -1; // skipped: padded row, or an expert another rank owns
+        else
+            compact_place_pair(
+                a, tid, ((excl_e + __popc(word_e & ((1u << (e & 31)) - 1u))) << kCompactRowShift) + rank);
+    }
+    // The expert of this thread: g = tid, whose bitmap word is this warp's. One expert per thread: spreading the
+    // experts over fewer threads measured slower at every width (S3b, route_width).
+    uint32_t const word_g = __shfl_sync(0xffffffffu, word, warp & 31);
+    int const excl_g = __shfl_sync(0xffffffffu, excl, warp & 31);
+    if (tid < G)
+    {
+        int const b0 = excl_g + __popc(word_g & ((1u << lane) - 1u));
+        int const cnt = s_cnt[tid];
+        compact_emit_expert(a, tid, cnt, b0);
+        compact_emit_slot(a, tid, cnt, b0, active);
+    }
+    if (tid == 0)
+    {
+        a.blk0[G] = active;
+        if (a.slot_sched != nullptr)
         {
-            int const e = lane + 32 * s;
-            v[s] = (e < E) ? router_to_float(logits[row + e]) : -INFINITY;
+#pragma unroll
+            for (int w = 0; w < kCompactSlotSchedWords; ++w)
+                a.slot_sched[w] = 0;
         }
-        if (!renormalize)
-            full_denom = router_full_denom<kSlots>(v, E, lane);
     }
-    router_select_topk<kSlots>(v, E, topk, renormalize, full_denom, lane, expert_map, masked, sentinel,
-        topk_ids + static_cast<int64_t>(token) * topk, topk_w + static_cast<int64_t>(token) * topk);
+}
+
+// One CTA (kCluster = false), or each CTA of one cluster of up to
+// kCompactMaxCluster CTAs (kCluster = true; launched with the cluster attribute,
+// grid = cluster). blockDim >= G: thread t owns expert t for the prefix and the
+// per-expert outputs. Pair i belongs to CTA (i / blockDim) % CTAs (interleaved
+// blockDim-wide chunks, so every warp's loads and slot_of_flat stores are
+// coalesced); each thread keeps kRegPairs pairs in registers (the host picks
+// the smallest of 1, 2, 4, 8 that holds its share, because every unrolled slot
+// is issued whether it holds a pair or not) and loads them all before it counts
+// any, so the loads are in flight together. Only the 8-pair instantiation has
+// the loop for pairs past the registers (more than 8 * blockDim * CTAs of them).
+// Inside an expert the rows go CTA by CTA, and inside a CTA in the order of the
+// shared atomics.
+//
+// kTiles (with_tiles, run fso_0.2.1_20261010/S10b-3b): also the sm_100/103 compact slot route's packed list of live
+// 64-row token tiles (compact_emit_tiles), from a second prefix over the experts' token-tile counts; every entry
+// past the live tiles is -1 and entry tiles_cap holds the count. Its own instantiation, so the kernels without it
+// are what they were.
+template <int kRegPairs, bool kCluster, bool kTiles>
+__global__ void __launch_bounds__(1024) moe_routing_compact_cta_kernel(CompactRoutingArgs a, bool pdl)
+{
+    if (pdl)
+    {
+        cudaGridDependencySynchronize();
+        if (threadIdx.x == 0)
+            cudaTriggerProgrammaticLaunchCompletion();
+    }
+    __shared__ int32_t s_cnt[kMaxGroups];                 // this CTA's per-expert count; the atomics hand out ranks
+    __shared__ int32_t s_base[kCluster ? kMaxGroups : 1]; // cluster: pairs of each expert in lower-ranked CTAs
+    __shared__ int32_t s_blk0[kMaxGroups];
+    __shared__ int2 s_wsum[32];
+    __shared__ int s_tsum[kTiles ? 32 : 1];
+
+    int const tid = static_cast<int>(threadIdx.x);
+    int const nthr = static_cast<int>(blockDim.x);
+    int const G = a.num_groups;
+    int const P = a.num_pairs;
+    int crank = 0;
+    int ncta = 1;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if constexpr (kCluster)
+    {
+        cg::cluster_group cl = cg::this_cluster();
+        crank = static_cast<int>(cl.block_rank());
+        ncta = static_cast<int>(cl.num_blocks());
+    }
+#endif
+    if (tid < G)
+        s_cnt[tid] = 0;
+    int const stride = ncta * nthr;
+    int const i0 = crank * nthr + tid;
+    int ev[kRegPairs];
+    int rk[kRegPairs];
+#pragma unroll
+    for (int k = 0; k < kRegPairs; ++k)
+    {
+        int const i = i0 + k * stride;
+        int const id = i < P ? a.topk_ids[i] : -1;
+        ev[k] = static_cast<unsigned>(id) < static_cast<unsigned>(G) ? id : -1;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int k = 0; k < kRegPairs; ++k)
+        rk[k] = ev[k] >= 0 ? atomicAdd(&s_cnt[ev[k]], 1) : 0;
+    // Pairs past the registers (more than kRegPairs * blockDim * CTAs of
+    // them): batches of kRegPairs loads in flight; each parks its rank in
+    // slot_of_flat, which the same thread turns into the row after the prefix.
+    if constexpr (kRegPairs == kCompactRegPairs)
+    {
+        for (int ib = i0 + kRegPairs * stride; ib < P; ib += kRegPairs * stride)
+        {
+            int eb[kRegPairs];
+#pragma unroll
+            for (int k = 0; k < kRegPairs; ++k)
+            {
+                int const i = ib + k * stride;
+                int const id = i < P ? a.topk_ids[i] : -1;
+                eb[k] = static_cast<unsigned>(id) < static_cast<unsigned>(G) ? id : -1;
+            }
+#pragma unroll
+            for (int k = 0; k < kRegPairs; ++k)
+            {
+                if (eb[k] >= 0)
+                    a.slot_of_flat[ib + k * stride] = atomicAdd(&s_cnt[eb[k]], 1);
+            }
+        }
+    }
+
+    // This thread's expert: its count over the CTA (or the cluster) and, in a
+    // cluster, the pairs of it that lower-ranked CTAs hold.
+    int cnt = 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if constexpr (kCluster)
+    {
+        cg::cluster_group cl = cg::this_cluster();
+        cl.sync(); // every CTA's counts are final and visible cluster-wide
+        if (tid < G)
+        {
+            int v[kCompactMaxCluster];
+#pragma unroll
+            for (int c = 0; c < kCompactMaxCluster; ++c)
+                v[c] = c < ncta ? *cl.map_shared_rank(&s_cnt[tid], c) : 0;
+            int base = 0;
+#pragma unroll
+            for (int c = 0; c < kCompactMaxCluster; ++c)
+            {
+                base += c < crank ? v[c] : 0;
+                cnt += v[c];
+            }
+            s_base[tid] = base;
+        }
+        // Our reads of the peers' counters are done; the matching wait sits at
+        // the end, so that no CTA leaves (and frees its shared memory) while a
+        // peer may still read it.
+        compact_cluster_arrive();
+    }
+    else
+#endif
+    {
+        __syncthreads();
+        if (tid < G)
+            cnt = s_cnt[tid];
+    }
+    int b0, a0, blocks_total, active_total;
+    compact_block_scan(cnt, s_wsum, b0, a0, blocks_total, active_total);
+    int t0 = 0;
+    int tiles_total = 0;
+    if constexpr (kTiles)
+        compact_block_scan1((cnt + kCompactTileRows - 1) / kCompactTileRows, s_tsum, t0, tiles_total);
+    if (tid < G)
+    {
+        s_blk0[tid] = b0;
+        if (tid % ncta == crank) // the per-expert outputs are spread over the CTAs of a cluster
+        {
+            compact_emit_expert(a, tid, cnt, b0);
+            compact_emit_slot(a, tid, cnt, a0, active_total);
+            if constexpr (kTiles)
+                compact_emit_tiles(a, tid, cnt, b0, t0);
+        }
+    }
+    if constexpr (kTiles)
+    {
+        for (int t = tiles_total + crank * nthr + tid; t < a.tiles_cap; t += ncta * nthr)
+            a.slot_tiles[t] = -1;
+        if (crank == 0 && tid == 0)
+            a.slot_tiles[a.tiles_cap] = tiles_total < a.tiles_cap ? tiles_total : a.tiles_cap;
+    }
+    if (crank == 0 && tid == 0)
+    {
+        a.blk0[G] = blocks_total;
+        if (a.slot_sched != nullptr)
+        {
+#pragma unroll
+            for (int w = 0; w < kCompactSlotSchedWords; ++w)
+                a.slot_sched[w] = 0;
+        }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int k = 0; k < kRegPairs; ++k)
+    {
+        int const i = i0 + k * stride;
+        if (i < P)
+        {
+            int const e = ev[k];
+            if (e < 0)
+                a.slot_of_flat[i] = -1; // skipped: padded row, or an expert another rank owns
+            else
+                compact_place_pair(a, i, (s_blk0[e] << kCompactRowShift) + (kCluster ? s_base[e] : 0) + rk[k]);
+        }
+    }
+    if constexpr (kRegPairs == kCompactRegPairs)
+    {
+        for (int ib = i0 + kRegPairs * stride; ib < P; ib += kRegPairs * stride)
+        {
+            int eb[kRegPairs];
+            int rb[kRegPairs];
+    #pragma unroll
+            for (int k = 0; k < kRegPairs; ++k)
+            {
+                int const i = ib + k * stride;
+                int const id = i < P ? a.topk_ids[i] : -1;
+                eb[k] = static_cast<unsigned>(id) < static_cast<unsigned>(G) ? id : -1;
+                rb[k] = eb[k] >= 0 ? a.slot_of_flat[i] : 0;
+            }
+    #pragma unroll
+            for (int k = 0; k < kRegPairs; ++k)
+            {
+                int const i = ib + k * stride;
+                if (i < P)
+                {
+                    int const e = eb[k];
+                    if (e < 0)
+                        a.slot_of_flat[i] = -1;
+                    else
+                        compact_place_pair(a, i, (s_blk0[e] << kCompactRowShift) + (kCluster ? s_base[e] : 0) + rb[k]);
+                }
+            }
+        }
+    }
+    if constexpr (kCluster)
+        compact_cluster_wait();
 }
 
 } // anonymous namespace
@@ -1235,10 +2071,6 @@ static inline bool fso_pdl_enabled()
     return v;
 }
 
-// See quant_kernels.cu: huge programmatic dependents flood the SMs and
-// throttle the parent's tail, so large grids launch plain.
-constexpr unsigned kFsoPdlMaxGridCtas = 4096;
-
 template <typename KernelT, typename... Args>
 static inline void fso_pdl_launch(KernelT kernel, dim3 grid, dim3 block, cudaStream_t stream, bool pdl, Args... args)
 {
@@ -1255,6 +2087,67 @@ static inline void fso_pdl_launch(KernelT kernel, dim3 grid, dim3 block, cudaStr
     cudaLaunchKernelEx(&cfg, kernel, args..., pdl);
 }
 
+// One wave of a glue kernel instantiation: the current device's SM count times the instantiation's occupancy at
+// `kThreads` threads and no dynamic shared memory (queried once per instantiation), i.e. the CTAs resident at once.
+template <auto kKernel, int kThreads>
+static int64_t fso_glue_wave()
+{
+    static int const per_sm = []
+    {
+        int n = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, kKernel, kThreads, 0) != cudaSuccess || n < 1)
+        {
+            (void) cudaGetLastError();
+            n = 1;
+        }
+        return n;
+    }();
+    return static_cast<int64_t>(at::cuda::getCurrentDeviceProperties()->multiProcessorCount) * per_sm;
+}
+
+// The bound that lets every glue launch carry PDL at every size (as in quant_kernels.cu): the one-item form (the code
+// each kernel always had) runs whenever its grid fits in kFsoGlueFlatWaves of its waves, and a grid-stride form of the
+// same per-item work beyond that, on kFsoGlueWaves waves (the combine's on one, see moe_combine_launch).
+constexpr int64_t kFsoGlueFlatWaves = 16;
+constexpr int64_t kFsoGlueWaves = 4;
+
+// Launch `kFlat` on `ctas` CTAs if they fit in kFsoGlueFlatWaves of its waves, else `kStride` on kFsoGlueWaves of its
+// waves; both with PDL when `pdl` is set (the global switch). `args` exclude the trailing pdl flag.
+template <auto kFlat, auto kStride, int kThreads, typename... Args>
+static void fso_glue_launch(int64_t ctas, cudaStream_t stream, bool pdl, Args... args)
+{
+    if (ctas < 1)
+        ctas = 1;
+    if (ctas <= fso_glue_wave<kFlat, kThreads>() * kFsoGlueFlatWaves)
+    {
+        fso_pdl_launch(kFlat, dim3(static_cast<unsigned>(ctas)), dim3(kThreads), stream, pdl, args...);
+        return;
+    }
+    int64_t const cap = fso_glue_wave<kStride, kThreads>() * kFsoGlueWaves;
+    fso_pdl_launch(kStride, dim3(static_cast<unsigned>(ctas < cap ? ctas : cap)), dim3(kThreads), stream, pdl, args...);
+}
+
+// Launch the combine on `ctas` CTAs' worth of items (one item per thread) with PDL unless FSO_DISABLE_PDL=1: the
+// one-item kernel up to kFsoGlueFlatWaves of its waves, else the grid-stride kernel on ONE wave of its own. Its loop
+// needs 80 registers on sm_90 and 95-102 on sm_100/sm_120 against 64 for the one-item body (3 or 2 resident 256-thread
+// CTAs per SM instead of 4), and every extra wave of it only adds a tail: on the H200 one wave measured 1.031x the
+// unbounded one-item grid at M = 8192, four waves 1.049x (run fso_0.2.1_20261010/S8b). Either way the bytes are the
+// same (each item is reduced by the same arithmetic).
+template <bool kBias, int kThreads, typename... Args>
+static void moe_combine_launch(int64_t ctas, cudaStream_t stream, bool pdl, Args... args)
+{
+    if (ctas < 1)
+        ctas = 1;
+    if (ctas <= fso_glue_wave<moe_combine_kernel<kBias, false>, kThreads>() * kFsoGlueFlatWaves)
+    {
+        fso_pdl_launch(moe_combine_kernel<kBias, false>, dim3(static_cast<unsigned>(ctas)), dim3(kThreads), stream, pdl,
+            args...);
+        return;
+    }
+    int64_t const wave = fso_glue_wave<moe_combine_kernel<kBias, true>, kThreads>();
+    fso_pdl_launch(moe_combine_kernel<kBias, true>, dim3(static_cast<unsigned>(wave < ctas ? wave : ctas)),
+        dim3(kThreads), stream, pdl, args...);
+}
 
 // Current device's SM major version (10 = sm_100 B200 / sm_103 B300), cached.
 // Mirrors the helper in mxfp8.cu; the multi-CTA routing builder is selected on
@@ -1591,6 +2484,292 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
 }
 
 
+// -----------------------------------------------------------------------
+// moe_build_routing_compact: topk_ids [M, topk] int32 -> the compact
+// 128-row-block layout (see the kernels above), one launch, no scratch.
+//
+// Which launch shape runs is a function of the routed-pair count only.
+// FSO_ROUTING_COMPACT_PATH forces one for an A/B or a test: small (the decode
+// kernel, up to 128 pairs), cta (one CTA) or clusterN (one cluster of N = 2..8
+// CTAs). FSO_ROUTING_COMPACT_THREADS overrides the CTA width of the cta and
+// cluster shapes (never below one thread per expert). Both are read once per
+// process.
+enum class CompactPath
+{
+    kSmall,
+    kCta,
+    kCluster,
+};
+
+struct CompactPlan
+{
+    CompactPath path;
+    int threads;
+    int ctas;
+    int reg_pairs; // pairs per thread held in registers: 1, 2, 4 or 8
+};
+
+// Up to here one CTA; above, one cluster of kCompactMaxCluster CTAs. At 4096
+// pairs (M = 512 at top-8) the two shapes cost the same; below it the cluster's
+// fixed cost loses, above it the one CTA's single SM does (S3 REPORT.md).
+constexpr int kCompactCtaMaxPairs = 4096;
+// The CTA shapes' width aims at this many pairs per thread (never below one thread per expert, never above 1024).
+constexpr int kCompactPairsPerThread = 2;
+
+static int compact_round32(int x)
+{
+    return (x + 31) / 32 * 32;
+}
+
+// `want_ptrs` / `want_tiles`: a call that asks for pointer arrays or for the token-tile list never takes the decode
+// kernel (neither is in CompactRoutingSmallArgs; no layer plan asks for either at a decode pair count).
+static CompactPlan compact_plan(int P, int G, bool want_ptrs, bool want_tiles)
+{
+    static std::string const forced = []
+    {
+        char const* e = std::getenv("FSO_ROUTING_COMPACT_PATH");
+        return std::string(e != nullptr ? e : "");
+    }();
+    static int const forced_threads = []
+    {
+        char const* e = std::getenv("FSO_ROUTING_COMPACT_THREADS");
+        return e != nullptr ? std::atoi(e) : 0;
+    }();
+    bool const thr_ok = forced_threads >= 32 && forced_threads <= 1024 && forced_threads % 32 == 0;
+    // A CTA shape over `ctas` CTAs: one thread per expert at least (the prefix and the per-expert outputs), else about
+    // kCompactPairsPerThread pairs per thread; the register batch is the smallest of 1, 2, 4, 8 that holds them.
+    auto cta_plan = [&](CompactPath path, int ctas) -> CompactPlan
+    {
+        int const per_cta = (P + ctas - 1) / ctas;
+        int t = thr_ok ? forced_threads
+                       : compact_round32((per_cta + kCompactPairsPerThread - 1) / kCompactPairsPerThread);
+        t = std::min(1024, std::max({t, compact_round32(G), 128}));
+        int const per_thread = (per_cta + t - 1) / t;
+        int const k = per_thread <= 1 ? 1 : per_thread <= 2 ? 2 : per_thread <= 4 ? 4 : kCompactRegPairs;
+        return {path, t, ctas, k};
+    };
+    // The decode kernel: one pair and one expert per thread.
+    int const small_threads = std::max(32, std::max(compact_round32(G), compact_round32(P)));
+    if (!forced.empty())
+    {
+        if (forced == "small" && P <= kCompactSmallMaxPairs && !want_ptrs && !want_tiles)
+            return {CompactPath::kSmall, small_threads, 1, 1};
+        if (forced == "cta")
+            return cta_plan(CompactPath::kCta, 1);
+        if (forced.rfind("cluster", 0) == 0)
+        {
+            int const n = std::atoi(forced.c_str() + 7);
+            if (n >= 2 && n <= kCompactMaxCluster)
+                return cta_plan(CompactPath::kCluster, n);
+        }
+        // A forced shape that cannot take this pair count falls through to the default.
+    }
+    if (P <= kCompactSmallMaxPairs && !want_ptrs && !want_tiles)
+        return {CompactPath::kSmall, small_threads, 1, 1};
+    if (P <= kCompactCtaMaxPairs)
+        return cta_plan(CompactPath::kCta, 1);
+    return cta_plan(CompactPath::kCluster, kCompactMaxCluster);
+}
+
+// cudaLaunchKernelEx with the PDL attribute and, for ctas > 1, a cluster of
+// `ctas` CTAs (grid = one cluster). Returns the launch status.
+template <typename KernelT, typename... Args>
+static cudaError_t compact_launch(KernelT kernel, int ctas, int threads, std::size_t smem, cudaStream_t stream,
+    bool pdl, Args... args)
+{
+    cudaLaunchConfig_t cfg{};
+    cudaLaunchAttribute attrs[2];
+    int n = 0;
+    attrs[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[n].val.programmaticStreamSerializationAllowed = pdl ? 1 : 0;
+    ++n;
+    if (ctas > 1)
+    {
+        attrs[n].id = cudaLaunchAttributeClusterDimension;
+        attrs[n].val.clusterDim.x = static_cast<unsigned>(ctas);
+        attrs[n].val.clusterDim.y = 1;
+        attrs[n].val.clusterDim.z = 1;
+        ++n;
+    }
+    cfg.gridDim = dim3(static_cast<unsigned>(ctas));
+    cfg.blockDim = dim3(static_cast<unsigned>(threads));
+    cfg.dynamicSmemBytes = smem;
+    cfg.stream = stream;
+    cfg.attrs = attrs;
+    cfg.numAttrs = n;
+    return cudaLaunchKernelEx(&cfg, kernel, args..., pdl);
+}
+
+// See docs/api and the Python wrapper (fish_scales_ops.gemm.mxfp8.moe_build_routing_compact) for the contract.
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+    at::Tensor>
+moe_build_routing_compact(at::Tensor topk_ids, int64_t num_groups, int64_t num_blocks, bool with_slots,
+    bool with_row_map, std::optional<at::Tensor> topk_w, std::vector<int64_t> problem_shapes_nk,
+    std::optional<std::vector<at::Tensor>> ptr_bases, std::vector<int64_t> ptr_strides, bool with_tiles)
+{
+    TORCH_CHECK(topk_ids.is_cuda() && topk_ids.dtype() == at::kInt, "topk_ids must be CUDA int32");
+    TORCH_CHECK(topk_ids.dim() == 2, "topk_ids must be [M, topk]");
+    TORCH_CHECK(topk_ids.is_contiguous(), "topk_ids must be contiguous");
+    TORCH_CHECK(num_groups >= 1 && num_groups <= kMaxGroups, "num_groups must be in [1, ", kMaxGroups, "]");
+    int64_t const M = topk_ids.size(0);
+    int64_t const topk = topk_ids.size(1);
+    int64_t const pairs = M * topk;
+    TORCH_CHECK(pairs <= (int64_t{1} << 30), "moe_build_routing_compact: M * topk = ", pairs, " routed pairs is too many");
+    // Sum over the active experts of ceil(cnt / 128) <= (pairs + 127 * active) / 128, active <= min(G, pairs): this
+    // bound holds for ANY ids (duplicates included), so a caller that passes it can never be overrun.
+    int64_t const bound = std::max<int64_t>(1, (pairs + 127 * std::min<int64_t>(num_groups, pairs)) / kCompactRows);
+    TORCH_CHECK(num_blocks >= bound, "moe_build_routing_compact: num_blocks = ", num_blocks, " is below the bound ",
+        bound, " for M * topk = ", pairs, " and num_groups = ", num_groups,
+        "; pass max(1, (M*topk + 127*min(G, M*topk)) // 128)");
+    TORCH_CHECK(num_blocks * kCompactRows <= INT32_MAX, "num_blocks * 128 must fit int32 rows");
+    // The token-tile list: at most sum over the active experts of ceil(cnt / 64) <= (pairs + 63 * active) / 64
+    // live tiles, for ANY ids, so this many entries can never be overrun.
+    int64_t const tiles_cap = std::max<int64_t>(1, (pairs + 63 * std::min<int64_t>(num_groups, pairs)) / kCompactTileRows);
+    if (with_tiles)
+    {
+        TORCH_CHECK(with_slots, "moe_build_routing_compact: with_tiles needs with_slots (the tile list's slot GEMMs "
+            "also take the work-stealing counter `slot_sched`)");
+        TORCH_CHECK(num_blocks <= kCompactTileMaxBlocks, "moe_build_routing_compact: with_tiles packs a 128-row block "
+            "index into 13 bits, so num_blocks must be at most ", kCompactTileMaxBlocks, ", got ", num_blocks);
+    }
+    TORCH_CHECK(problem_shapes_nk.size() % 2 == 0,
+        "problem_shapes_nk must be a flat list of (N, K) pairs, got ", problem_shapes_nk.size(), " ints");
+    int const num_ps = static_cast<int>(problem_shapes_nk.size() / 2);
+    TORCH_CHECK(num_ps <= kMaxProblemShapeSets,
+        "problem_shapes_nk names ", num_ps, " GEMMs; at most ", kMaxProblemShapeSets, " are supported");
+
+    CompactRoutingArgs args{};
+    for (int p = 0; p < num_ps; ++p)
+    {
+        int64_t const n = problem_shapes_nk[2 * p], k = problem_shapes_nk[2 * p + 1];
+        TORCH_CHECK(n >= 1 && k >= 1 && n <= INT32_MAX && k <= INT32_MAX,
+            "problem_shapes_nk pair ", p, " = (", n, ", ", k, ") must be positive int32");
+        args.ps.n[p] = static_cast<int32_t>(n);
+        args.ps.k[p] = static_cast<int32_t>(k);
+    }
+    args.ps.count = num_ps;
+
+    // Per-call pointer arrays: three base tensors and three byte strides per (N, K) pair.
+    bool const want_ptrs = ptr_bases.has_value() && !ptr_bases->empty();
+    if (want_ptrs)
+    {
+        TORCH_CHECK(static_cast<int>(ptr_bases->size()) == 3 * num_ps,
+            "ptr_bases must hold 3 tensors (A data, A scales, D data) per problem_shapes_nk pair: expected ",
+            3 * num_ps, ", got ", ptr_bases->size());
+        TORCH_CHECK(static_cast<int>(ptr_strides.size()) == 3 * num_ps,
+            "ptr_strides must hold 3 byte strides (A per row, A scales per 128-row block, D per row) per pair: "
+            "expected ", 3 * num_ps, ", got ", ptr_strides.size());
+        for (int p = 0; p < num_ps; ++p)
+        {
+            for (int j = 0; j < 3; ++j)
+            {
+                at::Tensor const& t = (*ptr_bases)[3 * p + j];
+                TORCH_CHECK(t.defined(), "ptr_bases[", 3 * p + j, "] is undefined");
+                int64_t const s = ptr_strides[3 * p + j];
+                TORCH_CHECK(s >= 0, "ptr_strides[", 3 * p + j, "] = ", s, " must be non-negative");
+                args.ptr_base[p][j] = static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(t.data_ptr()));
+                // per 128-row block: A and D strides are per row, the A-scale stride is already per block
+                args.ptr_step[p][j] = static_cast<uint64_t>(s) * (j == 1 ? 1u : static_cast<uint64_t>(kCompactRows));
+            }
+        }
+    }
+    else
+    {
+        TORCH_CHECK(ptr_strides.empty(), "ptr_strides given without ptr_bases");
+    }
+
+    bool const want_w = topk_w.has_value() && topk_w->defined() && topk_w->numel() > 0;
+    if (want_w)
+    {
+        auto const& tw = topk_w.value();
+        TORCH_CHECK(tw.is_cuda() && tw.dtype() == at::kFloat && tw.is_contiguous(),
+            "topk_w must be a contiguous CUDA fp32 tensor");
+        TORCH_CHECK(tw.numel() == pairs, "topk_w must have M * topk entries, matching topk_ids");
+        args.topk_w = reinterpret_cast<float const*>(tw.data_ptr());
+    }
+
+    int64_t const G = num_groups;
+    int64_t const rows = num_blocks * kCompactRows;
+    auto opts = topk_ids.options();
+    auto masked_m = at::empty({G}, opts);
+    auto blk0 = at::empty({G + 1}, opts);
+    auto slot_of_flat = at::empty({pairs}, opts);
+    auto slot_to_expert = at::empty({with_slots ? G : 0}, opts);
+    auto problem_shapes = at::empty({num_ps, G, 3}, opts);
+    auto ptr_arrays = at::empty({want_ptrs ? num_ps : 0, 3, G}, opts.dtype(at::kLong));
+    auto row_map = at::empty({with_row_map ? rows : 0}, opts);
+    auto weight_of_slot = at::empty({want_w ? rows : 0}, opts.dtype(at::kFloat));
+    // With the slot list, the slot route's work-stealing counter, zeroed by the kernel: a per-call tensor, so two
+    // calls in flight never share one, and the slot GEMMs of this call leave it zero for each other.
+    auto slot_sched = at::empty({with_slots ? kCompactSlotSchedWords : 0}, opts);
+    // With the token-tile list: the live 64-row token tiles of the slot route past a row capacity of 64, then -1,
+    // then their count (int32 [tiles_cap + 1]).
+    auto slot_tiles = at::empty({with_tiles ? tiles_cap + 1 : 0}, opts);
+
+    args.topk_ids = reinterpret_cast<int32_t const*>(topk_ids.data_ptr());
+    args.masked_m = reinterpret_cast<int32_t*>(masked_m.data_ptr());
+    args.blk0 = reinterpret_cast<int32_t*>(blk0.data_ptr());
+    args.slot_of_flat = reinterpret_cast<int32_t*>(slot_of_flat.data_ptr());
+    args.slot_to_expert = with_slots ? reinterpret_cast<int32_t*>(slot_to_expert.data_ptr()) : nullptr;
+    args.slot_sched = with_slots ? reinterpret_cast<int32_t*>(slot_sched.data_ptr()) : nullptr;
+    args.slot_tiles = with_tiles ? reinterpret_cast<int32_t*>(slot_tiles.data_ptr()) : nullptr;
+    args.tiles_cap = with_tiles ? static_cast<int>(tiles_cap) : 0;
+    args.problem_shapes = num_ps > 0 ? reinterpret_cast<int32_t*>(problem_shapes.data_ptr()) : nullptr;
+    args.ptr_arrays = want_ptrs ? reinterpret_cast<int64_t*>(ptr_arrays.data_ptr()) : nullptr;
+    args.row_map = with_row_map ? reinterpret_cast<int32_t*>(row_map.data_ptr()) : nullptr;
+    args.weight_of_slot = want_w ? reinterpret_cast<float*>(weight_of_slot.data_ptr()) : nullptr;
+    args.num_pairs = static_cast<int>(pairs);
+    args.topk = static_cast<int>(topk);
+    args.num_groups = static_cast<int>(G);
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    bool const pdl = fso_pdl_enabled();
+    CompactPlan const plan = compact_plan(static_cast<int>(pairs), static_cast<int>(G), want_ptrs, with_tiles);
+    cudaError_t err = cudaSuccess;
+    switch (plan.path)
+    {
+    case CompactPath::kSmall:
+    {
+        CompactRoutingSmallArgs sa{args.topk_ids, args.topk_w, args.masked_m, args.blk0, args.slot_of_flat,
+            args.slot_to_expert, args.slot_sched, args.problem_shapes, args.row_map, args.weight_of_slot, args.ps,
+            args.num_pairs, args.topk, args.num_groups};
+        err = compact_launch(moe_routing_compact_small_kernel, 1, plan.threads, 0, stream, pdl, sa);
+        break;
+    }
+    case CompactPath::kCta:
+    case CompactPath::kCluster:
+    {
+        bool const cl = plan.path == CompactPath::kCluster;
+#define FSO_COMPACT_CTA_T(K, TL)                                                                                     \
+    err = cl ? compact_launch(moe_routing_compact_cta_kernel<K, true, TL>, plan.ctas, plan.threads, 0, stream, pdl,   \
+                   args)                                                                                            \
+             : compact_launch(moe_routing_compact_cta_kernel<K, false, TL>, 1, plan.threads, 0, stream, pdl, args)
+#define FSO_COMPACT_CTA(K)                                                                                          \
+    do                                                                                                              \
+    {                                                                                                               \
+        if (with_tiles)                                                                                             \
+            FSO_COMPACT_CTA_T(K, true);                                                                             \
+        else                                                                                                        \
+            FSO_COMPACT_CTA_T(K, false);                                                                            \
+    } while (0)
+        switch (plan.reg_pairs)
+        {
+        case 1: FSO_COMPACT_CTA(1); break;
+        case 2: FSO_COMPACT_CTA(2); break;
+        case 4: FSO_COMPACT_CTA(4); break;
+        default: FSO_COMPACT_CTA(kCompactRegPairs); break;
+        }
+#undef FSO_COMPACT_CTA
+#undef FSO_COMPACT_CTA_T
+        break;
+    }
+    }
+    TORCH_CHECK(err == cudaSuccess, "moe_build_routing_compact: kernel launch failed: ", cudaGetErrorString(err));
+    return {masked_m, blk0, slot_of_flat, slot_to_expert, problem_shapes, ptr_arrays, row_map, weight_of_slot,
+        slot_sched, slot_tiles};
+}
+
+
 // moe_build_sorted: topk_ids [M, topk] int32 -> (sorted_expert_ids [P_max],
 // flat_to_sorted [M*topk], num_padded_dev [1]), one launch. P_max = M*topk +
 // min(M*topk, num_groups)*(block_m-1), rounded up to block_m, is the
@@ -1740,24 +2919,34 @@ at::Tensor moe_combine(at::Tensor dn, at::Tensor slot_of_flat, at::Tensor topk_w
     bool const small_grid = at::cuda::getCurrentDeviceProperties()->major == 12
         && total <= kSmallGridMaxCtas * kSmallGridThreads;
     int const threads = small_grid ? kSmallGridThreads : 256;
-    int const grid = static_cast<int>((total + threads - 1) / threads);
+    int64_t const ctas = (total + threads - 1) / threads;
     auto stream = at::cuda::getCurrentCUDAStream();
-    bool const pdl = fso_pdl_enabled() && static_cast<unsigned>(grid) <= kFsoPdlMaxGridCtas;
+    // PDL at every size (FSO_DISABLE_PDL=1 turns it off with the rest of the chain) on a bounded grid (see
+    // moe_combine_launch). Its bound is far above the 128-thread launch's 256 CTAs on every device, so that launch is
+    // the kernel it was.
+    bool const pdl = fso_pdl_enabled();
+    auto const* dn_p = reinterpret_cast<__nv_bfloat16 const*>(dn.data_ptr());
+    auto const* slot_p = reinterpret_cast<int32_t const*>(slot_of_flat.data_ptr());
+    auto const* w_p = reinterpret_cast<float const*>(topk_w.data_ptr());
+    auto* out_p = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
     if (bias_ptr != nullptr)
     {
-        fso_pdl_launch(moe_combine_kernel<true>, dim3(grid), dim3(threads), stream, pdl,
-            reinterpret_cast<__nv_bfloat16 const*>(dn.data_ptr()),
-            reinterpret_cast<int32_t const*>(slot_of_flat.data_ptr()),
-            reinterpret_cast<float const*>(topk_w.data_ptr()),
-            reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), bias_ptr, bias_scale_ptr, M, topk, H);
+        if (threads == kSmallGridThreads)
+            moe_combine_launch<true, kSmallGridThreads>(ctas, stream, pdl, dn_p, slot_p, w_p, out_p, bias_ptr,
+                bias_scale_ptr, M, topk, H);
+        else
+            moe_combine_launch<true, 256>(ctas, stream, pdl, dn_p, slot_p, w_p, out_p, bias_ptr, bias_scale_ptr, M,
+                topk, H);
     }
     else
     {
-        fso_pdl_launch(moe_combine_kernel<false>, dim3(grid), dim3(threads), stream, pdl,
-            reinterpret_cast<__nv_bfloat16 const*>(dn.data_ptr()),
-            reinterpret_cast<int32_t const*>(slot_of_flat.data_ptr()),
-            reinterpret_cast<float const*>(topk_w.data_ptr()),
-            reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), nullptr, nullptr, M, topk, H);
+        __nv_bfloat16 const* no_bias = nullptr;
+        float const* no_scale = nullptr;
+        if (threads == kSmallGridThreads)
+            moe_combine_launch<false, kSmallGridThreads>(ctas, stream, pdl, dn_p, slot_p, w_p, out_p, no_bias, no_scale,
+                M, topk, H);
+        else
+            moe_combine_launch<false, 256>(ctas, stream, pdl, dn_p, slot_p, w_p, out_p, no_bias, no_scale, M, topk, H);
     }
     return out;
 }
@@ -1784,16 +2973,16 @@ at::Tensor moe_combine_sorted(at::Tensor dn, at::Tensor flat_to_sorted, at::Tens
         "flat_to_sorted must have M*topk entries");
 
     auto out = at::empty({M, H}, dn.options());
-    int const threads = 256;
+    constexpr int threads = 256;
     int64_t const total = static_cast<int64_t>(M) * (H / 8);
-    int const grid = static_cast<int>((total + threads - 1) / threads);
     auto stream = at::cuda::getCurrentCUDAStream();
-    bool const pdl = fso_pdl_enabled() && static_cast<unsigned>(grid) <= kFsoPdlMaxGridCtas;
-    fso_pdl_launch(moe_combine_kernel<false>, dim3(grid), dim3(threads), stream, pdl,
+    // PDL at every size on a bounded grid (see moe_combine_launch).
+    __nv_bfloat16 const* no_bias = nullptr;
+    float const* no_scale = nullptr;
+    moe_combine_launch<false, threads>((total + threads - 1) / threads, stream, fso_pdl_enabled(),
         reinterpret_cast<__nv_bfloat16 const*>(dn.data_ptr()),
-        reinterpret_cast<int32_t const*>(flat_to_sorted.data_ptr()),
-        reinterpret_cast<float const*>(topk_w.data_ptr()),
-        reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), nullptr, nullptr, M, topk, H);
+        reinterpret_cast<int32_t const*>(flat_to_sorted.data_ptr()), reinterpret_cast<float const*>(topk_w.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), no_bias, no_scale, M, topk, H);
     return out;
 }
 
@@ -1855,14 +3044,16 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_topk_from_logits(at::Tensor l
     float* gate_ptr = with_shared_gate ? reinterpret_cast<float*>(shared_gate.data_ptr()) : nullptr;
     int const ld = static_cast<int>(logits.stride(0));
     int const tokens_per_cta = kRouterThreads / 32;
-    int const grid = (M + tokens_per_cta - 1) / tokens_per_cta;
+    int64_t const ctas = (static_cast<int64_t>(M) + tokens_per_cta - 1) / tokens_per_cta;
     auto stream = at::cuda::getCurrentCUDAStream();
-    bool const pdl = fso_pdl_enabled() && static_cast<unsigned>(grid) <= kFsoPdlMaxGridCtas;
+    // PDL at every size on a bounded grid (fso_glue_launch).
+    bool const pdl = fso_pdl_enabled();
 
-#define FSO_ROUTER_LAUNCH(TLOGIT, SLOTS, PTR)                                                                          \
-    fso_pdl_launch(moe_topk_from_logits_kernel<TLOGIT, SLOTS>, dim3(grid), dim3(kRouterThreads), stream, pdl, PTR,      \
-        n_valid, map_ptr, reinterpret_cast<int32_t*>(ids.data_ptr()), reinterpret_cast<float*>(weights.data_ptr()),     \
-        gate_ptr, M, E, ld, static_cast<int>(topk), E, renormalize)
+#define FSO_ROUTER_LAUNCH(TLOGIT, SLOTS, PTR)                                                                        \
+    fso_glue_launch<moe_topk_from_logits_kernel<TLOGIT, SLOTS, false>,                                               \
+        moe_topk_from_logits_kernel<TLOGIT, SLOTS, true>, kRouterThreads>(ctas, stream, pdl, PTR, n_valid, map_ptr,    \
+        reinterpret_cast<int32_t*>(ids.data_ptr()), reinterpret_cast<float*>(weights.data_ptr()), gate_ptr, M, E, ld,  \
+        static_cast<int>(topk), E, renormalize)
 
     if (logits.dtype() == at::kBFloat16)
     {

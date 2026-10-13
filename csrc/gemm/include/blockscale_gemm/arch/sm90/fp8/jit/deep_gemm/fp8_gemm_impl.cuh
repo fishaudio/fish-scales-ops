@@ -28,22 +28,37 @@
 #ifndef FSO_SWAPAB_CTAS_PER_SM
 #define FSO_SWAPAB_CTAS_PER_SM 1
 #endif
+// 1 when the dispatch built this grouped swap-AB GEMM with its weight boxes loaded evict-first in L2
+// (dispatch.cuh, sm90_swapab_weight_evict_first; compiler.cuh passes it as -D...=1 and names the cubin "_ef").
+#ifndef FSO_SWAPAB_WEIGHT_EVICT_FIRST
+#define FSO_SWAPAB_WEIGHT_EVICT_FIRST 0
+#endif
 #include "tma_utils.cuh"
 #include "utils.cuh"
 
 namespace deep_gemm
 {
 
-// Programmatic dependent launch (PDL) for the dense GEMM: `fso_pdl_wait` blocks until the preceding kernel in the
-// stream has completed and its memory is visible, and is a no-op when the launch carries no programmatic dependency
-// (a plain launch, or FSO_DISABLE_PDL=1 on the host side). The instruction is written out because NVRTC does not
-// declare cudaGridDependencySynchronize.
+// Programmatic dependent launch (PDL): `fso_pdl_wait` blocks until the preceding kernel in the stream has completed
+// and its memory is visible, and is a no-op when the launch carries no programmatic dependency (a plain launch, or
+// FSO_DISABLE_PDL=1 on the host side). The instruction is written out because NVRTC does not declare
+// cudaGridDependencySynchronize.
 //
-// The dense GEMM does not trigger its own dependents early (griddepcontrol.launch_dependents): they launch when it
-// completes, as in DeepGEMM v2's sm90_fp8_gemm_1d2d. On the H200 an early trigger by thread 0 after the wait made the
-// GEMM itself up to 2 % slower (0.5-1 % on most decode cells of wo, wqkv and gate_up) when its successor is not a
-// programmatic dependent (measured with FSO_DISABLE_PDL=1, 2026-10-05), and gained nothing measurable in the MLP
-// block, whose GEMMs are followed by silu*mul; it only helped back-to-back GEMMs.
+// Every kernel of this file, dense and grouped (MoE), executes the wait in every CTA once its prologue is done (shared
+// memory carved up, barriers initialised, TMA descriptors prefetched: only kernel parameters and shared memory are
+// touched) and before its first global read, the scheduler's read of the grouped layout (the sorted expert ids or
+// masked_m) included; dispatch.cuh launches every one of them with the attribute unless FSO_DISABLE_PDL=1. Because no
+// CTA can exit before its wait returns, a GEMM completes only after its predecessor has, so the completion of a
+// later kernel still implies that of every earlier one: the MoE combine reads the routing outputs before its own wait
+// and relies on that (moe_glue.cu).
+//
+// The GEMMs do not trigger their own dependents early (griddepcontrol.launch_dependents): a GEMM's dependents launch
+// once all of its CTAs have exited, as in DeepGEMM v2's sm90_fp8_gemm_1d2d. On the H200 an early trigger by thread 0
+// after the wait made the dense GEMM itself up to 2 % slower (0.5-1 % on most decode cells of wo, wqkv and gate_up)
+// when its successor is not a programmatic dependent (measured with FSO_DISABLE_PDL=1, 2026-10-05), and gained nothing
+// measurable in the MLP block, whose GEMMs are followed by silu*mul; it only helped back-to-back GEMMs. In the MoE
+// layer the same trigger in the grouped kernels gained 3 % at M = 1 but cost up to 1.2 % at M = 4-128 and 2.3 % at
+// M = 1024-2048 against the wait alone (2026-10-10).
 __device__ __forceinline__ void fso_pdl_wait()
 {
     asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -196,12 +211,11 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
     // Synchronize all threads to make barrier visible in normal memory model
     (kNumTMAMulticast > 1) ? cute::cluster_sync() : __syncthreads();
 
-    // PDL, dense GEMM only. Everything above reads only kernel parameters and shared memory, so it may overlap the
-    // preceding kernel (the activation quantize, which lets this GEMM launch as soon as its CTAs have started); every
-    // global access below (A and its scales, the B scales, D) comes after the wait. The grouped (MoE) instantiations
-    // compile without it.
-    if constexpr (SchedulerType::gemm_type == GemmType::Normal)
-        fso_pdl_wait();
+    // PDL wait, every GEMM type. Everything above reads only kernel parameters and shared memory, so it may overlap
+    // the preceding kernel (the activation quantize ahead of a dense GEMM, which lets this GEMM launch as soon as its
+    // CTAs have started; the gather-quantize or the FC1 ahead of a grouped one); every global access below (the
+    // grouped layout the scheduler reads, A and its scales, the B scales, D) comes after the wait.
+    fso_pdl_wait();
 
     // For pipeline unrolling
     struct DivisibleK
@@ -677,10 +691,8 @@ __global__ void __launch_bounds__(
     // Synchronize all threads to make barrier visible in normal memory model
     (kNumTMAMulticast > 1) ? cute::cluster_sync() : __syncthreads();
 
-    // PDL, dense swap-AB GEMM only: the same wait as fp8_gemm_kernel (see there). The grouped (MoE) instantiations
-    // compile without it.
-    if constexpr (SchedulerType::gemm_type == GemmType::Normal)
-        fso_pdl_wait();
+    // PDL wait, every GEMM type: the same place and contract as in fp8_gemm_kernel (see there).
+    fso_pdl_wait();
 
     // For pipeline unrolling
     struct DivisibleK
@@ -721,6 +733,12 @@ __global__ void __launch_bounds__(
     uint32_t m_block_idx, n_block_idx;
     auto scheduler = SchedulerType(problem_input);
 
+    // L2 policy of the weight boxes: evict-first when the dispatch built this grouped-contiguous (MoE) GEMM with
+    // FSO_SWAPAB_WEIGHT_EVICT_FIRST (dispatch.cuh, sm90_swapab_weight_evict_first, which says when and why), otherwise
+    // evict-normal as before. Every other GEMM type (the dense swap-AB GEMM among them) is unchanged.
+    constexpr bool kWeightEvictFirst
+        = SchedulerType::gemm_type == GemmType::GroupedContiguous and FSO_SWAPAB_WEIGHT_EVICT_FIRST != 0;
+
     if (threadIdx.x >= kNumMathThreads)
     {
         // TMA warp-group for loading data
@@ -749,8 +767,8 @@ __global__ void __launch_bounds__(
                             // Issue TMA A (weight) now without broadcasting
                             auto& full_barrier = *full_barriers[s];
                             int k_idx = k_iter * kFullKOfAllStages + s * BLOCK_K;
-                            tma_copy(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier), smem_a[s], k_idx,
-                                scheduler.get_global_m_idx(SHAPE_M, BLOCK_M, m_block_idx, n_block_idx));
+                            tma_copy_weight<kWeightEvictFirst>(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
+                                smem_a[s], k_idx, scheduler.get_global_m_idx(SHAPE_M, BLOCK_M, m_block_idx, n_block_idx));
 
                             // Issue TMA B (act) with broadcasting
                             tma_copy<kNumTMAMulticast>(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
@@ -1183,6 +1201,10 @@ __global__ void __launch_bounds__(get_num_threads_per_sm_2wg<kNumTMAThreads, kNu
 
     // Synchronize all threads to make barrier visible in normal memory model
     __syncthreads();
+
+    // PDL wait, at the place and with the contract of fp8_gemm_kernel's (see there): nothing above reads global
+    // memory, and the scheduler's first read of the sorted expert ids comes after it.
+    fso_pdl_wait();
 
     // For pipeline unrolling
     struct DivisibleK
@@ -1697,6 +1719,10 @@ __global__ void __launch_bounds__(get_num_threads_per_sm_2wg<kNumTMAThreads, kNu
 
     // Synchronize all threads to make barrier visible in normal memory model
     __syncthreads();
+
+    // PDL wait, at the place and with the contract of fp8_gemm_kernel's (see there): nothing above reads global
+    // memory, and the scheduler's first read of the sorted expert ids comes after it.
+    fso_pdl_wait();
 
     // For pipeline unrolling
     struct DivisibleK
@@ -2316,6 +2342,10 @@ __device__ __forceinline__ void swapab_gate_up_body(void* gmem_out, uint32_t sd_
     // Synchronize all threads to make barrier visible in normal memory model
     __syncthreads();
 
+    // PDL wait, at the place and with the contract of fp8_gemm_kernel's (see there): nothing above reads global
+    // memory, and the scheduler's first read of the sorted expert ids comes after it.
+    fso_pdl_wait();
+
     // For pipeline unrolling
     struct DivisibleK
     {
@@ -2349,6 +2379,9 @@ __device__ __forceinline__ void swapab_gate_up_body(void* gmem_out, uint32_t sd_
     uint32_t m_block_idx, n_block_idx;
     auto scheduler = SchedulerType(problem_input);
 
+    // L2 policy of the weight boxes: see fp8_gemm_kernel_swapAB.
+    constexpr bool kWeightEvictFirst = FSO_SWAPAB_WEIGHT_EVICT_FIRST != 0;
+
     if (threadIdx.x >= kNumMathThreads)
     {
         // TMA warp-group for loading data
@@ -2380,9 +2413,9 @@ __device__ __forceinline__ void swapab_gate_up_body(void* gmem_out, uint32_t sd_
                             int k_idx = k_iter * kFullKOfAllStages + s * BLOCK_K;
                             uint32_t const gate_row
                                 = scheduler.get_global_m_idx(SHAPE_M, BLOCK_M, m_block_idx, n_block_idx);
-                            tma_copy(tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier), smem_a[s], k_idx,
-                                gate_row);
-                            tma_copy(tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
+                            tma_copy_weight<kWeightEvictFirst>(tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
+                                smem_a[s], k_idx, gate_row);
+                            tma_copy_weight<kWeightEvictFirst>(tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
                                 smem_a[s] + L::kHalfBytesPerStage, k_idx, gate_row + SHAPE_M_HALF);
 
                             // Issue TMA B (activation) and its scales
@@ -3054,6 +3087,11 @@ __global__ void __launch_bounds__(384, 1)
     cute::cluster_arrive_relaxed();
     cute::cluster_wait();
 
+    // PDL wait, at the place and with the contract of fp8_gemm_kernel's (see there), once the cluster barrier has
+    // published the barrier initialisation: nothing above reads global memory, and both CTAs of the cluster wait
+    // before the scheduler's first read of the sorted expert ids.
+    fso_pdl_wait();
+
     // m_block_idx is the SwiGLU block b (I / 128 of them); the cluster is the scheduling unit.
     uint32_t m_block_idx, n_block_idx;
     auto scheduler = SchedulerType(problem_input);
@@ -3076,9 +3114,11 @@ __global__ void __launch_bounds__(384, 1)
                         empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
                         auto& full_barrier = *full_barriers[s];
                         int const k_idx = static_cast<int>(k_iter * kFullKOfAllStages + s * BLOCK_K);
-                        tma_copy(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier), smem_a[s], k_idx, gate_row);
-                        tma_copy(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
-                            smem_a[s] + L::kHalfBytesPerStage, k_idx, gate_row + SHAPE_M_HALF);
+                        tma_copy_weight<FSO_SWAPAB_WEIGHT_EVICT_FIRST != 0>(&tensor_map_a,
+                            reinterpret_cast<uint64_t*>(&full_barrier), smem_a[s], k_idx, gate_row);
+                        tma_copy_weight<FSO_SWAPAB_WEIGHT_EVICT_FIRST != 0>(&tensor_map_a,
+                            reinterpret_cast<uint64_t*>(&full_barrier), smem_a[s] + L::kHalfBytesPerStage, k_idx,
+                            gate_row + SHAPE_M_HALF);
                         tma_copy(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier), smem_b[s], k_idx, n_idx);
                         tma_copy(&tensor_map_scales_b, reinterpret_cast<uint64_t*>(&full_barrier), smem_scales_b[s],
                             n_block_idx * BLOCK_N, scheduler.get_global_scales_b_idx(k_idx / BLOCK_K));

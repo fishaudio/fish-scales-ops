@@ -1,7 +1,7 @@
 """sm_100/103 dense split-K workspace: growth after a capture, and growth inside one.
 
 The dense C++ cascade of sm_100/103 runs the narrow-N long-K decode cells
-(N <= 4096, K >= 4096 at M <= 32, K >= 8192 up to M = 128) as a two-kernel
+(N <= 4096, K >= 4096 at M <= 32, K >= 8192 up to M = 104) as a two-kernel
 parallel split-K, and keeps the FP32 partial sums in a per-thread workspace
 pool (`Sm100WorkspacePool` in
 csrc/gemm/include/blockscale_gemm/arch/sm100/mxfp8/dispatch.cuh). A captured
@@ -10,9 +10,10 @@ never free a buffer a graph may still use. Two cases, each in its own process so
 the thread-local pool starts empty:
 
 * ``grow``: capture the down projection (N = 2560, K = 9728) at M = 1, which
-  sizes the pool for that call; make an eager call at M = 128, which needs a
-  larger workspace; NaN-fill the captured output and replay. The replay must be
-  bit-exact against the eager M = 1 result, and the eager M = 128 result must be
+  sizes the pool for that call; make an eager call at M = 104 (the largest M of
+  the band), which needs a larger workspace; NaN-fill the captured output and
+  replay. The replay must be bit-exact against the eager M = 1 result, and the
+  eager M = 104 result must be
   unchanged afterwards. When the driver API of `cuda-python` is importable
   (nvidia-cutlass-dsl depends on it), the case also allocates a few sentinel
   buffers of exactly the M = 1 workspace size after the growth, fills them with a
@@ -22,10 +23,10 @@ the thread-local pool starts empty:
   elsewhere. ``--no-sentinel`` leaves them out, which is how the case runs under
   ``compute-sanitizer --tool memcheck`` (a sentinel would make the freed range
   valid memory again and hide the access).
-* ``capture_grow``: one eager call at M = 1, then a capture at M = 128 straight
+* ``capture_grow``: one eager call at M = 1, then a capture at M = 104 straight
   away. The pool cannot allocate inside a capture, so the op must raise
   RuntimeError naming the remedy, and the process must stay usable: an eager
-  M = 128 call afterwards must succeed and match a fresh one.
+  M = 104 call afterwards must succeed and match a fresh one.
 
 The children run with FSO_PRINT_TILE_INFO=1, so their stderr shows that the
 split-K kernel ran (``[fso sm100 tile] splitk``) and when the pool grew
@@ -48,7 +49,7 @@ import torch
 import fish_scales_ops as fso
 
 N, K = 2560, 9728            # Qwen3-4B `down`: 20 N tiles, 76 K blocks -> 4 K slices
-M_SMALL, M_LARGE = 1, 128
+M_SMALL, M_LARGE = 1, 104     # 104: the largest M the K >= 8192 split-K band takes
 SPLITS = 4                   # pick_splits(20 tiles, 76 K blocks) on a 148-SM part
 
 
@@ -137,7 +138,7 @@ def case_grow(sentinel=True):
     ref_large = _gemm(xl, sxl, wq, sw).clone()
     torch.cuda.synchronize()
     ref_large_host = ref_large.cpu()
-    assert torch.isfinite(ref_large).all(), "eager M=128 result has NaN/Inf"
+    assert torch.isfinite(ref_large).all(), f"eager M={M_LARGE} result has NaN/Inf"
 
     sent = _Sentinels(SPLITS * M_SMALL * N * 4, count=8) if sentinel else None
 
@@ -152,10 +153,10 @@ def case_grow(sentinel=True):
         raise AssertionError(f"replay after the workspace grew != eager (max abs diff {diff})")
     assert torch.equal(ref_large.cpu(), ref_large_host), (
         "the replays overwrote a tensor allocated after the workspace grew (the eager "
-        "M=128 result): the graph still writes the workspace the pool freed")
+        f"M={M_LARGE} result): the graph still writes the workspace the pool freed")
     again = _gemm(xl, sxl, wq, sw)
     torch.cuda.synchronize()
-    assert torch.equal(again.cpu(), ref_large_host), "eager M=128 changed after the replays"
+    assert torch.equal(again.cpu(), ref_large_host), f"eager M={M_LARGE} changed after the replays"
     if sent is not None and sent.cu is not None:
         bad, total = sent.clobbered(), len(sent.bufs)
         sent.free()
@@ -193,8 +194,8 @@ def case_capture_grow():
     y1 = _gemm(xl, sxl, wq, sw).clone()
     y2 = _gemm(xl, sxl, wq, sw)
     torch.cuda.synchronize()
-    assert torch.isfinite(y1).all() and torch.equal(y1, y2), "eager M=128 after the refusal is wrong"
-    print("  capture_grow      process usable after the refusal, eager M=128 consistent  OK")
+    assert torch.isfinite(y1).all() and torch.equal(y1, y2), f"eager M={M_LARGE} after the refusal is wrong"
+    print(f"  capture_grow      process usable after the refusal, eager M={M_LARGE} consistent  OK")
 
 
 def _child(case, *extra):
@@ -231,8 +232,8 @@ def main() -> int:
             problems.append(f"exit {r.returncode}")
         if "[fso sm100 tile] splitk" not in r.stderr:
             problems.append("the split-K kernel never ran")
-        # grow: the M = 1 call and the M = 128 call. capture_grow: the M = 1
-        # call and the eager M = 128 call after the refusal (none inside it).
+        # grow: the M = 1 call and the M = 104 call. capture_grow: the M = 1
+        # call and the eager M = 104 call after the refusal (none inside it).
         if len(grew) != 2:
             problems.append(f"expected 2 workspace growth lines, got {len(grew)}")
         if problems:

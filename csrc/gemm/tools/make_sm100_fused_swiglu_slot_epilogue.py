@@ -48,6 +48,24 @@ for many times over by the epilogue this route no longer needs: the stock slot
 kernel runs the TMA-store epilogue, whose staged bf16 D tiles are about sixteen
 times larger.
 
+The compact-layout twins (fso 0.2.1)
+------------------------------------
+The header also carries two classes for the compact slot route, whose kernel
+hands its epilogue a problem shape with N = the expert's routed row count
+(`fso_store_shape` in the generated slot kernel):
+
+* `FsoFusedSwiGluSlotNoSmemBounded`, the fused clone above with edit 9 calling
+  `fused_swiglu_slot_mxfp8_store_bounded`, which writes exactly the token
+  columns below N;
+* `FsoPlainSlotNoSmemBounded`, the same CUTLASS class cloned for the PLAIN
+  (unfused) slot GEMM: the EVT visit loop and the D store are replaced by
+  `fso_plain_slot::plain_slot_bf16_store` (plain_slot_store.cuh), a bf16 store
+  of the token columns below N with explicit output addressing
+  (`PlainSlotArgs`), bound to an N-major epilogue so that a thread holds one
+  accumulator row and the whole 64-column token tile (32dp32b TMEM atom).
+
+The masked class is untouched, so the masked slot route keeps its kernel.
+
 Each edit asserts its exact match count, so a CUTLASS bump that moves any of
 them fails the build here, naming the edit, rather than producing a silently
 different kernel.
@@ -138,6 +156,7 @@ def generate(cutlass_dir: str) -> tuple[str, list[str], str]:
     body = text[start:i + 1]
     report.append(f"edit 1 extract EVT Sm100NoSmem specialisation: {len(body)} chars")
 
+    original = body
     edits: list[tuple[str, str, int, str]] = []
 
     # --- edit 2: partial specialisation -> primary class template -----------
@@ -341,6 +360,97 @@ protected:
         body = body.replace(old, new, n)
         report.append(f"edit {what}: {cnt} site(s)")
 
+    # --- the compact twin: same clone, the exact-N store (see the docstring) -
+    bounded = body
+    for old, new, n, what in (
+            ("class FsoFusedSwiGluSlotNoSmem {", "class FsoFusedSwiGluSlotNoSmemBounded {", 1, "b1 class name"),
+            ("  FsoFusedSwiGluSlotNoSmem(Params const& params_, SharedStorage& shared_tensors)",
+             "  FsoFusedSwiGluSlotNoSmemBounded(Params const& params_, SharedStorage& shared_tensors)", 1,
+             "b2 constructor name"),
+            ("fso_swiglu_slot::fused_swiglu_slot_mxfp8_store(",
+             "fso_swiglu_slot::fused_swiglu_slot_mxfp8_store_bounded(", 1, "b3 exact-N store")):
+        cnt = bounded.count(old)
+        assert cnt == n, f"[{what}] literal found {cnt} times, expected {n}"
+        bounded = bounded.replace(old, new, n)
+        report.append(f"edit {what}: {cnt} site(s)")
+    body = body + "\n\n" + bounded
+
+    # --- the plain twin: the same CUTLASS class, a bf16 store bounded by N --
+    plain = original
+    sync_line = (
+        "    auto synchronize = [] () CUTLASS_LAMBDA_FUNC_INLINE "
+        "{ cutlass::arch::NamedBarrier::sync(ThreadCount, "
+        "cutlass::arch::ReservedNamedBarriers::EpilogueBarrier); };")
+    plain_edits = [
+        (EVT_CLASS_HEAD, PRIMARY_CLASS_HEAD.replace("FsoFusedSwiGluSlotNoSmem", "FsoPlainSlotNoSmemBounded"), 1,
+         "p1 primary-template head"),
+        ("""  CUTLASS_DEVICE
+  CollectiveEpilogue(Params const& params_, SharedStorage& shared_tensors)""",
+         """  CUTLASS_DEVICE
+  FsoPlainSlotNoSmemBounded(Params const& params_, SharedStorage& shared_tensors)""", 1, "p2 constructor name"),
+        ("""    ElementD* ptr_D = nullptr;
+    StrideD dD = {};
+  };""", """    ElementD* ptr_D = nullptr;
+    StrideD dD = {};
+    // fso plain slot store: the output's real addressing (the D stride above
+    // describes the N-major tag that selects the TMEM atom, not the tensor).
+    fso_plain_slot::PlainSlotArgs plain{};
+  };""", 2, "p3 Arguments / Params field"),
+        ("""    return {
+      FusionCallbacks::to_underlying_arguments(problem_shape, args.thread, workspace),
+      args.ptr_C,
+      args.dC,
+      args.ptr_D,
+      args.dD
+    };""", """    return {
+      FusionCallbacks::to_underlying_arguments(problem_shape, args.thread, workspace),
+      args.ptr_C,
+      args.dC,
+      args.ptr_D,
+      args.dD,
+      args.plain          // fso plain slot store
+    };""", 1, "p4 to_underlying_arguments carries the plain args"),
+        (sync_line, """    // fso plain slot store: ordinary locals (M and N are structured bindings,
+    // which C++17 does not allow the epilogue loop lambda to capture). N is the
+    // expert's routed row count on the compact slot route.
+    int const fso_M = static_cast<int>(M);
+    int const fso_N = static_cast<int>(N);
+    int const fso_l = static_cast<int>(cute::get<3>(cta_coord_mnkl));
+
+""" + sync_line, 1, "p5 plain locals for the store"),
+        ("""          CUTLASS_PRAGMA_UNROLL
+          for (int epi_v = 0; epi_v < size(tTR_rAcc_frg); ++epi_v) {
+            tTR_rD_frg(epi_v) = cst_callbacks.visit(tTR_rAcc_frg(epi_v), epi_v, epi_m, epi_n);
+          }
+""", """          // ---------------------------------------- fso plain slot store
+          // D = acc (alpha 1, no source), rounded to bf16, for the token columns
+          // below N only; this thread holds one weight row and the 64 columns.
+          fso_plain_slot::plain_slot_bf16_store(tTR_rAcc, tTR_cCD_mn, params.plain, fso_M, fso_N, fso_l);
+""", 1, "p6 plain store replaces the EVT visit loop"),
+        ("""          using VecType = uint_bit_t<VD * sizeof_bits_v<ElementD>>;
+          if constexpr (!is_same_v<VecType, uint256_t>) {
+            Tensor tTR_gD_frg = recast<VecType>(coalesce(tTR_gD(_,_,_,epi_m,epi_n)));
+            Tensor tTR_rD_frg = recast<VecType>(coalesce(tTR_rD));
+            Tensor tTR_pD_frg = tensor<1>(zipped_divide(coalesce(tTR_pCD_mn), mclD.compose(Int<VD>{})));
+            copy_if(tTR_pD_frg, tTR_rD_frg, tTR_gD_frg);
+          }
+          else {
+            auto tiled_r2g = make_tiled_copy_D(Copy_Atom<SM100_STORE_256bit_CACHE_NOALLOCATION, ElementD>{}, tiled_t2r);
+            auto thr_r2g = tiled_r2g.get_slice(threadIdx.x);
+            Tensor src = thr_r2g.retile_S(tTR_rD);
+            Tensor dst = thr_r2g.retile_D(tTR_gD(_,_,_,epi_m,epi_n));
+            Tensor prd = thr_r2g.retile_D(tTR_pCD_mn);
+            copy_if(tiled_r2g, prd, src, dst);
+          }""", """          // fso plain slot store: the stock D store is gone (the store above wrote D).
+          (void) sizeof(VD);""", 1, "p7 drop the stock D store"),
+    ]
+    for old, new, n, what in plain_edits:
+        cnt = plain.count(old)
+        assert cnt == n, f"[{what}] literal found {cnt} times, expected {n}"
+        plain = plain.replace(old, new, n)
+        report.append(f"edit {what}: {cnt} site(s)")
+    body = body + "\n\n" + plain
+
     out = """// GENERATED by csrc/gemm/tools/make_sm100_fused_swiglu_slot_epilogue.py -- do
 // not edit by hand, and do not check the result in: the build writes it into
 // the build directory only.
@@ -359,6 +469,7 @@ protected:
 #include "cutlass/epilogue/collective/sm100_epilogue_nosmem.hpp"
 
 #include "blockscale_gemm/arch/sm100/mxfp8/fused_swiglu_slot_store.cuh"
+#include "blockscale_gemm/arch/sm100/mxfp8/plain_slot_store.cuh"
 
 namespace cutlass {
 namespace epilogue {
