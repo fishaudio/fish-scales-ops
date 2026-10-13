@@ -2,7 +2,7 @@
 
 Performance figures are in `docs/perf/`, not here.
 
-## 0.2.1 — unreleased
+## 0.2.1 — 2026-10-13
 
 ### Changed (no action needed; reservations get smaller)
 
@@ -67,40 +67,54 @@ Performance figures are in `docs/perf/`, not here.
 - **RTX 5090 (sm_120/sm_121).** The dense down projection picks its Stream-K split by the rounds each slice runs
   (the MLP block is faster from 256 to 768 tokens), the MoE gather-quantize quantizes each token once and writes its
   top-k copies, and the Qwen3.5-35B-A3B experts take a better grouped tile around 1024 tokens; the MoE layer is
-  faster from 256 tokens up.
+  2–5 % faster from 1024 tokens up.
 - **H200 (sm_90) dense linear.** The block-FP8 GEMM also runs DeepGEMM v2's dense kernel (`sm90_fp8_gemm_1d2d`,
   vendored and compiled by the bundled NVRTC) at DeepGEMM's own configuration, for the tiles fso's kernel cannot run
   (256×128 with multicast, 128×160 and 128×192 from 512 tokens), for batches of 129–255 tokens, where fso's 128-row
   tiles left a second, mostly empty block, and for the long-K projections at 64 and 128 tokens. The choice depends
   on the shape only, and the outputs are bitwise identical either way. The Family A MLP block is about a third faster
-  at 160–192 tokens and 3–11 % faster from 1024 tokens; `FSO_SM90_DENSE_DG2=0` keeps every dense GEMM on fso's own kernel.
+  at 160 and 192 tokens, about 4 % faster at 64 and 128 tokens and 3–11 % faster from 1024 tokens up;
+  `FSO_SM90_DENSE_DG2=0` keeps every dense GEMM on fso's own kernel.
 - **H200 (sm_90) MoE layer and block.** The grouped GEMMs and the expert-sorted gather-quantize now launch with PDL,
   so each starts while its predecessor finishes. The swap-AB grouped GEMMs of the decode routes (the 16- and 32-row
   activation tiles) load the expert weights evict-first in L2, so the weights they stream once no longer push the
   layer's own intermediates out of L2 between the kernel that writes them and the one that reads them. The layer is
-  faster at decode and in prefill.
+  2–9 % faster at decode (the most at the smallest batches), and level or faster in prefill under uniform and
+  skewed routing.
 
 ### Known issues
 
 The gaps below are measured against the serving libraries on the same card; the summary under each table of
 `docs/perf/layer/` gives the batch sizes and the size of every gap.
 
-- **H200, MoE layer.** sglang 0.5.20's Triton FP8 MoE layer, run with apex's tuned configs, is faster than fso on
-  Family C at M = 16, 32 and 64.
 - **H200, dense MLP block.** sglang 0.5.20's block-FP8 linear layer (DeepGEMM `sm90_fp8_gemm_1d2d`, with the
-  programmatic dependent launch sglang serves it with) is faster than fso's block on the Family A MLP block from
-  M = 64 to M = 256 and from M = 1024 up.
-- **RTX 5090, Family C MoE layer.** vLLM 0.29.0's Triton FP8 MoE layer is faster than fso at M = 64 and 1024, and
-  sglang 0.5.20's at M = 512 and 1024.
-- **RTX 5090, Family C MoE block at M = 1.** With the shared expert computed after the routed layer and added to its
-  output, the block at M = 1 is 1.9 % slower than in 0.2.0: the shared expert's first GEMM, whose machine code is
-  unchanged, runs slower right after the compact routed chain, and the routing kernel's start is no longer hidden
-  behind the preceding add. Passing the shared expert's output to `fso.moe.layer` as `bias` instead of adding it
-  afterwards brings the block within 1 % of 0.2.0 in the same form, and is faster than the add form in either
-  release.
-- **Blackwell, dense MLP block.** On the B300, sglang's block-FP8 linear (DeepGEMM) is faster than fso's MXFP8 block
-  from M = 32 to M = 256 and at M = 1024 and 2048; on the RTX 5090, vLLM's block-FP8 linear (DeepGEMM, run as eager
-  ops) is faster at M = 512 and 1024.
+  programmatic dependent launch sglang serves it with) is faster than fso's block on the Family A MLP block at
+  M = 96, 160 and 192 by 6–12 % and at M = 64, 128, 256, 1024 and 8192 by 1–3 %. At 160 and 192 both libraries run
+  the same DeepGEMM kernels. fso's activation quantizer lets the next GEMM start early, so the GEMM's thread blocks
+  land on other SMs, and the 64-row down-projection tiles then read through other L2 partitions, which costs them
+  about 3 µs at M = 160.
+- **H200, MoE layer under one-EP-rank routing in prefill, against 0.2.0.** With E / 2 local experts the layer is
+  2.4 % slower than 0.2.0 on Family B at M = 2048 and 1.9 % slower on Family C at M = 8192; at the other prefill
+  sizes, and under uniform and skewed routing, it is level with 0.2.0 or faster. About 1.3 % of the Family C cell is
+  the cost of the shared allocation that takes 30 % off the call's transient memory.
+- **RTX 5090, Family C MoE layer at M = 64.** vLLM 0.29.0's Triton FP8 MoE layer is 1.8 % faster than fso at M = 64,
+  under uniform and under skewed routing; under skewed routing sglang 0.5.20's is also 1.6 % faster at M = 1024.
+- **RTX 5090, Family C MoE at M = 1 and 2, against 0.2.0.** The routed layer at M = 2 is 1.2 % slower than in
+  0.2.0; at every other M it is within 1 % of 0.2.0 or faster. With the shared expert computed after the routed layer
+  and added to its output, the block at M = 1 is 2.0 % slower than in 0.2.0: the shared expert's first GEMM, whose
+  machine code is unchanged, runs slower right after the compact routed chain, and the routing kernel's start is no
+  longer hidden behind the preceding add. Passing the shared expert's output to `fso.moe.layer` as `bias` instead of
+  adding it afterwards brings the block within 1 % of 0.2.0 in the same form, and is faster than the add form in
+  either release.
+- **Blackwell, dense MLP block at one batch size each.** On the B300, sglang's block-FP8 linear (DeepGEMM) is 1.6 %
+  faster than fso's MXFP8 block at M = 96, where fso's 2560-wide down projection runs on 80 thread blocks and
+  DeepGEMM's on 120; on the RTX 5090, vLLM's block-FP8 linear (DeepGEMM, run as eager ops) is 1.2 % faster at
+  M = 1024.
+- **Blackwell, the direct block-FP8 GEMM.** On sm_100/sm_103 and sm_120/sm_121, `fso.dense` serves a block-FP8
+  checkpoint through the MXFP8 path, the MXFP8 rows of the tables. The direct block-FP8 GEMM that `fso.compat`
+  keeps for callers who pass 1×128 / 128×128 operands themselves (`linear_fp8`, the BSFP8 rows) is slower than the
+  comparators' block-FP8 linear: on the B300 sglang's is faster at every M from 16 to 8192, by 16–21 % from M = 32
+  to M = 192; on the RTX 5090 vLLM's is faster from M = 512 up, by 5–14 %.
 
 ## 0.2.0 — 2026-10-06
 

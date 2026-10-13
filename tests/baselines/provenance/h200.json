@@ -5,20 +5,20 @@
    "bench_env": {},
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
-    "fingerprint": "c801228f6cf29df78df911843545f7f68da38400e33b242a6aadf6ff6825d406",
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "fingerprint": "6504b2765c65e8124450f35e27f738b8c83a61d87b6999ec288ea318befec8b5",
     "source": "kit"
    },
    "card": {
     "clocks_max_sm_mhz": 1980,
     "compute_mode": "Default",
     "driver": "595.58.03",
-    "index": "0",
+    "index": "3",
     "memory_total_mib": 143771,
     "name": "NVIDIA H200",
-    "pci": "00000000:8F:00.0",
+    "pci": "00000000:97:00.0",
     "power_limit_w": 700,
-    "uuid": "GPU-e87af6ea-2a7f-af85-f89f-e5a17e644ff1"
+    "uuid": "GPU-9860e51e-04ef-c66a-f09f-e3d4680ea4df"
    },
    "clock_flags": {},
    "clock_policy": {
@@ -52,510 +52,8 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T23:52:55Z",
-     "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
-     "cuda_toolkit": "13.0.3",
-     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
-     "dirty": false,
-     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
-     "glibc_required": "GLIBC_2.34",
-     "image": {
-      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
-      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
-      "name": "fso-build-wheel:7014ca7ac32a"
-     },
-     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
-     "nvrtc": {
-      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
-      "version": "13.0.88",
-      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
-     },
-     "python": "CPython 3.12.15",
-     "torch": "2.13.0+cu130",
-     "version": "0.2.0"
-    },
-    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
-    "extension_sha256": "0f7a715cc7c135f6877db36f5d9760e8b8575ea82ad862f5811546eff8777b84",
-    "source_build": false,
-    "version": "0.2.0"
-   },
-   "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-06T00:50:06Z",
-   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_release_0.2.0_cu130_20261005/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
-   "machine": "h200",
-   "manifest_sha256": "b814375372f308352a31a6601f7191ac35e588dc0a9cf55e69a1c7f0cb0add7a",
-   "observed_clocks": {
-    "dense_B": {
-     "busy_samples": 81,
-     "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 27,
-     "power_capped_share_of_busy": 0.3333,
-     "power_w_max": 502.32,
-     "samples": 341,
-     "sm_mhz_max_busy": 1980,
-     "sm_mhz_median_busy": 1980,
-     "sm_mhz_min_busy": 1485,
-     "temperature_c_max": 53,
-     "thermal_busy_samples": 0
-    }
-   },
-   "run": "cu130-h200",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_cu130_20261005/runs/cu130-h200",
-   "steps": [
-    {
-     "command": [
-      "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_release_0.2.0_cu130_20261005/h200/suite/kit/fish_scales_ops-0.2.0-testkit-7162cce/bench/gemm/python/bench_qwen3_4b_mlp.py",
-      "--run",
-      "--family",
-      "qwen3-30a3",
-      "--out",
-      "/data/bench-runs/fso_release_0.2.0_cu130_20261005/h200/perf/gemm_sm90_qwen3_30a3_dense.jsonl"
-     ],
-     "end_utc": "2026-10-06T00:42:52.036Z",
-     "env": "main",
-     "error_rows": 0,
-     "exit_code": 0,
-     "name": "dense_B",
-     "rows": 28,
-     "start_utc": "2026-10-06T00:41:43.952Z"
-    }
-   ],
-   "window_utc": [
-    "2026-10-06T00:41:43.952Z",
-    "2026-10-06T00:42:52.036Z"
-   ]
-  },
-  "gemm_sm90_qwen3_35a3_dense.jsonl": {
-   "bench_env": {},
-   "bench_tree": {
-    "bench_dirty": null,
-    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
-    "fingerprint": "c801228f6cf29df78df911843545f7f68da38400e33b242a6aadf6ff6825d406",
-    "source": "kit"
-   },
-   "card": {
-    "clocks_max_sm_mhz": 1980,
-    "compute_mode": "Default",
-    "driver": "595.58.03",
-    "index": "0",
-    "memory_total_mib": 143771,
-    "name": "NVIDIA H200",
-    "pci": "00000000:8F:00.0",
-    "power_limit_w": 700,
-    "uuid": "GPU-e87af6ea-2a7f-af85-f89f-e5a17e644ff1"
-   },
-   "clock_flags": {},
-   "clock_policy": {
-    "applied": "nothing: natural clock",
-    "max_sm_mhz": 1980,
-    "mhz": null,
-    "mode": "natural"
-   },
-   "drift_accepted": [],
-   "driver": "595.58.03",
-   "environments": {
-    "main": {
-     "packages": {
-      "flashinfer-python": "0.6.18",
-      "numpy": "2.3.5",
-      "nvidia-cublas": "13.1.1.3",
-      "nvidia-cuda-nvrtc": "13.0.88",
-      "nvidia-cudnn-cu13": "9.20.0.48",
-      "nvidia-cudnn-frontend": "1.30.0",
-      "nvidia-cutlass-dsl": "4.6.2",
-      "sgl-deep-gemm": "0.2.0+cu130",
-      "sglang": "0.5.20",
-      "sglang-kernel": "0.4.7+cu130",
-      "torch": "2.13.0+cu130",
-      "triton": "3.7.1"
-     },
-     "python": "/home/stone/venvs/apex-0520/bin/python",
-     "python_version": "3.12.3"
-    }
-   },
-   "fso": {
-    "build_info": {
-     "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T23:52:55Z",
-     "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
-     "cuda_toolkit": "13.0.3",
-     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
-     "dirty": false,
-     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
-     "glibc_required": "GLIBC_2.34",
-     "image": {
-      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
-      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
-      "name": "fso-build-wheel:7014ca7ac32a"
-     },
-     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
-     "nvrtc": {
-      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
-      "version": "13.0.88",
-      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
-     },
-     "python": "CPython 3.12.15",
-     "torch": "2.13.0+cu130",
-     "version": "0.2.0"
-    },
-    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
-    "extension_sha256": "0f7a715cc7c135f6877db36f5d9760e8b8575ea82ad862f5811546eff8777b84",
-    "source_build": false,
-    "version": "0.2.0"
-   },
-   "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-06T00:50:06Z",
-   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_release_0.2.0_cu130_20261005/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
-   "machine": "h200",
-   "manifest_sha256": "b814375372f308352a31a6601f7191ac35e588dc0a9cf55e69a1c7f0cb0add7a",
-   "observed_clocks": {
-    "dense_C": {
-     "busy_samples": 251,
-     "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 72,
-     "power_capped_share_of_busy": 0.2869,
-     "power_w_max": 552.11,
-     "samples": 1001,
-     "sm_mhz_max_busy": 1980,
-     "sm_mhz_median_busy": 1980,
-     "sm_mhz_min_busy": 1470,
-     "temperature_c_max": 55,
-     "thermal_busy_samples": 0
-    }
-   },
-   "run": "cu130-h200",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_cu130_20261005/runs/cu130-h200",
-   "steps": [
-    {
-     "command": [
-      "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_release_0.2.0_cu130_20261005/h200/suite/kit/fish_scales_ops-0.2.0-testkit-7162cce/bench/gemm/python/bench_qwen3_4b_mlp.py",
-      "--run",
-      "--family",
-      "qwen3.5-35a3",
-      "--out",
-      "/data/bench-runs/fso_release_0.2.0_cu130_20261005/h200/perf/gemm_sm90_qwen3_35a3_dense.jsonl"
-     ],
-     "end_utc": "2026-10-06T00:46:12.348Z",
-     "env": "main",
-     "error_rows": 0,
-     "exit_code": 0,
-     "name": "dense_C",
-     "rows": 84,
-     "start_utc": "2026-10-06T00:42:52.147Z"
-    }
-   ],
-   "window_utc": [
-    "2026-10-06T00:42:52.147Z",
-    "2026-10-06T00:46:12.348Z"
-   ]
-  },
-  "gemm_sm90_qwen3_4b.jsonl": {
-   "bench_env": {},
-   "bench_tree": {
-    "bench_dirty": null,
-    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
-    "fingerprint": "c801228f6cf29df78df911843545f7f68da38400e33b242a6aadf6ff6825d406",
-    "source": "kit"
-   },
-   "card": {
-    "clocks_max_sm_mhz": 1980,
-    "compute_mode": "Default",
-    "driver": "595.58.03",
-    "index": "0",
-    "memory_total_mib": 143771,
-    "name": "NVIDIA H200",
-    "pci": "00000000:8F:00.0",
-    "power_limit_w": 700,
-    "uuid": "GPU-e87af6ea-2a7f-af85-f89f-e5a17e644ff1"
-   },
-   "clock_flags": {},
-   "clock_policy": {
-    "applied": "nothing: natural clock",
-    "max_sm_mhz": 1980,
-    "mhz": null,
-    "mode": "natural"
-   },
-   "drift_accepted": [],
-   "driver": "595.58.03",
-   "environments": {
-    "main": {
-     "packages": {
-      "flashinfer-python": "0.6.18",
-      "numpy": "2.3.5",
-      "nvidia-cublas": "13.1.1.3",
-      "nvidia-cuda-nvrtc": "13.0.88",
-      "nvidia-cudnn-cu13": "9.20.0.48",
-      "nvidia-cudnn-frontend": "1.30.0",
-      "nvidia-cutlass-dsl": "4.6.2",
-      "sgl-deep-gemm": "0.2.0+cu130",
-      "sglang": "0.5.20",
-      "sglang-kernel": "0.4.7+cu130",
-      "torch": "2.13.0+cu130",
-      "triton": "3.7.1"
-     },
-     "python": "/home/stone/venvs/apex-0520/bin/python",
-     "python_version": "3.12.3"
-    }
-   },
-   "fso": {
-    "build_info": {
-     "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T23:52:55Z",
-     "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
-     "cuda_toolkit": "13.0.3",
-     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
-     "dirty": false,
-     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
-     "glibc_required": "GLIBC_2.34",
-     "image": {
-      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
-      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
-      "name": "fso-build-wheel:7014ca7ac32a"
-     },
-     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
-     "nvrtc": {
-      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
-      "version": "13.0.88",
-      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
-     },
-     "python": "CPython 3.12.15",
-     "torch": "2.13.0+cu130",
-     "version": "0.2.0"
-    },
-    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
-    "extension_sha256": "0f7a715cc7c135f6877db36f5d9760e8b8575ea82ad862f5811546eff8777b84",
-    "source_build": false,
-    "version": "0.2.0"
-   },
-   "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-06T00:50:06Z",
-   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_release_0.2.0_cu130_20261005/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
-   "machine": "h200",
-   "manifest_sha256": "b814375372f308352a31a6601f7191ac35e588dc0a9cf55e69a1c7f0cb0add7a",
-   "observed_clocks": {
-    "dense_A": {
-     "busy_samples": 293,
-     "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 137,
-     "power_capped_share_of_busy": 0.4676,
-     "power_w_max": 711.42,
-     "samples": 1010,
-     "sm_mhz_max_busy": 1980,
-     "sm_mhz_median_busy": 1965,
-     "sm_mhz_min_busy": 750,
-     "temperature_c_max": 62,
-     "thermal_busy_samples": 0
-    }
-   },
-   "run": "cu130-h200",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_cu130_20261005/runs/cu130-h200",
-   "steps": [
-    {
-     "command": [
-      "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_release_0.2.0_cu130_20261005/h200/suite/kit/fish_scales_ops-0.2.0-testkit-7162cce/bench/gemm/python/bench_qwen3_4b_mlp.py",
-      "--run",
-      "--family",
-      "qwen3-4b",
-      "--out",
-      "/data/bench-runs/fso_release_0.2.0_cu130_20261005/h200/perf/gemm_sm90_qwen3_4b.jsonl"
-     ],
-     "end_utc": "2026-10-06T00:40:00.186Z",
-     "env": "main",
-     "error_rows": 0,
-     "exit_code": 0,
-     "name": "dense_A",
-     "rows": 80,
-     "start_utc": "2026-10-06T00:36:38.156Z"
-    }
-   ],
-   "window_utc": [
-    "2026-10-06T00:36:38.156Z",
-    "2026-10-06T00:40:00.186Z"
-   ]
-  },
-  "gemm_sm90_qwen3_4b_mlp_fwd.jsonl": {
-   "bench_env": {},
-   "bench_tree": {
-    "bench_dirty": null,
-    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
-    "fingerprint": "c801228f6cf29df78df911843545f7f68da38400e33b242a6aadf6ff6825d406",
-    "source": "kit"
-   },
-   "card": {
-    "clocks_max_sm_mhz": 1980,
-    "compute_mode": "Default",
-    "driver": "595.58.03",
-    "index": "0",
-    "memory_total_mib": 143771,
-    "name": "NVIDIA H200",
-    "pci": "00000000:8F:00.0",
-    "power_limit_w": 700,
-    "uuid": "GPU-e87af6ea-2a7f-af85-f89f-e5a17e644ff1"
-   },
-   "clock_flags": {},
-   "clock_policy": {
-    "applied": "nothing: natural clock",
-    "max_sm_mhz": 1980,
-    "mhz": null,
-    "mode": "natural"
-   },
-   "drift_accepted": [],
-   "driver": "595.58.03",
-   "environments": {
-    "main": {
-     "packages": {
-      "flashinfer-python": "0.6.18",
-      "numpy": "2.3.5",
-      "nvidia-cublas": "13.1.1.3",
-      "nvidia-cuda-nvrtc": "13.0.88",
-      "nvidia-cudnn-cu13": "9.20.0.48",
-      "nvidia-cudnn-frontend": "1.30.0",
-      "nvidia-cutlass-dsl": "4.6.2",
-      "sgl-deep-gemm": "0.2.0+cu130",
-      "sglang": "0.5.20",
-      "sglang-kernel": "0.4.7+cu130",
-      "torch": "2.13.0+cu130",
-      "triton": "3.7.1"
-     },
-     "python": "/home/stone/venvs/apex-0520/bin/python",
-     "python_version": "3.12.3"
-    }
-   },
-   "fso": {
-    "build_info": {
-     "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T23:52:55Z",
-     "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
-     "cuda_toolkit": "13.0.3",
-     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
-     "dirty": false,
-     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
-     "glibc_required": "GLIBC_2.34",
-     "image": {
-      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
-      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
-      "name": "fso-build-wheel:7014ca7ac32a"
-     },
-     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
-     "nvrtc": {
-      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
-      "version": "13.0.88",
-      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
-     },
-     "python": "CPython 3.12.15",
-     "torch": "2.13.0+cu130",
-     "version": "0.2.0"
-    },
-    "commit": "7162cce58b4ad7d7c3c71ebdd539f92c4c6f35b4",
-    "extension_sha256": "0f7a715cc7c135f6877db36f5d9760e8b8575ea82ad862f5811546eff8777b84",
-    "source_build": false,
-    "version": "0.2.0"
-   },
-   "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-06T00:50:06Z",
-   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_release_0.2.0_cu130_20261005/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
-   "machine": "h200",
-   "manifest_sha256": "b814375372f308352a31a6601f7191ac35e588dc0a9cf55e69a1c7f0cb0add7a",
-   "observed_clocks": {
-    "mlp_fwd": {
-     "busy_samples": 56,
-     "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 16,
-     "power_capped_share_of_busy": 0.2857,
-     "power_w_max": 578.55,
-     "samples": 517,
-     "sm_mhz_max_busy": 1980,
-     "sm_mhz_median_busy": 1980.0,
-     "sm_mhz_min_busy": 1455,
-     "temperature_c_max": 55,
-     "thermal_busy_samples": 0
-    }
-   },
-   "run": "cu130-h200",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_cu130_20261005/runs/cu130-h200",
-   "steps": [
-    {
-     "command": [
-      "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_release_0.2.0_cu130_20261005/h200/suite/kit/fish_scales_ops-0.2.0-testkit-7162cce/bench/gemm/python/bench_qwen3_4b_mlp_forward.py",
-      "--run",
-      "--out",
-      "/data/bench-runs/fso_release_0.2.0_cu130_20261005/h200/perf/gemm_sm90_qwen3_4b_mlp_fwd.jsonl"
-     ],
-     "end_utc": "2026-10-06T00:41:43.838Z",
-     "env": "main",
-     "error_rows": 0,
-     "exit_code": 0,
-     "name": "mlp_fwd",
-     "rows": 14,
-     "start_utc": "2026-10-06T00:40:00.297Z"
-    }
-   ],
-   "window_utc": [
-    "2026-10-06T00:40:00.297Z",
-    "2026-10-06T00:41:43.838Z"
-   ]
-  },
-  "perf_moe_qwen3_30a3_ep2_h200.jsonl": {
-   "bench_env": {},
-   "bench_tree": {
-    "bench_dirty": null,
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
-    "source": "kit"
-   },
-   "card": {
-    "clocks_max_sm_mhz": 1980,
-    "compute_mode": "Default",
-    "driver": "595.58.03",
-    "index": "0",
-    "memory_total_mib": 143771,
-    "name": "NVIDIA H200",
-    "pci": "00000000:8F:00.0",
-    "power_limit_w": 700,
-    "uuid": "GPU-e87af6ea-2a7f-af85-f89f-e5a17e644ff1"
-   },
-   "clock_flags": {},
-   "clock_policy": {
-    "applied": "nothing: natural clock",
-    "max_sm_mhz": 1980,
-    "mhz": null,
-    "mode": "natural"
-   },
-   "drift_accepted": [],
-   "driver": "595.58.03",
-   "environments": {
-    "main": {
-     "packages": {
-      "flashinfer-python": "0.6.18",
-      "numpy": "2.3.5",
-      "nvidia-cublas": "13.1.1.3",
-      "nvidia-cuda-nvrtc": "13.0.88",
-      "nvidia-cudnn-cu13": "9.20.0.48",
-      "nvidia-cudnn-frontend": "1.30.0",
-      "nvidia-cutlass-dsl": "4.6.2",
-      "sgl-deep-gemm": "0.2.0+cu130",
-      "sglang": "0.5.20",
-      "sglang-kernel": "0.4.7+cu130",
-      "torch": "2.13.0+cu130",
-      "triton": "3.7.1"
-     },
-     "python": "/home/stone/venvs/apex-0520/bin/python",
-     "python_version": "3.12.3"
-    }
-   },
-   "fso": {
-    "build_info": {
-     "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-10T15:55:17Z",
-     "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+     "built_at": "2026-10-12T18:30:52Z",
+     "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
      "cuda_toolkit": "13.0.3",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
@@ -576,50 +74,632 @@
      "torch": "2.13.0+cu130",
      "version": "0.2.1"
     },
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "extension_sha256": "dfae2d579c6d36cd9c5819f19664bdd7dd0f1f25e3900090e13f9225c082f903",
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "extension_sha256": "9d6a3b09f4a324a43a3a1bce1f9214aabf26c339077271ace7c6efce85d9e79d",
     "source_build": false,
     "version": "0.2.1"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T20:07:34Z",
-   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
+   "installed_utc": "2026-10-13T00:02:09Z",
+   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
+   "lock_sha256": "5b78c8a5680a073f8e634e4e48f7e4a969ece4cd3db4e08c9f6cba648fc6f55b",
    "machine": "h200",
-   "manifest_sha256": "db9b79a0943298e594d4832f2858c54e2461e2bf0fd80e1f880b1aad87e44c75",
+   "manifest_sha256": "cdf3ba20db8ec9897f158340fa3fa7f0f0391d0f2aa4ec2030aa1898bd06bc9e",
    "observed_clocks": {
-    "srv_ep2_30a3": {
-     "busy_samples": 59,
+    "dense_B": {
+     "busy_samples": 98,
      "hw_slowdown_busy_samples": 0,
-     "power_cap_busy_samples": 3,
-     "power_capped_busy_samples": 3,
-     "power_capped_share_of_busy": 0.0508,
+     "power_cap_busy_samples": 23,
+     "power_capped_busy_samples": 23,
+     "power_capped_share_of_busy": 0.2347,
      "power_limit_w": 700,
-     "power_throttle_share_of_busy": 0.0508,
-     "power_w_max": 257.49,
-     "power_w_max_busy": 257.49,
-     "power_w_mean_busy": 136.7,
-     "samples": 215,
+     "power_throttle_share_of_busy": 0.2347,
+     "power_w_max": 321.47,
+     "power_w_max_busy": 321.47,
+     "power_w_mean_busy": 163.4,
+     "samples": 447,
      "sm_mhz_max_busy": 1980,
-     "sm_mhz_mean_busy": 1975.2,
-     "sm_mhz_median_busy": 1980,
-     "sm_mhz_min_busy": 1845,
-     "temperature_c_max": 48,
+     "sm_mhz_mean_busy": 1952.3,
+     "sm_mhz_median_busy": 1980.0,
+     "sm_mhz_min_busy": 1515,
+     "temperature_c_max": 52,
      "thermal_busy_samples": 0,
      "thermal_throttle_share_of_busy": 0.0,
      "throttle_reason_busy_samples": {
       "hw_power_brake": 0,
       "hw_slowdown": 0,
       "hw_thermal": 0,
-      "sw_power_cap": 3,
+      "sw_power_cap": 23,
       "sw_thermal": 0
      },
-     "throttle_share_of_busy": 0.0508
+     "throttle_share_of_busy": 0.2347
+    }
+   },
+   "power_flags": {
+    "dense_B": [
+     "the power cap held the clock in 23 of 98 busy samples (23 %); busy SM clock min 1515 MHz, mean 1952.3 MHz; busy power mean 163.4 W, max 321.47 W of the 700 W limit"
+    ]
+   },
+   "run": "0.2.1-h200",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200",
+   "steps": [
+    {
+     "command": [
+      "/home/stone/venvs/apex-0520/bin/python",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/kit/fish_scales_ops-0.2.1-testkit-d8737b4/bench/gemm/python/bench_qwen3_4b_mlp.py",
+      "--run",
+      "--family",
+      "qwen3-30a3",
+      "--out",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/perf/gemm_sm90_qwen3_30a3_dense.jsonl"
+     ],
+     "end_utc": "2026-10-12T18:50:30.315Z",
+     "env": "main",
+     "error_rows": 0,
+     "exit_code": 0,
+     "name": "dense_B",
+     "rows": 34,
+     "start_utc": "2026-10-12T18:49:00.931Z"
+    }
+   ],
+   "window_utc": [
+    "2026-10-12T18:49:00.931Z",
+    "2026-10-12T18:50:30.315Z"
+   ]
+  },
+  "gemm_sm90_qwen3_35a3_dense.jsonl": {
+   "bench_env": {},
+   "bench_tree": {
+    "bench_dirty": null,
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "fingerprint": "6504b2765c65e8124450f35e27f738b8c83a61d87b6999ec288ea318befec8b5",
+    "source": "kit"
+   },
+   "card": {
+    "clocks_max_sm_mhz": 1980,
+    "compute_mode": "Default",
+    "driver": "595.58.03",
+    "index": "3",
+    "memory_total_mib": 143771,
+    "name": "NVIDIA H200",
+    "pci": "00000000:97:00.0",
+    "power_limit_w": 700,
+    "uuid": "GPU-9860e51e-04ef-c66a-f09f-e3d4680ea4df"
+   },
+   "clock_flags": {},
+   "clock_policy": {
+    "applied": "nothing: natural clock",
+    "max_sm_mhz": 1980,
+    "mhz": null,
+    "mode": "natural"
+   },
+   "drift_accepted": [],
+   "driver": "595.58.03",
+   "environments": {
+    "main": {
+     "packages": {
+      "flashinfer-python": "0.6.18",
+      "numpy": "2.3.5",
+      "nvidia-cublas": "13.1.1.3",
+      "nvidia-cuda-nvrtc": "13.0.88",
+      "nvidia-cudnn-cu13": "9.20.0.48",
+      "nvidia-cudnn-frontend": "1.30.0",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "sgl-deep-gemm": "0.2.0+cu130",
+      "sglang": "0.5.20",
+      "sglang-kernel": "0.4.7+cu130",
+      "torch": "2.13.0+cu130",
+      "triton": "3.7.1"
+     },
+     "python": "/home/stone/venvs/apex-0520/bin/python",
+     "python_version": "3.12.3"
+    }
+   },
+   "fso": {
+    "build_info": {
+     "arch_list": "9.0a;10.0f;12.0a",
+     "built_at": "2026-10-12T18:30:52Z",
+     "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+     "cuda_toolkit": "13.0.3",
+     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+     "dirty": false,
+     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
+     "glibc_required": "GLIBC_2.34",
+     "image": {
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
+     },
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
+     "nvrtc": {
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+     },
+     "python": "CPython 3.12.15",
+     "torch": "2.13.0+cu130",
+     "version": "0.2.1"
+    },
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "extension_sha256": "9d6a3b09f4a324a43a3a1bce1f9214aabf26c339077271ace7c6efce85d9e79d",
+    "source_build": false,
+    "version": "0.2.1"
+   },
+   "host": "39-gcp-h200-2",
+   "installed_utc": "2026-10-13T00:02:09Z",
+   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
+   "lock_sha256": "5b78c8a5680a073f8e634e4e48f7e4a969ece4cd3db4e08c9f6cba648fc6f55b",
+   "machine": "h200",
+   "manifest_sha256": "cdf3ba20db8ec9897f158340fa3fa7f0f0391d0f2aa4ec2030aa1898bd06bc9e",
+   "observed_clocks": {
+    "dense_C": {
+     "busy_samples": 297,
+     "hw_slowdown_busy_samples": 0,
+     "power_cap_busy_samples": 69,
+     "power_capped_busy_samples": 69,
+     "power_capped_share_of_busy": 0.2323,
+     "power_limit_w": 700,
+     "power_throttle_share_of_busy": 0.2323,
+     "power_w_max": 393.7,
+     "power_w_max_busy": 393.7,
+     "power_w_mean_busy": 166.0,
+     "samples": 1280,
+     "sm_mhz_max_busy": 1980,
+     "sm_mhz_mean_busy": 1949.2,
+     "sm_mhz_median_busy": 1980,
+     "sm_mhz_min_busy": 1500,
+     "temperature_c_max": 52,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 69,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.2323
+    }
+   },
+   "power_flags": {
+    "dense_C": [
+     "the power cap held the clock in 69 of 297 busy samples (23 %); busy SM clock min 1500 MHz, mean 1949.2 MHz; busy power mean 166.0 W, max 393.7 W of the 700 W limit"
+    ]
+   },
+   "run": "0.2.1-h200",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200",
+   "steps": [
+    {
+     "command": [
+      "/home/stone/venvs/apex-0520/bin/python",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/kit/fish_scales_ops-0.2.1-testkit-d8737b4/bench/gemm/python/bench_qwen3_4b_mlp.py",
+      "--run",
+      "--family",
+      "qwen3.5-35a3",
+      "--out",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/perf/gemm_sm90_qwen3_35a3_dense.jsonl"
+     ],
+     "end_utc": "2026-10-12T18:54:46.492Z",
+     "env": "main",
+     "error_rows": 0,
+     "exit_code": 0,
+     "name": "dense_C",
+     "rows": 102,
+     "start_utc": "2026-10-12T18:50:30.431Z"
+    }
+   ],
+   "window_utc": [
+    "2026-10-12T18:50:30.431Z",
+    "2026-10-12T18:54:46.492Z"
+   ]
+  },
+  "gemm_sm90_qwen3_4b.jsonl": {
+   "bench_env": {},
+   "bench_tree": {
+    "bench_dirty": null,
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "fingerprint": "6504b2765c65e8124450f35e27f738b8c83a61d87b6999ec288ea318befec8b5",
+    "source": "kit"
+   },
+   "card": {
+    "clocks_max_sm_mhz": 1980,
+    "compute_mode": "Default",
+    "driver": "595.58.03",
+    "index": "3",
+    "memory_total_mib": 143771,
+    "name": "NVIDIA H200",
+    "pci": "00000000:97:00.0",
+    "power_limit_w": 700,
+    "uuid": "GPU-9860e51e-04ef-c66a-f09f-e3d4680ea4df"
+   },
+   "clock_flags": {},
+   "clock_policy": {
+    "applied": "nothing: natural clock",
+    "max_sm_mhz": 1980,
+    "mhz": null,
+    "mode": "natural"
+   },
+   "drift_accepted": [],
+   "driver": "595.58.03",
+   "environments": {
+    "main": {
+     "packages": {
+      "flashinfer-python": "0.6.18",
+      "numpy": "2.3.5",
+      "nvidia-cublas": "13.1.1.3",
+      "nvidia-cuda-nvrtc": "13.0.88",
+      "nvidia-cudnn-cu13": "9.20.0.48",
+      "nvidia-cudnn-frontend": "1.30.0",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "sgl-deep-gemm": "0.2.0+cu130",
+      "sglang": "0.5.20",
+      "sglang-kernel": "0.4.7+cu130",
+      "torch": "2.13.0+cu130",
+      "triton": "3.7.1"
+     },
+     "python": "/home/stone/venvs/apex-0520/bin/python",
+     "python_version": "3.12.3"
+    }
+   },
+   "fso": {
+    "build_info": {
+     "arch_list": "9.0a;10.0f;12.0a",
+     "built_at": "2026-10-12T18:30:52Z",
+     "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+     "cuda_toolkit": "13.0.3",
+     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+     "dirty": false,
+     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
+     "glibc_required": "GLIBC_2.34",
+     "image": {
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
+     },
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
+     "nvrtc": {
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+     },
+     "python": "CPython 3.12.15",
+     "torch": "2.13.0+cu130",
+     "version": "0.2.1"
+    },
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "extension_sha256": "9d6a3b09f4a324a43a3a1bce1f9214aabf26c339077271ace7c6efce85d9e79d",
+    "source_build": false,
+    "version": "0.2.1"
+   },
+   "host": "39-gcp-h200-2",
+   "installed_utc": "2026-10-13T00:02:09Z",
+   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
+   "lock_sha256": "5b78c8a5680a073f8e634e4e48f7e4a969ece4cd3db4e08c9f6cba648fc6f55b",
+   "machine": "h200",
+   "manifest_sha256": "cdf3ba20db8ec9897f158340fa3fa7f0f0391d0f2aa4ec2030aa1898bd06bc9e",
+   "observed_clocks": {
+    "dense_A": {
+     "busy_samples": 318,
+     "hw_slowdown_busy_samples": 0,
+     "power_cap_busy_samples": 133,
+     "power_capped_busy_samples": 133,
+     "power_capped_share_of_busy": 0.4182,
+     "power_limit_w": 700,
+     "power_throttle_share_of_busy": 0.4182,
+     "power_w_max": 722.63,
+     "power_w_max_busy": 722.63,
+     "power_w_mean_busy": 239.9,
+     "samples": 1264,
+     "sm_mhz_max_busy": 1980,
+     "sm_mhz_mean_busy": 1847.3,
+     "sm_mhz_median_busy": 1980.0,
+     "sm_mhz_min_busy": 1005,
+     "temperature_c_max": 61,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 133,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.4182
+    }
+   },
+   "power_flags": {
+    "dense_A": [
+     "the power cap held the clock in 133 of 318 busy samples (42 %); busy SM clock min 1005 MHz, mean 1847.3 MHz; busy power mean 239.9 W, max 722.63 W of the 700 W limit"
+    ]
+   },
+   "run": "0.2.1-h200",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200",
+   "steps": [
+    {
+     "command": [
+      "/home/stone/venvs/apex-0520/bin/python",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/kit/fish_scales_ops-0.2.1-testkit-d8737b4/bench/gemm/python/bench_qwen3_4b_mlp.py",
+      "--run",
+      "--family",
+      "qwen3-4b",
+      "--out",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/perf/gemm_sm90_qwen3_4b.jsonl"
+     ],
+     "end_utc": "2026-10-12T18:46:53.226Z",
+     "env": "main",
+     "error_rows": 0,
+     "exit_code": 0,
+     "name": "dense_A",
+     "rows": 95,
+     "start_utc": "2026-10-12T18:42:40.138Z"
+    }
+   ],
+   "window_utc": [
+    "2026-10-12T18:42:40.138Z",
+    "2026-10-12T18:46:53.226Z"
+   ]
+  },
+  "gemm_sm90_qwen3_4b_mlp_fwd.jsonl": {
+   "bench_env": {},
+   "bench_tree": {
+    "bench_dirty": null,
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "fingerprint": "6504b2765c65e8124450f35e27f738b8c83a61d87b6999ec288ea318befec8b5",
+    "source": "kit"
+   },
+   "card": {
+    "clocks_max_sm_mhz": 1980,
+    "compute_mode": "Default",
+    "driver": "595.58.03",
+    "index": "3",
+    "memory_total_mib": 143771,
+    "name": "NVIDIA H200",
+    "pci": "00000000:97:00.0",
+    "power_limit_w": 700,
+    "uuid": "GPU-9860e51e-04ef-c66a-f09f-e3d4680ea4df"
+   },
+   "clock_flags": {},
+   "clock_policy": {
+    "applied": "nothing: natural clock",
+    "max_sm_mhz": 1980,
+    "mhz": null,
+    "mode": "natural"
+   },
+   "drift_accepted": [],
+   "driver": "595.58.03",
+   "environments": {
+    "main": {
+     "packages": {
+      "flashinfer-python": "0.6.18",
+      "numpy": "2.3.5",
+      "nvidia-cublas": "13.1.1.3",
+      "nvidia-cuda-nvrtc": "13.0.88",
+      "nvidia-cudnn-cu13": "9.20.0.48",
+      "nvidia-cudnn-frontend": "1.30.0",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "sgl-deep-gemm": "0.2.0+cu130",
+      "sglang": "0.5.20",
+      "sglang-kernel": "0.4.7+cu130",
+      "torch": "2.13.0+cu130",
+      "triton": "3.7.1"
+     },
+     "python": "/home/stone/venvs/apex-0520/bin/python",
+     "python_version": "3.12.3"
+    }
+   },
+   "fso": {
+    "build_info": {
+     "arch_list": "9.0a;10.0f;12.0a",
+     "built_at": "2026-10-12T18:30:52Z",
+     "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+     "cuda_toolkit": "13.0.3",
+     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+     "dirty": false,
+     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
+     "glibc_required": "GLIBC_2.34",
+     "image": {
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
+     },
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
+     "nvrtc": {
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+     },
+     "python": "CPython 3.12.15",
+     "torch": "2.13.0+cu130",
+     "version": "0.2.1"
+    },
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "extension_sha256": "9d6a3b09f4a324a43a3a1bce1f9214aabf26c339077271ace7c6efce85d9e79d",
+    "source_build": false,
+    "version": "0.2.1"
+   },
+   "host": "39-gcp-h200-2",
+   "installed_utc": "2026-10-13T00:02:09Z",
+   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
+   "lock_sha256": "5b78c8a5680a073f8e634e4e48f7e4a969ece4cd3db4e08c9f6cba648fc6f55b",
+   "machine": "h200",
+   "manifest_sha256": "cdf3ba20db8ec9897f158340fa3fa7f0f0391d0f2aa4ec2030aa1898bd06bc9e",
+   "observed_clocks": {
+    "mlp_fwd": {
+     "busy_samples": 60,
+     "hw_slowdown_busy_samples": 0,
+     "power_cap_busy_samples": 12,
+     "power_capped_busy_samples": 12,
+     "power_capped_share_of_busy": 0.2,
+     "power_limit_w": 700,
+     "power_throttle_share_of_busy": 0.2,
+     "power_w_max": 575.27,
+     "power_w_max_busy": 575.27,
+     "power_w_mean_busy": 155.9,
+     "samples": 637,
+     "sm_mhz_max_busy": 1980,
+     "sm_mhz_mean_busy": 1919.0,
+     "sm_mhz_median_busy": 1980.0,
+     "sm_mhz_min_busy": 1470,
+     "temperature_c_max": 53,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 12,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.2
+    }
+   },
+   "power_flags": {
+    "mlp_fwd": [
+     "the power cap held the clock in 12 of 60 busy samples (20 %); busy SM clock min 1470 MHz, mean 1919.0 MHz; busy power mean 155.9 W, max 575.27 W of the 700 W limit"
+    ]
+   },
+   "run": "0.2.1-h200",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200",
+   "steps": [
+    {
+     "command": [
+      "/home/stone/venvs/apex-0520/bin/python",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/kit/fish_scales_ops-0.2.1-testkit-d8737b4/bench/gemm/python/bench_qwen3_4b_mlp_forward.py",
+      "--run",
+      "--out",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/perf/gemm_sm90_qwen3_4b_mlp_fwd.jsonl"
+     ],
+     "end_utc": "2026-10-12T18:49:00.814Z",
+     "env": "main",
+     "error_rows": 0,
+     "exit_code": 0,
+     "name": "mlp_fwd",
+     "rows": 17,
+     "start_utc": "2026-10-12T18:46:53.342Z"
+    }
+   ],
+   "window_utc": [
+    "2026-10-12T18:46:53.342Z",
+    "2026-10-12T18:49:00.814Z"
+   ]
+  },
+  "perf_moe_qwen3_30a3_ep2_h200.jsonl": {
+   "bench_env": {},
+   "bench_tree": {
+    "bench_dirty": null,
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "fingerprint": "6504b2765c65e8124450f35e27f738b8c83a61d87b6999ec288ea318befec8b5",
+    "source": "kit"
+   },
+   "card": {
+    "clocks_max_sm_mhz": 1980,
+    "compute_mode": "Default",
+    "driver": "595.58.03",
+    "index": "3",
+    "memory_total_mib": 143771,
+    "name": "NVIDIA H200",
+    "pci": "00000000:97:00.0",
+    "power_limit_w": 700,
+    "uuid": "GPU-9860e51e-04ef-c66a-f09f-e3d4680ea4df"
+   },
+   "clock_flags": {},
+   "clock_policy": {
+    "applied": "nothing: natural clock",
+    "max_sm_mhz": 1980,
+    "mhz": null,
+    "mode": "natural"
+   },
+   "drift_accepted": [],
+   "driver": "595.58.03",
+   "environments": {
+    "main": {
+     "packages": {
+      "flashinfer-python": "0.6.18",
+      "numpy": "2.3.5",
+      "nvidia-cublas": "13.1.1.3",
+      "nvidia-cuda-nvrtc": "13.0.88",
+      "nvidia-cudnn-cu13": "9.20.0.48",
+      "nvidia-cudnn-frontend": "1.30.0",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "sgl-deep-gemm": "0.2.0+cu130",
+      "sglang": "0.5.20",
+      "sglang-kernel": "0.4.7+cu130",
+      "torch": "2.13.0+cu130",
+      "triton": "3.7.1"
+     },
+     "python": "/home/stone/venvs/apex-0520/bin/python",
+     "python_version": "3.12.3"
+    }
+   },
+   "fso": {
+    "build_info": {
+     "arch_list": "9.0a;10.0f;12.0a",
+     "built_at": "2026-10-12T18:30:52Z",
+     "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+     "cuda_toolkit": "13.0.3",
+     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+     "dirty": false,
+     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
+     "glibc_required": "GLIBC_2.34",
+     "image": {
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
+     },
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
+     "nvrtc": {
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+     },
+     "python": "CPython 3.12.15",
+     "torch": "2.13.0+cu130",
+     "version": "0.2.1"
+    },
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "extension_sha256": "9d6a3b09f4a324a43a3a1bce1f9214aabf26c339077271ace7c6efce85d9e79d",
+    "source_build": false,
+    "version": "0.2.1"
+   },
+   "host": "39-gcp-h200-2",
+   "installed_utc": "2026-10-13T00:02:09Z",
+   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
+   "lock_sha256": "5b78c8a5680a073f8e634e4e48f7e4a969ece4cd3db4e08c9f6cba648fc6f55b",
+   "machine": "h200",
+   "manifest_sha256": "e4de523e85ee8435633d217878b457a3fd986769eb2806a1c2ef13a8ddb4447f",
+   "observed_clocks": {
+    "srv_ep2_30a3": {
+     "busy_samples": 62,
+     "hw_slowdown_busy_samples": 0,
+     "power_cap_busy_samples": 2,
+     "power_capped_busy_samples": 2,
+     "power_capped_share_of_busy": 0.0323,
+     "power_limit_w": 700,
+     "power_throttle_share_of_busy": 0.0323,
+     "power_w_max": 250.96,
+     "power_w_max_busy": 250.96,
+     "power_w_mean_busy": 135.0,
+     "samples": 242,
+     "sm_mhz_max_busy": 1980,
+     "sm_mhz_mean_busy": 1976.9,
+     "sm_mhz_median_busy": 1980.0,
+     "sm_mhz_min_busy": 1860,
+     "temperature_c_max": 46,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 2,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.0323
     }
    },
    "power_flags": {
     "srv_ep2_30a3": [
-     "the power cap held the clock in 3 of 59 busy samples (5 %); busy SM clock min 1845 MHz, mean 1975.2 MHz; busy power mean 136.7 W, max 257.49 W of the 700 W limit"
+     "the power cap held the clock in 2 of 62 busy samples (3 %); busy SM clock min 1860 MHz, mean 1976.9 MHz; busy power mean 135.0 W, max 250.96 W of the 700 W limit"
     ]
    },
    "run": "0.2.1-h200-serving",
@@ -628,7 +708,7 @@
     {
      "command": [
       "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_30a3.py",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/kit/fish_scales_ops-0.2.1-testkit-d8737b4/bench/gemm/python/bench_moe_qwen3_30a3.py",
       "--run",
       "--routing",
       "ep",
@@ -637,40 +717,40 @@
       "--impls",
       "fso_bsfp8_layer",
       "--out",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf_serving/perf_moe_qwen3_30a3_ep2_h200.jsonl"
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/perf_serving/perf_moe_qwen3_30a3_ep2_h200.jsonl"
      ],
-     "end_utc": "2026-10-10T17:06:22.459Z",
+     "end_utc": "2026-10-12T19:13:53.815Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "srv_ep2_30a3",
-     "rows": 15,
-     "start_utc": "2026-10-10T17:05:39.396Z"
+     "rows": 17,
+     "start_utc": "2026-10-12T19:13:05.535Z"
     }
    ],
    "window_utc": [
-    "2026-10-10T17:05:39.396Z",
-    "2026-10-10T17:06:22.459Z"
+    "2026-10-12T19:13:05.535Z",
+    "2026-10-12T19:13:53.815Z"
    ]
   },
   "perf_moe_qwen3_30a3_h200.jsonl": {
    "bench_env": {},
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "fingerprint": "6504b2765c65e8124450f35e27f738b8c83a61d87b6999ec288ea318befec8b5",
     "source": "kit"
    },
    "card": {
     "clocks_max_sm_mhz": 1980,
     "compute_mode": "Default",
     "driver": "595.58.03",
-    "index": "0",
+    "index": "3",
     "memory_total_mib": 143771,
     "name": "NVIDIA H200",
-    "pci": "00000000:8F:00.0",
+    "pci": "00000000:97:00.0",
     "power_limit_w": 700,
-    "uuid": "GPU-e87af6ea-2a7f-af85-f89f-e5a17e644ff1"
+    "uuid": "GPU-9860e51e-04ef-c66a-f09f-e3d4680ea4df"
    },
    "clock_flags": {},
    "clock_policy": {
@@ -704,8 +784,8 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-10T15:55:17Z",
-     "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+     "built_at": "2026-10-12T18:30:52Z",
+     "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
      "cuda_toolkit": "13.0.3",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
@@ -726,35 +806,35 @@
      "torch": "2.13.0+cu130",
      "version": "0.2.1"
     },
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "extension_sha256": "dfae2d579c6d36cd9c5819f19664bdd7dd0f1f25e3900090e13f9225c082f903",
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "extension_sha256": "9d6a3b09f4a324a43a3a1bce1f9214aabf26c339077271ace7c6efce85d9e79d",
     "source_build": false,
     "version": "0.2.1"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T20:07:34Z",
-   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
+   "installed_utc": "2026-10-13T00:02:09Z",
+   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
+   "lock_sha256": "5b78c8a5680a073f8e634e4e48f7e4a969ece4cd3db4e08c9f6cba648fc6f55b",
    "machine": "h200",
-   "manifest_sha256": "d6e786748379946f8d4d16df65b2f47e782c1fdfda83ef8b0d415a038d9bfaf8",
+   "manifest_sha256": "cdf3ba20db8ec9897f158340fa3fa7f0f0391d0f2aa4ec2030aa1898bd06bc9e",
    "observed_clocks": {
     "fso_30a3": {
-     "busy_samples": 58,
+     "busy_samples": 73,
      "hw_slowdown_busy_samples": 0,
      "power_cap_busy_samples": 5,
      "power_capped_busy_samples": 5,
-     "power_capped_share_of_busy": 0.0862,
+     "power_capped_share_of_busy": 0.0685,
      "power_limit_w": 700,
-     "power_throttle_share_of_busy": 0.0862,
-     "power_w_max": 362.96,
-     "power_w_max_busy": 362.96,
-     "power_w_mean_busy": 147.9,
-     "samples": 212,
+     "power_throttle_share_of_busy": 0.0685,
+     "power_w_max": 356.39,
+     "power_w_max_busy": 356.39,
+     "power_w_mean_busy": 146.6,
+     "samples": 245,
      "sm_mhz_max_busy": 1980,
-     "sm_mhz_mean_busy": 1950.5,
-     "sm_mhz_median_busy": 1980.0,
-     "sm_mhz_min_busy": 1500,
-     "temperature_c_max": 49,
+     "sm_mhz_mean_busy": 1963.2,
+     "sm_mhz_median_busy": 1980,
+     "sm_mhz_min_busy": 1635,
+     "temperature_c_max": 48,
      "thermal_busy_samples": 0,
      "thermal_throttle_share_of_busy": 0.0,
      "throttle_reason_busy_samples": {
@@ -764,12 +844,12 @@
       "sw_power_cap": 5,
       "sw_thermal": 0
      },
-     "throttle_share_of_busy": 0.0862
+     "throttle_share_of_busy": 0.0685
     }
    },
    "power_flags": {
     "fso_30a3": [
-     "the power cap held the clock in 5 of 58 busy samples (9 %); busy SM clock min 1500 MHz, mean 1950.5 MHz; busy power mean 147.9 W, max 362.96 W of the 700 W limit"
+     "the power cap held the clock in 5 of 73 busy samples (7 %); busy SM clock min 1635 MHz, mean 1963.2 MHz; busy power mean 146.6 W, max 356.39 W of the 700 W limit"
     ]
    },
    "run": "0.2.1-h200",
@@ -778,45 +858,45 @@
     {
      "command": [
       "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_30a3.py",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/kit/fish_scales_ops-0.2.1-testkit-d8737b4/bench/gemm/python/bench_moe_qwen3_30a3.py",
       "--run",
       "--impls",
       "fso_bsfp8_layer",
       "--out",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf/perf_moe_qwen3_30a3_h200.jsonl"
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/perf/perf_moe_qwen3_30a3_h200.jsonl"
      ],
-     "end_utc": "2026-10-10T16:50:11.540Z",
+     "end_utc": "2026-10-12T18:55:35.474Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "fso_30a3",
-     "rows": 15,
-     "start_utc": "2026-10-10T16:49:29.117Z"
+     "rows": 17,
+     "start_utc": "2026-10-12T18:54:46.609Z"
     }
    ],
    "window_utc": [
-    "2026-10-10T16:49:29.117Z",
-    "2026-10-10T16:50:11.540Z"
+    "2026-10-12T18:54:46.609Z",
+    "2026-10-12T18:55:35.474Z"
    ]
   },
   "perf_moe_qwen3_30a3_padded_h200.jsonl": {
    "bench_env": {},
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "fingerprint": "6504b2765c65e8124450f35e27f738b8c83a61d87b6999ec288ea318befec8b5",
     "source": "kit"
    },
    "card": {
     "clocks_max_sm_mhz": 1980,
     "compute_mode": "Default",
     "driver": "595.58.03",
-    "index": "0",
+    "index": "3",
     "memory_total_mib": 143771,
     "name": "NVIDIA H200",
-    "pci": "00000000:8F:00.0",
+    "pci": "00000000:97:00.0",
     "power_limit_w": 700,
-    "uuid": "GPU-e87af6ea-2a7f-af85-f89f-e5a17e644ff1"
+    "uuid": "GPU-9860e51e-04ef-c66a-f09f-e3d4680ea4df"
    },
    "clock_flags": {},
    "clock_policy": {
@@ -850,8 +930,8 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-10T15:55:17Z",
-     "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+     "built_at": "2026-10-12T18:30:52Z",
+     "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
      "cuda_toolkit": "13.0.3",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
@@ -872,621 +952,33 @@
      "torch": "2.13.0+cu130",
      "version": "0.2.1"
     },
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "extension_sha256": "dfae2d579c6d36cd9c5819f19664bdd7dd0f1f25e3900090e13f9225c082f903",
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "extension_sha256": "9d6a3b09f4a324a43a3a1bce1f9214aabf26c339077271ace7c6efce85d9e79d",
     "source_build": false,
     "version": "0.2.1"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T20:07:34Z",
-   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
+   "installed_utc": "2026-10-13T00:02:09Z",
+   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
+   "lock_sha256": "5b78c8a5680a073f8e634e4e48f7e4a969ece4cd3db4e08c9f6cba648fc6f55b",
    "machine": "h200",
-   "manifest_sha256": "db9b79a0943298e594d4832f2858c54e2461e2bf0fd80e1f880b1aad87e44c75",
+   "manifest_sha256": "e4de523e85ee8435633d217878b457a3fd986769eb2806a1c2ef13a8ddb4447f",
    "observed_clocks": {
     "srv_padded_30a3": {
-     "busy_samples": 43,
+     "busy_samples": 41,
      "hw_slowdown_busy_samples": 0,
      "power_cap_busy_samples": 0,
      "power_capped_busy_samples": 0,
      "power_capped_share_of_busy": 0.0,
      "power_limit_w": 700,
      "power_throttle_share_of_busy": 0.0,
-     "power_w_max": 163.85,
-     "power_w_max_busy": 163.85,
-     "power_w_mean_busy": 132.1,
-     "samples": 146,
+     "power_w_max": 168.82,
+     "power_w_max_busy": 168.48,
+     "power_w_mean_busy": 135.6,
+     "samples": 148,
      "sm_mhz_max_busy": 1980,
      "sm_mhz_mean_busy": 1980.0,
      "sm_mhz_median_busy": 1980,
-     "sm_mhz_min_busy": 1980,
-     "temperature_c_max": 42,
-     "thermal_busy_samples": 0,
-     "thermal_throttle_share_of_busy": 0.0,
-     "throttle_reason_busy_samples": {
-      "hw_power_brake": 0,
-      "hw_slowdown": 0,
-      "hw_thermal": 0,
-      "sw_power_cap": 0,
-      "sw_thermal": 0
-     },
-     "throttle_share_of_busy": 0.0
-    }
-   },
-   "power_flags": {},
-   "run": "0.2.1-h200-serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200-serving",
-   "steps": [
-    {
-     "command": [
-      "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_30a3.py",
-      "--run",
-      "--routing",
-      "padded",
-      "--impls",
-      "fso_bsfp8_layer",
-      "--out",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf_serving/perf_moe_qwen3_30a3_padded_h200.jsonl"
-     ],
-     "end_utc": "2026-10-10T17:02:47.596Z",
-     "env": "main",
-     "error_rows": 0,
-     "exit_code": 0,
-     "name": "srv_padded_30a3",
-     "rows": 10,
-     "start_utc": "2026-10-10T17:02:18.219Z"
-    }
-   ],
-   "window_utc": [
-    "2026-10-10T17:02:18.219Z",
-    "2026-10-10T17:02:47.596Z"
-   ]
-  },
-  "perf_moe_qwen3_30a3_skew_h200.jsonl": {
-   "bench_env": {},
-   "bench_tree": {
-    "bench_dirty": null,
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
-    "source": "kit"
-   },
-   "card": {
-    "clocks_max_sm_mhz": 1980,
-    "compute_mode": "Default",
-    "driver": "595.58.03",
-    "index": "0",
-    "memory_total_mib": 143771,
-    "name": "NVIDIA H200",
-    "pci": "00000000:8F:00.0",
-    "power_limit_w": 700,
-    "uuid": "GPU-e87af6ea-2a7f-af85-f89f-e5a17e644ff1"
-   },
-   "clock_flags": {},
-   "clock_policy": {
-    "applied": "nothing: natural clock",
-    "max_sm_mhz": 1980,
-    "mhz": null,
-    "mode": "natural"
-   },
-   "drift_accepted": [],
-   "driver": "595.58.03",
-   "environments": {
-    "main": {
-     "packages": {
-      "flashinfer-python": "0.6.18",
-      "numpy": "2.3.5",
-      "nvidia-cublas": "13.1.1.3",
-      "nvidia-cuda-nvrtc": "13.0.88",
-      "nvidia-cudnn-cu13": "9.20.0.48",
-      "nvidia-cudnn-frontend": "1.30.0",
-      "nvidia-cutlass-dsl": "4.6.2",
-      "sgl-deep-gemm": "0.2.0+cu130",
-      "sglang": "0.5.20",
-      "sglang-kernel": "0.4.7+cu130",
-      "torch": "2.13.0+cu130",
-      "triton": "3.7.1"
-     },
-     "python": "/home/stone/venvs/apex-0520/bin/python",
-     "python_version": "3.12.3"
-    }
-   },
-   "fso": {
-    "build_info": {
-     "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-10T15:55:17Z",
-     "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-     "cuda_toolkit": "13.0.3",
-     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
-     "dirty": false,
-     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
-     "glibc_required": "GLIBC_2.34",
-     "image": {
-      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
-      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
-      "name": "fso-build-wheel:7014ca7ac32a"
-     },
-     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
-     "nvrtc": {
-      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
-      "version": "13.0.88",
-      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
-     },
-     "python": "CPython 3.12.15",
-     "torch": "2.13.0+cu130",
-     "version": "0.2.1"
-    },
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "extension_sha256": "dfae2d579c6d36cd9c5819f19664bdd7dd0f1f25e3900090e13f9225c082f903",
-    "source_build": false,
-    "version": "0.2.1"
-   },
-   "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T20:07:34Z",
-   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
-   "machine": "h200",
-   "manifest_sha256": "db9b79a0943298e594d4832f2858c54e2461e2bf0fd80e1f880b1aad87e44c75",
-   "observed_clocks": {
-    "srv_skew_30a3": {
-     "busy_samples": 59,
-     "hw_slowdown_busy_samples": 0,
-     "power_cap_busy_samples": 7,
-     "power_capped_busy_samples": 7,
-     "power_capped_share_of_busy": 0.1186,
-     "power_limit_w": 700,
-     "power_throttle_share_of_busy": 0.1186,
-     "power_w_max": 357.36,
-     "power_w_max_busy": 357.36,
-     "power_w_mean_busy": 147.8,
-     "samples": 215,
-     "sm_mhz_max_busy": 1980,
-     "sm_mhz_mean_busy": 1961.7,
-     "sm_mhz_median_busy": 1980,
-     "sm_mhz_min_busy": 1575,
-     "temperature_c_max": 46,
-     "thermal_busy_samples": 0,
-     "thermal_throttle_share_of_busy": 0.0,
-     "throttle_reason_busy_samples": {
-      "hw_power_brake": 0,
-      "hw_slowdown": 0,
-      "hw_thermal": 0,
-      "sw_power_cap": 7,
-      "sw_thermal": 0
-     },
-     "throttle_share_of_busy": 0.1186
-    }
-   },
-   "power_flags": {
-    "srv_skew_30a3": [
-     "the power cap held the clock in 7 of 59 busy samples (12 %); busy SM clock min 1575 MHz, mean 1961.7 MHz; busy power mean 147.8 W, max 357.36 W of the 700 W limit"
-    ]
-   },
-   "run": "0.2.1-h200-serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200-serving",
-   "steps": [
-    {
-     "command": [
-      "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_30a3.py",
-      "--run",
-      "--routing",
-      "skew",
-      "--impls",
-      "fso_bsfp8_layer",
-      "--out",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf_serving/perf_moe_qwen3_30a3_skew_h200.jsonl"
-     ],
-     "end_utc": "2026-10-10T16:53:39.735Z",
-     "env": "main",
-     "error_rows": 0,
-     "exit_code": 0,
-     "name": "srv_skew_30a3",
-     "rows": 15,
-     "start_utc": "2026-10-10T16:52:56.692Z"
-    }
-   ],
-   "window_utc": [
-    "2026-10-10T16:52:56.692Z",
-    "2026-10-10T16:53:39.735Z"
-   ]
-  },
-  "perf_moe_qwen3_35a3_ep2_h200.jsonl": {
-   "bench_env": {},
-   "bench_tree": {
-    "bench_dirty": null,
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
-    "source": "kit"
-   },
-   "card": {
-    "clocks_max_sm_mhz": 1980,
-    "compute_mode": "Default",
-    "driver": "595.58.03",
-    "index": "0",
-    "memory_total_mib": 143771,
-    "name": "NVIDIA H200",
-    "pci": "00000000:8F:00.0",
-    "power_limit_w": 700,
-    "uuid": "GPU-e87af6ea-2a7f-af85-f89f-e5a17e644ff1"
-   },
-   "clock_flags": {},
-   "clock_policy": {
-    "applied": "nothing: natural clock",
-    "max_sm_mhz": 1980,
-    "mhz": null,
-    "mode": "natural"
-   },
-   "drift_accepted": [],
-   "driver": "595.58.03",
-   "environments": {
-    "main": {
-     "packages": {
-      "flashinfer-python": "0.6.18",
-      "numpy": "2.3.5",
-      "nvidia-cublas": "13.1.1.3",
-      "nvidia-cuda-nvrtc": "13.0.88",
-      "nvidia-cudnn-cu13": "9.20.0.48",
-      "nvidia-cudnn-frontend": "1.30.0",
-      "nvidia-cutlass-dsl": "4.6.2",
-      "sgl-deep-gemm": "0.2.0+cu130",
-      "sglang": "0.5.20",
-      "sglang-kernel": "0.4.7+cu130",
-      "torch": "2.13.0+cu130",
-      "triton": "3.7.1"
-     },
-     "python": "/home/stone/venvs/apex-0520/bin/python",
-     "python_version": "3.12.3"
-    }
-   },
-   "fso": {
-    "build_info": {
-     "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-10T15:55:17Z",
-     "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-     "cuda_toolkit": "13.0.3",
-     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
-     "dirty": false,
-     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
-     "glibc_required": "GLIBC_2.34",
-     "image": {
-      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
-      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
-      "name": "fso-build-wheel:7014ca7ac32a"
-     },
-     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
-     "nvrtc": {
-      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
-      "version": "13.0.88",
-      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
-     },
-     "python": "CPython 3.12.15",
-     "torch": "2.13.0+cu130",
-     "version": "0.2.1"
-    },
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "extension_sha256": "dfae2d579c6d36cd9c5819f19664bdd7dd0f1f25e3900090e13f9225c082f903",
-    "source_build": false,
-    "version": "0.2.1"
-   },
-   "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T20:07:34Z",
-   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
-   "machine": "h200",
-   "manifest_sha256": "db9b79a0943298e594d4832f2858c54e2461e2bf0fd80e1f880b1aad87e44c75",
-   "observed_clocks": {
-    "srv_ep2_35a3": {
-     "busy_samples": 61,
-     "hw_slowdown_busy_samples": 0,
-     "power_cap_busy_samples": 1,
-     "power_capped_busy_samples": 1,
-     "power_capped_share_of_busy": 0.0164,
-     "power_limit_w": 700,
-     "power_throttle_share_of_busy": 0.0164,
-     "power_w_max": 232.79,
-     "power_w_max_busy": 232.79,
-     "power_w_mean_busy": 136.1,
-     "samples": 215,
-     "sm_mhz_max_busy": 1980,
-     "sm_mhz_mean_busy": 1977.0,
-     "sm_mhz_median_busy": 1980,
-     "sm_mhz_min_busy": 1890,
-     "temperature_c_max": 44,
-     "thermal_busy_samples": 0,
-     "thermal_throttle_share_of_busy": 0.0,
-     "throttle_reason_busy_samples": {
-      "hw_power_brake": 0,
-      "hw_slowdown": 0,
-      "hw_thermal": 0,
-      "sw_power_cap": 1,
-      "sw_thermal": 0
-     },
-     "throttle_share_of_busy": 0.0164
-    }
-   },
-   "power_flags": {
-    "srv_ep2_35a3": [
-     "the power cap held the clock in 1 of 61 busy samples (2 %); busy SM clock min 1890 MHz, mean 1977.0 MHz; busy power mean 136.1 W, max 232.79 W of the 700 W limit"
-    ]
-   },
-   "run": "0.2.1-h200-serving",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200-serving",
-   "steps": [
-    {
-     "command": [
-      "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_35a3.py",
-      "--run",
-      "--routing",
-      "ep",
-      "--ep-size",
-      "2",
-      "--impls",
-      "fso_bsfp8_layer",
-      "--out",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf_serving/perf_moe_qwen3_35a3_ep2_h200.jsonl"
-     ],
-     "end_utc": "2026-10-10T17:10:35.293Z",
-     "env": "main",
-     "error_rows": 0,
-     "exit_code": 0,
-     "name": "srv_ep2_35a3",
-     "rows": 15,
-     "start_utc": "2026-10-10T17:09:52.175Z"
-    }
-   ],
-   "window_utc": [
-    "2026-10-10T17:09:52.175Z",
-    "2026-10-10T17:10:35.293Z"
-   ]
-  },
-  "perf_moe_qwen3_35a3_h200.jsonl": {
-   "bench_env": {},
-   "bench_tree": {
-    "bench_dirty": null,
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
-    "source": "kit"
-   },
-   "card": {
-    "clocks_max_sm_mhz": 1980,
-    "compute_mode": "Default",
-    "driver": "595.58.03",
-    "index": "0",
-    "memory_total_mib": 143771,
-    "name": "NVIDIA H200",
-    "pci": "00000000:8F:00.0",
-    "power_limit_w": 700,
-    "uuid": "GPU-e87af6ea-2a7f-af85-f89f-e5a17e644ff1"
-   },
-   "clock_flags": {},
-   "clock_policy": {
-    "applied": "nothing: natural clock",
-    "max_sm_mhz": 1980,
-    "mhz": null,
-    "mode": "natural"
-   },
-   "drift_accepted": [],
-   "driver": "595.58.03",
-   "environments": {
-    "main": {
-     "packages": {
-      "flashinfer-python": "0.6.18",
-      "numpy": "2.3.5",
-      "nvidia-cublas": "13.1.1.3",
-      "nvidia-cuda-nvrtc": "13.0.88",
-      "nvidia-cudnn-cu13": "9.20.0.48",
-      "nvidia-cudnn-frontend": "1.30.0",
-      "nvidia-cutlass-dsl": "4.6.2",
-      "sgl-deep-gemm": "0.2.0+cu130",
-      "sglang": "0.5.20",
-      "sglang-kernel": "0.4.7+cu130",
-      "torch": "2.13.0+cu130",
-      "triton": "3.7.1"
-     },
-     "python": "/home/stone/venvs/apex-0520/bin/python",
-     "python_version": "3.12.3"
-    }
-   },
-   "fso": {
-    "build_info": {
-     "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-10T15:55:17Z",
-     "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-     "cuda_toolkit": "13.0.3",
-     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
-     "dirty": false,
-     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
-     "glibc_required": "GLIBC_2.34",
-     "image": {
-      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
-      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
-      "name": "fso-build-wheel:7014ca7ac32a"
-     },
-     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
-     "nvrtc": {
-      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
-      "version": "13.0.88",
-      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
-     },
-     "python": "CPython 3.12.15",
-     "torch": "2.13.0+cu130",
-     "version": "0.2.1"
-    },
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "extension_sha256": "dfae2d579c6d36cd9c5819f19664bdd7dd0f1f25e3900090e13f9225c082f903",
-    "source_build": false,
-    "version": "0.2.1"
-   },
-   "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T20:07:34Z",
-   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
-   "machine": "h200",
-   "manifest_sha256": "d6e786748379946f8d4d16df65b2f47e782c1fdfda83ef8b0d415a038d9bfaf8",
-   "observed_clocks": {
-    "fso_35a3": {
-     "busy_samples": 72,
-     "hw_slowdown_busy_samples": 0,
-     "power_cap_busy_samples": 3,
-     "power_capped_busy_samples": 3,
-     "power_capped_share_of_busy": 0.0417,
-     "power_limit_w": 700,
-     "power_throttle_share_of_busy": 0.0417,
-     "power_w_max": 321.63,
-     "power_w_max_busy": 299.52,
-     "power_w_mean_busy": 141.9,
-     "samples": 224,
-     "sm_mhz_max_busy": 1980,
-     "sm_mhz_mean_busy": 1970.4,
-     "sm_mhz_median_busy": 1980.0,
-     "sm_mhz_min_busy": 1605,
-     "temperature_c_max": 46,
-     "thermal_busy_samples": 0,
-     "thermal_throttle_share_of_busy": 0.0,
-     "throttle_reason_busy_samples": {
-      "hw_power_brake": 0,
-      "hw_slowdown": 0,
-      "hw_thermal": 0,
-      "sw_power_cap": 3,
-      "sw_thermal": 0
-     },
-     "throttle_share_of_busy": 0.0417
-    }
-   },
-   "power_flags": {
-    "fso_35a3": [
-     "the power cap held the clock in 3 of 72 busy samples (4 %); busy SM clock min 1605 MHz, mean 1970.4 MHz; busy power mean 141.9 W, max 299.52 W of the 700 W limit"
-    ]
-   },
-   "run": "0.2.1-h200",
-   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200",
-   "steps": [
-    {
-     "command": [
-      "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_35a3.py",
-      "--run",
-      "--impls",
-      "fso_bsfp8_layer",
-      "--out",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf/perf_moe_qwen3_35a3_h200.jsonl"
-     ],
-     "end_utc": "2026-10-10T16:50:56.638Z",
-     "env": "main",
-     "error_rows": 0,
-     "exit_code": 0,
-     "name": "fso_35a3",
-     "rows": 15,
-     "start_utc": "2026-10-10T16:50:11.656Z"
-    }
-   ],
-   "window_utc": [
-    "2026-10-10T16:50:11.656Z",
-    "2026-10-10T16:50:56.638Z"
-   ]
-  },
-  "perf_moe_qwen3_35a3_padded_h200.jsonl": {
-   "bench_env": {},
-   "bench_tree": {
-    "bench_dirty": null,
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
-    "source": "kit"
-   },
-   "card": {
-    "clocks_max_sm_mhz": 1980,
-    "compute_mode": "Default",
-    "driver": "595.58.03",
-    "index": "0",
-    "memory_total_mib": 143771,
-    "name": "NVIDIA H200",
-    "pci": "00000000:8F:00.0",
-    "power_limit_w": 700,
-    "uuid": "GPU-e87af6ea-2a7f-af85-f89f-e5a17e644ff1"
-   },
-   "clock_flags": {},
-   "clock_policy": {
-    "applied": "nothing: natural clock",
-    "max_sm_mhz": 1980,
-    "mhz": null,
-    "mode": "natural"
-   },
-   "drift_accepted": [],
-   "driver": "595.58.03",
-   "environments": {
-    "main": {
-     "packages": {
-      "flashinfer-python": "0.6.18",
-      "numpy": "2.3.5",
-      "nvidia-cublas": "13.1.1.3",
-      "nvidia-cuda-nvrtc": "13.0.88",
-      "nvidia-cudnn-cu13": "9.20.0.48",
-      "nvidia-cudnn-frontend": "1.30.0",
-      "nvidia-cutlass-dsl": "4.6.2",
-      "sgl-deep-gemm": "0.2.0+cu130",
-      "sglang": "0.5.20",
-      "sglang-kernel": "0.4.7+cu130",
-      "torch": "2.13.0+cu130",
-      "triton": "3.7.1"
-     },
-     "python": "/home/stone/venvs/apex-0520/bin/python",
-     "python_version": "3.12.3"
-    }
-   },
-   "fso": {
-    "build_info": {
-     "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-10T15:55:17Z",
-     "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-     "cuda_toolkit": "13.0.3",
-     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
-     "dirty": false,
-     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
-     "glibc_required": "GLIBC_2.34",
-     "image": {
-      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
-      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
-      "name": "fso-build-wheel:7014ca7ac32a"
-     },
-     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
-     "nvrtc": {
-      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
-      "version": "13.0.88",
-      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
-     },
-     "python": "CPython 3.12.15",
-     "torch": "2.13.0+cu130",
-     "version": "0.2.1"
-    },
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "extension_sha256": "dfae2d579c6d36cd9c5819f19664bdd7dd0f1f25e3900090e13f9225c082f903",
-    "source_build": false,
-    "version": "0.2.1"
-   },
-   "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T20:07:34Z",
-   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
-   "machine": "h200",
-   "manifest_sha256": "db9b79a0943298e594d4832f2858c54e2461e2bf0fd80e1f880b1aad87e44c75",
-   "observed_clocks": {
-    "srv_padded_35a3": {
-     "busy_samples": 56,
-     "hw_slowdown_busy_samples": 0,
-     "power_cap_busy_samples": 0,
-     "power_capped_busy_samples": 0,
-     "power_capped_share_of_busy": 0.0,
-     "power_limit_w": 700,
-     "power_throttle_share_of_busy": 0.0,
-     "power_w_max": 167.92,
-     "power_w_max_busy": 163.3,
-     "power_w_mean_busy": 130.3,
-     "samples": 159,
-     "sm_mhz_max_busy": 1980,
-     "sm_mhz_mean_busy": 1980.0,
-     "sm_mhz_median_busy": 1980.0,
      "sm_mhz_min_busy": 1980,
      "temperature_c_max": 41,
      "thermal_busy_samples": 0,
@@ -1508,47 +1000,47 @@
     {
      "command": [
       "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/kit/fish_scales_ops-0.2.1-testkit-d8737b4/bench/gemm/python/bench_moe_qwen3_30a3.py",
       "--run",
       "--routing",
       "padded",
       "--impls",
       "fso_bsfp8_layer",
       "--out",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf_serving/perf_moe_qwen3_35a3_padded_h200.jsonl"
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/perf_serving/perf_moe_qwen3_30a3_padded_h200.jsonl"
      ],
-     "end_utc": "2026-10-10T17:04:21.962Z",
+     "end_utc": "2026-10-12T19:10:13.519Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
-     "name": "srv_padded_35a3",
+     "name": "srv_padded_30a3",
      "rows": 10,
-     "start_utc": "2026-10-10T17:03:50.211Z"
+     "start_utc": "2026-10-12T19:09:43.939Z"
     }
    ],
    "window_utc": [
-    "2026-10-10T17:03:50.211Z",
-    "2026-10-10T17:04:21.962Z"
+    "2026-10-12T19:09:43.939Z",
+    "2026-10-12T19:10:13.519Z"
    ]
   },
-  "perf_moe_qwen3_35a3_shared_h200.jsonl": {
+  "perf_moe_qwen3_30a3_skew_h200.jsonl": {
    "bench_env": {},
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "fingerprint": "6504b2765c65e8124450f35e27f738b8c83a61d87b6999ec288ea318befec8b5",
     "source": "kit"
    },
    "card": {
     "clocks_max_sm_mhz": 1980,
     "compute_mode": "Default",
     "driver": "595.58.03",
-    "index": "0",
+    "index": "3",
     "memory_total_mib": 143771,
     "name": "NVIDIA H200",
-    "pci": "00000000:8F:00.0",
+    "pci": "00000000:97:00.0",
     "power_limit_w": 700,
-    "uuid": "GPU-e87af6ea-2a7f-af85-f89f-e5a17e644ff1"
+    "uuid": "GPU-9860e51e-04ef-c66a-f09f-e3d4680ea4df"
    },
    "clock_flags": {},
    "clock_policy": {
@@ -1582,8 +1074,8 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-10T15:55:17Z",
-     "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+     "built_at": "2026-10-12T18:30:52Z",
+     "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
      "cuda_toolkit": "13.0.3",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
@@ -1604,33 +1096,621 @@
      "torch": "2.13.0+cu130",
      "version": "0.2.1"
     },
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "extension_sha256": "dfae2d579c6d36cd9c5819f19664bdd7dd0f1f25e3900090e13f9225c082f903",
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "extension_sha256": "9d6a3b09f4a324a43a3a1bce1f9214aabf26c339077271ace7c6efce85d9e79d",
     "source_build": false,
     "version": "0.2.1"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T20:07:34Z",
-   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
+   "installed_utc": "2026-10-13T00:02:09Z",
+   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
+   "lock_sha256": "5b78c8a5680a073f8e634e4e48f7e4a969ece4cd3db4e08c9f6cba648fc6f55b",
    "machine": "h200",
-   "manifest_sha256": "d6e786748379946f8d4d16df65b2f47e782c1fdfda83ef8b0d415a038d9bfaf8",
+   "manifest_sha256": "e4de523e85ee8435633d217878b457a3fd986769eb2806a1c2ef13a8ddb4447f",
    "observed_clocks": {
-    "fso_35a3_shared": {
-     "busy_samples": 81,
+    "srv_skew_30a3": {
+     "busy_samples": 75,
+     "hw_slowdown_busy_samples": 0,
+     "power_cap_busy_samples": 8,
+     "power_capped_busy_samples": 8,
+     "power_capped_share_of_busy": 0.1067,
+     "power_limit_w": 700,
+     "power_throttle_share_of_busy": 0.1067,
+     "power_w_max": 352.04,
+     "power_w_max_busy": 352.04,
+     "power_w_mean_busy": 153.0,
+     "samples": 244,
+     "sm_mhz_max_busy": 1980,
+     "sm_mhz_mean_busy": 1965.2,
+     "sm_mhz_median_busy": 1980,
+     "sm_mhz_min_busy": 1590,
+     "temperature_c_max": 47,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 8,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.1067
+    }
+   },
+   "power_flags": {
+    "srv_skew_30a3": [
+     "the power cap held the clock in 8 of 75 busy samples (11 %); busy SM clock min 1590 MHz, mean 1965.2 MHz; busy power mean 153.0 W, max 352.04 W of the 700 W limit"
+    ]
+   },
+   "run": "0.2.1-h200-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200-serving",
+   "steps": [
+    {
+     "command": [
+      "/home/stone/venvs/apex-0520/bin/python",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/kit/fish_scales_ops-0.2.1-testkit-d8737b4/bench/gemm/python/bench_moe_qwen3_30a3.py",
+      "--run",
+      "--routing",
+      "skew",
+      "--impls",
+      "fso_bsfp8_layer",
+      "--out",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/perf_serving/perf_moe_qwen3_30a3_skew_h200.jsonl"
+     ],
+     "end_utc": "2026-10-12T18:59:34.040Z",
+     "env": "main",
+     "error_rows": 0,
+     "exit_code": 0,
+     "name": "srv_skew_30a3",
+     "rows": 17,
+     "start_utc": "2026-10-12T18:58:45.177Z"
+    }
+   ],
+   "window_utc": [
+    "2026-10-12T18:58:45.177Z",
+    "2026-10-12T18:59:34.040Z"
+   ]
+  },
+  "perf_moe_qwen3_35a3_ep2_h200.jsonl": {
+   "bench_env": {},
+   "bench_tree": {
+    "bench_dirty": null,
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "fingerprint": "6504b2765c65e8124450f35e27f738b8c83a61d87b6999ec288ea318befec8b5",
+    "source": "kit"
+   },
+   "card": {
+    "clocks_max_sm_mhz": 1980,
+    "compute_mode": "Default",
+    "driver": "595.58.03",
+    "index": "3",
+    "memory_total_mib": 143771,
+    "name": "NVIDIA H200",
+    "pci": "00000000:97:00.0",
+    "power_limit_w": 700,
+    "uuid": "GPU-9860e51e-04ef-c66a-f09f-e3d4680ea4df"
+   },
+   "clock_flags": {},
+   "clock_policy": {
+    "applied": "nothing: natural clock",
+    "max_sm_mhz": 1980,
+    "mhz": null,
+    "mode": "natural"
+   },
+   "drift_accepted": [],
+   "driver": "595.58.03",
+   "environments": {
+    "main": {
+     "packages": {
+      "flashinfer-python": "0.6.18",
+      "numpy": "2.3.5",
+      "nvidia-cublas": "13.1.1.3",
+      "nvidia-cuda-nvrtc": "13.0.88",
+      "nvidia-cudnn-cu13": "9.20.0.48",
+      "nvidia-cudnn-frontend": "1.30.0",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "sgl-deep-gemm": "0.2.0+cu130",
+      "sglang": "0.5.20",
+      "sglang-kernel": "0.4.7+cu130",
+      "torch": "2.13.0+cu130",
+      "triton": "3.7.1"
+     },
+     "python": "/home/stone/venvs/apex-0520/bin/python",
+     "python_version": "3.12.3"
+    }
+   },
+   "fso": {
+    "build_info": {
+     "arch_list": "9.0a;10.0f;12.0a",
+     "built_at": "2026-10-12T18:30:52Z",
+     "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+     "cuda_toolkit": "13.0.3",
+     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+     "dirty": false,
+     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
+     "glibc_required": "GLIBC_2.34",
+     "image": {
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
+     },
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
+     "nvrtc": {
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+     },
+     "python": "CPython 3.12.15",
+     "torch": "2.13.0+cu130",
+     "version": "0.2.1"
+    },
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "extension_sha256": "9d6a3b09f4a324a43a3a1bce1f9214aabf26c339077271ace7c6efce85d9e79d",
+    "source_build": false,
+    "version": "0.2.1"
+   },
+   "host": "39-gcp-h200-2",
+   "installed_utc": "2026-10-13T00:02:09Z",
+   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
+   "lock_sha256": "5b78c8a5680a073f8e634e4e48f7e4a969ece4cd3db4e08c9f6cba648fc6f55b",
+   "machine": "h200",
+   "manifest_sha256": "e4de523e85ee8435633d217878b457a3fd986769eb2806a1c2ef13a8ddb4447f",
+   "observed_clocks": {
+    "srv_ep2_35a3": {
+     "busy_samples": 73,
+     "hw_slowdown_busy_samples": 0,
+     "power_cap_busy_samples": 2,
+     "power_capped_busy_samples": 2,
+     "power_capped_share_of_busy": 0.0274,
+     "power_limit_w": 700,
+     "power_throttle_share_of_busy": 0.0274,
+     "power_w_max": 226.48,
+     "power_w_max_busy": 220.52,
+     "power_w_mean_busy": 136.7,
+     "samples": 244,
+     "sm_mhz_max_busy": 1980,
+     "sm_mhz_mean_busy": 1977.1,
+     "sm_mhz_median_busy": 1980,
+     "sm_mhz_min_busy": 1830,
+     "temperature_c_max": 45,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 2,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.0274
+    }
+   },
+   "power_flags": {
+    "srv_ep2_35a3": [
+     "the power cap held the clock in 2 of 73 busy samples (3 %); busy SM clock min 1830 MHz, mean 1977.1 MHz; busy power mean 136.7 W, max 220.52 W of the 700 W limit"
+    ]
+   },
+   "run": "0.2.1-h200-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200-serving",
+   "steps": [
+    {
+     "command": [
+      "/home/stone/venvs/apex-0520/bin/python",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/kit/fish_scales_ops-0.2.1-testkit-d8737b4/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "--run",
+      "--routing",
+      "ep",
+      "--ep-size",
+      "2",
+      "--impls",
+      "fso_bsfp8_layer",
+      "--out",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/perf_serving/perf_moe_qwen3_35a3_ep2_h200.jsonl"
+     ],
+     "end_utc": "2026-10-12T19:18:51.986Z",
+     "env": "main",
+     "error_rows": 0,
+     "exit_code": 0,
+     "name": "srv_ep2_35a3",
+     "rows": 17,
+     "start_utc": "2026-10-12T19:18:03.245Z"
+    }
+   ],
+   "window_utc": [
+    "2026-10-12T19:18:03.245Z",
+    "2026-10-12T19:18:51.986Z"
+   ]
+  },
+  "perf_moe_qwen3_35a3_h200.jsonl": {
+   "bench_env": {},
+   "bench_tree": {
+    "bench_dirty": null,
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "fingerprint": "6504b2765c65e8124450f35e27f738b8c83a61d87b6999ec288ea318befec8b5",
+    "source": "kit"
+   },
+   "card": {
+    "clocks_max_sm_mhz": 1980,
+    "compute_mode": "Default",
+    "driver": "595.58.03",
+    "index": "3",
+    "memory_total_mib": 143771,
+    "name": "NVIDIA H200",
+    "pci": "00000000:97:00.0",
+    "power_limit_w": 700,
+    "uuid": "GPU-9860e51e-04ef-c66a-f09f-e3d4680ea4df"
+   },
+   "clock_flags": {},
+   "clock_policy": {
+    "applied": "nothing: natural clock",
+    "max_sm_mhz": 1980,
+    "mhz": null,
+    "mode": "natural"
+   },
+   "drift_accepted": [],
+   "driver": "595.58.03",
+   "environments": {
+    "main": {
+     "packages": {
+      "flashinfer-python": "0.6.18",
+      "numpy": "2.3.5",
+      "nvidia-cublas": "13.1.1.3",
+      "nvidia-cuda-nvrtc": "13.0.88",
+      "nvidia-cudnn-cu13": "9.20.0.48",
+      "nvidia-cudnn-frontend": "1.30.0",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "sgl-deep-gemm": "0.2.0+cu130",
+      "sglang": "0.5.20",
+      "sglang-kernel": "0.4.7+cu130",
+      "torch": "2.13.0+cu130",
+      "triton": "3.7.1"
+     },
+     "python": "/home/stone/venvs/apex-0520/bin/python",
+     "python_version": "3.12.3"
+    }
+   },
+   "fso": {
+    "build_info": {
+     "arch_list": "9.0a;10.0f;12.0a",
+     "built_at": "2026-10-12T18:30:52Z",
+     "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+     "cuda_toolkit": "13.0.3",
+     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+     "dirty": false,
+     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
+     "glibc_required": "GLIBC_2.34",
+     "image": {
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
+     },
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
+     "nvrtc": {
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+     },
+     "python": "CPython 3.12.15",
+     "torch": "2.13.0+cu130",
+     "version": "0.2.1"
+    },
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "extension_sha256": "9d6a3b09f4a324a43a3a1bce1f9214aabf26c339077271ace7c6efce85d9e79d",
+    "source_build": false,
+    "version": "0.2.1"
+   },
+   "host": "39-gcp-h200-2",
+   "installed_utc": "2026-10-13T00:02:09Z",
+   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
+   "lock_sha256": "5b78c8a5680a073f8e634e4e48f7e4a969ece4cd3db4e08c9f6cba648fc6f55b",
+   "machine": "h200",
+   "manifest_sha256": "cdf3ba20db8ec9897f158340fa3fa7f0f0391d0f2aa4ec2030aa1898bd06bc9e",
+   "observed_clocks": {
+    "fso_35a3": {
+     "busy_samples": 80,
      "hw_slowdown_busy_samples": 0,
      "power_cap_busy_samples": 5,
      "power_capped_busy_samples": 5,
-     "power_capped_share_of_busy": 0.0617,
+     "power_capped_share_of_busy": 0.0625,
      "power_limit_w": 700,
-     "power_throttle_share_of_busy": 0.0617,
-     "power_w_max": 332.32,
-     "power_w_max_busy": 332.19,
-     "power_w_mean_busy": 137.9,
-     "samples": 582,
+     "power_throttle_share_of_busy": 0.0625,
+     "power_w_max": 313.15,
+     "power_w_max_busy": 313.15,
+     "power_w_mean_busy": 139.7,
+     "samples": 261,
+     "sm_mhz_max_busy": 1980,
+     "sm_mhz_mean_busy": 1969.7,
+     "sm_mhz_median_busy": 1980.0,
+     "sm_mhz_min_busy": 1680,
+     "temperature_c_max": 47,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 5,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.0625
+    }
+   },
+   "power_flags": {
+    "fso_35a3": [
+     "the power cap held the clock in 5 of 80 busy samples (6 %); busy SM clock min 1680 MHz, mean 1969.7 MHz; busy power mean 139.7 W, max 313.15 W of the 700 W limit"
+    ]
+   },
+   "run": "0.2.1-h200",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200",
+   "steps": [
+    {
+     "command": [
+      "/home/stone/venvs/apex-0520/bin/python",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/kit/fish_scales_ops-0.2.1-testkit-d8737b4/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "--run",
+      "--impls",
+      "fso_bsfp8_layer",
+      "--out",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/perf/perf_moe_qwen3_35a3_h200.jsonl"
+     ],
+     "end_utc": "2026-10-12T18:56:27.706Z",
+     "env": "main",
+     "error_rows": 0,
+     "exit_code": 0,
+     "name": "fso_35a3",
+     "rows": 17,
+     "start_utc": "2026-10-12T18:55:35.591Z"
+    }
+   ],
+   "window_utc": [
+    "2026-10-12T18:55:35.591Z",
+    "2026-10-12T18:56:27.706Z"
+   ]
+  },
+  "perf_moe_qwen3_35a3_padded_h200.jsonl": {
+   "bench_env": {},
+   "bench_tree": {
+    "bench_dirty": null,
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "fingerprint": "6504b2765c65e8124450f35e27f738b8c83a61d87b6999ec288ea318befec8b5",
+    "source": "kit"
+   },
+   "card": {
+    "clocks_max_sm_mhz": 1980,
+    "compute_mode": "Default",
+    "driver": "595.58.03",
+    "index": "3",
+    "memory_total_mib": 143771,
+    "name": "NVIDIA H200",
+    "pci": "00000000:97:00.0",
+    "power_limit_w": 700,
+    "uuid": "GPU-9860e51e-04ef-c66a-f09f-e3d4680ea4df"
+   },
+   "clock_flags": {},
+   "clock_policy": {
+    "applied": "nothing: natural clock",
+    "max_sm_mhz": 1980,
+    "mhz": null,
+    "mode": "natural"
+   },
+   "drift_accepted": [],
+   "driver": "595.58.03",
+   "environments": {
+    "main": {
+     "packages": {
+      "flashinfer-python": "0.6.18",
+      "numpy": "2.3.5",
+      "nvidia-cublas": "13.1.1.3",
+      "nvidia-cuda-nvrtc": "13.0.88",
+      "nvidia-cudnn-cu13": "9.20.0.48",
+      "nvidia-cudnn-frontend": "1.30.0",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "sgl-deep-gemm": "0.2.0+cu130",
+      "sglang": "0.5.20",
+      "sglang-kernel": "0.4.7+cu130",
+      "torch": "2.13.0+cu130",
+      "triton": "3.7.1"
+     },
+     "python": "/home/stone/venvs/apex-0520/bin/python",
+     "python_version": "3.12.3"
+    }
+   },
+   "fso": {
+    "build_info": {
+     "arch_list": "9.0a;10.0f;12.0a",
+     "built_at": "2026-10-12T18:30:52Z",
+     "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+     "cuda_toolkit": "13.0.3",
+     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+     "dirty": false,
+     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
+     "glibc_required": "GLIBC_2.34",
+     "image": {
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
+     },
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
+     "nvrtc": {
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+     },
+     "python": "CPython 3.12.15",
+     "torch": "2.13.0+cu130",
+     "version": "0.2.1"
+    },
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "extension_sha256": "9d6a3b09f4a324a43a3a1bce1f9214aabf26c339077271ace7c6efce85d9e79d",
+    "source_build": false,
+    "version": "0.2.1"
+   },
+   "host": "39-gcp-h200-2",
+   "installed_utc": "2026-10-13T00:02:09Z",
+   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
+   "lock_sha256": "5b78c8a5680a073f8e634e4e48f7e4a969ece4cd3db4e08c9f6cba648fc6f55b",
+   "machine": "h200",
+   "manifest_sha256": "e4de523e85ee8435633d217878b457a3fd986769eb2806a1c2ef13a8ddb4447f",
+   "observed_clocks": {
+    "srv_padded_35a3": {
+     "busy_samples": 53,
+     "hw_slowdown_busy_samples": 0,
+     "power_cap_busy_samples": 0,
+     "power_capped_busy_samples": 0,
+     "power_capped_share_of_busy": 0.0,
+     "power_limit_w": 700,
+     "power_throttle_share_of_busy": 0.0,
+     "power_w_max": 173.06,
+     "power_w_max_busy": 173.06,
+     "power_w_mean_busy": 132.5,
+     "samples": 161,
+     "sm_mhz_max_busy": 1980,
+     "sm_mhz_mean_busy": 1980.0,
+     "sm_mhz_median_busy": 1980,
+     "sm_mhz_min_busy": 1980,
+     "temperature_c_max": 41,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 0,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.0
+    }
+   },
+   "power_flags": {},
+   "run": "0.2.1-h200-serving",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200-serving",
+   "steps": [
+    {
+     "command": [
+      "/home/stone/venvs/apex-0520/bin/python",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/kit/fish_scales_ops-0.2.1-testkit-d8737b4/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "--run",
+      "--routing",
+      "padded",
+      "--impls",
+      "fso_bsfp8_layer",
+      "--out",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/perf_serving/perf_moe_qwen3_35a3_padded_h200.jsonl"
+     ],
+     "end_utc": "2026-10-12T19:11:47.949Z",
+     "env": "main",
+     "error_rows": 0,
+     "exit_code": 0,
+     "name": "srv_padded_35a3",
+     "rows": 10,
+     "start_utc": "2026-10-12T19:11:15.822Z"
+    }
+   ],
+   "window_utc": [
+    "2026-10-12T19:11:15.822Z",
+    "2026-10-12T19:11:47.949Z"
+   ]
+  },
+  "perf_moe_qwen3_35a3_shared_h200.jsonl": {
+   "bench_env": {},
+   "bench_tree": {
+    "bench_dirty": null,
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "fingerprint": "6504b2765c65e8124450f35e27f738b8c83a61d87b6999ec288ea318befec8b5",
+    "source": "kit"
+   },
+   "card": {
+    "clocks_max_sm_mhz": 1980,
+    "compute_mode": "Default",
+    "driver": "595.58.03",
+    "index": "3",
+    "memory_total_mib": 143771,
+    "name": "NVIDIA H200",
+    "pci": "00000000:97:00.0",
+    "power_limit_w": 700,
+    "uuid": "GPU-9860e51e-04ef-c66a-f09f-e3d4680ea4df"
+   },
+   "clock_flags": {},
+   "clock_policy": {
+    "applied": "nothing: natural clock",
+    "max_sm_mhz": 1980,
+    "mhz": null,
+    "mode": "natural"
+   },
+   "drift_accepted": [],
+   "driver": "595.58.03",
+   "environments": {
+    "main": {
+     "packages": {
+      "flashinfer-python": "0.6.18",
+      "numpy": "2.3.5",
+      "nvidia-cublas": "13.1.1.3",
+      "nvidia-cuda-nvrtc": "13.0.88",
+      "nvidia-cudnn-cu13": "9.20.0.48",
+      "nvidia-cudnn-frontend": "1.30.0",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "sgl-deep-gemm": "0.2.0+cu130",
+      "sglang": "0.5.20",
+      "sglang-kernel": "0.4.7+cu130",
+      "torch": "2.13.0+cu130",
+      "triton": "3.7.1"
+     },
+     "python": "/home/stone/venvs/apex-0520/bin/python",
+     "python_version": "3.12.3"
+    }
+   },
+   "fso": {
+    "build_info": {
+     "arch_list": "9.0a;10.0f;12.0a",
+     "built_at": "2026-10-12T18:30:52Z",
+     "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+     "cuda_toolkit": "13.0.3",
+     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+     "dirty": false,
+     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
+     "glibc_required": "GLIBC_2.34",
+     "image": {
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
+     },
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
+     "nvrtc": {
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+     },
+     "python": "CPython 3.12.15",
+     "torch": "2.13.0+cu130",
+     "version": "0.2.1"
+    },
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "extension_sha256": "9d6a3b09f4a324a43a3a1bce1f9214aabf26c339077271ace7c6efce85d9e79d",
+    "source_build": false,
+    "version": "0.2.1"
+   },
+   "host": "39-gcp-h200-2",
+   "installed_utc": "2026-10-13T00:02:09Z",
+   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
+   "lock_sha256": "5b78c8a5680a073f8e634e4e48f7e4a969ece4cd3db4e08c9f6cba648fc6f55b",
+   "machine": "h200",
+   "manifest_sha256": "cdf3ba20db8ec9897f158340fa3fa7f0f0391d0f2aa4ec2030aa1898bd06bc9e",
+   "observed_clocks": {
+    "fso_35a3_shared": {
+     "busy_samples": 98,
+     "hw_slowdown_busy_samples": 0,
+     "power_cap_busy_samples": 5,
+     "power_capped_busy_samples": 5,
+     "power_capped_share_of_busy": 0.051,
+     "power_limit_w": 700,
+     "power_throttle_share_of_busy": 0.051,
+     "power_w_max": 332.76,
+     "power_w_max_busy": 317.34,
+     "power_w_mean_busy": 134.4,
+     "samples": 669,
      "sm_mhz_max_busy": 1980,
      "sm_mhz_mean_busy": 1972.8,
-     "sm_mhz_median_busy": 1980,
+     "sm_mhz_median_busy": 1980.0,
      "sm_mhz_min_busy": 1710,
      "temperature_c_max": 47,
      "thermal_busy_samples": 0,
@@ -1642,12 +1722,12 @@
       "sw_power_cap": 5,
       "sw_thermal": 0
      },
-     "throttle_share_of_busy": 0.0617
+     "throttle_share_of_busy": 0.051
     }
    },
    "power_flags": {
     "fso_35a3_shared": [
-     "the power cap held the clock in 5 of 81 busy samples (6 %); busy SM clock min 1710 MHz, mean 1972.8 MHz; busy power mean 137.9 W, max 332.19 W of the 700 W limit"
+     "the power cap held the clock in 5 of 98 busy samples (5 %); busy SM clock min 1710 MHz, mean 1972.8 MHz; busy power mean 134.4 W, max 317.34 W of the 700 W limit"
     ]
    },
    "run": "0.2.1-h200",
@@ -1656,45 +1736,45 @@
     {
      "command": [
       "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/kit/fish_scales_ops-0.2.1-testkit-d8737b4/bench/gemm/python/bench_moe_qwen3_35a3.py",
       "--run",
       "--impls",
       "fso_bsfp8_layer_shared",
       "--out",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf/perf_moe_qwen3_35a3_shared_h200.jsonl"
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/perf/perf_moe_qwen3_35a3_shared_h200.jsonl"
      ],
-     "end_utc": "2026-10-10T16:52:53.299Z",
+     "end_utc": "2026-10-12T18:58:41.599Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "fso_35a3_shared",
-     "rows": 15,
-     "start_utc": "2026-10-10T16:50:56.754Z"
+     "rows": 17,
+     "start_utc": "2026-10-12T18:56:27.822Z"
     }
    ],
    "window_utc": [
-    "2026-10-10T16:50:56.754Z",
-    "2026-10-10T16:52:53.299Z"
+    "2026-10-12T18:56:27.822Z",
+    "2026-10-12T18:58:41.599Z"
    ]
   },
   "perf_moe_qwen3_35a3_skew_h200.jsonl": {
    "bench_env": {},
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "fingerprint": "6504b2765c65e8124450f35e27f738b8c83a61d87b6999ec288ea318befec8b5",
     "source": "kit"
    },
    "card": {
     "clocks_max_sm_mhz": 1980,
     "compute_mode": "Default",
     "driver": "595.58.03",
-    "index": "0",
+    "index": "3",
     "memory_total_mib": 143771,
     "name": "NVIDIA H200",
-    "pci": "00000000:8F:00.0",
+    "pci": "00000000:97:00.0",
     "power_limit_w": 700,
-    "uuid": "GPU-e87af6ea-2a7f-af85-f89f-e5a17e644ff1"
+    "uuid": "GPU-9860e51e-04ef-c66a-f09f-e3d4680ea4df"
    },
    "clock_flags": {},
    "clock_policy": {
@@ -1728,8 +1808,8 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-10T15:55:17Z",
-     "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+     "built_at": "2026-10-12T18:30:52Z",
+     "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
      "cuda_toolkit": "13.0.3",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
@@ -1750,50 +1830,50 @@
      "torch": "2.13.0+cu130",
      "version": "0.2.1"
     },
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "extension_sha256": "dfae2d579c6d36cd9c5819f19664bdd7dd0f1f25e3900090e13f9225c082f903",
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "extension_sha256": "9d6a3b09f4a324a43a3a1bce1f9214aabf26c339077271ace7c6efce85d9e79d",
     "source_build": false,
     "version": "0.2.1"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T20:07:34Z",
-   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
+   "installed_utc": "2026-10-13T00:02:09Z",
+   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
+   "lock_sha256": "5b78c8a5680a073f8e634e4e48f7e4a969ece4cd3db4e08c9f6cba648fc6f55b",
    "machine": "h200",
-   "manifest_sha256": "db9b79a0943298e594d4832f2858c54e2461e2bf0fd80e1f880b1aad87e44c75",
+   "manifest_sha256": "e4de523e85ee8435633d217878b457a3fd986769eb2806a1c2ef13a8ddb4447f",
    "observed_clocks": {
     "srv_skew_35a3": {
-     "busy_samples": 77,
+     "busy_samples": 90,
      "hw_slowdown_busy_samples": 0,
-     "power_cap_busy_samples": 4,
-     "power_capped_busy_samples": 4,
-     "power_capped_share_of_busy": 0.0519,
+     "power_cap_busy_samples": 3,
+     "power_capped_busy_samples": 3,
+     "power_capped_share_of_busy": 0.0333,
      "power_limit_w": 700,
-     "power_throttle_share_of_busy": 0.0519,
-     "power_w_max": 308.92,
-     "power_w_max_busy": 308.92,
-     "power_w_mean_busy": 141.9,
-     "samples": 228,
+     "power_throttle_share_of_busy": 0.0333,
+     "power_w_max": 314.49,
+     "power_w_max_busy": 314.49,
+     "power_w_mean_busy": 142.5,
+     "samples": 257,
      "sm_mhz_max_busy": 1980,
-     "sm_mhz_mean_busy": 1972.0,
-     "sm_mhz_median_busy": 1980,
-     "sm_mhz_min_busy": 1695,
-     "temperature_c_max": 48,
+     "sm_mhz_mean_busy": 1968.8,
+     "sm_mhz_median_busy": 1980.0,
+     "sm_mhz_min_busy": 1680,
+     "temperature_c_max": 47,
      "thermal_busy_samples": 0,
      "thermal_throttle_share_of_busy": 0.0,
      "throttle_reason_busy_samples": {
       "hw_power_brake": 0,
       "hw_slowdown": 0,
       "hw_thermal": 0,
-      "sw_power_cap": 4,
+      "sw_power_cap": 3,
       "sw_thermal": 0
      },
-     "throttle_share_of_busy": 0.0519
+     "throttle_share_of_busy": 0.0333
     }
    },
    "power_flags": {
     "srv_skew_35a3": [
-     "the power cap held the clock in 4 of 77 busy samples (5 %); busy SM clock min 1695 MHz, mean 1972.0 MHz; busy power mean 141.9 W, max 308.92 W of the 700 W limit"
+     "the power cap held the clock in 3 of 90 busy samples (3 %); busy SM clock min 1680 MHz, mean 1968.8 MHz; busy power mean 142.5 W, max 314.49 W of the 700 W limit"
     ]
    },
    "run": "0.2.1-h200-serving",
@@ -1802,204 +1882,47 @@
     {
      "command": [
       "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/kit/fish_scales_ops-0.2.1-testkit-d8737b4/bench/gemm/python/bench_moe_qwen3_35a3.py",
       "--run",
       "--routing",
       "skew",
       "--impls",
       "fso_bsfp8_layer",
       "--out",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf_serving/perf_moe_qwen3_35a3_skew_h200.jsonl"
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/perf_serving/perf_moe_qwen3_35a3_skew_h200.jsonl"
      ],
-     "end_utc": "2026-10-10T16:58:09.505Z",
+     "end_utc": "2026-10-12T19:04:47.152Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "srv_skew_35a3",
-     "rows": 15,
-     "start_utc": "2026-10-10T16:57:23.906Z"
+     "rows": 17,
+     "start_utc": "2026-10-12T19:03:55.612Z"
     }
    ],
    "window_utc": [
-    "2026-10-10T16:57:23.906Z",
-    "2026-10-10T16:58:09.505Z"
+    "2026-10-12T19:03:55.612Z",
+    "2026-10-12T19:04:47.152Z"
    ]
   },
   "ref_mlp_qwen3_4b_h200.jsonl": {
    "bench_env": {},
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "18e4b67bb9ec243f0fc33f5ecad2df0725dae7d6",
-    "fingerprint": "e76a0e65b6535e0a82bbb7dcc20362463497b465b741ec310b3abe8a7b8d7f9e",
+    "commit": "ec578dd655c184e75c91f6eebb517021ef955589",
+    "fingerprint": "c4d699eea5a7042b8fb6bc140961ed147994c8ef9eb0bd09a91f8bbc1e468448",
     "source": "kit"
    },
    "card": {
     "clocks_max_sm_mhz": 1980,
     "compute_mode": "Default",
     "driver": "595.58.03",
-    "index": "0",
+    "index": "3",
     "memory_total_mib": 143771,
     "name": "NVIDIA H200",
-    "pci": "00000000:8F:00.0",
+    "pci": "00000000:97:00.0",
     "power_limit_w": 700,
-    "uuid": "GPU-e87af6ea-2a7f-af85-f89f-e5a17e644ff1"
-   },
-   "clock_flags": {},
-   "clock_policy": {
-    "applied": "nothing: natural clock",
-    "max_sm_mhz": 1980,
-    "mhz": null,
-    "mode": "natural"
-   },
-   "drift_accepted": [],
-   "driver": "595.58.03",
-   "environments": {
-    "main": {
-     "packages": {
-      "flashinfer-python": "0.6.18",
-      "numpy": "2.3.5",
-      "nvidia-cublas": "13.1.1.3",
-      "nvidia-cuda-nvrtc": "13.0.88",
-      "nvidia-cudnn-cu13": "9.20.0.48",
-      "nvidia-cudnn-frontend": "1.30.0",
-      "nvidia-cutlass-dsl": "4.6.2",
-      "sgl-deep-gemm": "0.2.0+cu130",
-      "sglang": "0.5.20",
-      "sglang-kernel": "0.4.7+cu130",
-      "torch": "2.13.0+cu130",
-      "triton": "3.7.1"
-     },
-     "python": "/home/stone/venvs/apex-0520/bin/python",
-     "python_version": "3.12.3"
-    }
-   },
-   "fso": {
-    "build_info": {
-     "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T04:22:09Z",
-     "commit": "37e316bc3febff51427dd956305e076f467b402a",
-     "cuda_toolkit": "13.2.1",
-     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
-     "dirty": false,
-     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
-     "glibc_required": "GLIBC_2.34",
-     "image": {
-      "base": "nvidia/cuda:13.2.1-devel-ubuntu22.04@sha256:3805e62773832c404db8785c63190aaba49bff02bb199b0d187ab897170c6cd1",
-      "id": "sha256:eb44d6a2d3470cd65a712b7c631a5fad4b6ff6cdeff54a78ec11385f6c6bb885",
-      "name": "fso-build-wheel:3536082a1d73"
-     },
-     "nvcc": "Cuda compilation tools, release 13.2, V13.2.78",
-     "nvrtc": {
-      "sha256": "a9049031da08cbedd0c20e3470e5a978dc330af0e0326b3b05774718c665dc3e",
-      "version": "13.2.78",
-      "wheel": "nvidia_cuda_nvrtc-13.2.78-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
-     },
-     "python": "CPython 3.12.15",
-     "torch": "2.13.0+cu130",
-     "version": "0.2.0"
-    },
-    "commit": "37e316bc3febff51427dd956305e076f467b402a",
-    "extension_sha256": "801f51e6cf79de8444196b7a448995bb3685e202b7038d2f0bc54e315663ecf4",
-    "source_build": false,
-    "version": "0.2.0"
-   },
-   "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-05T12:28:49Z",
-   "jit_compiler_sm90": "NVRTC 13.2 (/data/bench-runs/fso_release_0.2.0_20261005/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "4f4f7d998694057ba132ed40df623fa82161b5ddf8bc24045f10b2867dc67923",
-   "machine": "h200",
-   "manifest_sha256": "7f37aeef169a7e7f4f9df44730193e44b0dd497fdd79071e2088891b059e5690",
-   "observed_clocks": {
-    "mlp_ref_cublas": {
-     "busy_samples": 42,
-     "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 4,
-     "power_capped_share_of_busy": 0.0952,
-     "power_w_max": 416.23,
-     "samples": 528,
-     "sm_mhz_max_busy": 1980,
-     "sm_mhz_median_busy": 1980.0,
-     "sm_mhz_min_busy": 1530,
-     "temperature_c_max": 49,
-     "thermal_busy_samples": 0
-    },
-    "mlp_ref_sgl": {
-     "busy_samples": 40,
-     "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 7,
-     "power_capped_share_of_busy": 0.175,
-     "power_w_max": 387.22,
-     "samples": 637,
-     "sm_mhz_max_busy": 1980,
-     "sm_mhz_median_busy": 1980.0,
-     "sm_mhz_min_busy": 1470,
-     "temperature_c_max": 51,
-     "thermal_busy_samples": 0
-    }
-   },
-   "run": "h200-cmp-pdl",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/h200-cmp-pdl",
-   "steps": [
-    {
-     "command": [
-      "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_release_0.2.0_20261005/kits/kit-18e4b67/bench/gemm/python/bench_qwen3_4b_mlp_forward.py",
-      "--run",
-      "--dtypes",
-      "sgl_fp8b",
-      "--out",
-      "/data/bench-runs/fso_release_0.2.0_20261005/runs/h200-cmp-pdl/ref_mlp_sgl_h200.jsonl"
-     ],
-     "end_utc": "2026-10-05T12:26:06.265Z",
-     "env": "main",
-     "error_rows": 0,
-     "exit_code": 0,
-     "name": "mlp_ref_sgl",
-     "rows": 14,
-     "start_utc": "2026-10-05T12:23:58.923Z"
-    },
-    {
-     "command": [
-      "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_release_0.2.0_20261005/kits/kit-18e4b67/bench/gemm/python/bench_qwen3_4b_mlp_forward.py",
-      "--run",
-      "--dtypes",
-      "cublas_fp8b",
-      "--out",
-      "/data/bench-runs/fso_release_0.2.0_20261005/runs/h200-cmp-pdl/ref_mlp_cublas_h200.jsonl"
-     ],
-     "end_utc": "2026-10-05T12:27:52.026Z",
-     "env": "main",
-     "error_rows": 0,
-     "exit_code": 0,
-     "name": "mlp_ref_cublas",
-     "rows": 14,
-     "start_utc": "2026-10-05T12:26:06.385Z"
-    }
-   ],
-   "window_utc": [
-    "2026-10-05T12:23:58.923Z",
-    "2026-10-05T12:27:52.026Z"
-   ]
-  },
-  "ref_moe_qwen3_30a3_ep2_h200.jsonl": {
-   "bench_env": {},
-   "bench_tree": {
-    "bench_dirty": null,
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
-    "source": "kit"
-   },
-   "card": {
-    "clocks_max_sm_mhz": 1980,
-    "compute_mode": "Default",
-    "driver": "595.58.03",
-    "index": "0",
-    "memory_total_mib": 143771,
-    "name": "NVIDIA H200",
-    "pci": "00000000:8F:00.0",
-    "power_limit_w": 700,
-    "uuid": "GPU-e87af6ea-2a7f-af85-f89f-e5a17e644ff1"
+    "uuid": "GPU-9860e51e-04ef-c66a-f09f-e3d4680ea4df"
    },
    "clock_flags": {},
    "clock_policy": {
@@ -2061,29 +1984,224 @@
     "version": "0.2.1"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T20:07:34Z",
+   "installed_utc": "2026-10-13T00:02:10Z",
    "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
+   "lock_sha256": "5b78c8a5680a073f8e634e4e48f7e4a969ece4cd3db4e08c9f6cba648fc6f55b",
    "machine": "h200",
-   "manifest_sha256": "db9b79a0943298e594d4832f2858c54e2461e2bf0fd80e1f880b1aad87e44c75",
+   "manifest_sha256": "ec00070be57a3cb9a663950d1b5acb914849c34c18b9753d0100637118f9f6a9",
+   "observed_clocks": {
+    "mlp_ref_cublas": {
+     "busy_samples": 52,
+     "hw_slowdown_busy_samples": 0,
+     "power_cap_busy_samples": 7,
+     "power_capped_busy_samples": 7,
+     "power_capped_share_of_busy": 0.1346,
+     "power_limit_w": 700,
+     "power_throttle_share_of_busy": 0.1346,
+     "power_w_max": 408.13,
+     "power_w_max_busy": 408.11,
+     "power_w_mean_busy": 136.3,
+     "samples": 637,
+     "sm_mhz_max_busy": 1980,
+     "sm_mhz_mean_busy": 1946.2,
+     "sm_mhz_median_busy": 1980.0,
+     "sm_mhz_min_busy": 1530,
+     "temperature_c_max": 49,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 7,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.1346
+    },
+    "mlp_ref_sgl": {
+     "busy_samples": 48,
+     "hw_slowdown_busy_samples": 0,
+     "power_cap_busy_samples": 5,
+     "power_capped_busy_samples": 5,
+     "power_capped_share_of_busy": 0.1042,
+     "power_limit_w": 700,
+     "power_throttle_share_of_busy": 0.1042,
+     "power_w_max": 384.59,
+     "power_w_max_busy": 336.41,
+     "power_w_mean_busy": 131.1,
+     "samples": 735,
+     "sm_mhz_max_busy": 1980,
+     "sm_mhz_mean_busy": 1948.8,
+     "sm_mhz_median_busy": 1980.0,
+     "sm_mhz_min_busy": 1485,
+     "temperature_c_max": 49,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 5,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.1042
+    }
+   },
+   "power_flags": {
+    "mlp_ref_cublas": [
+     "the power cap held the clock in 7 of 52 busy samples (13 %); busy SM clock min 1530 MHz, mean 1946.2 MHz; busy power mean 136.3 W, max 408.11 W of the 700 W limit"
+    ],
+    "mlp_ref_sgl": [
+     "the power cap held the clock in 5 of 48 busy samples (10 %); busy SM clock min 1485 MHz, mean 1948.8 MHz; busy power mean 131.1 W, max 336.41 W of the 700 W limit"
+    ]
+   },
+   "run": "0.2.1-h200-cmp",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200-cmp",
+   "steps": [
+    {
+     "command": [
+      "/home/stone/venvs/apex-0520/bin/python",
+      "/home/stone/workspace/standalone/fso-021-kit-ec578dd/bench/gemm/python/bench_qwen3_4b_mlp_forward.py",
+      "--run",
+      "--dtypes",
+      "sgl_fp8b",
+      "--out",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/ref-h200-ec578dd/ref_mlp_sgl_h200.jsonl"
+     ],
+     "end_utc": "2026-10-12T15:35:19.843Z",
+     "env": "main",
+     "error_rows": 0,
+     "exit_code": 0,
+     "name": "mlp_ref_sgl",
+     "rows": 17,
+     "start_utc": "2026-10-12T15:32:52.740Z"
+    },
+    {
+     "command": [
+      "/home/stone/venvs/apex-0520/bin/python",
+      "/home/stone/workspace/standalone/fso-021-kit-ec578dd/bench/gemm/python/bench_qwen3_4b_mlp_forward.py",
+      "--run",
+      "--dtypes",
+      "cublas_fp8b",
+      "--out",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/ref-h200-ec578dd/ref_mlp_cublas_h200.jsonl"
+     ],
+     "end_utc": "2026-10-12T15:37:27.428Z",
+     "env": "main",
+     "error_rows": 0,
+     "exit_code": 0,
+     "name": "mlp_ref_cublas",
+     "rows": 17,
+     "start_utc": "2026-10-12T15:35:19.960Z"
+    }
+   ],
+   "window_utc": [
+    "2026-10-12T15:32:52.740Z",
+    "2026-10-12T15:37:27.428Z"
+   ]
+  },
+  "ref_moe_qwen3_30a3_ep2_h200.jsonl": {
+   "bench_env": {},
+   "bench_tree": {
+    "bench_dirty": null,
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "fingerprint": "6504b2765c65e8124450f35e27f738b8c83a61d87b6999ec288ea318befec8b5",
+    "source": "kit"
+   },
+   "card": {
+    "clocks_max_sm_mhz": 1980,
+    "compute_mode": "Default",
+    "driver": "595.58.03",
+    "index": "3",
+    "memory_total_mib": 143771,
+    "name": "NVIDIA H200",
+    "pci": "00000000:97:00.0",
+    "power_limit_w": 700,
+    "uuid": "GPU-9860e51e-04ef-c66a-f09f-e3d4680ea4df"
+   },
+   "clock_flags": {},
+   "clock_policy": {
+    "applied": "nothing: natural clock",
+    "max_sm_mhz": 1980,
+    "mhz": null,
+    "mode": "natural"
+   },
+   "drift_accepted": [],
+   "driver": "595.58.03",
+   "environments": {
+    "main": {
+     "packages": {
+      "flashinfer-python": "0.6.18",
+      "numpy": "2.3.5",
+      "nvidia-cublas": "13.1.1.3",
+      "nvidia-cuda-nvrtc": "13.0.88",
+      "nvidia-cudnn-cu13": "9.20.0.48",
+      "nvidia-cudnn-frontend": "1.30.0",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "sgl-deep-gemm": "0.2.0+cu130",
+      "sglang": "0.5.20",
+      "sglang-kernel": "0.4.7+cu130",
+      "torch": "2.13.0+cu130",
+      "triton": "3.7.1"
+     },
+     "python": "/home/stone/venvs/apex-0520/bin/python",
+     "python_version": "3.12.3"
+    }
+   },
+   "fso": {
+    "build_info": {
+     "arch_list": "9.0a;10.0f;12.0a",
+     "built_at": "2026-10-12T18:30:52Z",
+     "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+     "cuda_toolkit": "13.0.3",
+     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+     "dirty": false,
+     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
+     "glibc_required": "GLIBC_2.34",
+     "image": {
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
+     },
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
+     "nvrtc": {
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+     },
+     "python": "CPython 3.12.15",
+     "torch": "2.13.0+cu130",
+     "version": "0.2.1"
+    },
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "extension_sha256": "9d6a3b09f4a324a43a3a1bce1f9214aabf26c339077271ace7c6efce85d9e79d",
+    "source_build": false,
+    "version": "0.2.1"
+   },
+   "host": "39-gcp-h200-2",
+   "installed_utc": "2026-10-13T00:02:09Z",
+   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
+   "lock_sha256": "5b78c8a5680a073f8e634e4e48f7e4a969ece4cd3db4e08c9f6cba648fc6f55b",
+   "machine": "h200",
+   "manifest_sha256": "e4de523e85ee8435633d217878b457a3fd986769eb2806a1c2ef13a8ddb4447f",
    "observed_clocks": {
     "srv_ep2_ref_30a3": {
-     "busy_samples": 155,
+     "busy_samples": 180,
      "hw_slowdown_busy_samples": 0,
      "power_cap_busy_samples": 1,
      "power_capped_busy_samples": 1,
-     "power_capped_share_of_busy": 0.0065,
+     "power_capped_share_of_busy": 0.0056,
      "power_limit_w": 700,
-     "power_throttle_share_of_busy": 0.0065,
-     "power_w_max": 445.12,
-     "power_w_max_busy": 445.12,
-     "power_w_mean_busy": 235.3,
-     "samples": 1046,
+     "power_throttle_share_of_busy": 0.0056,
+     "power_w_max": 441.86,
+     "power_w_max_busy": 441.86,
+     "power_w_mean_busy": 230.9,
+     "samples": 1245,
      "sm_mhz_max_busy": 1980,
-     "sm_mhz_mean_busy": 1978.6,
-     "sm_mhz_median_busy": 1980,
-     "sm_mhz_min_busy": 1785,
-     "temperature_c_max": 47,
+     "sm_mhz_mean_busy": 1979.6,
+     "sm_mhz_median_busy": 1980.0,
+     "sm_mhz_min_busy": 1920,
+     "temperature_c_max": 45,
      "thermal_busy_samples": 0,
      "thermal_throttle_share_of_busy": 0.0,
      "throttle_reason_busy_samples": {
@@ -2093,12 +2211,12 @@
       "sw_power_cap": 1,
       "sw_thermal": 0
      },
-     "throttle_share_of_busy": 0.0065
+     "throttle_share_of_busy": 0.0056
     }
    },
    "power_flags": {
     "srv_ep2_ref_30a3": [
-     "the power cap held the clock in 1 of 155 busy samples (1 %); busy SM clock min 1785 MHz, mean 1978.6 MHz; busy power mean 235.3 W, max 445.12 W of the 700 W limit"
+     "the power cap held the clock in 1 of 180 busy samples (1 %); busy SM clock min 1920 MHz, mean 1979.6 MHz; busy power mean 230.9 W, max 441.86 W of the 700 W limit"
     ]
    },
    "run": "0.2.1-h200-serving",
@@ -2107,7 +2225,7 @@
     {
      "command": [
       "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_30a3.py",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/kit/fish_scales_ops-0.2.1-testkit-d8737b4/bench/gemm/python/bench_moe_qwen3_30a3.py",
       "--run",
       "--routing",
       "ep",
@@ -2116,166 +2234,40 @@
       "--impls",
       "triton_fp8b,dg_fp8_layer",
       "--out",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf_serving/ref_ep2_30a3_h200.jsonl"
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/perf_serving/ref_ep2_30a3_h200.jsonl"
      ],
-     "end_utc": "2026-10-10T17:09:52.060Z",
+     "end_utc": "2026-10-12T19:18:03.127Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "srv_ep2_ref_30a3",
-     "rows": 22,
-     "start_utc": "2026-10-10T17:06:22.574Z"
+     "rows": 26,
+     "start_utc": "2026-10-12T19:13:53.932Z"
     }
    ],
    "window_utc": [
-    "2026-10-10T17:06:22.574Z",
-    "2026-10-10T17:09:52.060Z"
+    "2026-10-12T19:13:53.932Z",
+    "2026-10-12T19:18:03.127Z"
    ]
   },
   "ref_moe_qwen3_30a3_h200.jsonl": {
    "bench_env": {},
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "18e4b67bb9ec243f0fc33f5ecad2df0725dae7d6",
-    "fingerprint": "e76a0e65b6535e0a82bbb7dcc20362463497b465b741ec310b3abe8a7b8d7f9e",
+    "commit": "ec578dd655c184e75c91f6eebb517021ef955589",
+    "fingerprint": "c4d699eea5a7042b8fb6bc140961ed147994c8ef9eb0bd09a91f8bbc1e468448",
     "source": "kit"
    },
    "card": {
     "clocks_max_sm_mhz": 1980,
     "compute_mode": "Default",
     "driver": "595.58.03",
-    "index": "0",
+    "index": "3",
     "memory_total_mib": 143771,
     "name": "NVIDIA H200",
-    "pci": "00000000:8F:00.0",
+    "pci": "00000000:97:00.0",
     "power_limit_w": 700,
-    "uuid": "GPU-e87af6ea-2a7f-af85-f89f-e5a17e644ff1"
-   },
-   "clock_flags": {},
-   "clock_policy": {
-    "applied": "nothing: natural clock",
-    "max_sm_mhz": 1980,
-    "mhz": null,
-    "mode": "natural"
-   },
-   "drift_accepted": [],
-   "driver": "595.58.03",
-   "environments": {
-    "main": {
-     "packages": {
-      "flashinfer-python": "0.6.18",
-      "numpy": "2.3.5",
-      "nvidia-cublas": "13.1.1.3",
-      "nvidia-cuda-nvrtc": "13.0.88",
-      "nvidia-cudnn-cu13": "9.20.0.48",
-      "nvidia-cudnn-frontend": "1.30.0",
-      "nvidia-cutlass-dsl": "4.6.2",
-      "sgl-deep-gemm": "0.2.0+cu130",
-      "sglang": "0.5.20",
-      "sglang-kernel": "0.4.7+cu130",
-      "torch": "2.13.0+cu130",
-      "triton": "3.7.1"
-     },
-     "python": "/home/stone/venvs/apex-0520/bin/python",
-     "python_version": "3.12.3"
-    }
-   },
-   "fso": {
-    "build_info": {
-     "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T04:22:09Z",
-     "commit": "37e316bc3febff51427dd956305e076f467b402a",
-     "cuda_toolkit": "13.2.1",
-     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
-     "dirty": false,
-     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
-     "glibc_required": "GLIBC_2.34",
-     "image": {
-      "base": "nvidia/cuda:13.2.1-devel-ubuntu22.04@sha256:3805e62773832c404db8785c63190aaba49bff02bb199b0d187ab897170c6cd1",
-      "id": "sha256:eb44d6a2d3470cd65a712b7c631a5fad4b6ff6cdeff54a78ec11385f6c6bb885",
-      "name": "fso-build-wheel:3536082a1d73"
-     },
-     "nvcc": "Cuda compilation tools, release 13.2, V13.2.78",
-     "nvrtc": {
-      "sha256": "a9049031da08cbedd0c20e3470e5a978dc330af0e0326b3b05774718c665dc3e",
-      "version": "13.2.78",
-      "wheel": "nvidia_cuda_nvrtc-13.2.78-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
-     },
-     "python": "CPython 3.12.15",
-     "torch": "2.13.0+cu130",
-     "version": "0.2.0"
-    },
-    "commit": "37e316bc3febff51427dd956305e076f467b402a",
-    "extension_sha256": "801f51e6cf79de8444196b7a448995bb3685e202b7038d2f0bc54e315663ecf4",
-    "source_build": false,
-    "version": "0.2.0"
-   },
-   "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-05T12:28:49Z",
-   "jit_compiler_sm90": "NVRTC 13.2 (/data/bench-runs/fso_release_0.2.0_20261005/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "4f4f7d998694057ba132ed40df623fa82161b5ddf8bc24045f10b2867dc67923",
-   "machine": "h200",
-   "manifest_sha256": "7f37aeef169a7e7f4f9df44730193e44b0dd497fdd79071e2088891b059e5690",
-   "observed_clocks": {
-    "ref_30a3": {
-     "busy_samples": 284,
-     "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 18,
-     "power_capped_share_of_busy": 0.0634,
-     "power_w_max": 708.56,
-     "samples": 1787,
-     "sm_mhz_max_busy": 1980,
-     "sm_mhz_median_busy": 1980.0,
-     "sm_mhz_min_busy": 1515,
-     "temperature_c_max": 52,
-     "thermal_busy_samples": 0
-    }
-   },
-   "run": "h200-cmp-pdl",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/h200-cmp-pdl",
-   "steps": [
-    {
-     "command": [
-      "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_release_0.2.0_20261005/kits/kit-18e4b67/bench/gemm/python/bench_moe_qwen3_30a3.py",
-      "--run",
-      "--impls",
-      "triton_bf16,triton_fp8b,dg_fp8_layer",
-      "--out",
-      "/data/bench-runs/fso_release_0.2.0_20261005/runs/h200-cmp-pdl/ref_new_30a3_h200.jsonl"
-     ],
-     "end_utc": "2026-10-05T12:17:30.087Z",
-     "env": "main",
-     "error_rows": 0,
-     "exit_code": 0,
-     "name": "ref_30a3",
-     "rows": 36,
-     "start_utc": "2026-10-05T12:11:32.268Z"
-    }
-   ],
-   "window_utc": [
-    "2026-10-05T12:11:32.268Z",
-    "2026-10-05T12:17:30.087Z"
-   ]
-  },
-  "ref_moe_qwen3_30a3_padded_h200.jsonl": {
-   "bench_env": {},
-   "bench_tree": {
-    "bench_dirty": null,
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
-    "source": "kit"
-   },
-   "card": {
-    "clocks_max_sm_mhz": 1980,
-    "compute_mode": "Default",
-    "driver": "595.58.03",
-    "index": "0",
-    "memory_total_mib": 143771,
-    "name": "NVIDIA H200",
-    "pci": "00000000:8F:00.0",
-    "power_limit_w": 700,
-    "uuid": "GPU-e87af6ea-2a7f-af85-f89f-e5a17e644ff1"
+    "uuid": "GPU-9860e51e-04ef-c66a-f09f-e3d4680ea4df"
    },
    "clock_flags": {},
    "clock_policy": {
@@ -2337,29 +2329,175 @@
     "version": "0.2.1"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T20:07:34Z",
+   "installed_utc": "2026-10-13T00:02:10Z",
    "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
+   "lock_sha256": "5b78c8a5680a073f8e634e4e48f7e4a969ece4cd3db4e08c9f6cba648fc6f55b",
    "machine": "h200",
-   "manifest_sha256": "db9b79a0943298e594d4832f2858c54e2461e2bf0fd80e1f880b1aad87e44c75",
+   "manifest_sha256": "ec00070be57a3cb9a663950d1b5acb914849c34c18b9753d0100637118f9f6a9",
+   "observed_clocks": {
+    "ref_30a3": {
+     "busy_samples": 337,
+     "hw_slowdown_busy_samples": 0,
+     "power_cap_busy_samples": 14,
+     "power_capped_busy_samples": 14,
+     "power_capped_share_of_busy": 0.0415,
+     "power_limit_w": 700,
+     "power_throttle_share_of_busy": 0.0415,
+     "power_w_max": 668.54,
+     "power_w_max_busy": 668.54,
+     "power_w_mean_busy": 262.5,
+     "samples": 2256,
+     "sm_mhz_max_busy": 1980,
+     "sm_mhz_mean_busy": 1971.2,
+     "sm_mhz_median_busy": 1980,
+     "sm_mhz_min_busy": 1485,
+     "temperature_c_max": 53,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 14,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.0415
+    }
+   },
+   "power_flags": {
+    "ref_30a3": [
+     "the power cap held the clock in 14 of 337 busy samples (4 %); busy SM clock min 1485 MHz, mean 1971.2 MHz; busy power mean 262.5 W, max 668.54 W of the 700 W limit"
+    ]
+   },
+   "run": "0.2.1-h200-cmp",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200-cmp",
+   "steps": [
+    {
+     "command": [
+      "/home/stone/venvs/apex-0520/bin/python",
+      "/home/stone/workspace/standalone/fso-021-kit-ec578dd/bench/gemm/python/bench_moe_qwen3_30a3.py",
+      "--run",
+      "--impls",
+      "triton_bf16,triton_fp8b,dg_fp8_layer",
+      "--out",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/ref-h200-ec578dd/ref_new_30a3_h200.jsonl"
+     ],
+     "end_utc": "2026-10-12T15:25:11.231Z",
+     "env": "main",
+     "error_rows": 0,
+     "exit_code": 0,
+     "name": "ref_30a3",
+     "rows": 43,
+     "start_utc": "2026-10-12T15:17:39.545Z"
+    }
+   ],
+   "window_utc": [
+    "2026-10-12T15:17:39.545Z",
+    "2026-10-12T15:25:11.231Z"
+   ]
+  },
+  "ref_moe_qwen3_30a3_padded_h200.jsonl": {
+   "bench_env": {},
+   "bench_tree": {
+    "bench_dirty": null,
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "fingerprint": "6504b2765c65e8124450f35e27f738b8c83a61d87b6999ec288ea318befec8b5",
+    "source": "kit"
+   },
+   "card": {
+    "clocks_max_sm_mhz": 1980,
+    "compute_mode": "Default",
+    "driver": "595.58.03",
+    "index": "3",
+    "memory_total_mib": 143771,
+    "name": "NVIDIA H200",
+    "pci": "00000000:97:00.0",
+    "power_limit_w": 700,
+    "uuid": "GPU-9860e51e-04ef-c66a-f09f-e3d4680ea4df"
+   },
+   "clock_flags": {},
+   "clock_policy": {
+    "applied": "nothing: natural clock",
+    "max_sm_mhz": 1980,
+    "mhz": null,
+    "mode": "natural"
+   },
+   "drift_accepted": [],
+   "driver": "595.58.03",
+   "environments": {
+    "main": {
+     "packages": {
+      "flashinfer-python": "0.6.18",
+      "numpy": "2.3.5",
+      "nvidia-cublas": "13.1.1.3",
+      "nvidia-cuda-nvrtc": "13.0.88",
+      "nvidia-cudnn-cu13": "9.20.0.48",
+      "nvidia-cudnn-frontend": "1.30.0",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "sgl-deep-gemm": "0.2.0+cu130",
+      "sglang": "0.5.20",
+      "sglang-kernel": "0.4.7+cu130",
+      "torch": "2.13.0+cu130",
+      "triton": "3.7.1"
+     },
+     "python": "/home/stone/venvs/apex-0520/bin/python",
+     "python_version": "3.12.3"
+    }
+   },
+   "fso": {
+    "build_info": {
+     "arch_list": "9.0a;10.0f;12.0a",
+     "built_at": "2026-10-12T18:30:52Z",
+     "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+     "cuda_toolkit": "13.0.3",
+     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+     "dirty": false,
+     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
+     "glibc_required": "GLIBC_2.34",
+     "image": {
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
+     },
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
+     "nvrtc": {
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+     },
+     "python": "CPython 3.12.15",
+     "torch": "2.13.0+cu130",
+     "version": "0.2.1"
+    },
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "extension_sha256": "9d6a3b09f4a324a43a3a1bce1f9214aabf26c339077271ace7c6efce85d9e79d",
+    "source_build": false,
+    "version": "0.2.1"
+   },
+   "host": "39-gcp-h200-2",
+   "installed_utc": "2026-10-13T00:02:09Z",
+   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
+   "lock_sha256": "5b78c8a5680a073f8e634e4e48f7e4a969ece4cd3db4e08c9f6cba648fc6f55b",
+   "machine": "h200",
+   "manifest_sha256": "e4de523e85ee8435633d217878b457a3fd986769eb2806a1c2ef13a8ddb4447f",
    "observed_clocks": {
     "srv_padded_ref_30a3": {
-     "busy_samples": 107,
+     "busy_samples": 106,
      "hw_slowdown_busy_samples": 0,
      "power_cap_busy_samples": 0,
      "power_capped_busy_samples": 0,
      "power_capped_share_of_busy": 0.0,
      "power_limit_w": 700,
      "power_throttle_share_of_busy": 0.0,
-     "power_w_max": 465.69,
-     "power_w_max_busy": 465.69,
-     "power_w_mean_busy": 340.2,
-     "samples": 312,
+     "power_w_max": 461.99,
+     "power_w_max_busy": 461.99,
+     "power_w_mean_busy": 341.5,
+     "samples": 311,
      "sm_mhz_max_busy": 1980,
      "sm_mhz_mean_busy": 1980.0,
-     "sm_mhz_median_busy": 1980,
+     "sm_mhz_median_busy": 1980.0,
      "sm_mhz_min_busy": 1980,
-     "temperature_c_max": 48,
+     "temperature_c_max": 46,
      "thermal_busy_samples": 0,
      "thermal_throttle_share_of_busy": 0.0,
      "throttle_reason_busy_samples": {
@@ -2379,47 +2517,47 @@
     {
      "command": [
       "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_30a3.py",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/kit/fish_scales_ops-0.2.1-testkit-d8737b4/bench/gemm/python/bench_moe_qwen3_30a3.py",
       "--run",
       "--routing",
       "padded",
       "--impls",
       "dg_fp8_layer",
       "--out",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf_serving/ref_padded_30a3_h200.jsonl"
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/perf_serving/ref_padded_30a3_h200.jsonl"
      ],
-     "end_utc": "2026-10-10T17:03:50.096Z",
+     "end_utc": "2026-10-12T19:11:15.711Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "srv_padded_ref_30a3",
      "rows": 5,
-     "start_utc": "2026-10-10T17:02:47.712Z"
+     "start_utc": "2026-10-12T19:10:13.630Z"
     }
    ],
    "window_utc": [
-    "2026-10-10T17:02:47.712Z",
-    "2026-10-10T17:03:50.096Z"
+    "2026-10-12T19:10:13.630Z",
+    "2026-10-12T19:11:15.711Z"
    ]
   },
   "ref_moe_qwen3_30a3_skew_h200.jsonl": {
    "bench_env": {},
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "fingerprint": "6504b2765c65e8124450f35e27f738b8c83a61d87b6999ec288ea318befec8b5",
     "source": "kit"
    },
    "card": {
     "clocks_max_sm_mhz": 1980,
     "compute_mode": "Default",
     "driver": "595.58.03",
-    "index": "0",
+    "index": "3",
     "memory_total_mib": 143771,
     "name": "NVIDIA H200",
-    "pci": "00000000:8F:00.0",
+    "pci": "00000000:97:00.0",
     "power_limit_w": 700,
-    "uuid": "GPU-e87af6ea-2a7f-af85-f89f-e5a17e644ff1"
+    "uuid": "GPU-9860e51e-04ef-c66a-f09f-e3d4680ea4df"
    },
    "clock_flags": {},
    "clock_policy": {
@@ -2453,8 +2591,8 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-10T15:55:17Z",
-     "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+     "built_at": "2026-10-12T18:30:52Z",
+     "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
      "cuda_toolkit": "13.0.3",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
@@ -2475,34 +2613,34 @@
      "torch": "2.13.0+cu130",
      "version": "0.2.1"
     },
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "extension_sha256": "dfae2d579c6d36cd9c5819f19664bdd7dd0f1f25e3900090e13f9225c082f903",
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "extension_sha256": "9d6a3b09f4a324a43a3a1bce1f9214aabf26c339077271ace7c6efce85d9e79d",
     "source_build": false,
     "version": "0.2.1"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T20:07:34Z",
-   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
+   "installed_utc": "2026-10-13T00:02:09Z",
+   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
+   "lock_sha256": "5b78c8a5680a073f8e634e4e48f7e4a969ece4cd3db4e08c9f6cba648fc6f55b",
    "machine": "h200",
-   "manifest_sha256": "db9b79a0943298e594d4832f2858c54e2461e2bf0fd80e1f880b1aad87e44c75",
+   "manifest_sha256": "e4de523e85ee8435633d217878b457a3fd986769eb2806a1c2ef13a8ddb4447f",
    "observed_clocks": {
     "srv_skew_ref_30a3": {
-     "busy_samples": 232,
+     "busy_samples": 261,
      "hw_slowdown_busy_samples": 0,
-     "power_cap_busy_samples": 5,
-     "power_capped_busy_samples": 5,
-     "power_capped_share_of_busy": 0.0216,
+     "power_cap_busy_samples": 4,
+     "power_capped_busy_samples": 4,
+     "power_capped_share_of_busy": 0.0153,
      "power_limit_w": 700,
-     "power_throttle_share_of_busy": 0.0216,
-     "power_w_max": 465.27,
-     "power_w_max_busy": 465.27,
-     "power_w_mean_busy": 286.6,
-     "samples": 1119,
+     "power_throttle_share_of_busy": 0.0153,
+     "power_w_max": 462.62,
+     "power_w_max_busy": 462.62,
+     "power_w_mean_busy": 283.2,
+     "samples": 1306,
      "sm_mhz_max_busy": 1980,
-     "sm_mhz_mean_busy": 1977.7,
-     "sm_mhz_median_busy": 1980.0,
-     "sm_mhz_min_busy": 1785,
+     "sm_mhz_mean_busy": 1977.9,
+     "sm_mhz_median_busy": 1980,
+     "sm_mhz_min_busy": 1800,
      "temperature_c_max": 49,
      "thermal_busy_samples": 0,
      "thermal_throttle_share_of_busy": 0.0,
@@ -2510,15 +2648,15 @@
       "hw_power_brake": 0,
       "hw_slowdown": 0,
       "hw_thermal": 0,
-      "sw_power_cap": 5,
+      "sw_power_cap": 4,
       "sw_thermal": 0
      },
-     "throttle_share_of_busy": 0.0216
+     "throttle_share_of_busy": 0.0153
     }
    },
    "power_flags": {
     "srv_skew_ref_30a3": [
-     "the power cap held the clock in 5 of 232 busy samples (2 %); busy SM clock min 1785 MHz, mean 1977.7 MHz; busy power mean 286.6 W, max 465.27 W of the 700 W limit"
+     "the power cap held the clock in 4 of 261 busy samples (2 %); busy SM clock min 1800 MHz, mean 1977.9 MHz; busy power mean 283.2 W, max 462.62 W of the 700 W limit"
     ]
    },
    "run": "0.2.1-h200-serving",
@@ -2527,47 +2665,47 @@
     {
      "command": [
       "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_30a3.py",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/kit/fish_scales_ops-0.2.1-testkit-d8737b4/bench/gemm/python/bench_moe_qwen3_30a3.py",
       "--run",
       "--routing",
       "skew",
       "--impls",
       "triton_fp8b,dg_fp8_layer",
       "--out",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf_serving/ref_skew_30a3_h200.jsonl"
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/perf_serving/ref_skew_30a3_h200.jsonl"
      ],
-     "end_utc": "2026-10-10T16:57:23.791Z",
+     "end_utc": "2026-10-12T19:03:55.497Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "srv_skew_ref_30a3",
-     "rows": 22,
-     "start_utc": "2026-10-10T16:53:39.848Z"
+     "rows": 26,
+     "start_utc": "2026-10-12T18:59:34.157Z"
     }
    ],
    "window_utc": [
-    "2026-10-10T16:53:39.848Z",
-    "2026-10-10T16:57:23.791Z"
+    "2026-10-12T18:59:34.157Z",
+    "2026-10-12T19:03:55.497Z"
    ]
   },
   "ref_moe_qwen3_35a3_ep2_h200.jsonl": {
    "bench_env": {},
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "fingerprint": "6504b2765c65e8124450f35e27f738b8c83a61d87b6999ec288ea318befec8b5",
     "source": "kit"
    },
    "card": {
     "clocks_max_sm_mhz": 1980,
     "compute_mode": "Default",
     "driver": "595.58.03",
-    "index": "0",
+    "index": "3",
     "memory_total_mib": 143771,
     "name": "NVIDIA H200",
-    "pci": "00000000:8F:00.0",
+    "pci": "00000000:97:00.0",
     "power_limit_w": 700,
-    "uuid": "GPU-e87af6ea-2a7f-af85-f89f-e5a17e644ff1"
+    "uuid": "GPU-9860e51e-04ef-c66a-f09f-e3d4680ea4df"
    },
    "clock_flags": {},
    "clock_policy": {
@@ -2601,8 +2739,8 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-10T15:55:17Z",
-     "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+     "built_at": "2026-10-12T18:30:52Z",
+     "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
      "cuda_toolkit": "13.0.3",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
@@ -2623,33 +2761,33 @@
      "torch": "2.13.0+cu130",
      "version": "0.2.1"
     },
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "extension_sha256": "dfae2d579c6d36cd9c5819f19664bdd7dd0f1f25e3900090e13f9225c082f903",
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "extension_sha256": "9d6a3b09f4a324a43a3a1bce1f9214aabf26c339077271ace7c6efce85d9e79d",
     "source_build": false,
     "version": "0.2.1"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T20:07:34Z",
-   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
+   "installed_utc": "2026-10-13T00:02:09Z",
+   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
+   "lock_sha256": "5b78c8a5680a073f8e634e4e48f7e4a969ece4cd3db4e08c9f6cba648fc6f55b",
    "machine": "h200",
-   "manifest_sha256": "db9b79a0943298e594d4832f2858c54e2461e2bf0fd80e1f880b1aad87e44c75",
+   "manifest_sha256": "e4de523e85ee8435633d217878b457a3fd986769eb2806a1c2ef13a8ddb4447f",
    "observed_clocks": {
     "srv_ep2_ref_35a3": {
-     "busy_samples": 229,
+     "busy_samples": 254,
      "hw_slowdown_busy_samples": 0,
      "power_cap_busy_samples": 0,
      "power_capped_busy_samples": 0,
      "power_capped_share_of_busy": 0.0,
      "power_limit_w": 700,
      "power_throttle_share_of_busy": 0.0,
-     "power_w_max": 465.68,
-     "power_w_max_busy": 465.68,
-     "power_w_mean_busy": 270.8,
-     "samples": 1111,
+     "power_w_max": 463.3,
+     "power_w_max_busy": 463.3,
+     "power_w_mean_busy": 275.2,
+     "samples": 1308,
      "sm_mhz_max_busy": 1980,
      "sm_mhz_mean_busy": 1980.0,
-     "sm_mhz_median_busy": 1980,
+     "sm_mhz_median_busy": 1980.0,
      "sm_mhz_min_busy": 1980,
      "temperature_c_max": 47,
      "thermal_busy_samples": 0,
@@ -2671,7 +2809,7 @@
     {
      "command": [
       "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/kit/fish_scales_ops-0.2.1-testkit-d8737b4/bench/gemm/python/bench_moe_qwen3_35a3.py",
       "--run",
       "--routing",
       "ep",
@@ -2680,166 +2818,40 @@
       "--impls",
       "triton_fp8b,dg_fp8_layer",
       "--out",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf_serving/ref_ep2_35a3_h200.jsonl"
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/perf_serving/ref_ep2_35a3_h200.jsonl"
      ],
-     "end_utc": "2026-10-10T17:14:17.830Z",
+     "end_utc": "2026-10-12T19:23:13.924Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "srv_ep2_ref_35a3",
-     "rows": 22,
-     "start_utc": "2026-10-10T17:10:35.410Z"
+     "rows": 26,
+     "start_utc": "2026-10-12T19:18:52.103Z"
     }
    ],
    "window_utc": [
-    "2026-10-10T17:10:35.410Z",
-    "2026-10-10T17:14:17.830Z"
+    "2026-10-12T19:18:52.103Z",
+    "2026-10-12T19:23:13.924Z"
    ]
   },
   "ref_moe_qwen3_35a3_h200.jsonl": {
    "bench_env": {},
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "18e4b67bb9ec243f0fc33f5ecad2df0725dae7d6",
-    "fingerprint": "e76a0e65b6535e0a82bbb7dcc20362463497b465b741ec310b3abe8a7b8d7f9e",
+    "commit": "ec578dd655c184e75c91f6eebb517021ef955589",
+    "fingerprint": "c4d699eea5a7042b8fb6bc140961ed147994c8ef9eb0bd09a91f8bbc1e468448",
     "source": "kit"
    },
    "card": {
     "clocks_max_sm_mhz": 1980,
     "compute_mode": "Default",
     "driver": "595.58.03",
-    "index": "0",
+    "index": "3",
     "memory_total_mib": 143771,
     "name": "NVIDIA H200",
-    "pci": "00000000:8F:00.0",
+    "pci": "00000000:97:00.0",
     "power_limit_w": 700,
-    "uuid": "GPU-e87af6ea-2a7f-af85-f89f-e5a17e644ff1"
-   },
-   "clock_flags": {},
-   "clock_policy": {
-    "applied": "nothing: natural clock",
-    "max_sm_mhz": 1980,
-    "mhz": null,
-    "mode": "natural"
-   },
-   "drift_accepted": [],
-   "driver": "595.58.03",
-   "environments": {
-    "main": {
-     "packages": {
-      "flashinfer-python": "0.6.18",
-      "numpy": "2.3.5",
-      "nvidia-cublas": "13.1.1.3",
-      "nvidia-cuda-nvrtc": "13.0.88",
-      "nvidia-cudnn-cu13": "9.20.0.48",
-      "nvidia-cudnn-frontend": "1.30.0",
-      "nvidia-cutlass-dsl": "4.6.2",
-      "sgl-deep-gemm": "0.2.0+cu130",
-      "sglang": "0.5.20",
-      "sglang-kernel": "0.4.7+cu130",
-      "torch": "2.13.0+cu130",
-      "triton": "3.7.1"
-     },
-     "python": "/home/stone/venvs/apex-0520/bin/python",
-     "python_version": "3.12.3"
-    }
-   },
-   "fso": {
-    "build_info": {
-     "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-05T04:22:09Z",
-     "commit": "37e316bc3febff51427dd956305e076f467b402a",
-     "cuda_toolkit": "13.2.1",
-     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
-     "dirty": false,
-     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
-     "glibc_required": "GLIBC_2.34",
-     "image": {
-      "base": "nvidia/cuda:13.2.1-devel-ubuntu22.04@sha256:3805e62773832c404db8785c63190aaba49bff02bb199b0d187ab897170c6cd1",
-      "id": "sha256:eb44d6a2d3470cd65a712b7c631a5fad4b6ff6cdeff54a78ec11385f6c6bb885",
-      "name": "fso-build-wheel:3536082a1d73"
-     },
-     "nvcc": "Cuda compilation tools, release 13.2, V13.2.78",
-     "nvrtc": {
-      "sha256": "a9049031da08cbedd0c20e3470e5a978dc330af0e0326b3b05774718c665dc3e",
-      "version": "13.2.78",
-      "wheel": "nvidia_cuda_nvrtc-13.2.78-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
-     },
-     "python": "CPython 3.12.15",
-     "torch": "2.13.0+cu130",
-     "version": "0.2.0"
-    },
-    "commit": "37e316bc3febff51427dd956305e076f467b402a",
-    "extension_sha256": "801f51e6cf79de8444196b7a448995bb3685e202b7038d2f0bc54e315663ecf4",
-    "source_build": false,
-    "version": "0.2.0"
-   },
-   "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-05T12:28:49Z",
-   "jit_compiler_sm90": "NVRTC 13.2 (/data/bench-runs/fso_release_0.2.0_20261005/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "4f4f7d998694057ba132ed40df623fa82161b5ddf8bc24045f10b2867dc67923",
-   "machine": "h200",
-   "manifest_sha256": "7f37aeef169a7e7f4f9df44730193e44b0dd497fdd79071e2088891b059e5690",
-   "observed_clocks": {
-    "ref_35a3": {
-     "busy_samples": 415,
-     "hw_slowdown_busy_samples": 0,
-     "power_capped_busy_samples": 12,
-     "power_capped_share_of_busy": 0.0289,
-     "power_w_max": 475.65,
-     "samples": 1942,
-     "sm_mhz_max_busy": 1980,
-     "sm_mhz_median_busy": 1980,
-     "sm_mhz_min_busy": 1710,
-     "temperature_c_max": 50,
-     "thermal_busy_samples": 0
-    }
-   },
-   "run": "h200-cmp-pdl",
-   "run_dir": "/data/bench-runs/fso_release_0.2.0_20261005/runs/h200-cmp-pdl",
-   "steps": [
-    {
-     "command": [
-      "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_release_0.2.0_20261005/kits/kit-18e4b67/bench/gemm/python/bench_moe_qwen3_35a3.py",
-      "--run",
-      "--impls",
-      "triton_bf16,triton_fp8b,dg_fp8_layer",
-      "--out",
-      "/data/bench-runs/fso_release_0.2.0_20261005/runs/h200-cmp-pdl/ref_new_35a3_h200.jsonl"
-     ],
-     "end_utc": "2026-10-05T12:23:58.806Z",
-     "env": "main",
-     "error_rows": 0,
-     "exit_code": 0,
-     "name": "ref_35a3",
-     "rows": 36,
-     "start_utc": "2026-10-05T12:17:30.205Z"
-    }
-   ],
-   "window_utc": [
-    "2026-10-05T12:17:30.205Z",
-    "2026-10-05T12:23:58.806Z"
-   ]
-  },
-  "ref_moe_qwen3_35a3_padded_h200.jsonl": {
-   "bench_env": {},
-   "bench_tree": {
-    "bench_dirty": null,
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
-    "source": "kit"
-   },
-   "card": {
-    "clocks_max_sm_mhz": 1980,
-    "compute_mode": "Default",
-    "driver": "595.58.03",
-    "index": "0",
-    "memory_total_mib": 143771,
-    "name": "NVIDIA H200",
-    "pci": "00000000:8F:00.0",
-    "power_limit_w": 700,
-    "uuid": "GPU-e87af6ea-2a7f-af85-f89f-e5a17e644ff1"
+    "uuid": "GPU-9860e51e-04ef-c66a-f09f-e3d4680ea4df"
    },
    "clock_flags": {},
    "clock_policy": {
@@ -2901,29 +2913,175 @@
     "version": "0.2.1"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T20:07:34Z",
+   "installed_utc": "2026-10-13T00:02:10Z",
    "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
+   "lock_sha256": "5b78c8a5680a073f8e634e4e48f7e4a969ece4cd3db4e08c9f6cba648fc6f55b",
    "machine": "h200",
-   "manifest_sha256": "db9b79a0943298e594d4832f2858c54e2461e2bf0fd80e1f880b1aad87e44c75",
+   "manifest_sha256": "ec00070be57a3cb9a663950d1b5acb914849c34c18b9753d0100637118f9f6a9",
+   "observed_clocks": {
+    "ref_35a3": {
+     "busy_samples": 467,
+     "hw_slowdown_busy_samples": 0,
+     "power_cap_busy_samples": 13,
+     "power_capped_busy_samples": 13,
+     "power_capped_share_of_busy": 0.0278,
+     "power_limit_w": 700,
+     "power_throttle_share_of_busy": 0.0278,
+     "power_w_max": 474.35,
+     "power_w_max_busy": 474.35,
+     "power_w_mean_busy": 297.4,
+     "samples": 2305,
+     "sm_mhz_max_busy": 1980,
+     "sm_mhz_mean_busy": 1976.9,
+     "sm_mhz_median_busy": 1980,
+     "sm_mhz_min_busy": 1710,
+     "temperature_c_max": 50,
+     "thermal_busy_samples": 0,
+     "thermal_throttle_share_of_busy": 0.0,
+     "throttle_reason_busy_samples": {
+      "hw_power_brake": 0,
+      "hw_slowdown": 0,
+      "hw_thermal": 0,
+      "sw_power_cap": 13,
+      "sw_thermal": 0
+     },
+     "throttle_share_of_busy": 0.0278
+    }
+   },
+   "power_flags": {
+    "ref_35a3": [
+     "the power cap held the clock in 13 of 467 busy samples (3 %); busy SM clock min 1710 MHz, mean 1976.9 MHz; busy power mean 297.4 W, max 474.35 W of the 700 W limit"
+    ]
+   },
+   "run": "0.2.1-h200-cmp",
+   "run_dir": "/data/bench-runs/fso_0.2.1_20261010/S12/runs/0.2.1-h200-cmp",
+   "steps": [
+    {
+     "command": [
+      "/home/stone/venvs/apex-0520/bin/python",
+      "/home/stone/workspace/standalone/fso-021-kit-ec578dd/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "--run",
+      "--impls",
+      "triton_bf16,triton_fp8b,dg_fp8_layer",
+      "--out",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/ref-h200-ec578dd/ref_new_35a3_h200.jsonl"
+     ],
+     "end_utc": "2026-10-12T15:32:52.605Z",
+     "env": "main",
+     "error_rows": 0,
+     "exit_code": 0,
+     "name": "ref_35a3",
+     "rows": 43,
+     "start_utc": "2026-10-12T15:25:11.345Z"
+    }
+   ],
+   "window_utc": [
+    "2026-10-12T15:25:11.345Z",
+    "2026-10-12T15:32:52.605Z"
+   ]
+  },
+  "ref_moe_qwen3_35a3_padded_h200.jsonl": {
+   "bench_env": {},
+   "bench_tree": {
+    "bench_dirty": null,
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "fingerprint": "6504b2765c65e8124450f35e27f738b8c83a61d87b6999ec288ea318befec8b5",
+    "source": "kit"
+   },
+   "card": {
+    "clocks_max_sm_mhz": 1980,
+    "compute_mode": "Default",
+    "driver": "595.58.03",
+    "index": "3",
+    "memory_total_mib": 143771,
+    "name": "NVIDIA H200",
+    "pci": "00000000:97:00.0",
+    "power_limit_w": 700,
+    "uuid": "GPU-9860e51e-04ef-c66a-f09f-e3d4680ea4df"
+   },
+   "clock_flags": {},
+   "clock_policy": {
+    "applied": "nothing: natural clock",
+    "max_sm_mhz": 1980,
+    "mhz": null,
+    "mode": "natural"
+   },
+   "drift_accepted": [],
+   "driver": "595.58.03",
+   "environments": {
+    "main": {
+     "packages": {
+      "flashinfer-python": "0.6.18",
+      "numpy": "2.3.5",
+      "nvidia-cublas": "13.1.1.3",
+      "nvidia-cuda-nvrtc": "13.0.88",
+      "nvidia-cudnn-cu13": "9.20.0.48",
+      "nvidia-cudnn-frontend": "1.30.0",
+      "nvidia-cutlass-dsl": "4.6.2",
+      "sgl-deep-gemm": "0.2.0+cu130",
+      "sglang": "0.5.20",
+      "sglang-kernel": "0.4.7+cu130",
+      "torch": "2.13.0+cu130",
+      "triton": "3.7.1"
+     },
+     "python": "/home/stone/venvs/apex-0520/bin/python",
+     "python_version": "3.12.3"
+    }
+   },
+   "fso": {
+    "build_info": {
+     "arch_list": "9.0a;10.0f;12.0a",
+     "built_at": "2026-10-12T18:30:52Z",
+     "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+     "cuda_toolkit": "13.0.3",
+     "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+     "dirty": false,
+     "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0",
+     "glibc_required": "GLIBC_2.34",
+     "image": {
+      "base": "nvidia/cuda:13.0.3-devel-ubuntu22.04@sha256:3869b846a8cc495ce11c172d87cfc0da8874b910d14a9810bec6b6182e9ee9f8",
+      "id": "sha256:89b1122cd2c09d011fcc2e61ef185e6593878210a911704aec5bcd0f3e36ef05",
+      "name": "fso-build-wheel:7014ca7ac32a"
+     },
+     "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
+     "nvrtc": {
+      "sha256": "ad9b6d2ead2435f11cbb6868809d2adeeee302e9bb94bcf0539c7a40d80e8575",
+      "version": "13.0.88",
+      "wheel": "nvidia_cuda_nvrtc-13.0.88-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+     },
+     "python": "CPython 3.12.15",
+     "torch": "2.13.0+cu130",
+     "version": "0.2.1"
+    },
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "extension_sha256": "9d6a3b09f4a324a43a3a1bce1f9214aabf26c339077271ace7c6efce85d9e79d",
+    "source_build": false,
+    "version": "0.2.1"
+   },
+   "host": "39-gcp-h200-2",
+   "installed_utc": "2026-10-13T00:02:09Z",
+   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
+   "lock_sha256": "5b78c8a5680a073f8e634e4e48f7e4a969ece4cd3db4e08c9f6cba648fc6f55b",
+   "machine": "h200",
+   "manifest_sha256": "e4de523e85ee8435633d217878b457a3fd986769eb2806a1c2ef13a8ddb4447f",
    "observed_clocks": {
     "srv_padded_ref_35a3": {
-     "busy_samples": 183,
+     "busy_samples": 173,
      "hw_slowdown_busy_samples": 0,
      "power_cap_busy_samples": 0,
      "power_capped_busy_samples": 0,
      "power_capped_share_of_busy": 0.0,
      "power_limit_w": 700,
      "power_throttle_share_of_busy": 0.0,
-     "power_w_max": 475.16,
-     "power_w_max_busy": 475.16,
-     "power_w_mean_busy": 360.3,
-     "samples": 386,
+     "power_w_max": 472.98,
+     "power_w_max_busy": 472.98,
+     "power_w_mean_busy": 371.8,
+     "samples": 387,
      "sm_mhz_max_busy": 1980,
      "sm_mhz_mean_busy": 1980.0,
      "sm_mhz_median_busy": 1980,
      "sm_mhz_min_busy": 1980,
-     "temperature_c_max": 50,
+     "temperature_c_max": 49,
      "thermal_busy_samples": 0,
      "thermal_throttle_share_of_busy": 0.0,
      "throttle_reason_busy_samples": {
@@ -2943,47 +3101,47 @@
     {
      "command": [
       "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/kit/fish_scales_ops-0.2.1-testkit-d8737b4/bench/gemm/python/bench_moe_qwen3_35a3.py",
       "--run",
       "--routing",
       "padded",
       "--impls",
       "dg_fp8_layer",
       "--out",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf_serving/ref_padded_35a3_h200.jsonl"
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/perf_serving/ref_padded_35a3_h200.jsonl"
      ],
-     "end_utc": "2026-10-10T17:05:39.281Z",
+     "end_utc": "2026-10-12T19:13:05.418Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "srv_padded_ref_35a3",
      "rows": 5,
-     "start_utc": "2026-10-10T17:04:22.078Z"
+     "start_utc": "2026-10-12T19:11:48.065Z"
     }
    ],
    "window_utc": [
-    "2026-10-10T17:04:22.078Z",
-    "2026-10-10T17:05:39.281Z"
+    "2026-10-12T19:11:48.065Z",
+    "2026-10-12T19:13:05.418Z"
    ]
   },
   "ref_moe_qwen3_35a3_skew_h200.jsonl": {
    "bench_env": {},
    "bench_tree": {
     "bench_dirty": null,
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "fingerprint": "27d55b98b5ab91f47fffd525bfc18c6883a9f58cf0432e261291732e1770a373",
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "fingerprint": "6504b2765c65e8124450f35e27f738b8c83a61d87b6999ec288ea318befec8b5",
     "source": "kit"
    },
    "card": {
     "clocks_max_sm_mhz": 1980,
     "compute_mode": "Default",
     "driver": "595.58.03",
-    "index": "0",
+    "index": "3",
     "memory_total_mib": 143771,
     "name": "NVIDIA H200",
-    "pci": "00000000:8F:00.0",
+    "pci": "00000000:97:00.0",
     "power_limit_w": 700,
-    "uuid": "GPU-e87af6ea-2a7f-af85-f89f-e5a17e644ff1"
+    "uuid": "GPU-9860e51e-04ef-c66a-f09f-e3d4680ea4df"
    },
    "clock_flags": {},
    "clock_policy": {
@@ -3017,8 +3175,8 @@
    "fso": {
     "build_info": {
      "arch_list": "9.0a;10.0f;12.0a",
-     "built_at": "2026-10-10T15:55:17Z",
-     "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
+     "built_at": "2026-10-12T18:30:52Z",
+     "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
      "cuda_toolkit": "13.0.3",
      "cutlass_commit": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
      "dirty": false,
@@ -3039,50 +3197,50 @@
      "torch": "2.13.0+cu130",
      "version": "0.2.1"
     },
-    "commit": "55f138ceb4d6e9e33844c969bcc606191d5c53e9",
-    "extension_sha256": "dfae2d579c6d36cd9c5819f19664bdd7dd0f1f25e3900090e13f9225c082f903",
+    "commit": "d8737b43de14d14b6069817f0eae442f511d8a0f",
+    "extension_sha256": "9d6a3b09f4a324a43a3a1bce1f9214aabf26c339077271ace7c6efce85d9e79d",
     "source_build": false,
     "version": "0.2.1"
    },
    "host": "39-gcp-h200-2",
-   "installed_utc": "2026-10-10T20:07:34Z",
-   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
-   "lock_sha256": "72a0304b8fc77293a9d2424f4215a32b82ef9c8e9a408b8c6ec21b3119c82e8e",
+   "installed_utc": "2026-10-13T00:02:09Z",
+   "jit_compiler_sm90": "NVRTC 13.0 (/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/site/fish_scales_ops/_nvrtc/libnvrtc.so.13)",
+   "lock_sha256": "5b78c8a5680a073f8e634e4e48f7e4a969ece4cd3db4e08c9f6cba648fc6f55b",
    "machine": "h200",
-   "manifest_sha256": "db9b79a0943298e594d4832f2858c54e2461e2bf0fd80e1f880b1aad87e44c75",
+   "manifest_sha256": "e4de523e85ee8435633d217878b457a3fd986769eb2806a1c2ef13a8ddb4447f",
    "observed_clocks": {
     "srv_skew_ref_35a3": {
-     "busy_samples": 353,
+     "busy_samples": 406,
      "hw_slowdown_busy_samples": 0,
-     "power_cap_busy_samples": 5,
-     "power_capped_busy_samples": 5,
-     "power_capped_share_of_busy": 0.0142,
+     "power_cap_busy_samples": 6,
+     "power_capped_busy_samples": 6,
+     "power_capped_share_of_busy": 0.0148,
      "power_limit_w": 700,
-     "power_throttle_share_of_busy": 0.0142,
-     "power_w_max": 475.74,
-     "power_w_max_busy": 475.74,
-     "power_w_mean_busy": 322.2,
-     "samples": 1242,
+     "power_throttle_share_of_busy": 0.0148,
+     "power_w_max": 473.61,
+     "power_w_max_busy": 473.61,
+     "power_w_mean_busy": 319.0,
+     "samples": 1482,
      "sm_mhz_max_busy": 1980,
-     "sm_mhz_mean_busy": 1978.4,
-     "sm_mhz_median_busy": 1980,
-     "sm_mhz_min_busy": 1785,
-     "temperature_c_max": 51,
+     "sm_mhz_mean_busy": 1978.9,
+     "sm_mhz_median_busy": 1980.0,
+     "sm_mhz_min_busy": 1800,
+     "temperature_c_max": 49,
      "thermal_busy_samples": 0,
      "thermal_throttle_share_of_busy": 0.0,
      "throttle_reason_busy_samples": {
       "hw_power_brake": 0,
       "hw_slowdown": 0,
       "hw_thermal": 0,
-      "sw_power_cap": 5,
+      "sw_power_cap": 6,
       "sw_thermal": 0
      },
-     "throttle_share_of_busy": 0.0142
+     "throttle_share_of_busy": 0.0148
     }
    },
    "power_flags": {
     "srv_skew_ref_35a3": [
-     "the power cap held the clock in 5 of 353 busy samples (1 %); busy SM clock min 1785 MHz, mean 1978.4 MHz; busy power mean 322.2 W, max 475.74 W of the 700 W limit"
+     "the power cap held the clock in 6 of 406 busy samples (1 %); busy SM clock min 1800 MHz, mean 1978.9 MHz; busy power mean 319.0 W, max 473.61 W of the 700 W limit"
     ]
    },
    "run": "0.2.1-h200-serving",
@@ -3091,27 +3249,27 @@
     {
      "command": [
       "/home/stone/venvs/apex-0520/bin/python",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/suite/kit/fish_scales_ops-0.2.1-testkit-55f138c/bench/gemm/python/bench_moe_qwen3_35a3.py",
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/suite/kit/fish_scales_ops-0.2.1-testkit-d8737b4/bench/gemm/python/bench_moe_qwen3_35a3.py",
       "--run",
       "--routing",
       "skew",
       "--impls",
       "triton_fp8b,dg_fp8_layer",
       "--out",
-      "/data/bench-runs/fso_0.2.1_20261010/S12/run-55f138c/h200/perf_serving/ref_skew_35a3_h200.jsonl"
+      "/data/bench-runs/fso_0.2.1_20261010/S12/run-d8737b4/h200/perf_serving/ref_skew_35a3_h200.jsonl"
      ],
-     "end_utc": "2026-10-10T17:02:18.104Z",
+     "end_utc": "2026-10-12T19:09:43.828Z",
      "env": "main",
      "error_rows": 0,
      "exit_code": 0,
      "name": "srv_skew_ref_35a3",
-     "rows": 22,
-     "start_utc": "2026-10-10T16:58:09.619Z"
+     "rows": 26,
+     "start_utc": "2026-10-12T19:04:47.270Z"
     }
    ],
    "window_utc": [
-    "2026-10-10T16:58:09.619Z",
-    "2026-10-10T17:02:18.104Z"
+    "2026-10-12T19:04:47.270Z",
+    "2026-10-12T19:09:43.828Z"
    ]
   }
  },

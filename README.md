@@ -117,24 +117,24 @@ in [`docs/perf/`](docs/perf/README.md).
 
 | family            | op                                             | shape                                                        | M / S  | dtype           |     µs | TFLOPS |
 |-------------------|------------------------------------------------|--------------------------------------------------------------|--------|-----------------|-------:|-------:|
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | block-FP8 1×128 |  17.40 |      6 |
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 373.12 |   1094 |
-| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | block-FP8 1×128 |   20.9 |    3.6 |
-| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | block-FP8 1×128 |  331.9 |  465.9 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | block-FP8 1×128 |   29.3 |    1.9 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | block-FP8 1×128 |  361.8 |  320.5 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | block-FP8 1×128 |  17.38 |      6 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 333.39 |   1224 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | block-FP8 1×128 |   20.1 |    3.8 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | block-FP8 1×128 |  331.7 |  466.1 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | block-FP8 1×128 |   27.6 |    2.1 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | block-FP8 1×128 |  360.4 |  321.8 |
 
 ### sm_120 — NVIDIA RTX 5090 (170 SMs, 2400 MHz locked)
 
 | family            | op                                             | shape                                                        | M / S  | dtype           |     µs | TFLOPS |
 |-------------------|------------------------------------------------|--------------------------------------------------------------|--------|-----------------|-------:|-------:|
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | MXFP8 1×32      |  35.66 |      3 |
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | MXFP8 1×32      | 663.23 |    615 |
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 648.54 |    629 |
-| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | MXFP8 1×32      |   32.6 |    2.3 |
-| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | MXFP8 1×32      |  560.2 |  276.0 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | MXFP8 1×32      |   39.3 |    1.4 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | MXFP8 1×32      |  712.9 |  162.7 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | MXFP8 1×32      |  35.69 |      3 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | MXFP8 1×32      | 661.10 |    617 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 645.76 |    632 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | MXFP8 1×32      |   32.7 |    2.3 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | MXFP8 1×32      |  546.4 |  283.0 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | MXFP8 1×32      |   39.4 |    1.4 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | MXFP8 1×32      |  703.0 |  165.0 |
 
 ## TODO
 
@@ -142,17 +142,24 @@ Open items after 0.2.1: the known issues of [`CHANGELOG.md`](CHANGELOG.md),
 whose measured gaps are in the summaries of [`docs/perf/`](docs/perf/README.md),
 two planned items, and two build items.
 
-- **H200 MoE layer at some decode batch sizes**, against sglang's Triton FP8 MoE layer
-  ([`docs/perf/layer/sm90.md`](docs/perf/layer/sm90.md), Families B and C).
-- **H200 dense MLP block at M = 64–256 and from M = 1024 up**, against sglang's block-FP8 linear (DeepGEMM)
-  ([`docs/perf/layer/sm90.md`](docs/perf/layer/sm90.md), Family A).
-- **RTX 5090 Family C MoE layer at M = 64, 512 and 1024**, against the Triton FP8 MoE layers of vLLM and sglang
-  ([`docs/perf/layer/sm120.md`](docs/perf/layer/sm120.md), Family C).
-- **RTX 5090 Family C MoE block at M = 1** with the shared expert added after the routed layer, against 0.2.0
+- **H200 dense MLP block at M = 96, 160 and 192 (6–12 %) and at M = 64, 128, 256, 1024 and 8192 (1–3 %)**, against
+  sglang's block-FP8 linear (DeepGEMM) ([`docs/perf/layer/sm90.md`](docs/perf/layer/sm90.md), Family A).
+  Candidates: a fused SwiGLU and 1×128 quantize kernel, and a DeepGEMM tile order whose L2 traffic does not depend
+  on the SMs that the early-started GEMM's thread blocks land on.
+- **H200 MoE layer under one-EP-rank routing at M = 2048 (Family B) and M = 8192 (Family C)**, against 0.2.0
   ([`CHANGELOG.md`](CHANGELOG.md), 0.2.1 known issues).
-- **Blackwell dense MLP block at some batch sizes**, against sglang's DeepGEMM linear on the B300 and vLLM's on the
-  RTX 5090 ([`docs/perf/layer/sm100.md`](docs/perf/layer/sm100.md),
-  [`docs/perf/layer/sm120.md`](docs/perf/layer/sm120.md), Family A).
+- **RTX 5090 Family C MoE layer at M = 64**, against vLLM's Triton FP8 MoE layer, and at M = 1024 under skewed
+  routing against sglang's ([`docs/perf/layer/sm120.md`](docs/perf/layer/sm120.md), Family C).
+- **RTX 5090 Family C MoE at M = 1 and 2 against 0.2.0**: the routed layer at M = 2 and the block with the shared
+  expert added after the routed layer at M = 1 ([`CHANGELOG.md`](CHANGELOG.md), 0.2.1 known issues).
+- **Blackwell dense MLP block at one batch size each**: M = 96 on the B300 against sglang's DeepGEMM linear, M = 1024
+  on the RTX 5090 against vLLM's ([`docs/perf/layer/sm100.md`](docs/perf/layer/sm100.md),
+  [`docs/perf/layer/sm120.md`](docs/perf/layer/sm120.md), Family A). On the B300 the 2560-wide down projection at
+  96–112 tokens needs a swap-AB kernel with small token tiles, or a split-K that reduces inside the cluster.
+- **The direct block-FP8 GEMM on Blackwell** (`fso.compat.linear_fp8`), against sglang's DeepGEMM linear on the
+  B300 (16–21 % from M = 32 to M = 192) and vLLM's on the RTX 5090 (5–14 % from M = 512). `fso.dense` serves
+  block-FP8 checkpoints through the MXFP8 path there; this item concerns callers who pass block-FP8 operands
+  themselves. Candidates on the B300: the path's own 1×128 activation quantizer and its cuBLAS launches.
 - **MoE layer transient memory at decode batch sizes.** On Blackwell the compact layout reserves a whole 128-row
   block for every expert that can receive a row, so at decode-band M one call's transient
   (`fso.moe.transient_bytes`) is several times that of trtllm-gen's and Triton's MoE layers. Candidates: store the
