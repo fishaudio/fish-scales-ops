@@ -2,6 +2,57 @@
 
 Performance figures are in `docs/perf/`, not here.
 
+## 0.2.2 — 2026-10-15
+
+A patch release: one fix, no API change, no new kernel.
+
+### Fixed
+
+- **sm_120/sm_121: wrong (sometimes non-finite) rows from the MoE layer and the dense GEMMs under same-context
+  concurrency (#11).** Affected were sm_120 callers whose fish-scales-ops GEMMs ran while kernels of another stream
+  of the same CUDA context shared the SMs, for example auxiliary kernels on a high-priority side stream next to a
+  CUDA-graph forward; a second process never triggered it, and neither did a GEMM running alone. The sm_120
+  block-scaled GEMM kernel released each TMA-filled shared-memory stage right after issuing its `ldmatrix` /
+  `ld.shared` reads of it, with no `fence.proxy.async` between the reads and the release, so the producer's next TMA
+  write could overwrite the stage before a delayed read had completed. When CTAs of another kernel on the same SM
+  delayed those reads, some 8x8 fragments of the weight operand were taken from the next k-tile, which made 8- to
+  96-column windows of one expert's rows wrong in FC2 (non-finite when the wrong bytes met a large scale) and, through
+  a wrong SwiGLU block in FC1, a small error over whole rows. The kernel now executes `fence.proxy.async.shared::cta`
+  before every stage release. The dense FP8 and MXFP8 GEMMs on sm_120 share the kernel and are fixed by the same
+  change. Outputs are unchanged bit for bit. The issue's script, unchanged, went from about 1 wrong replay in 3,500 to
+  0 in 332,148 with its high-priority interferer and 0 in 130,640 without.
+
+### Not affected
+
+sm_90 (H200) and sm_100/sm_103 (B300) are not affected, and their kernels are unchanged. The race needs a
+generic-proxy read of a TMA-filled operand stage that the stage's release does not wait for; on sm_120 that read is
+the `ldmatrix` of the A/B tiles, because `mma.sync` takes its operands from registers. On sm_90 the WGMMA reads the
+A/B tiles from shared memory itself, through descriptors, in the async proxy that the TMA writes in, and the stage
+is released only after `warpgroup_wait<0>()`, that is, after the WGMMA has finished reading it; on sm_100/sm_103 the
+tcgen05 UMMA reads shared memory and the stage is released by its commit. So the race fixed here cannot occur on
+their operand paths. The only generic-proxy reads of a TMA-filled stage on sm_90 are the per-stage scale factors, a
+few floats read with `ld.shared` before the WGMMA batch is issued, whose release is not formally ordered after the
+load (no proxy fence; as in upstream DeepGEMM) but follows a whole WGMMA batch; a stress test of the 0.2.1 kernels
+on an H200 under the issue's conditions found no wrong output in 4,205,661 compared replays, and a per-stage proxy
+fence there cost the H200 dense tables 2–3 % at the median and up to 9 % on the narrow-N decode GEMMs, so the sm_90
+kernels are left as they are (README TODO).
+
+### Known issues
+
+- **RTX 5090: the fence costs a fixed amount per pipeline stage, so the shortest GEMMs pay the most.** Against
+  0.2.1, the narrow-N decode projections (wo, gdn.out_proj, shared_gate_up, shared_down) are up to 5.6 % slower,
+  every other dense and MoE cell stays within 2.3 %, and the table medians move by 0.03 to 0.62 %. The per-cell
+  numbers are in `docs/perf/`; winning the cost back elsewhere is in the README TODO.
+
+The H200 and B300 tables are 0.2.1's: the H200 runs the same sm_90 machine code, and the B300's sm_100/sm_103
+kernels are byte-identical to 0.2.1's.
+
+### Install
+
+As 0.2.1: install the wheel attached to the GitHub release with `pip install --no-deps` into an environment with
+torch 2.13.0+cu130. After upgrading, a caller that serialized its auxiliary streams with the forward because of #11
+can remove that serialization.
+
 ## 0.2.1 — 2026-10-13
 
 ### Changed (no action needed; reservations get smaller)

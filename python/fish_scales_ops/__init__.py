@@ -55,7 +55,7 @@ from . import attention, compat, dense, gemm, moe  # noqa: E402
 
 __all__ = ["dense", "moe", "attention", "compat", "build_info"]
 
-__version__ = "0.2.1"  # keep in step with python/pyproject.toml
+__version__ = "0.2.2"  # keep in step with python/pyproject.toml
 
 
 def build_info() -> dict:

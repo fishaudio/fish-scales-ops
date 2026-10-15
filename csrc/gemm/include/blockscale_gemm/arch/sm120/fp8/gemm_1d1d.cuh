@@ -272,6 +272,24 @@ struct SM120BlockScaledKernel
     static_assert(kPreWaitBStages >= 0 && kPreWaitBStages <= KT::AB_Stages,
         "the pre-wait B copies belong to the first round of AB_Stages stages");
 
+    // A math thread hands a shared-memory stage (A/B or SFA/SFB) back to the TMA producer
+    // once it has issued its shared-to-register copies of that stage. Those copies
+    // (ldmatrix / ld.shared) are generic-proxy reads; the producer's next copy into the
+    // stage is an async-proxy (TMA) write. The PTX memory model orders the two only through
+    // a fence.proxy.async between the reads and the release, so the fence comes first.
+    // Without it the arrive does not wait for the loads: the 0.2.1 SASS issued every
+    // SYNCS.ARRIVE with an empty wait mask while the stage's LDSM / LDS were still
+    // outstanding, and when other kernels' CTAs on the same SM delayed those loads, the
+    // producer's TMA overwrote the stage first and some 8x8 ldmatrix fragments came from
+    // the next k-tile (issue #11: wrong 8-64-column windows of a tile, occasionally NaN, on
+    // the RTX 5090 while another stream of the same context ran kernels).
+    template <class Barrier>
+    CUTE_DEVICE static void release_stage(Barrier& empty_barrier)
+    {
+        cutlass::arch::fence_view_async_shared();
+        empty_barrier.arrive();
+    }
+
     using ProblemShape = typename KT::ProblemShape;
 
     // The problem shape the activation tensors A, SFA and D are built over: the
@@ -940,7 +958,7 @@ struct SM120BlockScaledKernel
 #endif
             cute::copy(s2r_copy_SFA, tXsSFA(_, _, _, Int<0>{}), tXrSFA);
             cute::copy(s2r_copy_SFB, tXsSFB(_, _, _, Int<0>{}), tXrSFB);
-            sf_empty_mbar[0].arrive();
+            release_stage(sf_empty_mbar[0]);
 
             cute::for_each(cute::make_int_sequence<KT::kNumStagePerSF>{},
                 [&](auto iter)
@@ -951,7 +969,7 @@ struct SM120BlockScaledKernel
                             ab_full_mbar[read_stage].wait(ab_phase);
                             cute::copy(s2r_copy_A, tXsA(_, _, _, read_stage), tXrA);
                             cute::copy(s2r_copy_B, tXsB(_, _, _, read_stage), tXrB);
-                            ab_empty_mbar[read_stage].arrive();
+                            release_stage(ab_empty_mbar[read_stage]);
 
                             auto tCrSFA_stage = tCrSFA_frg(_, _, _, iter * KT::AB_Stages + read_stage);
                             auto tCrSFB_stage = tCrSFB_frg(_, _, _, iter * KT::AB_Stages + read_stage);
@@ -976,7 +994,7 @@ struct SM120BlockScaledKernel
 #endif
         cute::copy(s2r_copy_SFA, tXsSFA(_, _, _, Int<0>{}), tXrSFA);
         cute::copy(s2r_copy_SFB, tXsSFB(_, _, _, Int<0>{}), tXrSFB);
-        sf_empty_mbar[0].arrive();
+        release_stage(sf_empty_mbar[0]);
 
         // Last SF span. k_tile_count is aligned to AB_Stages (NOT to the
         // 4-k-tile SF span), so on short-K shapes (e.g. K=768 with
@@ -997,7 +1015,7 @@ struct SM120BlockScaledKernel
                             ab_full_mbar[read_stage].wait(ab_phase);
                             cute::copy(s2r_copy_A, tXsA(_, _, _, read_stage), tXrA);
                             cute::copy(s2r_copy_B, tXsB(_, _, _, read_stage), tXrB);
-                            ab_empty_mbar[read_stage].arrive();
+                            release_stage(ab_empty_mbar[read_stage]);
                             if constexpr (iter == decltype(num_batches)::value - 1
                                 && read_stage == KT::AB_Stages - 1)
                             {

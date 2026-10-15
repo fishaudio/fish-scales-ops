@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fish-scales-ops"
-version = "0.2.1"
+version = "0.2.2"
 description = "Block-scaled FP8 / MXFP8 GEMM, MoE layer and attention kernels for sm_90, sm_100/sm_103 and sm_120/sm_121."
 requires-python = ">=3.10"
 dependencies = ["torch>=2.11"]

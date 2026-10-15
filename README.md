@@ -128,20 +128,33 @@ in [`docs/perf/`](docs/perf/README.md).
 
 | family            | op                                             | shape                                                        | M / S  | dtype           |     µs | TFLOPS |
 |-------------------|------------------------------------------------|--------------------------------------------------------------|--------|-----------------|-------:|-------:|
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | MXFP8 1×32      |  35.69 |      3 |
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | MXFP8 1×32      | 661.10 |    617 |
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 645.76 |    632 |
-| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | MXFP8 1×32      |   32.7 |    2.3 |
-| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | MXFP8 1×32      |  546.4 |  283.0 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | MXFP8 1×32      |   39.4 |    1.4 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | MXFP8 1×32      |  703.0 |  165.0 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | MXFP8 1×32      |  35.72 |      3 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | MXFP8 1×32      | 667.01 |    612 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 653.93 |    624 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | MXFP8 1×32      |   33.2 |    2.3 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | MXFP8 1×32      |  552.5 |  279.8 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | MXFP8 1×32      |   39.9 |    1.4 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | MXFP8 1×32      |  703.6 |  164.8 |
 
 ## TODO
 
-Open items after 0.2.1: the known issues of [`CHANGELOG.md`](CHANGELOG.md),
+Open items after 0.2.2: the known issues of [`CHANGELOG.md`](CHANGELOG.md),
 whose measured gaps are in the summaries of [`docs/perf/`](docs/perf/README.md),
-two planned items, and two build items.
+two items from the #11 fix (one performance, one formal ordering), two planned items, and two build items.
 
+- **Win back the sm_120 fence cost elsewhere.** The `fence.proxy.async.shared::cta` that 0.2.2 issues before every
+  stage release of the sm_120 block-scaled GEMM (the #11 fix) costs the narrow-N decode GEMMs of the RTX 5090 tables
+  up to about 6 % and a few MoE layer cells (M = 1–2, the padded buckets M = 8 and 32) up to about 2 % (the 0.2.2
+  known issues). Candidates: release a stage
+  one k-tile later, behind loads the mainloop already waits on, so that one fence covers several stages; or a
+  documented ordering primitive cheaper than a per-stage proxy fence.
+- **sm_90 scale-factor read ordering.** The DeepGEMM sm_90 kernels read a stage's scale factors with `ld.shared`
+  before the WGMMA batch and release the stage after `warpgroup_wait<0>()` without a proxy fence, so that release is
+  not formally ordered after the scale load (the operand tiles are read by the WGMMA itself, in the async proxy, so
+  the #11 race does not apply there). A stress test under the #11 conditions on an H200 found no wrong output in
+  4,205,661 compared replays of the 0.2.1 kernels. Order the scale-factor reads before the stage release with a
+  documented primitive, if one costs less than a per-stage proxy fence (which cost up to 9 % on the H200 dense
+  decode cells).
 - **H200 dense MLP block at M = 96, 160 and 192 (6–12 %) and at M = 64, 128, 256, 1024 and 8192 (1–3 %)**, against
   sglang's block-FP8 linear (DeepGEMM) ([`docs/perf/layer/sm90.md`](docs/perf/layer/sm90.md), Family A).
   Candidates: a fused SwiGLU and 1×128 quantize kernel, and a DeepGEMM tile order whose L2 traffic does not depend

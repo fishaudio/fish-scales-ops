@@ -168,6 +168,17 @@ struct SM120MxFP8SmallMKernel
             ab_full_mbar, ab_empty_mbar, sf_full_mbar, sf_empty_mbar, store_full_mbar, store_empty_mbar);
     }
 
+    // Hand a shared-memory stage back to the TMA producer after this thread's generic-proxy
+    // reads of it: the proxy fence orders those reads before the producer's next async-proxy
+    // (TMA) write into the stage. See SM120BlockScaledKernel::release_stage (fp8/gemm_1d1d.cuh,
+    // issue #11) for the race the fence closes.
+    template <class Barrier>
+    CUTE_DEVICE static void release_stage(Barrier& empty_barrier)
+    {
+        cutlass::arch::fence_view_async_shared();
+        empty_barrier.arrive();
+    }
+
     template <class BlkCoord>
     CUTE_DEVICE static void load_sf(Params const& params, SharedStorage& shared_storage, BlkCoord const& blk_coord,
         int32_t sf_tile_count, uint32_t& phase, uint32_t& store_phase)
@@ -405,7 +416,7 @@ struct SM120MxFP8SmallMKernel
             sf_full_mbar[0].wait(sf_phase);
             cute::copy(s2r_copy_SFA, tXsSFA(_, _, _, Int<0>{}), tXrSFA);
             cute::copy(s2r_copy_SFB, tXsSFB(_, _, _, Int<0>{}), tXrSFB);
-            sf_empty_mbar[0].arrive();
+            release_stage(sf_empty_mbar[0]);
 
             cute::for_each(cute::make_int_sequence<KT::kNumStagePerSF>{},
                 [&](auto iter)
@@ -416,7 +427,7 @@ struct SM120MxFP8SmallMKernel
                             ab_full_mbar[read_stage].wait(ab_phase);
                             cute::copy(s2r_copy_A, tXsA(_, _, _, read_stage), tXrA);
                             cute::copy(s2r_copy_B, tXsB(_, _, _, read_stage), tXrB);
-                            ab_empty_mbar[read_stage].arrive();
+                            release_stage(ab_empty_mbar[read_stage]);
 
                             auto tCrSFA_stage = tCrSFA_frg(_, _, _, iter * KT::AB_Stages + read_stage);
                             auto tCrSFB_stage = tCrSFB_frg(_, _, _, iter * KT::AB_Stages + read_stage);
@@ -431,7 +442,7 @@ struct SM120MxFP8SmallMKernel
         sf_full_mbar[0].wait(sf_phase);
         cute::copy(s2r_copy_SFA, tXsSFA(_, _, _, Int<0>{}), tXrSFA);
         cute::copy(s2r_copy_SFB, tXsSFB(_, _, _, Int<0>{}), tXrSFB);
-        sf_empty_mbar[0].arrive();
+        release_stage(sf_empty_mbar[0]);
 
         cute::for_each(cute::make_int_sequence<KT::kNumStagePerSF>{},
             [&](auto iter)
@@ -442,7 +453,7 @@ struct SM120MxFP8SmallMKernel
                         ab_full_mbar[read_stage].wait(ab_phase);
                         cute::copy(s2r_copy_A, tXsA(_, _, _, read_stage), tXrA);
                         cute::copy(s2r_copy_B, tXsB(_, _, _, read_stage), tXrB);
-                        ab_empty_mbar[read_stage].arrive();
+                        release_stage(ab_empty_mbar[read_stage]);
                         if constexpr (iter == KT::kNumStagePerSF - 1 && read_stage == KT::AB_Stages - 1)
                         {
                             cutlass::arch::NamedBarrier::sync(KT::kNumMathThreads, 0);
