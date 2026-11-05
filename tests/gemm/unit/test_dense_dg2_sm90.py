@@ -15,9 +15,10 @@ Each mode runs in its own child process over the same cells, and the test checks
   2. the route: with the default, every cell of the rule's classes launches sm90_fp8_gemm_1d2d_impl with the expected
      tile (and, where the expectation names one, the cluster: c2x1 pairs two M blocks, c1x2 two N blocks), the cells of
      FH1's two swap-AB bands and of its 64-row weight tiles at 8 <= M <= 32 launch fp8_gemm_kernel_swapAB with the
-     expected tile, and every control cell (swap-AB
-     small M, M = 256 gate_up, one-wave 256 x 128 picks, the neighbours of FH1's rules) launches fso's kernels;
-     FSO_SM90_DENSE_DG2=0 never launches the v2 kernel;
+     expected tile, the cells of the in-cluster split-K route (FH5) launch fp8_gemm_kernel_swapAB_splitk with the
+     expected slice count, and every control cell (swap-AB small M, M = 256 gate_up, one-wave 256 x 128 picks, the
+     neighbours of FH1's rules) launches fso's kernels; FSO_SM90_DENSE_DG2=0 never launches the v2 kernel (the split-K
+     route's cells keep that route in every mode);
   3. graph capture: in the default mode a CUDA graph of the quantize + GEMM chain on seven v2 cells, with the output
      clobbered between capture and replay, replays to the eager result.
   4. a value other than 0, 1 or all prints one warning and keeps the default.
@@ -45,7 +46,8 @@ CELLS = [
     (512, 6144, 2560, "dg2 128x192"),     # 128 x 192
     (2048, 10008, 2048, "dg2 256x128"),   # N not a multiple of 2 x 128: the multicast pairs end in an odd tail
     (512, 10008, 2048, "dg2 128x160"),    # N not a multiple of 160, multicast on B
-    (64, 2560, 9728, "dg2 64x32"),        # decode class: 64-row tile, K >= 8192
+    (64, 2560, 9728, "splitk 2"),         # FH5: the in-cluster split-K route takes M <= 64 at K >= 8192 for N <= 4224
+    #                                       (it was the v2 decode class, 64 x 32; the 64-row v2 tile stays at M = 128)
     (128, 2560, 9728, "dg2 64x48"),
     (100, 2560, 9728, "fso"),             # decode M with a partly filled last 64-row block: fso's kernel
     #                                       (fp8_gemm_kernel_swapAB with a 40-token tile since H4 of issue 12)
@@ -56,7 +58,7 @@ CELLS = [
     (224, 9216, 2048, "dg2 128x144"),
     (224, 2560, 4096, "fso"),             # 128 < M < 256 but DeepGEMM picks 64 x 80: fso's kernel
     (224, 19456, 2560, "dg2 128x160"),
-    (16, 2560, 9728, "fso"),              # swap-AB small M
+    (16, 2560, 9728, "splitk 3"),         # FH5: split-K, three slices on SMs shared two to one (token tile 16)
     (256, 19456, 2560, "fso"),            # 128 x 160 at M = 256 (DeepGEMM's pick, two waves): fso's kernel
     (2048, 2048, 4096, "fso"),            # DeepGEMM picks one wave of 256 x 128 without multicast
     (64, 2560, 4096, "fso"),              # 64-row tile but K < 8192
@@ -118,8 +120,9 @@ GRAPH_CELLS = [(1024, 19456, 2560), (128, 2560, 9728), (80, 5120, 2048), (288, 5
 
 def kernel_of(names):
     """"dg2 <block_m>x<block_n>" (with " c2x1" for a two-CTA cluster that shares the weight, multicast on B, and
-    " c1x2" for one that shares the activation, multicast on A), "swapAB <weight rows>x<token tile>" for
-    fp8_gemm_kernel_swapAB, "fso" for fp8_gemm_kernel. The v2 kernel's template arguments run <major, 0, N, 0, 1,
+    " c1x2" for one that shares the activation, multicast on A), "splitk <slices>" for the in-cluster split-K kernel
+    fp8_gemm_kernel_swapAB_splitk, "swapAB <weight rows>x<token tile>" for fp8_gemm_kernel_swapAB, "fso" for
+    fp8_gemm_kernel. The v2 kernel's template arguments run <major, 0, N, 0, 1,
     BLOCK_M, BLOCK_N, 128, 128, 128, swizzle, stages, 128, threads, cluster size, multicast on A, ...>."""
     for n in names:
         m = re.search(r"sm90_fp8_gemm_1d2d_impl<[^,]*, 0u?, \d+u?, 0u?, 1u?, (\d+)u?, (\d+)u?, 128u?, 128u?, 128u?, "
@@ -127,6 +130,10 @@ def kernel_of(names):
         if m:
             cluster = "" if m.group(3) == "1" else (" c1x2" if m.group(4) == "true" else " c2x1")
             return f"dg2 {m.group(1)}x{m.group(2)}{cluster}"
+    for n in names:
+        m = re.search(r"fp8_gemm_kernel_swapAB_splitk<\d+u?, \d+u?, (\d+)u?,", n)
+        if m:
+            return f"splitk {m.group(1)}"
     for n in names:
         m = re.search(r"fp8_gemm_kernel_swapAB<\d+u?, \d+u?, (\d+)u?, (\d+)u?,", n)
         if m:
@@ -236,10 +243,13 @@ def main():
             if want is not None and not matches(got, want):
                 failures.append(f"{key}: default mode launched {got}, expected {want}")
             n_dg2 += got.startswith("dg2")
-            if not matches(results["0"]["kernels"][key], "fso"):
-                failures.append(f"{key}: FSO_SM90_DENSE_DG2=0 launched {results['0']['kernels'][key]}")
+            # The split-K route's calls are on neither of the paths the knob selects between: they keep the route.
+            want0 = want if want is not None and want.startswith("splitk") else "fso"
+            if not matches(results["0"]["kernels"][key], want0):
+                failures.append(f"{key}: FSO_SM90_DENSE_DG2=0 launched {results['0']['kernels'][key]}, "
+                                f"expected {want0}")
         print(f"[2] default route: {n_dg2} of {len(CELLS)} cells on sm90_fp8_gemm_1d2d_impl, as expected; "
-              "FSO_SM90_DENSE_DG2=0 runs fp8_gemm_kernel on every cell")
+              "FSO_SM90_DENSE_DG2=0 runs fp8_gemm_kernel on every cell outside the split-K route")
         # 3. graph capture and replay
         for key, ok in results[None]["graph"].items():
             if not ok:

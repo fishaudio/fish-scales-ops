@@ -512,6 +512,41 @@ __global__ void dummy_kernel() {
 )";
 }
 
+// The source of one instantiation of fp8_gemm_kernel_swapAB_splitk (deep_gemm/fso_dense_splitk.cuh), the in-cluster
+// split-K route of the dense GEMM, at `c` for K = `shape_k`, with the dense epilogue variant `epilogue`. As in
+// generateKernel, a dummy kernel takes the instantiation's address so that NVRTC emits it.
+inline std::string generateKernelSplitK(
+    uint32_t shape_k, DenseSplitKConfig const& c, DenseEpilogueKey const& epilogue = DenseEpilogueKey{})
+{
+    std::string const args = std::to_string(shape_k) + "u, " + std::to_string(c.block_t) + "u, "
+        + std::to_string(c.splits) + "u, " + std::to_string(c.stages) + "u, " + epilogue.template_args();
+    return R"(
+#ifdef __CUDACC_RTC__
+#ifndef NVRTC_JIT_COMPILATION
+#define NVRTC_JIT_COMPILATION
+#endif
+
+#include <deep_gemm/nvrtc_std.cuh>
+
+#else
+
+#include <string>
+#include <cuda.h>
+
+#endif
+
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <deep_gemm/nvrtc_cutlass.cuh>
+#include <deep_gemm/fso_dense_splitk.cuh>
+
+__global__ void dummy_kernel() {
+  void *ptr = (void *)&deep_gemm::fp8_gemm_kernel_swapAB_splitk<)"
+        + args + R"(>;
+}
+)";
+}
+
 // FNV-1a, 64-bit. The disk cache's content key must come out the same in every process and every build of the
 // extension, which std::hash does not promise; FNV-1a is fixed by its definition. Integers are fed as 8 little-endian
 // bytes and strings with a length prefix, so two different field sequences never produce the same byte stream.
@@ -852,6 +887,52 @@ public:
             flags.push_back("-I" + dir.string());
         }
         return compileAndCache(name, generateKernelDg2(c, epilogue), flags, deep_gemm::GemmType::Normal);
+    }
+
+    // fp8_gemm_kernel_swapAB_splitk at `c` for K = `shape_k` with the dense epilogue variant `epilogue`
+    // (generateKernelSplitK), under the runtime name "gemm_swapAB_splitk_<K>_t<token tile>_s<slices>_st<stages>" plus
+    // the epilogue's suffix (the kernel does not depend on M or N). The flags are build()'s plus the diagnostic 186
+    // (an unsigned comparison with zero, which a one-slice instantiation makes constant).
+    Runtime* buildSplitK(
+        uint32_t shape_k, DenseSplitKConfig const& c, DenseEpilogueKey const& epilogue = DenseEpilogueKey{})
+    {
+        int sm_version = tensorrt_llm::common::getSMVersion();
+        if (sm_version != 90)
+        {
+            TLLM_THROW("fp8_gemm_kernel_swapAB_splitk only runs on Hopper (SM90); this device is SM%d.", sm_version);
+        }
+        std::string const name = "gemm_swapAB_splitk_" + std::to_string(shape_k) + "_t" + std::to_string(c.block_t)
+            + "_s" + std::to_string(c.splits) + "_st" + std::to_string(c.stages) + epilogue.name_suffix();
+        auto& runtimeCache = getGlobalRuntimeCache();
+        if (Runtime* cachedRuntime = runtimeCache.find(name))
+        {
+            return cachedRuntime;
+        }
+        std::vector<std::string> flags
+            = {"-std=c++17", "--gpu-architecture=sm_90a", "--ptxas-options=-allow-expensive-optimizations=true",
+                "--ptxas-options=--register-usage-level=10", "--diag-suppress=161,174,177,186,940",
+                "-D__FORCE_INCLUDE_CUDA_FP16_HPP_FROM_FP16_H__=1", "-D__FORCE_INCLUDE_CUDA_BF16_HPP_FROM_BF16_H__=1"};
+        if (char const* extra = std::getenv("FSO_JIT_EXTRA_FLAGS"))
+        {
+            std::istringstream tokens(extra);
+            for (std::string tok; tokens >> tok;)
+                flags.push_back(tok);
+        }
+        if (kJitUseNvcc)
+        {
+            for (char const* f : {"-O3", "-cubin", "--expt-relaxed-constexpr", "--expt-extended-lambda",
+                     "--compiler-options=-fPIC,-O3,-Wno-deprecated-declarations,-Wno-abi"})
+                flags.push_back(f);
+        }
+        else
+        {
+            flags.push_back("-default-device");
+        }
+        for (auto const& dir : includeDirs_)
+        {
+            flags.push_back("-I" + dir.string());
+        }
+        return compileAndCache(name, generateKernelSplitK(shape_k, c, epilogue), flags, deep_gemm::GemmType::Normal);
     }
 
     // Compiles `code` with `flags` (or loads it from the disk cache) into a Runtime and records it in the in-memory

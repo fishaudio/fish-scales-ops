@@ -33,6 +33,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "fso_dense_splitk_layout.cuh"
 #include "scheduler.cuh"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/tllmException.h"
@@ -824,6 +825,123 @@ inline GemmConfig get_dense_swap_ab_config(uint32_t shape_m, uint32_t shape_n, u
         dense_pick_stages(block_m, block_n, shape_k, true, num_stages, smem_size);
     }
     return std::make_tuple(block_m, block_n, num_stages, num_tma_multicast, smem_size);
+}
+
+// ------------------------------------------------------------------------------------------------------------------
+// The in-cluster split-K route of the dense GEMM (fp8_gemm_kernel_swapAB_splitk, fso_dense_splitk.cuh): one 64-row
+// weight tile per cluster of `splits` CTAs that divide K between them, one token tile covering all of M.
+struct DenseSplitKConfig
+{
+    uint32_t block_t = 0; // token tile: max(16, M rounded up to 8), at most 64
+    uint32_t splits = 0;  // CTAs per cluster, each taking one slice of K; 0 when the route does not apply
+    uint32_t stages = 0;  // pipeline stages per CTA
+    uint32_t smem = 0;    // dynamic shared memory per CTA in bytes
+    uint32_t tiles = 0;   // 64-row weight tiles = clusters
+
+    [[nodiscard]] bool valid() const
+    {
+        return splits != 0;
+    }
+
+    [[nodiscard]] uint32_t ctas() const
+    {
+        return tiles * splits;
+    }
+};
+
+// The dynamic shared memory from which a CTA leaves no room for a second one on an sm_90 SM (two need 2 x (smem + 1 KB
+// reserved) <= 228 KB). The split-K kernel requests at least this much, so that its CTAs never share an SM: launched
+// early behind a programmatic predecessor (the activation quantize ahead of a bf16-x call), the CTAs of a kernel that
+// would fit twice are stacked two to an SM on the SMs that are free at that moment, and a stacked CTA streams its slice
+// at half the rate (FH5 trace, runs/FH5/data/hold_t2.jsonl: down 2560 x 9216 at M = 24 ran 80 CTAs on 44 SMs behind
+// the quantize, its K loop 7.9 against 6.2 us on 80 SMs after a GEMM). A predecessor without shared memory can still
+// share the SM.
+constexpr uint32_t kDenseSplitKOneCtaPerSmBytes = 114u * 1024u;
+
+// The split-K launch of an M x N x K dense GEMM with `splits` K slices, whatever the route rule says: the token tile
+// covering M, 8 stages (fewer when a slice has fewer K blocks) and the shared memory of fso_dense_splitk_layout.cuh,
+// raised to kDenseSplitKOneCtaPerSmBytes when `one_cta_per_sm`. Invalid when the kernel cannot serve the shape:
+// M = 0 or above 64, K not a multiple of 128, N not a multiple of 8 (the D tensor map's row stride), or a slice count
+// outside 1 .. 4 or above K / 128.
+inline DenseSplitKConfig make_dense_splitk_config(
+    uint32_t m, uint32_t n, uint32_t k, uint32_t splits, bool one_cta_per_sm = true)
+{
+    namespace L = deep_gemm::fso_dense_splitk_smem;
+    DenseSplitKConfig c;
+    if (m == 0 || m > 64 || n == 0 || k == 0 || k % 128 != 0 || n % 8 != 0 || splits < 1 || splits > L::kNumSlabs
+        || splits > k / 128)
+        return c;
+    constexpr uint32_t kCapacity = 232448; // sm_90 dynamic shared memory per block
+    uint32_t const kb_slice = (k / 128 + splits - 1) / splits;
+    c.block_t = std::max(16u, (m + 7) / 8 * 8);
+    c.stages = std::min(8u, kb_slice);
+    c.smem = L::total_bytes(c.block_t, splits, c.stages, kb_slice);
+    if (one_cta_per_sm)
+        c.smem = std::max(c.smem, kDenseSplitKOneCtaPerSmBytes);
+    c.tiles = (n + L::kBlockW - 1) / L::kBlockW;
+    if (c.smem > kCapacity)
+        return DenseSplitKConfig{};
+    c.splits = splits;
+    return c;
+}
+
+// The slice count the split-K route prefers for an N x K weight on `num_sms` SMs, 0 when it does not take the shape
+// (issue #12, FH5; /data/bench-runs/fso_issue12_20261028/runs/FH5, holds B, E and G). With tiles = ceil(N / 64)
+// clusters, one per 64-row weight tile: the largest S of 4 and 3 whose S * tiles CTAs take at most three quarters of
+// the SMs and whose slices hold at least 2 K blocks each; else 3 when K > 4096 and 3 * tiles CTAs fit the SMs; else 2
+// when 2 * tiles CTAs fit them and the slices hold at least 2 K blocks. More slices stream a weight faster until about
+// three quarters of the SMs work; past that they add reduction work without a faster stream, except on long K: at
+// K <= 4096, S = 3 on 40 tiles (2560 x 4096) tied S = 2 at M <= 8 and lost 3.5 % at M = 16, while on 32 tiles
+// (2048 x 4096) it won 4-5 % over S = 2 and S = 4 lost; at K = 9216, S = 3 on 40 tiles won 2-6 % at M <= 24 (served
+// call); with 4 K blocks (2048 x 512) S = 2 won over S = 3, whose slices hold 2 / 1 / 1. The dispatcher lowers the
+// count where one cluster per tile does not fit at once (sm90_dense_splitk_route in dispatch.cuh).
+inline uint32_t dense_splitk_preferred_slices(uint32_t n, uint32_t k, int num_sms)
+{
+    if (num_sms <= 0 || n == 0 || k == 0 || k % 128 != 0)
+        return 0;
+    uint32_t const tiles = (n + 63) / 64;
+    uint32_t const kb = k / 128;
+    uint32_t const sms = static_cast<uint32_t>(num_sms);
+    for (uint32_t s = 4; s >= 3; --s)
+    {
+        if (4 * s * tiles <= 3 * sms && 2 * s <= kb)
+            return s;
+    }
+    if (k > 4096u && 3 * tiles <= sms && 6 <= kb)
+        return 3;
+    if (2 * tiles <= sms && 4 <= kb)
+        return 2;
+    return 0;
+}
+
+// The largest M the split-K route takes at `splits` slices and K = `k`, by K class: M <= 64 at K >= 8192; M <= 56 at
+// 4096 <= K < 8192; at 2048 <= K < 4096, M <= 40 with 3 or 4 slices and M <= 24 with 2; M <= 24 below K = 2048. Every
+// call of the band won on the served bf16-x call and on the 2b call against the routes it replaces (FH5 holds C, E, G
+// and BAND, two passes): down 2560 x 9216 -5 % at M = 64; at M = 52 / 56 every N of 1024 .. 4224 at K = 4096, 4608,
+// 5120, 6144 and 7680, in both passes (2560 x 5120 at M = 56 by the least, -0.8 % and -4.3 %; o 2560 x 4096 -6 % and
+// -2 %, llm_o 2048 x 4096 -15 % and -4 % at M = 52 and 56); 2048 x 2048 -7 % and 1024 x 2048 -15 % at M = 40,
+// 2560 x 2048 -3 % and 2048 x 512 -5 % at M = 24. Past the edges the split route lost or tied: at M = 60 / 64 (token
+// tile 64) from K = 4096 to 6144 on most N (at K = 4096 o +5 % / +6 %, llm_o +0.4 % / +7 %; it still won on every N
+// at K = 7680), 2560 x 2048 at M = 32 (+0.5 %), 2048 x 2048 and 1024 x 2048 at M = 64 (+16 %, +19 %), 2048 x 512 at
+// M = 32 (-1 %).
+inline uint32_t dense_splitk_max_m(uint32_t splits, uint32_t k)
+{
+    if (k >= 8192u)
+        return 64u;
+    if (k >= 4096u)
+        return 56u;
+    if (k >= 2048u && splits >= 3)
+        return 40u;
+    return 24u;
+}
+
+// The split-K route's configuration for an M x N x K dense GEMM at `splits` slices under the route's band
+// (dense_splitk_max_m), one CTA per SM; invalid outside the band.
+inline DenseSplitKConfig get_dense_splitk_config(uint32_t m, uint32_t n, uint32_t k, uint32_t splits)
+{
+    if (splits < 2 || m > dense_splitk_max_m(splits, k))
+        return DenseSplitKConfig{};
+    return make_dense_splitk_config(m, n, k, splits, /*one_cta_per_sm=*/true);
 }
 
 // ------------------------------------------------------------------------------------------------------------------

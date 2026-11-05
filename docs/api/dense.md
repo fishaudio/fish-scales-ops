@@ -225,7 +225,7 @@ handle's kind and on the device's architecture:
 
 | kind | architecture | what runs |
 |---|---|---|
-| `"bsfp8"` | sm_90 | `linear_qx`, which quantizes the activation to 1×128 block-FP8 inside the GEMM op and runs the deep_gemm WGMMA kernel. The result is bit-identical to `quantize_activation` + `linear(xq, weight, x_scale=sx)` everywhere, and to `quantize_1x128_fp8` + `linear_fp8` except on a 128-element group whose amax is below 1.00044e-10 when `K % 512 == 0` (where `quantize_1x128_fp8` floors at `1e-10f` and `linear_qx` at the bf16 value of it) |
+| `"bsfp8"` | sm_90 | `linear_qx`, which quantizes the activation to 1×128 block-FP8 inside the GEMM op and runs the deep_gemm WGMMA kernel (the in-cluster split-K kernel in its band, below). The result is bit-identical to `quantize_activation` + `linear(xq, weight, x_scale=sx)` everywhere, the split-K band included, and to `quantize_1x128_fp8` + `linear_fp8` except on a 128-element group whose amax is below 1.00044e-10 when `K % 512 == 0` (where `quantize_1x128_fp8` floors at `1e-10f` and `linear_qx` at the bf16 value of it) |
 | `"mxfp8"` | sm_120 / sm_121 | one op, `linear_mxfp8_bf16x`: in the decode band (`M ≤ 64`), where the small-M route's rule R2 picks it, one kernel (`sm120.smallm`, form G2) that quantizes the activation to 1×32 MXFP8 inside itself and runs the GEMM; elsewhere the fused 1×32 activation quantize (`quantize_1x32_fp8`'s kernel) followed by `linear_mxfp8_raw`, that is the small-M route's form G1 where its rule R1 picks it and the CUTLASS MXFP8 cascade with Stream-K otherwise. The bytes are those of `quantize_activation` + `linear(xq, weight, x_scale=sx)` on every shape |
 | `"mxfp8"` | sm_100 / sm_103 | the fused 1×32 activation quantize, then `linear_mxfp8`, the Python router: the CuTe-DSL swap-AB row (the M ≤ 64 decode band and, above it, the narrow-N long-K band: N ≤ 4096, K ≥ 4096; the narrow-N short-K band: N ≤ 4096, 1024 ≤ K ≤ 2560, while its split-K grid has at most 80 CTAs; the identity call of a wide-N short-K cell while the row's 1-SM grid fits one wave; the erf-GELU call of a short-K cell where the cascade's short-K tile rule would leave its 64-wide tile), cuBLAS `scaled_mm`, the CuTe-DSL tier and the C++ cascade (which also takes the bias calls of the narrow-N short-K cells just above the decode band that the swap-AB row leaves: N ≤ 2048, 1024 ≤ K ≤ 2560, 64 < M ≤ 256). The bf16-x call and the pre-quantized call of a shape and epilogue take the same route |
 | anything else | any | `NotImplementedError` naming the architecture for a kind of another architecture, `ValueError` for an unknown kind |
@@ -273,6 +273,57 @@ route off (the routes of 0.2.2), `FSO_SMALLM_ROUTE=1` takes it on every call wit
 reduction. It does not write the quantized output: `linear_quantized` runs on
 the cascade on every sm_120/sm_121 call (see `linear_quantized` below for what
 that means for its bytes).
+
+**The sm_90 in-cluster split-K route.** On sm_90 the decode band of the narrower
+weights has a GEMM of its own (`fp8_gemm_kernel_swapAB_splitk`), which the
+dispatcher takes before every other sm_90 route. At small `M` the other routes give
+every output element to one CTA, so a narrow weight is streamed by one CTA per
+weight tile only (40 of the H200's 132 SMs for `N = 2560` at 64-row tiles). The
+split-K route gives
+each 64-row weight tile a thread-block cluster of `S` CTAs. Each CTA streams one
+contiguous slice of `K`, and the cluster adds the `S` fp32 partial sums of every
+output element in rank order (`p_0 + p_1 + … + p_{S−1}`) in shared memory, applies
+`bias`, `activation` and `residual` once to the sum and rounds once to bf16: one
+launch, no workspace. The rule, in `M`, `N`, `K` and the SM count, with
+`tiles = ⌈N / 64⌉`:
+
+- `S` is the largest of 4 and 3 whose `S × tiles` CTAs take at most three quarters
+  of the SMs and whose slices hold at least 2 blocks of 128 along `K`; else 3 when
+  `K > 4096` and `3 × tiles` CTAs fit the SMs; else 2 when `2 × tiles` CTAs fit them
+  and the slices hold at least 2 blocks.
+- The kernel runs one CTA per SM. When the occupancy calculator cannot place one
+  cluster per tile at once, a launch whose token tile has at most 24 rows keeps `S`
+  with two CTAs to an SM if that places them, and any other launch drops one slice
+  and checks the band again.
+- The band: `M ≤ 64` for `K ≥ 8192`, `M ≤ 56` for `4096 ≤ K < 8192`, `M ≤ 40` for
+  `2048 ≤ K < 4096` with 3 or 4 slices, and `M ≤ 24` otherwise.
+
+On the H200 that takes every weight up to `N = 4224` in its band: `2560 × 4096`
+with 2 slices up to `M = 56`, `2048 × 4096` with 3, `1280 × 5120` with 4,
+`2560 × 9216` and `2560 × 9728` with 3 up to `M = 24` and 2 from `M = 25` to 64,
+`1024 × 2048` with 4 up to `M = 40`, and `2048 × 512` with 2 up to `M = 24`. Wider weights (`5120 × 2048` and
+up) keep their routes. The decision depends on the shape and the device only, so
+the identity call, every epilogue call, the bf16-x call and the pre-quantized call
+of a shape take the same route.
+
+The route's result is deterministic: the same bytes on every call, replay, stream
+and process, and the bf16-x call equals `linear(xq, weight, x_scale=sx)` bit for
+bit. It is not bit-identical to the one-CTA routes it replaces, because an
+element's 128-wide blocks along `K` are summed per slice and the slices are then
+added in rank order, not in `K` order. The fp32 sums therefore differ by about one
+rounding of the partial sums. After the rounding to bf16 almost every element is
+equal, and the others differ by one unit in the last place. An element whose sum
+nearly cancels (a result far below the partial sums) can differ by a few more
+units, which is still far below the output's scale. On the 94 cells of the H200
+A/B that the route takes (6.0 million bf16-x outputs), 566 elements (0.0094 %)
+differed from the routes it replaces. 545 of them differed by one unit in the last
+place. The other 21 differed by 2 to 28 units, all on values below 1.6 × 10⁻⁵ in
+outputs whose largest magnitude was about 2. The largest absolute difference was
+one unit in the last place of a value near 1.3. `FSO_SM90_DENSE_SPLITK=0` turns the
+route off and gives the routes and bytes the dispatcher has without it. With
+`FSO_SM90_SPLITK_S=1` the kernel runs one slice and sums the blocks in `K` order, as
+the one-CTA routes do; on the test's cells its bytes equal those of the route it
+replaces.
 
 `tests/gemm/unit/test_dense.py` asserts that `linear` is `torch.equal` to the
 explicit composition from `fso.compat` on every architecture: on sm_90 to
@@ -405,8 +456,9 @@ architectures. It copies a misaligned or non-contiguous bf16 `x` and refuses a
 handle with a misaligned weight or scale exactly as `linear` does.
 
 Malformed epilogue arguments raise `ValueError`. In this build sm_90 applies
-`bias`, `residual` and `activation` on all three of its dense GEMM kernels, each
-in its one launch; on sm_100/sm_103 the CuTe-DSL swap-AB row (the M ≤ 64 decode
+`bias`, `residual` and `activation` on all four of its dense GEMM kernels, each
+in its one launch (on the in-cluster split-K kernel of the decode band once,
+after the rank-order sum of its slices); on sm_100/sm_103 the CuTe-DSL swap-AB row (the M ≤ 64 decode
 band and the bands and calls it takes above it) applies all three inside both of its
 kernels (in the in-cluster split-K kernel once, after the fp32 sum), tier 1 (cuBLAS `scaled_mm`) applies the bias through cuBLAS's own
 fused epilogue, tier 2 (the CuTe-DSL persistent kernel) applies none, and the

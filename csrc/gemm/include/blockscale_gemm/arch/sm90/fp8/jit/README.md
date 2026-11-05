@@ -9,7 +9,8 @@ tuple and keeps the resulting cubin in memory for the rest of the process.
 
 ## Two dense kernels
 
-The dense GEMM (`gemm_dispatch_sm90`, `GemmType::Normal`) runs one of two kernels; both compute every
+Outside the band of the in-cluster split-K kernel (next section), the dense GEMM (`gemm_dispatch_sm90`,
+`GemmType::Normal`) runs one of two kernels; both compute every
 output element in one CTA, accumulate each 128-wide K block in FP32 and promote it with the same scale product
 in the same K order, so their outputs are bitwise identical and the choice between them is a tile choice:
 
@@ -35,9 +36,31 @@ in the same K order, so their outputs are bitwise identical and the choice betwe
   attribute is a cluster launch even at size 1; the CTAs then land on the SMs in another order, which changes
   the L2 partition each tile's operands come from and slows the 64-row tiles markedly.
 
+## The in-cluster split-K kernel (issue #12, FH5)
+
+`fp8_gemm_kernel_swapAB_splitk` (`deep_gemm/fso_dense_splitk.cuh`; its shared-memory layout, which the host's
+configuration reads too, in `deep_gemm/fso_dense_splitk_layout.cuh`) is the dispatcher's first choice where its rule
+takes a cell (`get_dense_splitk_config` in `jit_utils.cuh`): small M on a narrow weight, where the two kernels above
+leave most of the SMs idle because they give every output element to one CTA. It gives each 64-row weight tile a
+thread-block cluster of S CTAs (1 to 4); CTA r of the cluster streams one contiguous slice of K through an 8-stage
+ring, and the cluster adds the S fp32 partial sums of every output element in rank order (`p_0 + p_1 + ... +
+p_{S-1}`) in the owning CTA's shared memory, pushed there with `st.async` and counted by an mbarrier, then applies the
+epilogue fields once and rounds to bf16 once: one launch, no global workspace, deterministic. It is the one dense
+kernel that does not compute every output element in one CTA, so its bytes are not those of the two kernels above:
+the sum of an element's K blocks is added in another order, so its fp32 value can differ by about one rounding of the
+partial sums. After the bf16 rounding that is one unit in the last place on almost every element that differs, and a
+few more units only where the sum nearly cancels (`docs/api/dense.md` has the measured counts).
+With one slice (`FSO_SM90_SPLITK_S=1`, no cluster) it promotes exactly as `fp8_gemm_kernel_swapAB` and gives that
+kernel's bytes. Every thread executes `griddepcontrol.wait` before its first global read (weights, scales, bias and
+residual alike), and the kernel does not trigger its dependents early. Its runtimes are named
+`gemm_swapAB_splitk_<K>_t<token tile>_s<slices>_st<stages>` plus the epilogue's suffix; `runGemmSwapABSplitK`
+launches it with the cluster-dimension attribute only for S > 1.
+
 ## Dense epilogue variants (interface v1, issue #12)
 
-`fso.dense.linear(..., bias=, residual=, activation="gelu_erf")` runs on all three dense kernels above. A call with
+`fso.dense.linear(..., bias=, residual=, activation="gelu_erf")` runs on all three dense kernels above and on the
+split-K kernel (`fp8_gemm_kernel_swapAB_splitk<..., kBias, kAct, kResidual>`, the struct its last argument; the owner
+warp of each slab applies the fields to the reduced sum). A call with
 any of these fields builds a variant of the kernel the same call without them runs, at the same tile configuration:
 `fp8_gemm_kernel` / `fp8_gemm_kernel_swapAB` with the scheduler input `NormalSchedulerInputEpi<kBias, kAct, kResidual>`
 / `NormalSchedulerInputSwapABEpi<...>` (which carries the `fso::DenseEpilogue` by value), or
@@ -150,10 +173,11 @@ The result should be empty.
 |---|---|
 | `deep_gemm/fp8_gemm.cuh` | TMA descriptor builders + run-host wrappers |
 | `deep_gemm/fp8_gemm_impl.cuh` | the kernel `fp8_gemm_kernel<...>` |
+| `deep_gemm/fso_dense_splitk.cuh`, `fso_dense_splitk_layout.cuh` | the in-cluster split-K kernel `fp8_gemm_kernel_swapAB_splitk<...>` and its shared-memory layout |
 | `deep_gemm/scheduler.cuh` | persistent + grouped + strided-batched schedulers |
 | `deep_gemm/compiler.cuh` | NVRTC driver — generates kernel source, compiles through the NVRTC table (loaded once per process), keys the opt-in disk cache by content |
 | `deep_gemm/runtime.cuh` | runtime cubin loader, the in-memory runtime cache and the `FSO_JIT_*` knobs |
-| `deep_gemm/jit_utils.cuh` | `get_best_gemm_config` + `get_smem_size` heuristic (every caller), `get_dense_gemm_config` (the dense GEMM's tile rules on top of it), `get_dg2_dense_config` + `use_dg2_dense` (DeepGEMM v2's configuration and the route to its kernel); the NVRTC function table and its loader |
+| `deep_gemm/jit_utils.cuh` | `get_best_gemm_config` + `get_smem_size` heuristic (every caller), `get_dense_gemm_config` (the dense GEMM's tile rules on top of it), `get_dg2_dense_config` + `use_dg2_dense` (DeepGEMM v2's configuration and the route to its kernel), `get_dense_splitk_config` (the split-K route's rule and configuration); the NVRTC function table and its loader |
 | `deep_gemm/{comm,common,epilogue,impls,mma,ptx,scheduler}/` | DeepGEMM v2's dense kernel `sm90_fp8_gemm_1d2d_impl` and its headers (sgl-project/DeepGEMM v0.2.0, MIT); `nvrtc_shim/` holds the two standard headers its NVRTC build needs |
 | `deep_gemm/{mma,tma}_utils.cuh` | WGMMA + TMA helpers |
 | `deep_gemm/utils.cuh` | misc primitives (`ceil_div`, `lane_id`, etc.) |

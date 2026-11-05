@@ -111,6 +111,147 @@ inline uint32_t sm90_swap_block_n_override()
     return v;
 }
 
+// FSO_SM90_DENSE_SPLITK, read once per process: the in-cluster split-K route of the dense GEMM
+// (fp8_gemm_kernel_swapAB_splitk). Unset or "1": the rule (deep_gemm::jit::dense_splitk_preferred_slices and the
+// band of dense_splitk_max_m; the default); "0": off, every call takes the routes below; "force": every call the
+// kernel can serve (M <= 64, K % 128 == 0, N % 8 == 0), outside the band too, with the rule's slice count where it
+// gives one and 2 elsewhere, for sweeps. With the rule, a forced swap-AB configuration (FSO_SM90_SWAP_MAX_M or
+// FSO_SM90_SWAP_BN set) turns the route off. FSO_SM90_SPLITK_S=<s> (1 to 4), read once per process, replaces the
+// slice count of every call the route takes. Another value of either is ignored with one line on stderr.
+enum class Sm90SplitKMode
+{
+    kRule,
+    kOff,
+    kForce
+};
+
+inline Sm90SplitKMode sm90_dense_splitk_mode()
+{
+    static Sm90SplitKMode const mode = []
+    {
+        char const* e = std::getenv("FSO_SM90_DENSE_SPLITK");
+        if (e == nullptr || e[0] == '\0' || std::string(e) == "1")
+            return Sm90SplitKMode::kRule;
+        if (std::string(e) == "0")
+            return Sm90SplitKMode::kOff;
+        if (std::string(e) == "force")
+            return Sm90SplitKMode::kForce;
+        std::fprintf(stderr, "[fish_scales_ops] FSO_SM90_DENSE_SPLITK=%s is not 0, 1 or force; using the default (1)\n",
+            e);
+        return Sm90SplitKMode::kRule;
+    }();
+    return mode;
+}
+
+inline uint32_t sm90_dense_splitk_slices_override()
+{
+    static uint32_t const v = []
+    {
+        uint32_t const s = sm90_env_u32("FSO_SM90_SPLITK_S");
+        if (s > 4u)
+        {
+            std::fprintf(
+                stderr, "[fish_scales_ops] FSO_SM90_SPLITK_S=%u is not in 1 .. 4; using the route's count\n", s);
+            return 0u;
+        }
+        return s;
+    }();
+    return v;
+}
+
+// The resident-cluster limit of one split-K kernel at its configuration, from the occupancy calculator, cached per
+// process (the first call of a kernel is an eager one: the JIT compile cannot run inside a capture either).
+inline int sm90_splitk_max_clusters(cudaKernel_t kernel, deep_gemm::jit::DenseSplitKConfig const& c)
+{
+    struct Entry
+    {
+        void* kernel;
+        uint32_t ctas, smem;
+        int clusters;
+    };
+    static std::vector<Entry> s_cache;
+    for (auto const& e : s_cache)
+    {
+        if (e.kernel == reinterpret_cast<void*>(kernel) && e.ctas == c.ctas() && e.smem == c.smem)
+            return e.clusters;
+    }
+    int const n = deep_gemm::splitKMaxActiveClusters(kernel, c);
+    s_cache.push_back({reinterpret_cast<void*>(kernel), c.ctas(), c.smem, n});
+    return n;
+}
+
+// Runs the dense GEMM on the split-K route when FSO_SM90_DENSE_SPLITK and the rule take it, and returns whether it
+// did; false leaves the call to the routes of gemm_dispatch_sm90. The route serves every epilogue field the dispatcher
+// does (bias, residual and erf-GELU, applied once after the reduction), so the decision depends on (M, N, K) and the
+// SM count only, never on the epilogue: the identity call, the bias call and the bf16-x call of a shape take the same
+// route.
+//
+// Slices and placement. The rule's slice count (deep_gemm::jit::dense_splitk_preferred_slices) runs with one CTA per
+// SM (deep_gemm::jit::kDenseSplitKOneCtaPerSmBytes) when the occupancy calculator places one cluster per 64-row weight
+// tile at once. When it does not, a launch with a token tile of at most 24 rows keeps the slice count at the kernel's
+// own shared-memory size, where two CTAs may share an SM; otherwise the count drops by one slice and the band
+// (dense_splitk_max_m) is checked again. Measured on the H200 (one CTA per SM: 66 clusters of 2, 39 of 3, 30 of 4),
+// that is down 2560 x 9216 (40 tiles): S = 3 sharing SMs at M <= 24 (1.5-6 % faster than S = 2, served call), S = 2
+// one per SM from M = 25 on (where S = 3's shared SMs cost more: -15 % against -11..-13 %). A launch that finds no
+// slice count of 2 or more keeps the routes below. FSO_SM90_SPLITK_S forces one count, which is taken at one CTA per SM
+// or not at all.
+inline bool sm90_dense_splitk_route(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, int ld_d,
+    float* scales_a, float* scales_b, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, cudaStream_t stream,
+    int num_device_sms, fso::DenseEpilogue const& epilogue, deep_gemm::jit::DenseEpilogueKey const& epi_key, bool pdl)
+{
+    Sm90SplitKMode const mode = sm90_dense_splitk_mode();
+    if (mode == Sm90SplitKMode::kOff)
+        return false;
+    // A forced swap-AB configuration (FSO_SM90_SWAP_MAX_M, FSO_SM90_SWAP_BN) is a sweep of that route: it reaches every
+    // call it names, so the rule does not take them first (as FSO_FORCE_TILE turns the sm_120 small-M route off).
+    if (mode == Sm90SplitKMode::kRule && (sm90_swap_max_m_override() != 0u || sm90_swap_block_n_override() != 0u))
+        return false;
+    uint32_t const forced = sm90_dense_splitk_slices_override();
+    uint32_t s = forced != 0u ? forced
+                              : deep_gemm::jit::dense_splitk_preferred_slices(shape_n, shape_k, num_device_sms);
+    if (s == 0u && mode == Sm90SplitKMode::kForce)
+        s = 2u;
+    auto fits = [&](cudaKernel_t kernel, deep_gemm::jit::DenseSplitKConfig const& c)
+    {
+        if (c.splits <= 1)
+            return true;
+        int const clusters = sm90_splitk_max_clusters(kernel, c);
+        return clusters < 0 || static_cast<uint32_t>(clusters) >= c.tiles;
+    };
+    for (; s >= 1u; --s)
+    {
+        deep_gemm::jit::DenseSplitKConfig c = mode == Sm90SplitKMode::kForce
+            ? deep_gemm::jit::make_dense_splitk_config(shape_m, shape_n, shape_k, s)
+            : deep_gemm::jit::get_dense_splitk_config(shape_m, shape_n, shape_k, s);
+        if (!c.valid())
+            return false;
+        auto runtime = deep_gemm::jit::getGlobalCompiler().buildSplitK(shape_k, c, epi_key);
+        auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
+        bool ok = fits(kernel, c);
+        if (!ok && forced == 0u && c.block_t <= 24u)
+        {
+            deep_gemm::jit::DenseSplitKConfig const shared
+                = deep_gemm::jit::make_dense_splitk_config(shape_m, shape_n, shape_k, s, /*one_cta_per_sm=*/false);
+            if (shared.valid() && fits(kernel, shared))
+            {
+                c = shared;
+                ok = true;
+            }
+        }
+        if (!ok)
+        {
+            if (forced != 0u || s <= 2u)
+                return false;
+            continue; // one cluster per tile does not fit at once: one slice fewer
+        }
+        // The kernel's weight is gemm_dispatch_sm90's B and its activation A, as on the swap-AB route below.
+        deep_gemm::runGemmSwapABSplitK(kernel, mat_b, ld_b, mat_a, ld_a, mat_d, ld_d, scales_b, scales_a, shape_m,
+            shape_n, shape_k, c, stream, pdl, epilogue);
+        return true;
+    }
+    return false;
+}
+
 // `epilogue`: the dense epilogue of interface v1 (common/epilogue.cuh). Bias, residual and erf-GELU
 // (kDenseEpiServedSm90DeepGemm) are applied by each of the three kernels below to its promoted fp32 accumulator before
 // its one bf16 rounding (deep_gemm/fso_dense_epilogue.cuh), in a JIT variant of the kernel the identity call runs at
@@ -134,6 +275,12 @@ inline void gemm_dispatch_sm90(void* mat_a, int ld_a, void* mat_b, int ld_b, voi
 
     constexpr uint32_t block_k = 128;
     constexpr uint32_t num_problems = 1;
+
+    // The in-cluster split-K route first (sm90_dense_splitk_route above): where few weight tiles leave most of the SMs
+    // idle at decode sizes, the CTAs of a cluster divide K between them and add their partial sums in rank order.
+    if (sm90_dense_splitk_route(mat_a, ld_a, mat_b, ld_b, mat_d, ld_d, scales_a, scales_b, shape_m, shape_n, shape_k,
+            stream, num_device_sms, epilogue, epi_key, fso_pdl_enabled()))
+        return;
 
     // Small-M routing. The main path's block_m floor is 64 (Hopper WGMMA 2-warpgroup layout), so below M = 64 its
     // activation tile is partly empty, and so is its last M block up to M = 128. Swap-AB turns the small dimension

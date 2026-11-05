@@ -34,6 +34,10 @@ DENSE = [  # (N, K, M): default routes, chosen for kernel-family and stage-count
     # the swap-AB routes above M = 96 (issue 12, H4): 64-row tiles with 32 / 48 tokens, 128-row tiles with 48 / 80
     # tokens on two-wave launches
     (2048, 4096, 97), (2560, 4096, 136), (9728, 2560, 144), (12288, 2048, 152),
+    # the in-cluster split-K route (issue 12, FH5): two slices with 16 / 24 / 48 / 56 / 64 tokens, three with 16 / 32
+    # (and sharing SMs on 40 tiles), four with 16 / 24 / 56, and the 4 K blocks of 2048 x 512 in two slices
+    (2560, 4096, 8), (2560, 4096, 24), (2048, 4096, 16), (2048, 4096, 32), (2560, 9216, 8), (2560, 9216, 48),
+    (2560, 9728, 64), (1024, 2048, 16), (1024, 4096, 24), (2048, 512, 8), (2560, 4096, 56), (1280, 5120, 56),
 ]
 FORCED = [(12288, 2048, 136)]  # the swap-AB 128 x 24 tile of the failure, FSO_SM90_SWAP_MAX_M=1024 FSO_SM90_SWAP_BN=24
 MOE = [("C", 1), ("C", 2), ("C", 64), ("C", 1024), ("B", 1), ("B", 512)]
