@@ -175,6 +175,35 @@ class _Sm100BlockScaledGemmCommon:
     fso_epi_bias: bool = False
     fso_epi_act: int = 0
     fso_epi_res: bool = False
+    # fso-pdl: set by _fso_set_weights_first from the kernels' __init__.
+    fso_wf: bool = False
+
+    # fso-pdl: the most stages filled before the wait (None: every stage but one).
+    fso_wf_cap = None
+
+    def _fso_set_weights_first(self, weights_first: bool, cap=None) -> None:
+        """fso-pdl: `weights_first` False is today's kernel, byte for byte. True builds the weights-first variant:
+        the TMA warp issues the weight (kernel operand A under swap-AB) and weight-scale (SFA) copies of its first
+        tile's first stages before its griddepcontrol.wait, and the activation (B), activation-scale (SFB) copies
+        of those stages after it, against the same stage barriers. At most `cap` stages, and never every stage, go
+        before the wait (see `_fso_wf_stages`; fso's decode row passes 4 for a one-CTA tile and 1 for the two-CTA
+        tile). Every other warp keeps its wait where
+        today's kernel has it, so the bias, the residual and the output are touched only after a wait, as before."""
+        self.fso_wf = bool(weights_first)
+        self.fso_wf_cap = None if cap is None else int(cap)
+
+    def _fso_wf_stages(self) -> int:
+        """fso-pdl: the most stages the weights-first TMA warp fills before its griddepcontrol.wait: `fso_wf_cap`,
+        and never every stage. One stage is always left free: the producer's try-acquire of the stage after the last
+        one it filled must find that stage empty, because the consumer can free none of them before the activation
+        copies that follow the wait (with every stage filled, that try-wait sits on a stage that cannot complete
+        before the wait; G0D measured about 3.7 us per call on the C++ kernel built that way,
+        runs/G0D/report/probe.md). The cap keeps the activation copies after the wait from queueing behind many
+        weight copies: with every stage but one filled, fso measured the pre-quantized LLM decode call 0.1-0.2 us
+        slower; with four on the one-CTA tiles and one on the two-CTA tile, faster (run fso_issue12_20261028/FB1)."""
+        if self.fso_wf_cap is not None:
+            return max(0, min(self.num_ab_stage - 1, self.fso_wf_cap))
+        return self.num_ab_stage - 1
 
     def _fso_set_epilogue(self, fso_epilogue: Optional[Tuple[bool, int, bool]]) -> None:
         """fso-epilogue: `fso_epilogue` is None (today's kernel, byte for byte) or `(has_bias, act, has_residual)`

@@ -578,9 +578,16 @@ __global__ void fp8bs_quantize_1x32_packed_kernel(
 // land at the same sf_word_index and the padded rows get the same zero words.
 //
 // PDL: launched with programmatic stream serialization unless FSO_DISABLE_PDL=1. Every thread waits on the
-// parent grid (cudaGridDependencySynchronize) before its first global access, read or write, and thread 0 of
-// every CTA then releases the dependent launch, so the GEMM that consumes the output can be created and run
-// its prologue while this kernel still runs; that GEMM waits for this grid's completion before it reads.
+// parent grid (cudaGridDependencySynchronize) before its first global access, read or write. The plain quantize
+// releases the dependent launch from thread 0 of every CTA at entry, before that wait (issue #12, FB1), and the
+// SwiGLU form right after it, so the GEMM that consumes the output can be created and run its prologue (and, on
+// the sm_100 decode row, issue its weight stages) while this kernel still runs; that GEMM waits for this grid's
+// completion before it reads what this kernel writes. Because the release comes before the wait, the dependent can
+// also overlap the kernel in front of this one: a dense GEMM after it must not read before its own wait anything
+// that kernel writes (the weight-handle rule of docs/api/dense.md). The release is the same for every grid: a
+// release by rounds of one CTA per SM (the last round at entry, the earlier ones at exit) measured slower on every
+// B300 cell whose grid exceeds one round, because six of these CTAs fit on an SM (35 registers per thread) and the
+// GEMM was then created only near the end of this kernel (run fso_issue12_20261028/FB1, hold S).
 namespace
 {
 
@@ -649,11 +656,16 @@ __global__ void __launch_bounds__(kWideQuantThreads) fp8bs_quantize_1x32_packed_
     __nv_fp8_e4m3* __restrict__ out_fp8, int32_t* __restrict__ out_packed,
     __nv_bfloat16 const* __restrict__ input, int M, int K, int M_pad, bool pdl)
 {
+    // The plain quantize releases its dependent at entry (issue #12, FB1), before its own wait: the GEMM that
+    // consumes its output is then created and runs its prologue (on the decode row it also issues its weight
+    // stages) while this kernel still waits for the kernel in front of it and runs. That GEMM waits for this grid's
+    // completion before it reads the codes or the scale words, so the release hands nothing over early. (The SwiGLU
+    // form below keeps its release after its wait.)
     if (pdl)
     {
-        cudaGridDependencySynchronize();
         if (threadIdx.x == 0)
             cudaTriggerProgrammaticLaunchCompletion();
+        cudaGridDependencySynchronize();
     }
     int const num_kp = K >> 7;
     int64_t const t = static_cast<int64_t>(blockIdx.x) * kWideQuantThreads + threadIdx.x;

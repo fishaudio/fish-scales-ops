@@ -504,6 +504,18 @@ decode row binds those addresses as raw pointers, which is the general rule of
 bytes in place (reloading into the same tensors) and replaying is correct;
 preparing a new handle means capturing again.
 
+On sm_100/103 the GEMM of a dense call may read the handle's weight and scale
+before its programmatic-launch wait (the weights-first prologue of the swap-AB
+row), and the activation quantize of a call with a bf16 `x` releases the GEMM at
+its own entry, before it waits for the kernel in front of it. The kernel
+launched immediately before a dense call on the same stream must therefore not
+write `weight.weight` or `weight.scale`, in either form of the call; `x`, `xq`,
+`sx`, the bias and the residual may come from that kernel. `prepare_weight`
+ends with one plain launch, so the very next call may use the handle it
+returns. Rewriting the weight bytes in place with an ordinary copy and then
+replaying a captured graph stays correct, because a graph launch waits for
+everything launched before it on the stream (`test_dense_v1.py`, case x).
+
 ## `supported` and `describe`
 
 `supported(format, arch=None)` answers from the architecture matrix: `"bsfp8"`

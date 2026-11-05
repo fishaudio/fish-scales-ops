@@ -222,7 +222,17 @@ The cases, each run where the hardware exists and skipped with a message elsewhe
       the small-M route are counted and printed. (b) and (f) treat linear_quantized as served where the route of the
       call applies it. `--case s` runs this case alone.
 
-usage: python tests/gemm/unit/test_dense_v1.py [--case a|b|c|d|e|f|g|o|w|p|q|r|s]
+  The weight handle and the weights-first GEMMs (issue #12, FB1), sm_100/sm_103 only:
+  x.  prepare_weight -> linear back to back, both entries, behind a producer that releases its dependents at once and
+      finishes 2 ms later: equal to the synchronized call (prepare_weight ends with a plain launch). A weight written
+      by the kernel launched right before a pre-quantized call: on the decode row with weights first it is read before
+      it is complete (the control: the call differs), on every other route after (the guard: the call is equal).
+      prepare_weight with its plain launch dropped: the differing calls are counted (data). A captured graph whose
+      weight bytes are rewritten in place (memcpy, gather kernel) and replayed equals the eager call on the new
+      weight. fso.compat.linear_fp8 packing FP32 scales inside the call equals the call on pre-packed scales.
+      `--case x` runs this case alone.
+
+usage: python tests/gemm/unit/test_dense_v1.py [--case a|b|c|d|e|f|g|o|w|p|q|r|s|x]
 """
 import os
 import re
@@ -5360,6 +5370,201 @@ def _case_s_sm120() -> None:
           f"scale words; on the cascade (route off) it equals quantize_activation(linear()) bit for bit")
 
 
+# --- (x) sm_100/sm_103: the weight handle is complete before the next launch (issue #12, FB1) ------------------------
+#
+# The GEMMs of the sm_100/sm_103 decode row read the weight and its scale before their PDL wait (the weights-first
+# prologue, fish_scales_ops.gemm._sm100_decode._WEIGHTS_FIRST); the other routes read nothing before it. A weight
+# written by the kernel launched right before a decode-row GEMM would therefore be read before it is complete, and
+# prepare_weight ends with one plain launch (fso.dense._complete_handle). The producer in front of each call below is
+# the probe of case (m): it releases its programmatic dependents at entry and finishes 2 ms later, so a programmatic
+# launch behind it can start at once.
+
+def _x_dst_handle(dw):
+    """A handle of dw's shapes, strides and dtypes with zeroed tensors (the destination the producer fills)."""
+    w2 = torch.zeros_like(dw.weight)
+    s2 = torch.zeros_like(dw.scale)
+    return type(dw)(dw.kind, dw.format, dw.arch, dw.in_features, dw.out_features, w2, s2)
+
+
+def case_x(major: int) -> None:
+    """sm_100/sm_103 (issue #12, FB1): the weight handle and the weights-first GEMMs.
+      x1  prepare_weight -> linear back to back, both entries (a bf16 x: quantize + GEMM; the pre-quantized x), behind
+          a producer that releases its dependents at once and finishes 2 ms later (the weight quantize, a
+          programmatic dependent of it, runs only then): every call equals the same call made after a device
+          synchronization. prepare_weight ends with one plain launch, which starts only when the weight quantize has
+          completed, so neither entry's GEMM can start before the handle is complete.
+      x2  a weight written by the kernel launched right before a pre-quantized call (the producer copies the codes
+          and the scale words into a zeroed handle 2 ms after releasing its dependents). On the decode row with
+          weights first, the control: the weight is read before it is written, and the call differs from the call on
+          the final handle (the overlap the plain launch closes). On every other route, and with weights first off,
+          the guard: the GEMM reads nothing before its wait, and the call equals the call on the final handle. The
+          bf16-x entry behind the same writer is printed (its activation quantize stands between the writer and the
+          GEMM; whether the GEMM can overlap the writer depends on where the quantize releases it).
+      x2b prepare_weight with the plain launch dropped (fso.dense._complete_handle patched to the identity), behind the
+          producer, both entries, eight trials each: the calls that differ from the synchronized call are counted and
+          printed (data; how wide this window is depends on where the activation and weight quantizes release their
+          dependents).
+      x3  a captured graph of linear (both entries) whose weight bytes are rewritten in place by an ordinary torch copy
+          (a copy-engine memcpy, and a gather kernel), then replayed: equals the eager call on the new weight. A graph
+          launch depends on everything launched before it on the stream (a full dependency: a programmatic edge exists
+          only between kernel nodes inside a graph), so the GEMM's early weight reads come after the copy.
+      x4  fso.compat.linear_fp8 with FP32 scales, which it packs inside the call (both FP32, and each of the two
+          mixes with a pre-packed scale), behind the producer: equal to the call on scales packed beforehand. The
+          call writes the weight side first and keeps a plain launch between that write and the GEMM.
+    Skipped with FSO_DISABLE_PDL=1 for x1 / x2 / x2b / x4 (nothing overlaps then)."""
+    if major != 10:
+        print(f"  x  sm_100/sm_103 only; skipped on {_arch_label()}")
+        return
+    from fish_scales_ops.gemm import _sm100_decode, _sm100_dispatch
+    pdl = os.environ.get("FSO_DISABLE_PDL") != "1"
+    weights_first = pdl and _sm100_decode._weights_first()
+    ext = _pdl_probe() if pdl else None
+    spin = 2_000_000  # ns
+    if pdl:
+        t0, t1 = torch.ones(256, dtype=torch.int16, device="cuda"), torch.zeros(256, dtype=torch.int16, device="cuda")
+        ext.slow_copy2(t0, t1, t0, t1, 1, 1000)
+        torch.cuda.synchronize()
+    tiny_s, tiny_d = torch.ones(64, dtype=torch.int16, device="cuda"), torch.zeros(64, dtype=torch.int16, device="cuda")
+    # (N, K, M): the decode row's split-K and persistent forms and its two-CTA tile at M = 64 (the kernels that read
+    # the weight before their wait), and short-K cells with a bias: the 1280 x 1280 ones on the row's narrow short-K
+    # split-K form, the 5120 x 1280 one on tier 1 (cuBLAS scaled_mm, a plain launch, which reads nothing before the
+    # kernel in front has finished). Each cell's route is asked from the router, so the case follows the routes.
+    cells = ((5120, 2048, 1), (2048, 4096, 16), (5120, 2048, 64), (1280, 5120, 78), (1280, 1280, 78),
+             (1280, 1280, 182), (5120, 1280, 182))
+    for N, K, M in cells:
+        w = make_w(N, K, seed=1301 + N + K)
+        x = make_x(M, K, seed=1302 + M)
+        b = (torch.randn(N, device="cuda") * 0.1).bfloat16() if K == 1280 else None
+        dw_ref = D.prepare_weight(w, format="mxfp8")
+        xq, sx = D.quantize_activation(x)
+        torch.cuda.synchronize()
+        want = {"bf16-x": D.linear(x, dw_ref, bias=b), "2b": D.linear(xq, dw_ref, x_scale=sx, bias=b)}
+        torch.cuda.synchronize()
+        calls = {"bf16-x": lambda d: D.linear(x, d, bias=b), "2b": lambda d: D.linear(xq, d, x_scale=sx, bias=b)}
+        route = _sm100_dispatch.plan(M, N, K, _q_epilogue(M, N, bias=b) if b is not None else None)
+        reads_early = weights_first and route == "sm100.decode"
+        tag = f"N={N:5d} K={K:5d} M={M:5d} {route}"
+        if pdl:
+            # x1: producer -> prepare_weight -> linear
+            for entry, call in calls.items():
+                ok = True
+                for _ in range(4):
+                    torch.cuda.synchronize()
+                    ext.slow_copy2(tiny_s, tiny_d, tiny_s, tiny_d, 1, spin)
+                    dw = D.prepare_weight(w, format="mxfp8")
+                    got = call(dw)
+                    torch.cuda.synchronize()
+                    ok &= bytes_equal(got, want[entry])
+                _check(ok, f"x1 {tag} {entry}: prepare_weight -> linear behind a late producer != the synchronized call")
+                print(f"  x1 {tag} {entry:6s}: producer -> prepare_weight -> linear == synchronized call {_ok(ok)}")
+            # x2: a weight written by the kernel right before the call
+            for entry, call in calls.items():
+                dst = _x_dst_handle(dw_ref)
+                call(dst)  # warm with the destination handle (descriptors, JIT)
+                dst.weight.zero_(), dst.scale.zero_()
+                torch.cuda.synchronize()
+                ext.slow_copy2(dw_ref.weight.view(torch.int16), dst.weight.view(torch.int16),
+                               dw_ref.scale.view(torch.int16), dst.scale.view(torch.int16), 8, spin)
+                got = call(dst)
+                torch.cuda.synchronize()
+                differs = not bytes_equal(got, want[entry])
+                if entry == "2b" and reads_early:
+                    _check(differs, f"x2 {tag} 2b: a weight written by the kernel right before the call was read after "
+                                    f"it was complete (the control saw no overlap)")
+                    print(f"  x2 {tag} 2b    : weight written 2 ms after its writer released the GEMM: the call "
+                          f"differs from the call on the final weight {_ok(differs)} (the overlap is real)")
+                elif entry == "2b":
+                    _check(not differs, f"x2 {tag} 2b: a GEMM that reads nothing before its wait read a weight written "
+                                        f"by the kernel right before the call before it was complete")
+                    print(f"  x2 {tag} 2b    : weight written 2 ms after its writer released the GEMM: the call "
+                          f"equals the call on the final weight {_ok(not differs)} (nothing read before the wait)")
+                else:
+                    print(f"  x2 {tag} bf16-x: the same writer in front of the activation quantize: the call "
+                          f"{'differs' if differs else 'equals the call on the final weight'} (data)")
+            # x2b: prepare_weight without its plain launch
+            saved = getattr(D, "_complete_handle", None)
+            if saved is None:
+                print(f"  x2b {tag}: prepare_weight has no trailing plain launch in this build; skipped")
+            else:
+                D._complete_handle = lambda dw_: dw_
+                try:
+                    for entry, call in calls.items():
+                        n_diff = 0
+                        for _ in range(8):
+                            torch.cuda.synchronize()
+                            ext.slow_copy2(tiny_s, tiny_d, tiny_s, tiny_d, 1, spin)
+                            dw = D.prepare_weight(w, format="mxfp8")
+                            got = call(dw)
+                            torch.cuda.synchronize()
+                            n_diff += 0 if bytes_equal(got, want[entry]) else 1
+                        print(f"  x2b {tag} {entry:6s}: prepare_weight WITHOUT its plain launch -> linear: {n_diff} "
+                              f"of 8 calls differ from the synchronized call (data)")
+                finally:
+                    D._complete_handle = saved
+        # x3: in-place rewrite, then graph replay
+        w2 = make_w(N, K, seed=1303 + N + K)
+        dw2 = D.prepare_weight(w2, format="mxfp8")
+        torch.cuda.synchronize()
+        want2 = {"bf16-x": D.linear(x, dw2, bias=b), "2b": D.linear(xq, dw2, x_scale=sx, bias=b)}
+        for entry, call in calls.items():
+            dw = D.prepare_weight(w, format="mxfp8")
+            call(dw)
+            torch.cuda.synchronize()
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                call(dw)
+            torch.cuda.current_stream().wait_stream(s)
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, stream=s):
+                out = call(dw)
+            g.replay()
+            torch.cuda.synchronize()
+            ok0 = bytes_equal(out, want[entry])
+            dw.weight.copy_(dw2.weight)  # same dtype, contiguous: a copy-engine memcpy
+            dw.scale.copy_(dw2.scale)
+            g.replay()
+            torch.cuda.synchronize()
+            ok1 = bytes_equal(out, want2[entry])
+            src_w, dst_w = dw.weight.view(torch.uint8).view(-1), dw.weight.view(torch.uint8).view(-1)
+            idx = torch.arange(dw_ref.weight.numel(), device="cuda")
+            torch.index_select(dw_ref.weight.view(torch.uint8).view(-1), 0, idx, out=dst_w)  # a gather kernel
+            idx_s = torch.arange(dw_ref.scale.numel(), device="cuda")
+            torch.index_select(dw_ref.scale.view(-1), 0, idx_s, out=dw.scale.view(-1))
+            g.replay()
+            torch.cuda.synchronize()
+            ok2 = bytes_equal(out, want[entry])
+            del src_w
+            ok = ok0 and ok1 and ok2
+            _check(ok, f"x3 {tag} {entry}: graph replay after an in-place weight rewrite != eager on the new weight "
+                       f"(capture {ok0}, memcpy {ok1}, gather kernel {ok2})")
+            print(f"  x3 {tag} {entry:6s}: graph replay after an in-place rewrite (memcpy, then a gather kernel) == "
+                  f"eager on the new weight {_ok(ok)}")
+            del g
+        # x4: linear_fp8 packing FP32 scales inside the call, behind the producer
+        if pdl:
+            wq, sw32 = C.quantize_128x128_fp8(w)
+            xq1, sx32 = C.quantize_1x128_fp8(x)
+            # the reference packs with the kernels linear_fp8 itself runs (the unchecked torch ops), ahead of the call
+            ops = torch.ops.fish_scales_ops
+            sxp, swp = ops.repack_fp8_act_scales(sx32.contiguous(), False), ops.repack_fp8_wgt_scales(sw32, False)
+            torch.cuda.synchronize()
+            ref = C.linear_fp8(xq1, wq, sxp, swp)
+            torch.cuda.synchronize()
+            ok = True
+            for sx_, sw_ in ((sx32, sw32), (sxp, sw32), (sx32, swp)):
+                for _ in range(3):
+                    torch.cuda.synchronize()
+                    ext.slow_copy2(tiny_s, tiny_d, tiny_s, tiny_d, 1, spin)
+                    got = C.linear_fp8(xq1, wq, sx_, sw_)
+                    torch.cuda.synchronize()
+                    ok &= bytes_equal(got, ref)
+            _check(ok, f"x4 {tag}: linear_fp8 with scales packed inside the call != the call on pre-packed scales")
+            print(f"  x4 {tag}: linear_fp8 packing its FP32 scales in the call (three scale mixes) == pre-packed "
+                  f"{_ok(ok)}")
+
+
 def _finish(ok_line: str) -> int:
     if failures:
         print("\nFAILURES:")
@@ -5470,6 +5675,9 @@ def main() -> int:
         print("== (s) linear_quantized beside another route: sm_100/sm_103 on the C++ cascade (every tile family "
               "forced, and the natural routing); sm_120/sm_121 on the cascade beside the small-M route ==")
         case_s(major)
+    if wanted("x"):
+        print("== (x) sm_100/sm_103: the weight handle is complete before the next launch; weights-first GEMMs ==")
+        case_x(major)
     return _finish("fso.dense interface v1: ALL PASS")
 
 

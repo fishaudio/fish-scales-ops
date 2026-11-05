@@ -571,17 +571,36 @@ def prepare_weight(w, *, format, scale=None) -> DenseWeight:
             return DenseWeight("bsfp8", fmt, arch, k, n, q, sq)
         else:
             q, sq = quantize_1x32_fp8(wd)
-        return DenseWeight("mxfp8", fmt, arch, k, n, q, sq)
+        return _complete_handle(DenseWeight("mxfp8", fmt, arch, k, n, q, sq))
 
     if is_fp8:
         if isinstance(scale, torch.Tensor) and scale.dtype == torch.uint8:
             sq = _ue8m0_scale(scale, n, k, w.device, major, ctx)
         else:
             sq = _mxfp8_scale(scale, n, k, w.device, major, ctx)
-        return DenseWeight("mxfp8", fmt, arch, k, n, _aligned_storage(wd.contiguous()),
-                           _aligned_storage(sq, 32 if major == 10 else 16))
+        return _complete_handle(DenseWeight("mxfp8", fmt, arch, k, n, _aligned_storage(wd.contiguous()),
+                                            _aligned_storage(sq, 32 if major == 10 else 16)))
     q, sq = quantize_1x32_fp8(wd)
-    return DenseWeight("mxfp8", fmt, arch, k, n, q, sq)
+    return _complete_handle(DenseWeight("mxfp8", fmt, arch, k, n, q, sq))
+
+
+def _complete_handle(dw: DenseWeight) -> DenseWeight:
+    """Return ``dw`` once its tensors are complete for every kernel launched after this point (sm_100/sm_103).
+
+    Why. On sm_100/sm_103 the GEMMs of the decode row read the weight and its scale before their
+    programmatic-dependent-launch wait (the weights-first prologue, issue #12 FB1), and the activation quantize of a
+    bf16-x call can release the GEMM at its own entry, before it waits (its last round of CTAs does). Such a GEMM
+    can therefore overlap the kernel launched right before the call on the same stream, and a weight written by that
+    kernel could be read before it is complete. This function's own last write is such a kernel: the quantize of a
+    bf16 weight (a programmatic-dependent launch itself, which releases its dependents early), or the scale repack
+    of a checkpoint. So the handle ends with one plain launch (a one-word fill, no programmatic serialisation) on the
+    current stream: a plain launch starts only once every kernel in front of it on the stream has completed and its
+    writes are visible, and anything launched after it can overlap at most that fill. ``prepare_weight`` followed
+    directly by ``linear`` is then safe (test_dense_v1, case x). The fill costs one tiny launch per prepared weight,
+    at load time; nothing synchronises the host."""
+    if dw.arch // 10 == 10:
+        torch.zeros(1, dtype=torch.int32, device=dw.weight.device)
+    return dw
 
 
 

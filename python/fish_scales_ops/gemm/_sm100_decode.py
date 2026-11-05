@@ -164,14 +164,39 @@ _WIDE_TOKEN_TILE = 64
 #: tables/SWEEP_BC.txt).
 MIN_WIDE_TOKEN_K = 1024
 #: Programmatic dependent launch. The kernels own both sides of the
-#: griddepcontrol pair (wait at entry, launch-dependents at the end of the
-#: mainloop), which is what makes it capture-safe here; this is unrelated to
-#: the closed "PDL on a CUTLASS GEMM with no GDC compiled in" item.
+#: griddepcontrol pair (the wait before any load of the activation, its scale,
+#: the bias or the residual, and launch-dependents at the kernel's end), which
+#: is what makes it capture-safe here; this is unrelated to the closed "PDL on
+#: a CUTLASS GEMM with no GDC compiled in" item. Under PDL the weight and its
+#: scale are read before the wait (``_WEIGHTS_FIRST``).
 #: ``FSO_DISABLE_PDL=1`` (read once per process, like the C++ launches) drops
 #: the attribute from the launch; the kernels' griddepcontrol instructions are
 #: then no-ops and the bytes are unchanged (test_dense_v1, case q).
 _ENABLE_PDL = True
 _PDL: Optional[bool] = None
+#: Weights first (issue #12, FB1). Under PDL both kernels are built with ``fso_weights_first``: the TMA warp issues
+#: the weight and weight-scale copies of its first tile's first stages (``_wf_pre_wait_stages``, never every stage)
+#: before its griddepcontrol.wait and the activation and activation-scale copies after it, so the weight stream of a
+#: call overlaps the kernel in front of it (the activation quantize of a bf16-x call, which releases this kernel at
+#: its entry). Every other warp waits where it did, so the bias, the residual and the output are touched only after
+#: a wait. Without PDL the kernels are today's, byte for byte. The order of the loads changes nothing in the
+#: arithmetic, so the output bytes are the same either way (test_dense_v1, cases q and x).
+_WEIGHTS_FIRST = True
+#: The most stages the weights-first TMA warp fills before its wait, a constant of each kernel variant: the one-CTA
+#: tiles (the split-K kernel at every token tile and the persistent kernel at cluster (1, 1)) fill up to four, the
+#: two-CTA tile (the persistent kernel's 256-row weight tile in a cluster of two) fills one. Measured on the B300
+#: with cold weights (run fso_issue12_20261028/FB1, holds C and E1, two passes each). With every stage but one filled
+#: before the wait, the activation copies issued after it queued behind up to ten weight copies in the TMA unit and
+#: the pre-quantized LLM decode call got 0.1-0.2 us slower than without weights first. With four, the one-CTA tiles
+#: were faster in both calls on every decode-row target cell (the bf16-x call by 0.26-0.81 us, the pre-quantized call
+#: by 0.02-0.53 us), but on the two-CTA tile the pre-quantized call of llm_o (2048 x 4096) was 0.06-0.07 us slower
+#: (+1.1 % at M = 64 and at M = 416). The window in front of a pre-quantized call is only the previous GEMM's tail,
+#: so the activation copies that follow the wait start behind the weight copies issued before it, and on the
+#: two-CTA tile four stages of them cost more than the early start gained. With one stage both calls of llm_o 64
+#: and llm_qkv 64 were faster than on 0281c5f (hold C: the pre-quantized call by 0.04 us each, the bf16-x call,
+#: which also carries the quantize's release at entry, by 0.26 and 0.42 us).
+WF_PRE_WAIT_STAGES_ONE_CTA = 4
+WF_PRE_WAIT_STAGES_TWO_CTA = 1
 
 
 def _pdl_enabled() -> bool:
@@ -179,6 +204,19 @@ def _pdl_enabled() -> bool:
     if _PDL is None:
         _PDL = _ENABLE_PDL and not env_flag("FSO_DISABLE_PDL")
     return _PDL
+
+
+def _weights_first() -> bool:
+    """True when the kernels are built in the weights-first form: under PDL, which is the only setting in which a
+    load can be issued before the kernel in front has finished (see ``_WEIGHTS_FIRST``)."""
+    return _WEIGHTS_FIRST and _pdl_enabled()
+
+
+def _wf_pre_wait_stages(cluster) -> int:
+    """The weights-first stages of a kernel variant before its wait: ``WF_PRE_WAIT_STAGES_TWO_CTA`` for the
+    persistent kernel's two-CTA tile (a cluster of two), ``WF_PRE_WAIT_STAGES_ONE_CTA`` for every one-CTA tile (the
+    split-K kernel's tactics carry cluster (1, 1); its K slices are a separate cluster dimension)."""
+    return WF_PRE_WAIT_STAGES_TWO_CTA if cluster[0] * cluster[1] > 1 else WF_PRE_WAIT_STAGES_ONE_CTA
 
 
 #: Shortest K slice worth giving a CTA, in elements: four mainloop K-tiles of
@@ -930,7 +968,9 @@ def _get_compiled(st: dict, cfg: _ConfigT, sf_m: int, sf_n: int, sf_k: int,
     """
     tile, cluster, swap_ab, split_k = cfg
     pdl = _pdl_enabled()
-    key = (tile, cluster, swap_ab, split_k, pdl, epi)
+    wf = _weights_first()
+    cap = _wf_pre_wait_stages(cluster) if wf else None
+    key = (tile, cluster, swap_ab, split_k, pdl, epi, wf, cap)
     fn = st["compiled"].get(key)
     if fn is not None:
         return fn
@@ -938,6 +978,10 @@ def _get_compiled(st: dict, cfg: _ConfigT, sf_m: int, sf_n: int, sf_k: int,
     make_ptr, cuda_drv = st["make_ptr"], st["cuda"]
 
     kw = {} if epi is None else {"fso_epilogue": epi}
+    if wf:
+        kw["fso_weights_first"] = True
+    if cap is not None:
+        kw["fso_wf_cap"] = int(cap)
     if split_k > 1:
         gemm = st["SK"](32, tile, split_k, pdl, **kw)
     else:

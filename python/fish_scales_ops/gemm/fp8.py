@@ -100,14 +100,25 @@ def linear_fp8(
         # check (check=False): the check copies a flag to the host, which would
         # synchronize every call and make the call uncapturable. Same kernels,
         # same bytes as the checked public wrappers.
+        #
+        # The weight side is written first. Under PDL the GEMMs of the decode row read the weight and its scale
+        # before their programmatic-launch wait (issue #12, FB1), so the kernel launched immediately before the
+        # GEMM must not be one that writes the weight (the copy of a strided w_fp8) or its packed scale. Those
+        # copies and repacks are plain launches: the activation-scale repack, when there is one, starts only after
+        # them and stands between them and the GEMM; otherwise one plain one-word fill does (the fence of
+        # fso.dense.prepare_weight). The order of these kernels changes no byte.
         ops = torch.ops.fish_scales_ops
-        if sx.dtype == torch.float32:
-            sx = ops.repack_fp8_act_scales(sx.contiguous(), False)
+        w_c = w_fp8.contiguous()
+        wrote_weight = w_c.data_ptr() != w_fp8.data_ptr()
         if sw.dtype == torch.float32:
             sw = ops.repack_fp8_wgt_scales(sw.contiguous(), False)
+            wrote_weight = True
+        if sx.dtype == torch.float32:
+            sx = ops.repack_fp8_act_scales(sx.contiguous(), False)
+        elif wrote_weight:
+            torch.zeros(1, dtype=torch.int32, device=w_c.device)
         from .mxfp8 import linear_mxfp8
-        return linear_mxfp8(x_fp8.contiguous(), w_fp8.contiguous(), sx, sw, bias=bias, residual=residual,
-                            activation=activation)
+        return linear_mxfp8(x_fp8.contiguous(), w_c, sx, sw, bias=bias, residual=residual, activation=activation)
     return torch.ops.fish_scales_ops.linear_fp8(
         x_fp8.contiguous(),
         w_fp8.contiguous(),
