@@ -32,8 +32,9 @@ architecture. The epilogue arguments (`bias`, `residual`, `activation`) and
 `linear_quantized` are validated and passed down to the architecture's GEMM. On
 sm_90 the GEMM applies `bias`, `residual` and `activation="gelu_erf"` itself, in
 the same launch, on every shape, for a bf16 `x` and for the pre-quantized form.
-On sm_100/sm_103 the CuTe-DSL swap-AB row (the M ≤ 64 decode band and the
-narrow-N long-K band above it) and the C++ cascade (tier 3 of the sm_100
+On sm_100/sm_103 the CuTe-DSL swap-AB row (the M ≤ 64 decode band, the
+narrow-N long-K and short-K bands above it, and the identity and erf-GELU
+calls it takes on some other short-K cells) and the C++ cascade (tier 3 of the sm_100
 router) apply all three, tier 1 (cuBLAS `scaled_mm`) applies the bias, and the
 router sends a call to the first tier of its shape that applies every field it
 carries; every route of the sm_120/sm_121 MXFP8 cascade and the sm_120/sm_121
@@ -226,7 +227,7 @@ handle's kind and on the device's architecture:
 |---|---|---|
 | `"bsfp8"` | sm_90 | `linear_qx`, which quantizes the activation to 1×128 block-FP8 inside the GEMM op and runs the deep_gemm WGMMA kernel. The result is bit-identical to `quantize_activation` + `linear(xq, weight, x_scale=sx)` everywhere, and to `quantize_1x128_fp8` + `linear_fp8` except on a 128-element group whose amax is below 1.00044e-10 when `K % 512 == 0` (where `quantize_1x128_fp8` floors at `1e-10f` and `linear_qx` at the bf16 value of it) |
 | `"mxfp8"` | sm_120 / sm_121 | one op, `linear_mxfp8_bf16x`: in the decode band (`M ≤ 64`), where the small-M route's rule R2 picks it, one kernel (`sm120.smallm`, form G2) that quantizes the activation to 1×32 MXFP8 inside itself and runs the GEMM; elsewhere the fused 1×32 activation quantize (`quantize_1x32_fp8`'s kernel) followed by `linear_mxfp8_raw`, that is the small-M route's form G1 where its rule R1 picks it and the CUTLASS MXFP8 cascade with Stream-K otherwise. The bytes are those of `quantize_activation` + `linear(xq, weight, x_scale=sx)` on every shape |
-| `"mxfp8"` | sm_100 / sm_103 | the fused 1×32 activation quantize, then `linear_mxfp8`, the Python router: the CuTe-DSL swap-AB row (the M ≤ 64 decode band and, above it, the narrow-N long-K band: N ≤ 4096, K ≥ 4096), cuBLAS `scaled_mm`, the CuTe-DSL tier and the C++ cascade (which also takes the bias calls of the narrow-N short-K cells just above the decode band: N ≤ 2048, 1024 ≤ K ≤ 2560, 64 < M ≤ 256) |
+| `"mxfp8"` | sm_100 / sm_103 | the fused 1×32 activation quantize, then `linear_mxfp8`, the Python router: the CuTe-DSL swap-AB row (the M ≤ 64 decode band and, above it, the narrow-N long-K band: N ≤ 4096, K ≥ 4096; the narrow-N short-K band: N ≤ 4096, 1024 ≤ K ≤ 2560, while its split-K grid has at most 80 CTAs; the identity call of a wide-N short-K cell while the row's 1-SM grid fits one wave; the erf-GELU call of a short-K cell where the cascade's short-K tile rule would leave its 64-wide tile), cuBLAS `scaled_mm`, the CuTe-DSL tier and the C++ cascade (which also takes the bias calls of the narrow-N short-K cells just above the decode band that the swap-AB row leaves: N ≤ 2048, 1024 ≤ K ≤ 2560, 64 < M ≤ 256). The bf16-x call and the pre-quantized call of a shape and epilogue take the same route |
 | anything else | any | `NotImplementedError` naming the architecture for a kind of another architecture, `ValueError` for an unknown kind |
 
 The op also checks the metadata of its arguments, so a caller of the raw op
@@ -406,7 +407,7 @@ handle with a misaligned weight or scale exactly as `linear` does.
 Malformed epilogue arguments raise `ValueError`. In this build sm_90 applies
 `bias`, `residual` and `activation` on all three of its dense GEMM kernels, each
 in its one launch; on sm_100/sm_103 the CuTe-DSL swap-AB row (the M ≤ 64 decode
-band and the narrow-N long-K band above it) applies all three inside both of its
+band and the bands and calls it takes above it) applies all three inside both of its
 kernels (in the in-cluster split-K kernel once, after the fp32 sum), tier 1 (cuBLAS `scaled_mm`) applies the bias through cuBLAS's own
 fused epilogue, tier 2 (the CuTe-DSL persistent kernel) applies none, and the
 C++ cascade applies all three on every configuration its rules pick and on its
@@ -420,7 +421,11 @@ that apply every field of the call, so a tier that owns a cell by shape but lack
 one of its fields hands the cell to the next tier that has it (a residual or GELU
 call on a tier-1 cell runs on the swap-AB row's persistent form when the cell is
 narrow-N long-K and that form's clusters fit one wave, on the cascade otherwise;
-the bias alone stays on tier 1), and a field is never dropped and never refused
+the bias alone stays on tier 1; on short-K cells the router also chooses by the
+fields: the swap-AB row takes the identity call of a wide-N cell and the
+erf-GELU call where the cascade's short-K tile rule would leave its 64-wide
+tile, while the bias and residual calls of those cells keep their tiers), and a
+field is never dropped and never refused
 for want of a kernel on that architecture. `linear_quantized` is served on
 sm_120/sm_121 by every route of the MXFP8 cascade (the single-launch tiles write
 `xq_next` and `scale_next` from the GEMM's staged tile; the Stream-K route writes

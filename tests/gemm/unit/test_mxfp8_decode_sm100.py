@@ -3,11 +3,15 @@
 The decode row (`python/fish_scales_ops/gemm/_sm100_decode.py`) puts two
 vendored NVIDIA CuTe-DSL kernels in front of the three tiers of the sm_100
 MXFP8 router for the band M ≤ 64: the split-K and persistent kernels at the
-8/16/32-wide token tile up to M = 32, and the persistent kernel at the 64-wide
-token tile with the 2-CTA 256-row weight tile in a cluster of two from M = 33
-to 64 (the long-K narrow-N cells of that upper band stay with the C++
-cascade, and so does a shape whose clusters of two exceed the resident ones
-where the cascade's wave rule owns the cell: `gate_up` at M = 64). This file
+8/16/32-wide token tile up to M = 32, and from M = 33 to 64 the split-K kernel
+at the 64-wide token tile on the narrow-N cells with 4096 ≤ K < 8192 (FB2) and
+the persistent kernel at the 64-wide token tile with the 2-CTA 256-row weight
+tile in a cluster of two elsewhere (the K ≥ 8192 narrow-N cells of that upper
+band stay with the C++ cascade, and so does a shape whose clusters of two
+exceed the resident ones where the cascade's wave rule owns the cell: `gate_up`
+at M = 64). Above M = 64 it adds the narrow-N long-K band (P5), the narrow-N
+short-K band, and the identity and erf-GELU calls of some short-K cells (FB2;
+`test_fb2_routing`, `test_fb2_accuracy`). This file
 checks the three things that can go wrong when a kernel is
 swapped in under an existing public op:
 
@@ -236,21 +240,26 @@ def test_routing() -> None:
             f"shared_gate_up M={M}: unexpected split {cfg}")
     print("  routing  a K = 512 narrow-N shape falls through to one slice  OK")
 
-    # The upper band, 32 < M <= 64: one form, the persistent kernel at the
-    # 64-wide token tile with the 2-CTA 256-row weight tile in a cluster of
-    # two, on every shape but the long-K narrow-N class.
+    # The upper band, 32 < M <= 64: the persistent kernel at the 64-wide token
+    # tile with the 2-CTA 256-row weight tile in a cluster of two, on every
+    # shape but the long-K narrow-N class; since FB2 the narrow-N cells with
+    # 4096 <= K < 8192 (wo) run on the split-K kernel at the 64-wide token
+    # tile, in two slices at K = 4096 (the band-above form, _split_t64).
     for tag, N, K in SHAPES:
         for M in M_GRID_WIDE + [33, 63]:
             cfg = _sm100_decode.pick_config(M, N, K)
+            narrow_long = (N + 127) // 128 <= 32 and 4096 <= K < 8192
             if _row_takes(N, K, M):
-                assert cfg == WIDE_FORM, \
-                    f"{tag} M={M}: expected {WIDE_FORM}, got {cfg}"
+                want = SPLIT_T64(2) if narrow_long else WIDE_FORM
+                assert cfg == want, \
+                    f"{tag} M={M}: expected {want}, got {cfg}"
             else:
                 assert cfg is None, \
                     f"{tag} M={M}: a cell the row declines was taken ({cfg})"
     # The class boundary is in k and tiles_n, not in the shape name: a
-    # 2560-wide shape one K-tile short of 8192 is taken, one at 8192 is not,
-    # and a long-K shape that is not narrow (48 tiles) is taken.
+    # 2560-wide shape one K-tile short of 8192 is taken (on the wide-token
+    # form: 8064 divides into neither split), one at 8192 is not, and a long-K
+    # shape that is not narrow (48 tiles) is taken.
     assert _sm100_decode.pick_config(40, 2560, 8064) == WIDE_FORM
     assert _sm100_decode.pick_config(40, 2560, 8192) is None
     assert _sm100_decode.pick_config(64, 6144, 9728) == WIDE_FORM
@@ -272,8 +281,8 @@ def test_routing() -> None:
     # An N or K that is not a multiple of 128 is declined in this band too.
     assert _sm100_decode.pick_config(64, 2560, 2560 + 64) is None
     assert _sm100_decode.pick_config(64, 2560 + 64, 4096) is None
-    print("  routing  32 < M <= 64 takes the wide-token form except long-K "
-          "narrow-N  OK")
+    print("  routing  32 < M <= 64 takes the wide-token form except narrow-N "
+          "long-K (split-K at 4096 <= K < 8192, the cascade at K >= 8192)  OK")
 
     # Above the decode band the row takes only the narrow-N long-K band (issue #12, P5). On the Family A shapes of
     # this file that leaves every one of these M to the tiers below: the wide-N shapes are not the band, the
@@ -410,6 +419,125 @@ def test_band_accuracy() -> None:
         assert bool((diff <= ulp).all()), f"{tag} M={M}: band output differs from {tier} by more than one bf16 ulp"
         print(f"  band {tag:>8} M={M:>4}  {want}  cos={c_new:.6f} (was {c_old:.6f} on {tier}) "
               f"maxdiff={diff.max().item():.3e}  OK")
+
+
+# (FB2) the B300 swap-AB route rules: (label, N, K, M, expected tier and tactic per call kind). "id" is the identity
+# call, "b" the bias, "g" bias + erf-GELU; a tier name alone means the call keeps that tier.
+FB2_T64 = SPLIT_T64
+FB2_P128 = ((128, 64), (1, 1), True, 1)
+FB2_CELLS = [
+    # the narrow-N long-K class at 32 < M <= 64: the split-K form at the 64-wide token tile
+    ("o",        2048, 4096,  33, {"id": FB2_T64(2), "b": FB2_T64(2), "g": FB2_T64(2)}),
+    ("o",        2048, 4096,  64, {"id": FB2_T64(2), "b": FB2_T64(2), "g": FB2_T64(2)}),
+    ("fc2",      1280, 5120,  48, {"id": FB2_T64(4), "b": FB2_T64(4), "g": FB2_T64(4)}),
+    ("conv_out", 1280, 7680,  64, {"id": FB2_T64(4), "b": FB2_T64(4), "g": FB2_T64(4)}),
+    # the narrow-N short-K band: the split-K form in two slices while its grid has at most 80 CTAs
+    ("q",        1280, 1280,  78, {"id": FB2_T64(2), "b": FB2_T64(2), "g": FB2_T64(2)}),
+    ("q",        1280, 1280, 256, {"id": FB2_T64(2), "b": FB2_T64(2), "g": FB2_T64(2)}),
+    ("proj2",    2048, 1280, 117, {"id": FB2_T64(2), "b": FB2_T64(2), "g": FB2_T64(2)}),
+    ("sh_gu",    1024, 2048, 320, {"id": FB2_T64(2), "b": FB2_T64(2), "g": FB2_T64(2)}),
+    # identity calls of wide-N short-K cells: the 1-SM persistent form; their bias / GELU calls keep their tier
+    ("qkv",      5120, 2048,  96, {"id": FB2_P128, "b": "sm100.cascade", "g": "sm100.cascade"}),
+    ("qkv",      5120, 2048, 160, {"id": FB2_P128, "b": "sm100.smm", "g": FB2_P128}),
+    ("wqkv_g",   9216, 2048, 128, {"id": FB2_P128, "b": "sm100.cascade", "g": "sm100.cascade"}),
+    # erf-GELU calls where the cascade's short-K rule would leave its 64-wide tile
+    ("fc1",      5120, 1280, 182, {"id": FB2_P128, "b": "sm100.smm", "g": FB2_P128}),
+    ("n2048",    2048, 1280, 533, {"id": "sm100.smm", "b": "sm100.smm", "g": FB2_P128}),
+]
+# Cells one step outside each rule, every call on the tier it had: (label, N, K, M, tiers per call kind)
+FB2_OUT = [
+    ("q 257",    1280, 1280, 257, {"id": "sm100.smm", "b": "sm100.smm", "g": "sm100.cascade"}),
+    ("proj2 129", 2048, 1280, 129, {"id": "sm100.smm", "b": "sm100.cascade", "g": "sm100.cascade"}),
+    ("qkvf 78",  3840, 1280,  78, {"id": "sm100.cascade", "b": "sm100.cascade", "g": "sm100.cascade"}),
+    ("qkv 193",  5120, 2048, 193, {"id": "sm100.smm", "b": "sm100.smm", "g": "sm100.cascade"}),
+    ("fc1 117",  5120, 1280, 117, {"id": FB2_P128, "b": "sm100.cascade", "g": "sm100.cascade"}),
+    ("fc1 193",  5120, 1280, 193, {"id": "sm100.smm", "b": "sm100.smm", "g": "sm100.cascade"}),
+    ("gdn_in 96", 12288, 2048, 96, {"id": "sm100.smm", "b": "sm100.smm", "g": "sm100.cascade"}),
+    ("down 48",  2560, 9728,  48, {"id": "sm100.cascade", "b": "sm100.cascade", "g": "sm100.cascade"}),
+]
+
+
+def _fb2_epilogue(kind: str, M: int, N: int):
+    from fish_scales_ops.gemm import _epilogue
+    if kind == "id":
+        return None
+    b = torch.zeros(N, dtype=torch.bfloat16, device="cuda")
+    return _epilogue.Epilogue(bias=b, activation="gelu_erf" if kind == "g" else None)
+
+
+def _fb2_tactic(M: int, N: int, K: int, kind: str):
+    """The tactic the router hands the swap-AB row for this call kind (None when no picker names one)."""
+    from fish_scales_ops.gemm import _sm100_decode
+    cfg = _sm100_decode.pick_config(M, N, K)
+    if cfg is None and kind == "id":
+        cfg = _sm100_decode.pick_identity_config(M, N, K)
+    elif cfg is None and kind == "g":
+        cfg = _sm100_decode.pick_activation_config(M, N, K)
+    return cfg
+
+
+def test_fb2_routing() -> None:
+    """(FB2) Each rule's cells get its tactic for the call kinds it takes and plan() names the row there; the other
+    call kinds of those cells, and the cells one step outside each rule, keep their tiers; linear_quantized stays on
+    the cascade everywhere."""
+    from fish_scales_ops.gemm import _epilogue, _sm100_dispatch
+    for label, N, K, M, want in FB2_CELLS + FB2_OUT:
+        for kind, w in want.items():
+            plan = _sm100_dispatch.plan(M, N, K, _fb2_epilogue(kind, M, N))
+            if isinstance(w, str):
+                assert plan == w, f"{label} M={M} {kind}: plan {plan}, expected {w}"
+            else:
+                got = _fb2_tactic(M, N, K, kind)
+                assert plan == "sm100.decode" and got == w, \
+                    f"{label} M={M} {kind}: plan {plan} tactic {got}, expected the row with {w}"
+        eq = _epilogue.Epilogue(bias=torch.zeros(N, dtype=torch.bfloat16, device="cuda"), activation="gelu_erf",
+                                quantized=True)
+        assert _sm100_dispatch.plan(M, N, K, eq) == "sm100.cascade", f"{label} M={M}: linear_quantized left the cascade"
+    print(f"  routing  FB2: {len(FB2_CELLS)} rule cells on their tactics, {len(FB2_OUT)} neighbours on their tiers, "
+          "linear_quantized on the cascade  OK")
+
+
+def test_fb2_accuracy() -> None:
+    """(FB2) On every rule cell, each call the row takes against the tier that served it before (tier 1 or the C++
+    cascade for the identity, the cascade for the fused calls): the cosine against the fp32 reference agrees to five
+    decimals and every element within one bf16 ulp (the K split and the summation order differ, so the bytes are not
+    expected to match); the bf16-x call equals the pre-quantized call byte for byte."""
+    from fish_scales_ops.gemm import _epilogue
+    for label, N, K, M, want in FB2_CELLS:
+        x, w, xq, sx, wq, sw = _inputs(M, N, K)
+        b = (torch.randn(N, device="cuda") * 0.1).bfloat16()
+        dw = fso.dense.prepare_weight(w, format="mxfp8")
+        dxq, dsx = fso.dense.quantize_activation(x)
+        for kind, tac in want.items():
+            if isinstance(tac, str):
+                continue
+            act = "gelu_erf" if kind == "g" else None
+            bias = b if kind != "id" else None
+            y_new = fso.compat.linear_mxfp8(xq, wq, sx, sw, bias=bias, activation=act)
+            if kind == "id":
+                y_old, tier = _baseline(xq, sx, wq, sw)
+            else:
+                epi = _epilogue.Epilogue(bias=bias, activation=act)
+                y_old, tier = torch.ops.fish_scales_ops.linear_mxfp8_raw(xq, wq, sx, sw, *_epilogue.raw_args(epi)), \
+                    "tier3_cxx_cascade"
+            ref = x.float() @ w.float().t()
+            if bias is not None:
+                ref = ref + bias.float()
+            if act:
+                ref = F.gelu(ref, approximate="none")
+            torch.cuda.synchronize()
+            c_new, c_old = _cos(y_new, ref), _cos(y_old, ref)
+            assert c_new >= 0.999 and round(c_new, 5) == round(c_old, 5), \
+                f"{label} M={M} {kind}: cos {c_new:.6f}, shipped path {c_old:.6f}"
+            diff = (y_new.float() - y_old.float()).abs()
+            assert bool((diff <= _bf16_tolerance(y_old)).all()), \
+                f"{label} M={M} {kind}: output differs from {tier} by more than one bf16 ulp"
+            y_x = fso.dense.linear(x, dw, bias=bias, activation=act)
+            y_2b = fso.dense.linear(dxq, dw, x_scale=dsx, bias=bias, activation=act)
+            assert torch.equal(y_x.view(torch.int16), y_2b.view(torch.int16)), \
+                f"{label} M={M} {kind}: the bf16-x call differs from the pre-quantized call"
+            print(f"  fb2  {label:>8} M={M:>4} {kind:>2}  {tac}  cos={c_new:.6f} (was {c_old:.6f} on {tier}) "
+                  f"maxdiff={diff.max().item():.3e}  bf16 x == 2b  OK")
 
 
 def test_capture() -> None:
@@ -615,6 +743,10 @@ def main() -> int:
     test_band_accuracy()
     print("\n== routing ==")
     test_routing()
+    print("\n== FB2 route rules: routing ==")
+    test_fb2_routing()
+    print("\n== FB2 route rules: accuracy vs the shipped path ==")
+    test_fb2_accuracy()
     print("\n== CUDA-graph capture ==")
     test_capture()
     print("\n== version gate (subprocess with a mocked old DSL) ==")

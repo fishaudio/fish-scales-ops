@@ -133,8 +133,8 @@ The activation is quantized inside the op on every call:
 - 1×128 block-FP8 on sm_90, through `linear_qx`;
 - MXFP8 1×32 on the Blackwell parts, followed by the architecture's MXFP8 GEMM router.
 
-On B200/B300 the router includes the CuTe-DSL swap-AB row (the M ≤ 64 decode band and the narrow-N long-K band
-above it) and the cuBLAS and CuTe-DSL tiers.
+On B200/B300 the router includes the CuTe-DSL swap-AB row (the M ≤ 64 decode band, the narrow-N long-K and short-K
+bands above it, and some calls of other short-K cells) and the cuBLAS and CuTe-DSL tiers.
 
 **Tensor parallelism.** A column-parallel shard is `[N/tp, K]` and a row-parallel shard is
 `[N, K/tp]`. Each rank prepares its own shard, and the per-rank `K` and, on Blackwell, `N` must stay

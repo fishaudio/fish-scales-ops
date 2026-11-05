@@ -1,9 +1,9 @@
 """Dense MXFP8 swap-AB kernels for sm_100/sm_103: the decode band (M ≤ 64) and
-the narrow-N long-K band above it.
+the narrow-N long-K and short-K bands above it.
 
 This module is the swap-AB row of the sm_100/sm_103 MXFP8 router (named the
 *decode* row after its first band). It sits in front of the three tiers
-described in :mod:`._sm100_dispatch` and takes two bands that none of the
+described in :mod:`._sm100_dispatch` and takes the bands that none of the
 three shipped tiers fits:
 
 * **The decode band, M ≤ 64.** cuBLAS ``scaled_mm`` (tier 1) picks a 128- or
@@ -24,7 +24,21 @@ three shipped tiers fits:
   2-CTA form takes the cells whose split would not fit one wave. A call
   carrying a field tier 1 does not apply (residual, erf-GELU) on a narrow-N
   long-K cell above that band is taken by the persistent form too, ahead of the
-  C++ cascade (``pick_fallthrough_config``).
+  C++ cascade (``pick_fallthrough_config``). The same split-K form also serves
+  the narrow-N long-K class inside the decode band, from M = 33 (FB2).
+* **The narrow-N short-K band above the decode band (FB2),** N ≤ 4096 with
+  1024 ≤ K ≤ 2560 at M > 64 while the split-K form with 64-wide token tiles in
+  two slices has at most 80 CTAs (``_narrow_short_k_config``): the tower's
+  1280 x 1280 projections to M = 256, 2048-2560-wide shapes to M = 128,
+  Family C shared.gate_up to M = 320. Tier 1 and the cascade put 20-40 CTAs on
+  these problems.
+* **Two kinds of call on short-K cells the row does not own by shape (FB2),**
+  both on the 1-SM persistent form at the 128 x 64 tile while its grid fits one
+  wave: the identity call of a wide-N cell above M = 64
+  (``pick_identity_config``), and the erf-GELU call of a cell where the
+  cascade's short-K tile rule has to leave its 64-wide tile
+  (``pick_activation_config``). The router asks for them by the call's fields;
+  the bias and residual calls of those cells keep their tiers.
 
 The kernels used here come from the vendored NVIDIA/FlashInfer package in
 ``_vendor/flashinfer_sm100_blockscaled`` (BSD-3-Clause; see its README and
@@ -113,7 +127,12 @@ orientation and prefetch setting the kernel accepts, four shapes × four M,
 two passes); for the narrow-N long-K band above M = 64 the design note and
 gate-1 sweep of issue #12 (``fso_issue12_20261028/runs/P5`` and ``P5g1``:
 every split-K and persistent tactic on o, fc2 and conv_out at M = 78-1079,
-two to four passes per arm, cold weights).
+two to four passes per arm, cold weights); for the FB2 rules (the narrow-N
+long-K class at 32 < M ≤ 64, the narrow-N short-K band, the identity and
+erf-GELU calls above) the B300 re-measurement of gate 0's candidates
+(``fso_issue12_20261028/runs/G0D`` and ``runs/FB2``: the forced swap-AB
+configurations against the route of 0.2.3 on 140 cells with their M and N
+neighbours, both entry forms, two passes, cold weights), cited in each rule.
 """
 from __future__ import annotations
 
@@ -191,10 +210,28 @@ NARROW_LONG_K_TOKEN_TILE = 64
 #: against the two-way one at the same grid: slower on o (K = 4096, slices of 1024: 5.66 against 5.39 us at
 #: M = 80), faster on fc2 (K = 5120, 1280: 5.54 against 5.71) and conv_out (K = 7680, 1920: 6.49 against 7.37).
 NARROW_LONG_K_MIN_SPLIT4_SLICE_K = 1280
+# The narrow-N short-K band above the decode band (FB2; ``_narrow_short_k_config``).
+#: Most CTAs the band's split-K form may launch: ``2 * tiles_n * ceil(M / 64)``. Every call measured on a grid of at
+#: most 80 CTAs was faster on the form than on its previous tier, on both entry forms; from 96 CTAs some fused calls
+#: were slower (see the function).
+NARROW_SHORT_K_MAX_CTAS = 80
+
+# The 1-SM persistent form above the decode band on short-K cells (FB2; ``pick_identity_config``,
+# ``pick_activation_config``): the persistent kernel at the 128 x 64 MMA tile (128 weight rows x 64 tokens),
+# cluster (1, 1), one K slice, swap-AB, one tile per CTA while its grid fits one wave.
+#: The form, as a tactic.
+SHORT_K_TOKEN_TILE_FORM = ((128, 64), (1, 1), True, 1)
+#: Deepest K of the short-K cells the form takes above the decode band: the bound of the C++ cascade's short-K tile
+#: rule (``pick_short_k_tile`` in dispatch.cuh, ``_sm100_smm.SHORT_K_MAX_K``). Measured at K = 1280, 2048 and 2560.
+SHORT_K_TOKEN_TILE_MAX_K = 2560
+#: Widest M of the activation calls the form takes: the top of the cascade short-K rule's M range (kShortKMaxM).
+SHORT_K_TOKEN_TILE_MAX_M = 2048
 
 _STATE: Optional[dict] = None
 _CFG_CACHE: dict = {}
 _FT_CACHE: dict = {}
+_ID_CACHE: dict = {}
+_ACT_CACHE: dict = {}
 _CLUSTERS: dict = {}
 _ARG_CACHE: dict = {}
 _ALPHA: dict = {}
@@ -339,12 +376,23 @@ def pick_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
     * ``m > 64`` → the narrow-N long-K band (``_narrow_long_k_config``): only
       ``tiles_n <= 32`` with ``k >= 4096``, up to where tier 1's own grid fills
       the machine, outside the C++ cascade's two measured rules (its two-kernel
-      split-K at ``k >= 8192, m <= 104`` and its wave tile); None everywhere
-      else, so the tiers below see every other cell exactly as before.
-    * ``32 < m <= 64`` runs on the persistent kernel with a 64-wide token tile
+      split-K at ``k >= 8192, m <= 104`` and its wave tile); and the narrow-N
+      short-K band (``_narrow_short_k_config``, FB2): ``tiles_n <= 32`` with
+      ``1024 <= k <= 2560``, the split-K kernel with 64-wide token tiles in two
+      slices while that grid has at most ``NARROW_SHORT_K_MAX_CTAS`` CTAs; None
+      everywhere else, so the tiers below see every other cell exactly as
+      before. (The router also asks this row for the identity calls and the
+      erf-GELU calls of some short-K cells it does not own by shape:
+      ``pick_identity_config``, ``pick_activation_config``.)
+    * ``32 < m <= 64`` on the narrow-N long-K class (``tiles_n <= 32``,
+      ``4096 <= k``, outside the cascade's two-kernel split-K at ``k >= 8192``)
+      runs on the split-K kernel with the 64-wide token tile, the form of the
+      band above (``_split_t64``: four slices where each keeps 1280 of K, else
+      two; FB2). Every other cell of the band runs on the persistent kernel with
+      a 64-wide token tile
       and the 2-CTA 256-row weight tile in a cluster of two, swap-AB, one K
-      slice (``_wide_token_config``); the split-K class refuses the band and the
-      narrower token tiles refuse it too. Three shape classes are declined and
+      slice (``_wide_token_config``); the split-K class's narrow tiles refuse
+      the band. Three shape classes are declined and
       left to the tiers below: the long-K narrow-N class (``k >= 8192`` with
       ``tiles_n <= 32``), whose two-kernel split-K in the C++ cascade keeps the
       whole machine busy while one weight tile per cluster cannot; the short-K
@@ -382,7 +430,12 @@ def pick_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
     hit = _CFG_CACHE.get(key, _MISSING)
     if hit is not _MISSING:
         return hit
-    cfg = _compute_config(m, n, k) if m <= MAX_DECODE_M else _narrow_long_k_config(m, n, k)
+    if m <= MAX_DECODE_M:
+        cfg = _compute_config(m, n, k)
+    else:
+        cfg = _narrow_long_k_config(m, n, k)
+        if cfg is None:
+            cfg = _narrow_short_k_config(m, n, k)
     _CFG_CACHE[key] = cfg
     _print_tactic("", m, n, k, cfg)
     return cfg
@@ -416,6 +469,108 @@ def pick_fallthrough_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
     return cfg
 
 
+def pick_identity_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
+    """Tactic for an identity call (no epilogue field) above the decode band on a wide-N short-K cell, or None (FB2).
+
+    The cells: ``m > 64``, wide N (``tiles_n > 32``), ``MIN_WIDE_TOKEN_K <= k <= SHORT_K_TOKEN_TILE_MAX_K``, while the
+    1-SM persistent form's grid, ``ceil(M / 64) * tiles_n`` CTAs (128 weight rows by 64 tokens each), fits one wave of
+    the SMs. On the B300's 148 SMs that is M <= 192 for 38-49 weight tiles (llm_qkv / Family B wqkv [5120 x 2048],
+    fc1 [5120 x 1280], Family A wqkv [6144 x 2560]) and M <= 128 for 50-74 tiles (Family C wqkv_gated
+    [9216 x 2048]); wider shapes (gate [9728 x 2560], gdn.in_proj [12288 x 2048], gate_up) never fit above M = 64.
+    The form is ``SHORT_K_TOKEN_TILE_FORM`` (the persistent kernel at the 128 x 64 MMA tile, cluster (1, 1), one K
+    slice), after the kernel's own ``can_implement`` in the swapped orientation.
+
+    Why. Without the rule these calls run on the C++ cascade's wave rule at 64 < M <= 128 (the 1-SM 128 x 64 tile:
+    128 tokens by 64 weight rows, ``ceil(N / 64)`` CTAs, the same count as this form's) and on tier 1 at 128 < M
+    (cuBLAS's 128 x 128 kernel, ``tiles_n * ceil(M / 128)`` CTAs, two thirds of this form's at M = 129-192).
+    Measured on the B300 with cold weights (run ``fso_issue12_20261028/runs/FB2``, steps 1 and 1b, two passes, both
+    entry forms; 2b = pre-quantized x, bf16 x = ``fso.dense.linear(x)``, the activation quantize plus the GEMM):
+    [5120 x 2048] at M = 65-128 5.29-5.33 -> 4.99-5.03 us (2b) and 6.59-6.84 -> 6.45-6.62 us (bf16 x), at
+    M = 144-192 5.61-5.65 -> 5.09-5.11 and 7.03-7.07 -> 6.73-6.85; [5120 x 1280] at M = 78-192 4.23-4.60 -> 3.94-4.02
+    and 5.68-5.89 -> 5.37-5.55; [6144 x 2560] at M = 65-192 6.01-6.32 -> 5.71-5.83 and 7.35-7.88 -> 7.32-7.74 (at
+    M = 80 the bf16-x call 7.38 -> 7.44, the one cell measured slower, by 0.8 %); [9216 x 2048] at M = 65-128
+    6.49-6.59 -> 6.22-6.33 and 7.95-8.02 -> 7.72-7.76. Where the grid does not fit, the form lost: [5120 x 1280] at
+    M = 208 / 256 (160 CTAs) 4.51 -> 5.24 us, [12288 x 2048] at M = 96 / 128 and [9728 x 2560] at M = 96 by 16-19 %.
+    The 2-CTA 256-row form with the same token tile was faster on the bf16-x call of [5120 x 2048] at M = 65-128
+    (6.26-6.42 us) but slower on [9216 x 2048] and on [6144 x 2560] at M = 160 / 192, so the rule keeps one form.
+
+    Why the identity call only. A bias call measured slower on this form, on both entry forms: [5120 x 2048] at
+    M = 80 / 128 5.31 / 5.39 -> 5.72 us (cascade) and at M = 160 7.15 -> 7.51 us in the bf16-x form (tier 1), [6144 x
+    2560] at M = 96 6.00 -> 6.48 us, [5120 x 1280] at M = 129-192 5.85-5.90 -> 6.30-6.32 us in the bf16-x form: the
+    vendored kernels add the bias in their epilogue element by element, while the cascade and cuBLAS fuse it into a
+    vectorised store. So the router asks this only for a call with no epilogue field (``_sm100_dispatch``); a bias,
+    residual or activation call of these cells keeps the tier it had (erf-GELU calls: ``pick_activation_config``).
+    """
+    if m <= MAX_DECODE_M:
+        return None
+    key = (m, n, k)
+    hit = _ID_CACHE.get(key, _MISSING)
+    if hit is not _MISSING:
+        return hit
+    cfg = None
+    if (n + 127) // 128 > NARROW_LONG_K_MAX_TILES_N and MIN_WIDE_TOKEN_K <= k <= SHORT_K_TOKEN_TILE_MAX_K:
+        cfg = _short_k_token_tile(m, n, k)
+    _ID_CACHE[key] = cfg
+    _print_tactic(" identity", m, n, k, cfg)
+    return cfg
+
+
+def pick_activation_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
+    """Tactic for a call carrying an activation (erf-GELU) above the decode band on a short-K cell where the C++
+    cascade's short-K tile rule has to leave its 64-wide tile, or None (FB2).
+
+    The cells: ``64 < m <= SHORT_K_TOKEN_TILE_MAX_M`` and ``MIN_WIDE_TOKEN_K <= k <= SHORT_K_TOKEN_TILE_MAX_K``,
+    where the cascade's 1-SM 128 x 64 grid, ``ceil(M / 128) * ceil(N / 64)`` CTAs, overflows one wave of the SMs
+    while the 1-SM persistent form of this row, ``ceil(M / 64) * ceil(N / 128)`` CTAs, fits one: a token count in
+    the first half of a 128-row tile, where the swap-AB form's 64-row token granularity saves a whole wave. On the
+    B300's 148 SMs that is M = 129-192 for N = 4736-6272 (fc1 [5120 x 1280], the tower's bias + erf-GELU role),
+    M = 385-448 for N = 2560 and M = 513-576 for N = 2048, and never for N = 1280 or 3840. The form is
+    ``SHORT_K_TOKEN_TILE_FORM``, after the kernel's own ``can_implement``.
+
+    Why. The short-K rule (``pick_short_k_tile`` in dispatch.cuh) gives a fused call the 1-SM 128 x 64 tile while
+    that grid fits one wave, and otherwise a 128-wide tile (the 2-SM 256 x 128 form at fc1 M = 129-256, 80 CTAs),
+    whose erf-GELU epilogue covers twice the outputs per CTA, fully exposed behind a ten-block mainloop. Measured on
+    the B300 with cold weights (run ``fso_issue12_20261028/runs/FB2``, steps 1 and 1c, two passes, both entry forms):
+    fc1 at M = 129-192 6.58-6.60 -> 5.99-6.01 us (2b) and 8.14-8.19 -> 7.59-7.62 us (bf16 x). Outside the cells the
+    form lost: at M = 117, where the cascade's 128 x 64 grid fits (80 CTAs), 5.00 -> 5.98 us, and at M = 208-288,
+    where this form's grid spills (160 CTAs), 6.60-7.00 -> 7.94-8.11 us. The vendored kernels' erf-GELU epilogue
+    costs about 2 us over their identity epilogue at these shapes, so the rule takes only the cells where the
+    cascade loses a wave. The router asks this only for a call with an activation (``_sm100_dispatch``); the
+    quantized output of ``linear_quantized`` stays on the cascade, which alone writes it.
+    """
+    if m <= MAX_DECODE_M or m > SHORT_K_TOKEN_TILE_MAX_M:
+        return None
+    key = (m, n, k)
+    hit = _ACT_CACHE.get(key, _MISSING)
+    if hit is not _MISSING:
+        return hit
+    cfg = None
+    if MIN_WIDE_TOKEN_K <= k <= SHORT_K_TOKEN_TILE_MAX_K:
+        from . import _sm100_smm
+        if ((m + 127) // 128) * ((n + 63) // 64) > _sm100_smm._sm_count():
+            cfg = _short_k_token_tile(m, n, k)
+    _ACT_CACHE[key] = cfg
+    _print_tactic(" activation", m, n, k, cfg)
+    return cfg
+
+
+def _short_k_token_tile(m: int, n: int, k: int) -> Optional[_ConfigT]:
+    """``SHORT_K_TOKEN_TILE_FORM`` for ``(m, n, k)`` when its grid, ``ceil(M / 64) * ceil(N / 128)`` CTAs (one tile
+    each), fits one wave of the SMs and the kernel's ``can_implement`` accepts the swapped problem; else None."""
+    st = _init()
+    if st is None or n % 128 != 0 or k % 128 != 0:
+        return None
+    from . import _sm100_smm
+    tile, cluster = SHORT_K_TOKEN_TILE_FORM[0], SHORT_K_TOKEN_TILE_FORM[1]
+    if ((m + tile[1] - 1) // tile[1]) * ((n + tile[0] - 1) // tile[0]) > _sm100_smm._sm_count():
+        return None
+    PK, cutlass = st["PK"], st["cutlass"]
+    if not PK.can_implement(cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, 32, cutlass.BFloat16,
+                            tile, cluster, n, m, k, 1, "k", "k", "m"):
+        return None
+    return SHORT_K_TOKEN_TILE_FORM
+
+
 def _print_tactic(what: str, m: int, n: int, k: int, cfg: Optional[_ConfigT]) -> None:
     if cfg is not None and env_flag("FSO_PRINT_TILE_INFO"):
         # stderr, like the C++ tile-info prints of the same knob and like
@@ -442,6 +597,11 @@ def _compute_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
     tiles_n = (n + 127) // 128
     sms = _sm100_smm._sm_count()
     if not SK.supports_m(m):
+        if tiles_n <= NARROW_LONG_K_MAX_TILES_N and k >= NARROW_LONG_K_MIN_K and not _cascade_split_owns(m, k):
+            # The narrow-N long-K class at 32 < M <= 64 (FB2): the band-above form, see _split_t64.
+            cfg = _split_t64(m, n, k, st)
+            if cfg is not None:
+                return cfg
         return _wide_token_config(m, n, k, tiles_n, PK, cutlass)
     tile = SK.mma_tiler_mn_for_m(m)
     deepest = 4 if (k >= 8192 or m <= 8) else 2
@@ -493,7 +653,11 @@ def _wide_token_config(m: int, n: int, k: int, tiles_n: int,
     is halved against the 128-row tile at cluster (1, 1), and unlike a cluster
     of four it never leaves a cluster slot idle on a 20-tile grid. Prefetch
     lost on every cell measured. FlashInfer's own autotuner picks this tactic
-    for the narrow-N shape at M = 64 and M = 128.
+    for the narrow-N shape at M = 64 and M = 128. The sweep predates the split-K
+    kernel's 64-wide token tile (issue #12, P5); on the narrow-N long-K class
+    (``tiles_n <= 32``, ``4096 <= k < 8192``) that form is faster and is asked
+    first (``_split_t64``, FB2), so this form takes those cells only where no
+    split depth is valid for their K.
 
     Three shape classes are declined; the same sweep kept the first two on the
     tier that serves them:
@@ -552,17 +716,24 @@ def _max_active_clusters(st: dict, size: int) -> int:
     return hit
 
 
+def _cascade_split_owns(m: int, k: int) -> bool:
+    """True where the C++ cascade's two-kernel split-K owns a narrow-N cell: ``k >= 8192`` at ``m <= 104`` (the long-K
+    clause of its parallel split-K in ``dispatch.cuh``; its ``M <= 32, K >= 4096`` clause never sees a cell, since
+    this row takes M <= 32 first)."""
+    return k >= 8192 and m <= 104
+
+
 def _narrow_long_k_class(m: int, n: int, k: int) -> bool:
     """The cells above the decode band that the swap-AB kernels may take: narrow N (``tiles_n <= 32``) with long
     K (``k >= 4096``), minus the two rules of the C++ cascade that were measured to win there: its two-kernel
-    split-K (``k >= 8192`` at ``m <= 104``, ``dispatch.cuh``) and its wave tile (``_sm100_smm.wave_tile_owns``:
-    the 2-SM 256 x 64 tile for N = 2560 up to M = 256)."""
+    split-K (``_cascade_split_owns``) and its wave tile (``_sm100_smm.wave_tile_owns``: the 2-SM 256 x 64 tile for
+    N = 2560 up to M = 256)."""
     from . import _sm100_smm
     if m <= MAX_DECODE_M or k < NARROW_LONG_K_MIN_K:
         return False
     if (n + 127) // 128 > NARROW_LONG_K_MAX_TILES_N:
         return False
-    if k >= 8192 and m <= 104:
+    if _cascade_split_owns(m, k):
         return False
     return not _sm100_smm.wave_tile_owns(m, n)
 
@@ -609,7 +780,34 @@ def _narrow_long_k_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
     tiles_n = (n + 127) // 128
     if tiles_n * ((m + 127) // 128) > NARROW_LONG_K_MAX_CUBLAS_CTAS:
         return None
+    cfg = _split_t64(m, n, k, st)
+    if cfg is not None:
+        return cfg
+    return _persistent_wide(m, n, k, (NARROW_LONG_K_TOKEN_TILE,), st)
+
+
+def _split_t64(m: int, n: int, k: int, st: dict) -> Optional[_ConfigT]:
+    """The split-K kernel with the 64-wide token tile (``NARROW_LONG_K_TOKEN_TILE``), one cluster per (weight tile,
+    token tile): four K slices when each slice keeps at least ``NARROW_LONG_K_MIN_SPLIT4_SLICE_K`` of K and the
+    clusters of four fit one wave of resident clusters, else two (slices of at least ``MIN_SLICE_K``) while the
+    clusters of two fit; the kernel's grid is not persistent, so a second wave would run the whole K chain again for
+    the tail. Checked with the kernel's own ``is_valid_tactic``; None when no depth qualifies.
+
+    Two callers. The narrow-N long-K band above the decode band (``_narrow_long_k_config``), and since FB2 the same
+    class at 32 < M <= 64 (``_compute_config``): narrow N (``tiles_n <= 32``) with ``4096 <= k`` outside the cascade's
+    two-kernel split-K (``k >= 8192``), where the band below used the persistent 2-CTA 256-row form with one K slice,
+    whose ``ceil(N / 256)`` clusters put 16-20 CTAs on the machine (o [2048 x 4096], wo [2560 x 4096]). There one
+    token tile covers the problem, so the split puts ``tiles_n * split`` CTAs on it instead. Measured on the B300 with
+    cold weights against that form (run ``fso_issue12_20261028/runs/FB2``, step 1, two passes, both entry forms;
+    2b = pre-quantized x, bf16 x = the activation quantize plus the GEMM): o [2048 x 4096] at M = 33-64 two slices,
+    6.08-6.24 -> 5.36-5.40 us (2b) and 7.41-7.58 -> 6.77-6.88 us (bf16 x); wo [2560 x 4096] at M = 40-64 two slices,
+    6.32-6.35 -> 5.57-5.58 and 7.57-7.69 -> 6.99-7.08; fc2 [1280 x 5120, bias + residual] at M = 48 / 64 four slices,
+    8.05 / 8.16 -> 5.79 / 5.84 and 9.60 / 9.77 -> 7.28 / 7.52; conv_out [1280 x 7680] at M = 64 four slices, 9.27 ->
+    6.29. The four-way split on o and wo (slices of 1024, below the four-way floor) measured 5.33-5.38 / 6.87-7.01
+    and 5.76-5.77 / 7.17-7.56: on o within 0.03 us of two slices in the 2b form and slower in the bf16-x form, on wo
+    slower in both, as the band's floor predicts."""
     SK, cutlass = st["SK"], st["cutlass"]
+    tiles_n = (n + 127) // 128
     tile_n = NARROW_LONG_K_TOKEN_TILE
     clusters = tiles_n * ((m + tile_n - 1) // tile_n)
     for split_k in (4, 2):
@@ -619,7 +817,59 @@ def _narrow_long_k_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
             continue
         if SK.is_valid_tactic(m, k, cutlass.Float8E4M3FN, split_k, tile_n):
             return ((128, tile_n), (1, 1), True, split_k)
-    return _persistent_wide(m, n, k, (NARROW_LONG_K_TOKEN_TILE,), st)
+    return None
+
+
+def _narrow_short_k_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
+    """The narrow-N short-K band above the decode band (FB2): narrow N (``tiles_n <= 32``) with
+    ``MIN_WIDE_TOKEN_K <= k <= SHORT_K_TOKEN_TILE_MAX_K`` at ``m > 64``, the split-K kernel with 64-wide token tiles
+    (several per problem) in two K slices, while its grid, ``2 * tiles_n * ceil(M / 64)`` CTAs, has at most
+    ``NARROW_SHORT_K_MAX_CTAS``; every call of such a cell (identity, bias, residual, erf-GELU), after the kernel's own
+    ``is_valid_tactic`` (``k % 256 == 0``). On the B300 that is M <= 256 for N = 1280 (the tower's q / k / v, out_proj
+    and proj1), M <= 128 for N = 2048-2560 (proj2; the tp2 shards [2048 x 2048] / [2560 x 2048]) and M <= 320 for
+    N = 1024 (Family C shared.gate_up [1024 x 2048]); N = 3072-4096 never qualifies above M = 64.
+
+    Why. Without the band these cells run on tier 1 (identity calls, cuBLAS's 128 x 128 kernel over the whole K),
+    on the C++ cascade's short-K tile (the bias calls tier 1 declines, ``_sm100_smm.short_k_owns``, and every
+    residual or activation call: the 1-SM 128 x 64 tile, ``ceil(M / 128) * ceil(N / 64)`` CTAs, 20-40 on N = 1280),
+    or on the cascade's wave tile (the tp2 qkv shard). Both leave most of the machine idle on these narrow
+    problems; the split puts two CTAs on every (weight tile, token tile) of 128 x 64, each over half of K, and sums
+    the halves inside the cluster without a second launch. Measured on the B300 with cold weights (run
+    ``fso_issue12_20261028/runs/FB2``, steps 1, 1b and 1c, two passes, both entry forms; 2b = pre-quantized x,
+    bf16 x = the activation quantize plus the GEMM), us, previous tier -> this form, 2b and bf16 x:
+
+    * [1280 x 1280] at M = 78-256 (40-80 CTAs): identity 3.88-4.14 -> 3.38-3.59 and 5.36-5.51 -> 4.86-4.96; bias
+      3.85-3.88 -> 3.79-3.83 and 5.41-5.44 -> 5.30-5.32; bias + residual 4.14-4.20 -> 4.10-4.14 and 5.77-5.88 ->
+      5.59-5.62; bias + erf-GELU 4.62-4.73 -> 4.46-4.51 and 6.24-6.34 -> 6.01-6.04.
+    * [2048 x 1280] at M = 78 / 117 (64 CTAs): identity 4.25 -> 3.49 and 5.69 -> 4.96; bias 3.92-3.94 -> 3.91-3.92
+      and 5.47-5.48 -> 5.38-5.39; bias + erf-GELU 4.73 -> 4.59 and 6.34 -> 6.11; bias + residual 4.23 -> 4.22 and
+      5.85 -> 5.69.
+    * [1024 x 2048] at M = 96-320 (32-80 CTAs): identity 4.73-5.29 -> 3.84-3.97 and 6.28-6.72 -> 5.33-5.67; bias at
+      M = 256 4.64 -> 4.21 and 6.19 -> 5.79. [2048 x 2048] at M = 96 / 128 (64 CTAs): identity 5.37-5.40 -> 4.02 and
+      6.80-6.87 -> 5.49-5.51. [2560 x 2048] at M = 96 / 128 (80 CTAs): identity 4.71-4.72 -> 4.16-4.17 and
+      6.24-6.27 -> 5.63-5.66; bias at M = 128 4.83 -> 4.48 and 6.35 -> 6.04.
+
+    The CTA bound. Identity calls kept gaining on larger grids (to 128 CTAs: [1024 x 2048] at M = 512 4.76 -> 4.01
+    and 6.50 -> 6.45), but fused calls did not: at 96 CTAs the bias call of [2048 x 1280] at M = 182 was 3.90 ->
+    3.94 us (2b), at 120 CTAs the bias + residual and bias + erf-GELU calls of [1280 x 1280] at M = 364 were
+    5.86 -> 6.05 and 6.35 -> 6.48 us (bf16 x) and the bias call of [3840 x 1280] at M = 78 4.10 -> 4.38 us (2b), at
+    128 CTAs the bias call of [2048 x 1280] at M = 256 3.91 -> 3.99 and 5.48 -> 5.79 us. ``NARROW_SHORT_K_MAX_CTAS`` is
+    the largest grid on which every measured call gained, so one rule serves every field of a cell and its calls
+    keep one route. K below 1024 is not taken: a slice would be shorter than ``MIN_SLICE_K``, where one slice beat
+    two (Family C shared.down [2048 x 512])."""
+    st = _init()
+    if st is None or n % 128 != 0 or k % 128 != 0:
+        return None
+    tiles_n = (n + 127) // 128
+    if tiles_n > NARROW_LONG_K_MAX_TILES_N or not (MIN_WIDE_TOKEN_K <= k <= SHORT_K_TOKEN_TILE_MAX_K):
+        return None
+    tile_n = NARROW_LONG_K_TOKEN_TILE
+    if 2 * tiles_n * ((m + tile_n - 1) // tile_n) > NARROW_SHORT_K_MAX_CTAS:
+        return None
+    SK, cutlass = st["SK"], st["cutlass"]
+    if not SK.is_valid_tactic(m, k, cutlass.Float8E4M3FN, 2, tile_n):
+        return None
+    return ((128, tile_n), (1, 1), True, 2)
 
 
 def _persistent_wide(m: int, n: int, k: int, token_tiles, st: dict) -> Optional[_ConfigT]:

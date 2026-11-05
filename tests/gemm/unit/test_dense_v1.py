@@ -161,8 +161,17 @@ The cases, each run where the hardware exists and skipped with a message elsewhe
       (identity, bias, residual, bias + GELU, linear_quantized) runs the tile a test-local mirror of the rule names
       (checked on the MMA atom of the kernel that ran) and plan() names the tier it ran on; the -0.0 corner;
       capture on a non-default stream; two-stream concurrent replay (200 x) of two short-K tiles.
-      FSO_DISABLE_PDL=1 (children) gives the digests of the decode, smm, wide and shortk families. `--case q` runs
-      this case alone.
+      fb2 (the B300 swap-AB route rules): section-10 exactness, both entry paths, every call checked for the tier it
+      ran on, on the cells of each rule: the narrow-N long-K class at 32 < M <= 64 on the split-K form with the
+      64-wide token tile (1280 x 5120 in four slices, 2048 / 2560 x 4096 in two); the narrow-N short-K band (two
+      slices while the split-K grid has at most 80 CTAs: 1280 x 1280 at M = 65 / 129 / 256, 2048 x 1280 at 117,
+      1024 x 2048 at 320, 2560 x 2048 at 96, 2048 x 2048 at 80); the identity call of wide-N short-K cells on the
+      1-SM persistent 128 x 64 form, their bias / residual calls on the tier they had; the erf-GELU calls the row
+      takes where the cascade's short-K rule would leave its 64-wide tile; each rule's picker against the tactic and
+      on the cells one step outside it; linear_quantized planned on the cascade; the -0.0 corner; capture on a
+      non-default stream (both entries); four captured calls replayed concurrently on four streams (200 x).
+      FSO_DISABLE_PDL=1 (children) gives the digests of the decode, smm, wide, shortk and fb2 families. `--case q`
+      runs this case alone.
 
   The sm_120/sm_121 quantized output, fso.dense.linear_quantized (S3c), sm_120/sm_121 only:
   r.  sm_120/sm_121, linear_quantized on every route of the MXFP8 cascade, each in its own subprocess (the natural
@@ -3411,41 +3420,51 @@ def case_p(major: int) -> None:
 #   shortk   (issue #12, T1) the cascade's short-K tile rule (pick_short_k_tile): exactness on the cells whose bias
 #            calls tier 1 declines and on the tier-1 cells whose residual / GELU calls take the rule's tiles, the tile each cascade
 #            call ran checked against a test-local mirror of the rule, the -0.0 corner, capture, two streams.
-#   */nopdl  the decode, smm, wide and shortk families again with FSO_DISABLE_PDL=1; their output digests must match.
+#   fb2      (FB2) the swap-AB route rules of the B300 adoption round: exactness on each rule's cells with every call's
+#            tier (Q_FB2_CELLS), the rules' tactics and edges (Q_FB2_TACTICS, Q_FB2_EDGES), linear_quantized on the
+#            cascade, the -0.0 corner, capture, four streams.
+#   */nopdl  the decode, smm, wide, shortk and fb2 families again with FSO_DISABLE_PDL=1; their output digests must
+#            match.
 
 Q_ENV = {"FSO_PRINT_TILE_INFO": "1"}
 # Narrow-N shapes whose decode cells split K in-cluster (tiles_n <= 32; K % 256 == 0 and K / split >= 512).
 Q_SPLIT_SHAPES = ((1280, 5120), (1280, 7680), (2048, 4096), (1280, 1280))
 Q_SPLIT_MS = (1, 7, 8, 16, 32)
-# The persistent form: wide N at M <= 32 (one K slice) and the 64-wide token tile from M = 33.
-Q_PERSIST_CELLS = tuple((5120, 1280, M) for M in (12, 33, 48, 64)) + tuple((1280, 5120, M) for M in (33, 48, 64)) \
-    + ((1280, 1280, 48),)
+# The persistent form: wide N at M <= 32 (one K slice) and the 64-wide token tile from M = 33, on wide N and on the
+# narrow-N cells with K < 4096. (Since FB2 the narrow-N long-K cells of 32 < M <= 64, 1280 x 5120 among them, run on the
+# split-K form with the 64-wide token tile: Q_FB2_CELLS.)
+Q_PERSIST_CELLS = tuple((5120, 1280, M) for M in (12, 33, 48, 64)) + ((1280, 1280, 48), (2048, 2048, 64))
 # Cells tier 1 owns (should_route, outside the decode band and the wave rule). fc1 [5120 x 1280] at the tower rungs
 # M = 78 / 117 / 533 is NOT one of them: there the cascade's wave rule (`_sm100_smm.wave_tile_owns`, 148 SMs: a
-# 128x64 tile puts 80 CTAs on the machine) owns the cell by shape, identity included, so fc1 enters tier 1 at M = 182.
-# Nor, for the bias, are the narrow-N short-K cells at 64 < M <= 256 (1280 x 1280 and 2048 x 1280 at M = 78 / 129 / 182:
+# 128x64 tile puts 80 CTAs on the machine) owns the cell by shape, identity included, so fc1 enters tier 1 at M = 129.
+# Nor, for the bias, are the narrow-N short-K cells at 64 < M <= 256 (2048 x 1280 at M = 129 / 182:
 # `_sm100_smm.short_k_owns`, issue #12 T1), whose bias calls the shortk family below runs on the cascade; the bias stays
-# on tier 1 from M = 257.
-Q_SMM_CELLS = ((5120, 1280, 182), (5120, 1280, 129), (5120, 1280, 1079), (1280, 1280, 364), (1280, 1280, 257),
+# on tier 1 from M = 257. Nor, since FB2, fc1 at M = 129-192, whose identity and erf-GELU calls the swap-AB row takes
+# (Q_FB2_CELLS); from M = 193 the row's 1-SM grid no longer fits one wave and every call keeps its tier.
+Q_SMM_CELLS = ((5120, 1280, 208), (5120, 1280, 256), (5120, 1280, 1079), (1280, 1280, 364), (1280, 1280, 257),
                (2048, 1280, 364), (2048, 1280, 1079))
 # (issue #12, T1) the cascade's short-K tile rule (pick_short_k_tile in dispatch.cuh), on the card's own routing.
 # Cells whose bias calls tier 1 declines (narrow N, 1024 <= K <= 2560, 64 < M <= 256): the identity stays on tier 1,
 # every other call runs on the cascade, on the 1-SM 128 x 64 tile, except the bias and residual calls at 128 < M <= 256,
-# which take the 2-SM 256 x 64 tile.
-Q_SHORTK_DECLINE_CELLS = ((1280, 1280, 65), (1280, 1280, 78), (1280, 1280, 129), (1280, 1280, 256), (2048, 1280, 117),
-                          (2048, 1280, 182), (1024, 2048, 96), (2048, 2048, 80), (2048, 2560, 200))
+# which take the 2-SM 256 x 64 tile. Since FB2 the swap-AB row's narrow-N short-K band takes every call of the cells
+# whose split-K grid (2 x tiles_n x ceil(M / 64) CTAs) has at most 80 CTAs (1280 x 1280 to M = 256, 2048-wide to
+# M = 128, 1024 x 2048 to M = 320: Q_FB2_CELLS), so the cells left here are 1536- and 2048-wide above M = 128.
+Q_SHORTK_DECLINE_CELLS = ((2048, 1280, 129), (2048, 1280, 182), (2048, 1280, 256), (2048, 2048, 160), (1536, 1280, 200),
+                          (2048, 2560, 200))
 # Cells tier 1 keeps for the identity and the bias, whose residual / GELU / quantized calls take the rule's tiles on
-# the cascade: 5120 x 1280 at M = 182 (2-SM 256 x 128, TileK 128) and 364 (1-SM 128 x 128), 1280 x 1280 at M = 364
-# (1-SM 128 x 64) and 1079 (2-SM 256 x 128), 2048 x 1280 at M = 533 (2-SM 256 x 128) and 1079 (1-SM 128 x 128).
-Q_SHORTK_EPI_CELLS = ((5120, 1280, 182), (5120, 1280, 364), (1280, 1280, 364), (1280, 1280, 1079), (2048, 1280, 533),
+# the cascade: 5120 x 1280 at M = 256 (2-SM 256 x 128, TileK 128) and 364 (1-SM 128 x 128), 1280 x 1280 at M = 364
+# (1-SM 128 x 64) and 1079 (2-SM 256 x 128), 2048 x 1280 at M = 600 (2-SM 256 x 128) and 1079 (1-SM 128 x 128). (At
+# 5120 x 1280 M = 129-192 and 2048 x 1280 M = 513-576 the erf-GELU calls run on the swap-AB row since FB2:
+# Q_FB2_CELLS.)
+Q_SHORTK_EPI_CELLS = ((5120, 1280, 256), (5120, 1280, 364), (1280, 1280, 364), (1280, 1280, 1079), (2048, 1280, 600),
                       (2048, 1280, 1079))
 # (issue #12, T1b) cells the wave rule owns (2368 <= N <= 4736 at M <= 128: tier 1 declines every call), so every call
 # runs on the cascade: the 1-SM 128 x 64 tile where the activation is under 128 KiB (the empty-pair guard of
 # pick_wave_tile: the fused q / k / v 3840 x 1280 at M = 78 and 102, 4096 x 1280 at M = 65, 3840 x 1536 at M = 85), the
-# 2-SM 256 x 64 tile from 128 KiB on (3840 x 1280 at M = 103 and 117, 3840 x 1536 at M = 86, the tp2 qkv shard
-# 2560 x 2048 at M = 96).
+# 2-SM 256 x 64 tile from 128 KiB on (3840 x 1280 at M = 103 and 117, 3840 x 1536 at M = 86). (The tp2 qkv shard
+# 2560 x 2048 at M = 96 runs on the swap-AB row's narrow-N short-K band since FB2.)
 Q_SHORTK_WAVE_CELLS = ((3840, 1280, 78), (3840, 1280, 102), (3840, 1280, 103), (3840, 1280, 117), (4096, 1280, 65),
-                       (3840, 1536, 85), (3840, 1536, 86), (2560, 2048, 96))
+                       (3840, 1536, 85), (3840, 1536, 86))
 # plan / route agreement grids: the issue-12 shapes (tower, stem, LLM tp1 and tp2) and the Family A / B / C dense
 # projections of docs/perf/README.md.
 Q_AGREE_SHAPES = tuple(dict.fromkeys(SHAPES + ((2560, 2048), (2048, 2048),
@@ -3471,6 +3490,24 @@ Q_WIDE_FALLTHROUGH = ((1280, 5120, 1079, ((256, 128), (2, 1), True, 1)),)
 Q_WIDE_FORCED_TACTICS = (((128, 64), (1, 1), True, 2), ((128, 64), (1, 1), True, 4), ((128, 128), (1, 1), True, 2),
                          ((128, 128), (1, 1), True, 4), ((256, 64), (2, 1), True, 1), ((256, 128), (2, 1), True, 1))
 Q_WIDE_FORCED_CELLS = ((2048, 4096, 129), (1280, 5120, 200), (1280, 7680, 65))
+# (FB2) the route rules of the B300 swap-AB adoption round: (N, K, M, identity tier, bias tier, residual tier,
+# activation tier) on natural routing. The narrow-N long-K class at 32 < M <= 64 on the split-K form with the 64-wide
+# token tile (four slices on 1280 x 5120, two on 2048 / 2560 x 4096); the narrow-N short-K band (two slices while the
+# split-K grid has at most 80 CTAs); the identity call of wide-N short-K cells on the 1-SM persistent 128 x 64 form
+# (its bias / residual calls keep their tier); the erf-GELU call where the cascade's short-K rule would leave its
+# 64-wide tile (fc1 5120 x 1280 at M = 129-192, 2048 x 1280 at 513-576, 2560 x 1280 at 385-448, 6144 x 2560 at
+# 129-192), whose identity / bias / residual calls keep tier 1 or the cascade.
+_DEC, _SMM, _CAS = "sm100.decode", "sm100.smm", "sm100.cascade"
+Q_FB2_CELLS = tuple((1280, 5120, M, _DEC, _DEC, _DEC, _DEC) for M in (33, 48, 64)) + (
+    (2048, 4096, 48, _DEC, _DEC, _DEC, _DEC), (2560, 4096, 40, _DEC, _DEC, _DEC, _DEC),
+    (1280, 1280, 65, _DEC, _DEC, _DEC, _DEC), (1280, 1280, 129, _DEC, _DEC, _DEC, _DEC),
+    (1280, 1280, 256, _DEC, _DEC, _DEC, _DEC), (2048, 1280, 117, _DEC, _DEC, _DEC, _DEC),
+    (1024, 2048, 320, _DEC, _DEC, _DEC, _DEC), (2560, 2048, 96, _DEC, _DEC, _DEC, _DEC),
+    (2048, 2048, 80, _DEC, _DEC, _DEC, _DEC),
+    (5120, 2048, 96, _DEC, _CAS, _CAS, _CAS), (9216, 2048, 128, _DEC, _CAS, _CAS, _CAS),
+    (5120, 1280, 78, _DEC, _CAS, _CAS, _CAS), (5120, 1280, 182, _DEC, _SMM, _CAS, _DEC),
+    (6144, 2560, 160, _DEC, _SMM, _CAS, _DEC), (2048, 1280, 533, _SMM, _SMM, _CAS, _DEC),
+    (2560, 1280, 448, _SMM, _SMM, _CAS, _DEC))
 
 
 def _q_tier(names) -> str:
@@ -3574,16 +3611,18 @@ def _q_epilogue(M: int, N: int, bias=None, residual=None, activation=None):
 
 
 def _q_cell(M: int, N: int, K: int, seed: int, ext, dig: _PDigest, local: list, stats: dict, want_tier: str,
-            fallthrough_tier: str = None, bias_tier: str = None) -> None:
+            fallthrough_tier: str = None, bias_tier: str = None, act_tier: str = None) -> None:
     """The exactness cases of section 10 on one cell, each call checked for the route it ran on: `want_tier` for
     the identity, `bias_tier or want_tier` for the bias (issue #12 T1: the bias calls of the short-K narrow-N cells
-    leave tier 1), and `fallthrough_tier or want_tier` for residual / GELU calls (tier 1 serves the bias alone, so
-    those fall through to the cascade there)."""
+    leave tier 1), `fallthrough_tier or want_tier` for residual calls (tier 1 serves the bias alone, so those fall
+    through to the cascade there), and `act_tier or fallthrough_tier or want_tier` for erf-GELU calls (FB2: the
+    swap-AB row takes them where the cascade's short-K rule would leave its 64-wide tile)."""
     from fish_scales_ops.gemm import _sm100_dispatch
     L = D.linear
     tag = f"M={M} N={N} K={K}"
     ft = fallthrough_tier or want_tier
     bt = bias_tier or want_tier
+    at = act_tier or ft
     x, w = _p_ints(M, N, K, seed, sparse=False)
     dw = _p_weight(w)
     xq, sx = D.quantize_activation(x)
@@ -3631,7 +3670,8 @@ def _q_cell(M: int, N: int, K: int, seed: int, ext, dig: _PDigest, local: list, 
     # plan() must name the tier each call ran on.
     for label, epi, tier in (("bias", _q_epilogue(M, N, bias=b), bt),
                              ("residual", _q_epilogue(M, N, residual=r), ft),
-                             ("bias+residual", _q_epilogue(M, N, bias=b, residual=r), ft)):
+                             ("bias+residual", _q_epilogue(M, N, bias=b, residual=r), ft),
+                             ("bias+gelu", _q_epilogue(M, N, bias=b, activation="gelu_erf"), at)):
         p = _sm100_dispatch.plan(M, N, K, epi)
         if p != tier:
             local.append(f"{tag} plan({label}) = {p}, but the call ran on {tier}")
@@ -3645,11 +3685,11 @@ def _q_cell(M: int, N: int, K: int, seed: int, ext, dig: _PDigest, local: list, 
     gl0 = ext.gelu_ref(accs.float().contiguous())
     zs = (accs == 0) & (bd == 0)
     run("bias + gelu_erf", lambda: L(xsq, dws, x_scale=ssx, bias=b, activation="gelu_erf"),
-        torch.where(zs, y0s, gl.bfloat16()), ft, one_kernel=(ft == "sm100.decode"))
+        torch.where(zs, y0s, gl.bfloat16()), at, one_kernel=(at == "sm100.decode"))
     run("bias + gelu_erf + residual", lambda: L(xsq, dws, x_scale=ssx, bias=b, residual=r, activation="gelu_erf"),
-        (gl + r.float()).bfloat16(), ft)
+        (gl + r.float()).bfloat16(), at)
     run("gelu_erf (bf16 x)", lambda: L(xs, dws, activation="gelu_erf"), torch.where(accs == 0, y0s, gl0.bfloat16()),
-        ft)
+        at)
     stats["gelu_active"] += int(((accs + bd).abs() < 4).sum())
     dig.add(y0s)
     stats["cells"] += 1
@@ -3713,14 +3753,14 @@ def _q_two_streams(local: list) -> None:
 
 
 def _q_shortk_two_streams(local: list) -> None:
-    """(issue #12, T1) different fused calls on the cascade's short-K tiles (1-SM 128 x 64 with bias + residual,
+    """(issue #12, T1) different fused calls on the cascade's short-K tiles (2-SM 256 x 64 with bias + residual,
     1-SM 128 x 128 with bias + erf-GELU, and (T1b) the fused q / k / v 3840 x 1280 at M = 78 with bias on the 1-SM
     128 x 64 tile the empty-pair guard picks) captured on one stream each of one thread and replayed concurrently 200
     times; each must equal its serial result every time."""
     L = D.linear
     calls = []
-    for (N, K, M, seed, kw) in ((1280, 1280, 78, 211, dict(residual=True)), (5120, 1280, 364, 212,
-                                                                            dict(activation="gelu_erf")),
+    for (N, K, M, seed, kw) in ((2048, 1280, 129, 211, dict(residual=True)), (5120, 1280, 364, 212,
+                                                                             dict(activation="gelu_erf")),
                                 (3840, 1280, 78, 213, dict())):
         dw = prepared(10, N, K, seed=seed)
         x = make_x(M, K, seed=seed + 1)
@@ -3827,9 +3867,12 @@ def _q_pdl(local: list, stats: dict) -> None:
     cells = ((1280, 5120, 7, dict(bias=True, residual=True, activation="gelu_erf"), "sm100.decode"),
              (5120, 1280, 48, dict(bias=True, residual=True, activation="gelu_erf"), "sm100.decode"),
              (5120, 1280, 182, dict(bias=True, residual=False, activation=None), "sm100.smm"),
-             (1280, 1280, 78, dict(bias=True, residual=True, activation=None), "sm100.cascade"),
-             # (T1) a bias-only call of a narrow-N short-K cell tier 1 declines: the cascade's 128 x 64 tile
-             (1280, 1280, 78, dict(bias=True, residual=False, activation=None), "sm100.cascade"),
+             (2048, 1280, 129, dict(bias=True, residual=True, activation=None), "sm100.cascade"),
+             # (T1) a bias-only call of a narrow-N short-K cell tier 1 declines: the cascade's short-K tile
+             (2048, 1280, 129, dict(bias=True, residual=False, activation=None), "sm100.cascade"),
+             # (FB2) the narrow-N short-K band's split-K form, and an erf-GELU call the row takes from the cascade
+             (1280, 1280, 78, dict(bias=True, residual=True, activation=None), "sm100.decode"),
+             (5120, 1280, 182, dict(bias=True, residual=False, activation="gelu_erf"), "sm100.decode"),
              # (P5) the narrow-N long-K band: its split-K form, and the fall-through of a tier-1 cell onto the row
              (2048, 4096, 129, dict(bias=True, residual=True, activation="gelu_erf"), "sm100.decode"),
              (1280, 5120, 1079, dict(bias=True, residual=True, activation=None), "sm100.decode"))
@@ -4013,7 +4056,7 @@ def _q_wide(ext, dig: _PDigest, local: list, stats: dict) -> None:
         _q_cell(M, N, K, M * 1009 + N * 17 + K, ext, dig, local, stats, "sm100.decode")
     # The band's top: tier 1 keeps o at M = 640 (the 128-wide persistent form is not used on the band, see
     # _narrow_long_k_config) and fc2 at M = 1079 (90 cuBLAS CTAs); a K below 4096 and a wide N are not the band.
-    for (N, K, M) in ((2048, 4096, 640), (1280, 5120, 1079), (2560, 4096, 512), (1280, 1280, 182), (5120, 4096, 182)):
+    for (N, K, M) in ((2048, 4096, 640), (1280, 5120, 1079), (2560, 4096, 512), (3840, 1280, 182), (5120, 4096, 182)):
         got = _sm100_decode.pick_config(M, N, K)
         if got is not None:
             local.append(f"wide M={M} N={N} K={K}: pick_config {got}, expected None (not the band)")
@@ -4040,6 +4083,117 @@ def _q_wide(ext, dig: _PDigest, local: list, stats: dict) -> None:
                    local)
     _q_wide_determinism(local, stats)
     _q_wide_two_streams(local)
+
+
+# (FB2) the tactic each Q_FB2_CELLS cell's swap-AB calls must run: (N, K, M) -> (picker, tactic). "config" is
+# pick_config (the cell is the row's by shape, every call); "identity" pick_identity_config and "activation"
+# pick_activation_config (the row takes only those calls of the cell).
+_FB2_T64 = lambda s: ((128, 64), (1, 1), True, s)  # noqa: E731
+_FB2_P128 = ((128, 64), (1, 1), True, 1)
+Q_FB2_TACTICS = {(1280, 5120, 33): ("config", _FB2_T64(4)), (1280, 5120, 48): ("config", _FB2_T64(4)),
+                 (1280, 5120, 64): ("config", _FB2_T64(4)), (2048, 4096, 48): ("config", _FB2_T64(2)),
+                 (2560, 4096, 40): ("config", _FB2_T64(2)), (1280, 1280, 65): ("config", _FB2_T64(2)),
+                 (1280, 1280, 129): ("config", _FB2_T64(2)), (1280, 1280, 256): ("config", _FB2_T64(2)),
+                 (2048, 1280, 117): ("config", _FB2_T64(2)), (1024, 2048, 320): ("config", _FB2_T64(2)),
+                 (2560, 2048, 96): ("config", _FB2_T64(2)), (2048, 2048, 80): ("config", _FB2_T64(2)),
+                 (5120, 2048, 96): ("identity", _FB2_P128), (9216, 2048, 128): ("identity", _FB2_P128),
+                 (5120, 1280, 78): ("identity", _FB2_P128), (5120, 1280, 182): ("identity", _FB2_P128),
+                 (6144, 2560, 160): ("identity", _FB2_P128), (2048, 1280, 533): ("activation", _FB2_P128),
+                 (2560, 1280, 448): ("activation", _FB2_P128)}
+# (FB2) the rules' edges: (N, K, M, picker, expected) on cells one step outside (None) and inside each rule.
+Q_FB2_EDGES = (
+    # the narrow-N short-K band: 80 CTAs of the split-K grid at most
+    (1280, 1280, 256, "config", _FB2_T64(2)), (1280, 1280, 257, "config", None),
+    (2048, 1280, 128, "config", _FB2_T64(2)), (2048, 1280, 129, "config", None),
+    (1024, 2048, 320, "config", _FB2_T64(2)), (1024, 2048, 321, "config", None),
+    (3840, 1280, 65, "config", None), (2048, 512, 128, "config", None), (2048, 1152, 128, "config", None),
+    # the narrow-N long-K class at 32 < M <= 64: the cascade's two-kernel split-K keeps K >= 8192; a K no split divides
+    # keeps the wide-token form
+    (2560, 9728, 48, "config", None), (2560, 8064, 40, "config", ((256, 64), (2, 1), True, 1)),
+    # identity calls of wide-N short-K cells: the 1-SM grid fits one wave; K <= 2560; narrow N is not the rule's
+    (5120, 2048, 192, "identity", _FB2_P128), (5120, 2048, 193, "identity", None),
+    (9216, 2048, 128, "identity", _FB2_P128), (9216, 2048, 129, "identity", None),
+    (12288, 2048, 96, "identity", None), (5120, 4096, 96, "identity", None), (4096, 2048, 96, "identity", None),
+    (5120, 896, 96, "identity", None),
+    # erf-GELU calls: the cascade's 1-SM 128 x 64 grid overflows one wave while the row's grid fits
+    (5120, 1280, 128, "activation", None), (5120, 1280, 129, "activation", _FB2_P128),
+    (5120, 1280, 192, "activation", _FB2_P128), (5120, 1280, 193, "activation", None),
+    (2048, 1280, 512, "activation", None), (2048, 1280, 513, "activation", _FB2_P128),
+    (2048, 1280, 576, "activation", _FB2_P128), (2048, 1280, 577, "activation", None),
+    (1280, 1280, 1079, "activation", None), (5120, 4096, 182, "activation", None))
+
+
+def _q_fb2(ext, dig: _PDigest, local: list, stats: dict) -> None:
+    """(FB2) The route rules of the B300 swap-AB adoption: see Q_FB2_CELLS and the family list above case q."""
+    from fish_scales_ops.gemm import _sm100_decode
+    from fish_scales_ops.gemm import _epilogue as E, _sm100_dispatch
+    pickers = {"config": _sm100_decode.pick_config, "identity": _sm100_decode.pick_identity_config,
+               "activation": _sm100_decode.pick_activation_config}
+    for (N, K, M, picker, want) in Q_FB2_EDGES:
+        got = pickers[picker](M, N, K)
+        if got != want:
+            local.append(f"fb2 edge M={M} N={N} K={K}: {picker} picker {got}, expected {want}")
+    for (N, K, M, t_id, t_bias, t_res, t_act) in Q_FB2_CELLS:
+        picker, want = Q_FB2_TACTICS[(N, K, M)]
+        got = pickers[picker](M, N, K)
+        if got != want:
+            local.append(f"fb2 M={M} N={N} K={K}: {picker} picker {got}, expected {want}")
+        if picker != "config" and _sm100_decode.pick_config(M, N, K) is not None:
+            local.append(f"fb2 M={M} N={N} K={K}: pick_config owns a cell the rule takes only by call")
+        # linear_quantized stays on the cascade, which alone writes the quantized output
+        eq = E.make("case q", m=M, n=N, device=torch.device("cuda", torch.cuda.current_device()), quantized=True,
+                    bias=torch.zeros(N, dtype=torch.bfloat16, device="cuda"), activation="gelu_erf")
+        if _sm100_dispatch.plan(M, N, K, eq) != "sm100.cascade":
+            local.append(f"fb2 M={M} N={N} K={K}: linear_quantized not planned on the cascade")
+        _q_cell(M, N, K, M * 1009 + N * 17 + K, ext, dig, local, stats, t_id, t_res, bias_tier=t_bias, act_tier=t_act)
+    _q_zero_corner(78, 1280, 1280, "sm100.decode", local, stats, "zero_byte_fb2_shortk")
+    _q_zero_corner(96, 5120, 2048, "sm100.decode", local, stats, "zero_byte_fb2_identity", bias_tier="sm100.cascade")
+    _q_zero_corner(48, 2048, 4096, "sm100.decode", local, stats, "zero_byte_fb2_split64")
+    calls = []
+    for (N, K, M, seed, kw) in ((1280, 1280, 182, 51, dict(residual=True)), (5120, 1280, 182, 52,
+                                                                            dict(activation="gelu_erf")),
+                                (2048, 4096, 48, 53, dict(residual=True, activation="gelu_erf"))):
+        x, w = _p_ints(M, N, K, seed, sparse=False)
+        dw = _p_weight(w)
+        xq, sx = D.quantize_activation(x)
+        b = torch.randn(N, device="cuda").bfloat16()
+        r = torch.randn(M, N, device="cuda").bfloat16() if kw.get("residual") else None
+        act = kw.get("activation")
+        _p_capture(f"fb2 M={M} N={N} K={K} {kw} (2b)",
+                   lambda: D.linear(xq, dw, x_scale=sx, bias=b, residual=r, activation=act), local)
+        _p_capture(f"fb2 M={M} N={N} K={K} {kw} (bf16 x)", lambda: D.linear(x, dw, bias=b, residual=r, activation=act),
+                   local)
+        calls.append(lambda xq=xq, dw=dw, sx=sx, b=b, r=r, act=act: D.linear(xq, dw, x_scale=sx, bias=b, residual=r,
+                                                                             activation=act))
+    # identity on the 1-SM persistent form (no epilogue tensors)
+    x, w = _p_ints(160, 6144, 2560, 54, sparse=False)
+    dw = _p_weight(w)
+    xq, sx = D.quantize_activation(x)
+    _p_capture("fb2 M=160 N=6144 K=2560 identity (bf16 x)", lambda: D.linear(x, dw), local)
+    calls.append(lambda xq=xq, dw=dw, sx=sx: D.linear(xq, dw, x_scale=sx))
+    # 200 concurrent replays of the four captured calls on four streams, each against its serial result
+    refs = [c().clone() for c in calls]
+    torch.cuda.synchronize()
+    streams = [torch.cuda.Stream() for _ in calls]
+    graphs, outs = [], []
+    for c, s in zip(calls, streams):
+        s.wait_stream(torch.cuda.current_stream())
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            outs.append(c())
+        graphs.append(g)
+    torch.cuda.synchronize()
+    bad = [torch.zeros((), dtype=torch.int64, device="cuda") for _ in calls]
+    for _ in range(200):
+        for i in range(len(calls)):
+            with torch.cuda.stream(streams[i]):
+                graphs[i].replay()
+                bad[i] += (_bits(outs[i]) != _bits(refs[i])).sum()
+    torch.cuda.synchronize()
+    nbad = [int(t) for t in bad]
+    stats["determinism_cells"] += len(calls)
+    if any(nbad):
+        local.append(f"fb2 concurrent replay on four streams: {nbad} mismatching elements over 200 iterations")
 
 
 def q_worker(label: str) -> int:
@@ -4074,7 +4228,7 @@ def q_worker(label: str) -> int:
         for (N, K, M) in Q_SMM_CELLS:
             _q_cell(M, N, K, M * 1009 + N * 17 + K, ext, dig, local, stats, "sm100.smm", "sm100.cascade")
         _q_zero_corner(364, 1280, 1280, "sm100.smm", local, stats, "zero_byte_smm")
-        _q_zero_corner(129, 5120, 1280, "sm100.smm", local, stats, "zero_byte_smm_wide")
+        _q_zero_corner(208, 5120, 1280, "sm100.smm", local, stats, "zero_byte_smm_wide")
         for (N, K, M, seed) in ((5120, 1280, 182, 21), (1280, 1280, 364, 22)):
             x, w = _p_ints(M, N, K, seed, sparse=False)
             dw = _p_weight(w)
@@ -4096,8 +4250,8 @@ def q_worker(label: str) -> int:
         for (N, K, M) in Q_SHORTK_WAVE_CELLS:
             _q_cell(M, N, K, M * 1009 + N * 17 + K, ext, dig, local, stats, "sm100.cascade")
             _q_shortk_tiles(M, N, K, local, stats)
-        _q_zero_corner(78, 1280, 1280, "sm100.smm", local, stats, "zero_byte_shortk", bias_tier="sm100.cascade")
-        for (N, K, M, seed) in ((1280, 1280, 78, 41), (5120, 1280, 364, 42), (1280, 1280, 1079, 43),
+        _q_zero_corner(129, 2048, 1280, "sm100.smm", local, stats, "zero_byte_shortk", bias_tier="sm100.cascade")
+        for (N, K, M, seed) in ((2048, 1280, 129, 41), (5120, 1280, 364, 42), (1280, 1280, 1079, 43),
                                 (3840, 1280, 78, 44)):
             x, w = _p_ints(M, N, K, seed, sparse=False)
             dw = _p_weight(w)
@@ -4113,6 +4267,9 @@ def q_worker(label: str) -> int:
     elif label == "wide":
         ext = _sm100_gelu_ext()
         _q_wide(ext, dig, local, stats)
+    elif label == "fb2":
+        ext = _sm100_gelu_ext()
+        _q_fb2(ext, dig, local, stats)
     elif label == "agree":
         _q_agree(local, stats)
     elif label == "pdl":
@@ -4146,12 +4303,13 @@ def case_q(major: int) -> None:
     if not _sm100_decode.enabled():
         print("  q  SKIP: the CuTe-DSL decode row is not available in this environment")
         return
-    runs = [("decode", {}), ("smm", {}), ("wide", {}), ("shortk", {}), ("agree", {}), ("pdl", {}),
+    runs = [("decode", {}), ("smm", {}), ("wide", {}), ("shortk", {}), ("fb2", {}), ("agree", {}), ("pdl", {}),
             ("decode/nopdl", {"FSO_DISABLE_PDL": "1"}), ("smm/nopdl", {"FSO_DISABLE_PDL": "1"}),
-            ("wide/nopdl", {"FSO_DISABLE_PDL": "1"}), ("shortk/nopdl", {"FSO_DISABLE_PDL": "1"})]
+            ("wide/nopdl", {"FSO_DISABLE_PDL": "1"}), ("shortk/nopdl", {"FSO_DISABLE_PDL": "1"}),
+            ("fb2/nopdl", {"FSO_DISABLE_PDL": "1"})]
     digests = {}
-    tactic_re = re.compile(r"^\[fso sm100 decode(?: fall-through)?\] M=(\d+) N=(\d+) K=(\d+) -> (\S+) "
-                           r"tiler=\((\d+), (\d+)\)")
+    tactic_re = re.compile(r"^\[fso sm100 decode(?: fall-through| identity| activation)?\] M=(\d+) N=(\d+) K=(\d+) "
+                           r"-> (\S+) tiler=\((\d+), (\d+)\)")
     for label, env in runs:
         worker = label.split("/")[0]
         r, summary = _q_spawn(worker, env)
@@ -4186,7 +4344,7 @@ def case_q(major: int) -> None:
         if not ok and summary is not None:
             for f in summary["failures"][:10]:
                 print(f"       {f}")
-    for k in ("decode", "smm", "wide", "shortk"):
+    for k in ("decode", "smm", "wide", "shortk", "fb2"):
         same = k in digests and digests.get(k) == digests.get(f"{k}/nopdl")
         _check(same, f"q: FSO_DISABLE_PDL=1 changed the bytes of family {k}")
         print(f"  q  PDL on / off, family {k}: identical bytes  {_ok(same)}")
