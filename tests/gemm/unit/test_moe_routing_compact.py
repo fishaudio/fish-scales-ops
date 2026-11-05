@@ -133,8 +133,29 @@ def check_contract(ids, g, nb_max, out, want_all, topk_w, bases):
         slot_ref[: active.numel()] = active
         if not torch.equal(slots.long(), slot_ref):
             errs.append("slot_to_expert")
-        # the slot route's work-stealing counter: two int32 words, zero (S10b-1)
-        if sched.dtype != torch.int32 or sched.numel() != 2 or bool((sched != 0).any()):
+        # the slot route's counters: the work-stealing counter's two int32 words (S10b-1), zero; then for the fused
+        # FC1 + FC2 slot kernel (issue #13 lever 5) one counter per slot, zero, and one packed fact word per slot,
+        # expert | rows << 16 for the active slots and -1 after them; on sm_100/103 only, where that kernel exists.
+        # With the token-tile list (asked for together with the pointer arrays below) num_blocks more words for that
+        # kernel's token-tile mode (I13-L5b): live_halves << 20 for every block in use (two halves when the block
+        # holds more than 64 of its expert's rows), the words of unused blocks unspecified.
+        if torch.cuda.get_device_capability(ids.device)[0] == 10:
+            info_ref = torch.full((g,), -1, dtype=torch.int64, device=ids.device)
+            info_ref[: active.numel()] = active | (cnt[active].clamp(max=0xffff) << 16)
+            info_ref = torch.where(info_ref >= 2 ** 31, info_ref - 2 ** 32, info_ref)
+            n_blk = nb_max if tiles.numel() else 0
+            if (sched.dtype != torch.int32 or sched.numel() != 2 + 2 * g + n_blk or bool((sched[: 2 + g] != 0).any())
+                    or not torch.equal(sched[2 + g: 2 + 2 * g].long(), info_ref)):
+                errs.append("slot_sched")
+            elif n_blk:
+                used = int(blk0_ref[g])
+                halves = torch.zeros(used, dtype=torch.long, device=ids.device)
+                for x, c in enumerate(cnt.tolist()):
+                    for j in range((c + ROWS - 1) // ROWS):
+                        halves[int(blk0_ref[x]) + j] = 2 if c - ROWS * j > 64 else 1
+                if not torch.equal(sched[2 + 2 * g: 2 + 2 * g + used].long(), halves << 20):
+                    errs.append("slot_sched token-tile block words")
+        elif sched.dtype != torch.int32 or sched.numel() != 2 or bool((sched != 0).any()):
             errs.append("slot_sched")
         # the slot route's token-tile list (S10b-3b), asked for together with the pointer arrays (a request the
         # decode shape does not take either): every expert's 64-row token tiles in order, then -1, then the count

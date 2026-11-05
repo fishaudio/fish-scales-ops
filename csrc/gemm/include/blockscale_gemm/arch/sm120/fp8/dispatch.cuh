@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "blockscale_gemm/common/epilogue.cuh"
 #include "blockscale_gemm/common/kernel_utils.cuh"
 #include "blockscale_gemm/arch/sm120/common/env_overrides.cuh"
 #include "blockscale_gemm/arch/sm120/fp8/gemm_1d1d.cuh"
@@ -90,20 +91,22 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels::blockscale_gemm
 {
 
-inline void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a, float* scales_b,
-    uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, cudaStream_t stream, int num_device_sms = kNumDeviceSMs)
+// The block-FP8 1x128 dense cascade on sm_120/sm_121: the instance and the K split a call runs. The rules are the
+// ones gemm_dispatch_sm120 has always applied, in the same order, with each launch statement replaced by the route
+// it launched (and the Stream-K launcher's clamps of the split applied, sm120_streamk_effective_split). It serves the
+// launch below and the Stream-K scratch size the runner asks for (CutlassFp8BlockScaleGemmRunner::
+// getStreamKScratchSize), so the two cannot disagree.
+inline Sm120DenseRoute sm120_fp8_dense_route(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_device_sms)
 {
-    if (num_device_sms < 0)
-        num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
-
-    auto* a = reinterpret_cast<__nv_fp8_e4m3*>(mat_a);
-    auto* b = reinterpret_cast<__nv_fp8_e4m3*>(mat_b);
-    auto* d = reinterpret_cast<__nv_bfloat16*>(mat_d);
-    int64_t ld_a = shape_k;
-    int64_t ld_b = shape_k;
-    int64_t ld_d = shape_n;
-    constexpr int64_t stride = 0;
-    constexpr uint32_t num_problems = 1;
+    auto fp8_route = [&](int tm, int tn, int st, int ks = 1)
+    {
+        Sm120DenseRoute r;
+        r.tile_m = tm;
+        r.tile_n = tn;
+        r.stages = st;
+        r.k_split = sm120_streamk_effective_split(ks, static_cast<int>(shape_k), /*sf_block=*/512);
+        return r;
+    };
 
     // E15: same negative result as the MXFP8 path — see mxfp8/dispatch.cuh
     // note. GEMV kernel kept in `common/gemv.cuh` for reference but not
@@ -125,33 +128,26 @@ inline void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* sc
     if (force_tile_applies(forced, shape_k))
     {
         int const k_split = forced.stream_k() ? forced.ks : 1;
-        bool handled = false;
         if (k_split <= 1)
         {
-            #define DISPATCH_FORCED(TM_, TN_, ST_) \
-                launch_sm120_gemm_kernel<TM_, TN_, ST_>(a, ld_a, stride, b, ld_b, stride, d, ld_d, stride, \
-                    scales_a, stride, scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms)
-            if      (forced.tm ==  32 && forced.tn == 128 && forced.st == 4) { DISPATCH_FORCED( 32, 128, 4); handled = true; }
-            else if (forced.tm ==  32 && forced.tn ==  64 && forced.st == 4) { DISPATCH_FORCED( 32,  64, 4); handled = true; }
-            else if (forced.tm ==  64 && forced.tn == 128 && forced.st == 4) { DISPATCH_FORCED( 64, 128, 4); handled = true; }
-            else if (forced.tm ==  64 && forced.tn ==  64 && forced.st == 4) { DISPATCH_FORCED( 64,  64, 4); handled = true; }
-            else if (forced.tm ==  96 && forced.tn == 128 && forced.st == 2) { DISPATCH_FORCED( 96, 128, 2); handled = true; }
-            else if (forced.tm == 128 && forced.tn == 128 && forced.st == 2) { DISPATCH_FORCED(128, 128, 2); handled = true; }
-            else if (forced.tm == 160 && forced.tn == 128 && forced.st == 2) { DISPATCH_FORCED(160, 128, 2); handled = true; }
+            #define DISPATCH_FORCED(TM_, TN_, ST_) return fp8_route(TM_, TN_, ST_)
+            if      (forced.tm ==  32 && forced.tn == 128 && forced.st == 4) { DISPATCH_FORCED( 32, 128, 4); }
+            else if (forced.tm ==  32 && forced.tn ==  64 && forced.st == 4) { DISPATCH_FORCED( 32,  64, 4); }
+            else if (forced.tm ==  64 && forced.tn == 128 && forced.st == 4) { DISPATCH_FORCED( 64, 128, 4); }
+            else if (forced.tm ==  64 && forced.tn ==  64 && forced.st == 4) { DISPATCH_FORCED( 64,  64, 4); }
+            else if (forced.tm ==  96 && forced.tn == 128 && forced.st == 2) { DISPATCH_FORCED( 96, 128, 2); }
+            else if (forced.tm == 128 && forced.tn == 128 && forced.st == 2) { DISPATCH_FORCED(128, 128, 2); }
+            else if (forced.tm == 160 && forced.tn == 128 && forced.st == 2) { DISPATCH_FORCED(160, 128, 2); }
             #undef DISPATCH_FORCED
         }
         else
         {
-            #define DISPATCH_FORCED_SK(TM_, TN_, ST_) \
-                launch_sm120_streamk_gemm<TM_, TN_, ST_>(a, static_cast<int>(ld_a), b, static_cast<int>(ld_b), d, \
-                    static_cast<int>(ld_d), static_cast<int>(shape_m), static_cast<int>(shape_n), \
-                    static_cast<int>(shape_k), scales_a, scales_b, k_split, num_device_sms, stream)
-            if      (forced.tm ==  32 && forced.st == 4) { DISPATCH_FORCED_SK( 32, 128, 4); handled = true; }
-            else if (forced.tm ==  64 && forced.st == 4) { DISPATCH_FORCED_SK( 64, 128, 4); handled = true; }
-            else if (forced.tm == 128 && forced.st == 2) { DISPATCH_FORCED_SK(128, 128, 2); handled = true; }
+            #define DISPATCH_FORCED_SK(TM_, TN_, ST_) return fp8_route(TM_, TN_, ST_, k_split)
+            if      (forced.tm ==  32 && forced.st == 4) { DISPATCH_FORCED_SK( 32, 128, 4); }
+            else if (forced.tm ==  64 && forced.st == 4) { DISPATCH_FORCED_SK( 64, 128, 4); }
+            else if (forced.tm == 128 && forced.st == 2) { DISPATCH_FORCED_SK(128, 128, 2); }
             #undef DISPATCH_FORCED_SK
         }
-        if (handled) return;
         // unknown combo: fall through to regular dispatch
     }
 
@@ -164,21 +160,8 @@ inline void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* sc
     int const k_split = sm120_streamk_choose_k_split(static_cast<int>(shape_m), static_cast<int>(shape_n),
         static_cast<int>(shape_k), num_device_sms);
 
-#define DISPATCH_TILE(TM_, TN_, ST_)                                                                                   \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        if (k_split <= 1)                                                                                              \
-        {                                                                                                              \
-            launch_sm120_gemm_kernel<TM_, TN_, ST_>(a, ld_a, stride, b, ld_b, stride, d, ld_d, stride, scales_a,       \
-                stride, scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);            \
-        }                                                                                                              \
-        else                                                                                                           \
-        {                                                                                                              \
-            launch_sm120_streamk_gemm<TM_, TN_, ST_>(a, static_cast<int>(ld_a), b, static_cast<int>(ld_b), d,           \
-                static_cast<int>(ld_d), static_cast<int>(shape_m), static_cast<int>(shape_n),                          \
-                static_cast<int>(shape_k), scales_a, scales_b, k_split, num_device_sms, stream);                       \
-        }                                                                                                              \
-    } while (0)
+// The instance (TM_, TN_, ST_), single launch when k_split <= 1, else Stream-K with k_split slices.
+#define DISPATCH_TILE(TM_, TN_, ST_) return fp8_route(TM_, TN_, ST_, k_split)
 
     // K-aware override (2026-05-05 P2 retune + E19 narrow-N port).
     //
@@ -205,9 +188,7 @@ inline void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* sc
     {
         if (shape_k <= 2048 && (shape_m <= 32 || tiles_n < 32))
         {
-            launch_sm120_gemm_kernel<32, 128, 4>(a, ld_a, stride, b, ld_b, stride, d, ld_d, stride, scales_a,
-                stride, scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
-            return;
+            return fp8_route(32, 128, 4);
         }
         // Narrow-N small/mid-M: gated on K<9728 (same as MXFP8 E18 — for
         // K≥9728 the cascade's Stream-K path beats single-launch (32,64,4)
@@ -221,15 +202,11 @@ inline void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* sc
         if (small_m_narrow_n || mid_m_narrow_n_64)
         {
             if (tiles_n == 1 && shape_m >= 4096)
-                launch_sm120_gemm_kernel<64, 64, 4>(a, ld_a, stride, b, ld_b, stride, d, ld_d, stride, scales_a,
-                    stride, scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
+                return fp8_route(64, 64, 4);
             else if (mid_m_narrow_n_64)
-                launch_sm120_gemm_kernel<64, 64, 4>(a, ld_a, stride, b, ld_b, stride, d, ld_d, stride, scales_a,
-                    stride, scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
+                return fp8_route(64, 64, 4);
             else
-                launch_sm120_gemm_kernel<32, 64, 4>(a, ld_a, stride, b, ld_b, stride, d, ld_d, stride, scales_a,
-                    stride, scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
-            return;
+                return fp8_route(32, 64, 4);
         }
     }
 
@@ -285,6 +262,62 @@ inline void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* sc
             DISPATCH_TILE(64, 128, 4);
     }
 #undef DISPATCH_TILE
+    // Every branch above returns (the compiler proves the end unreachable).
+}
+
+// `epilogue`: the dense epilogue of interface v1 (common/epilogue.cuh). This route applies none of its fields yet
+// (kDenseEpiServedSm120Fp8Cascade) and refuses a non-identity one before it launches anything.
+//
+// `streamk_scratch` / `streamk_scratch_bytes`: the caller's bf16 partial scratch for a Stream-K route
+// (sm120_fp8_dense_route(...).streamk_scratch_bytes(M, N); the runner's op bodies allocate it from the torch caching
+// allocator on `stream`). A single-launch route reads neither; a Stream-K route without enough scratch is an error.
+inline void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a, float* scales_b,
+    uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, cudaStream_t stream, int num_device_sms = kNumDeviceSMs,
+    fso::DenseEpilogue const& epilogue = fso::DenseEpilogue{}, void* streamk_scratch = nullptr,
+    std::size_t streamk_scratch_bytes = 0)
+{
+    fso::require_dense_epilogue(epilogue, fso::kDenseEpiServedSm120Fp8Cascade,
+        "sm_120/sm_121 block-FP8 1x128 GEMM (gemm_dispatch_sm120, the CUTLASS cascade)");
+    if (num_device_sms < 0)
+        num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
+
+    auto* a = reinterpret_cast<__nv_fp8_e4m3*>(mat_a);
+    auto* b = reinterpret_cast<__nv_fp8_e4m3*>(mat_b);
+    auto* d = reinterpret_cast<__nv_bfloat16*>(mat_d);
+    int64_t ld_a = shape_k;
+    int64_t ld_b = shape_k;
+    int64_t ld_d = shape_n;
+    constexpr int64_t stride = 0;
+    constexpr uint32_t num_problems = 1;
+
+    Sm120DenseRoute const route = sm120_fp8_dense_route(shape_m, shape_n, shape_k, num_device_sms);
+    auto is = [&](int tm, int tn, int st) { return route.tile_m == tm && route.tile_n == tn && route.stages == st; };
+    if (route.k_split > 1)
+    {
+#define SK_FP8(TM_, TN_, ST_)                                                                                          \
+    if (is(TM_, TN_, ST_))                                                                                             \
+    {                                                                                                                  \
+        launch_sm120_streamk_gemm<TM_, TN_, ST_>(a, static_cast<int>(ld_a), b, static_cast<int>(ld_b), d,               \
+            static_cast<int>(ld_d), static_cast<int>(shape_m), static_cast<int>(shape_n), static_cast<int>(shape_k),    \
+            scales_a, scales_b, route.k_split, num_device_sms, stream, streamk_scratch, streamk_scratch_bytes);       \
+        return;                                                                                                        \
+    }
+        // The Stream-K tiles of the cascade and of FSO_FORCE_KSPLIT (the chooser never splits at tiles_n >= 96).
+        SK_FP8(32, 128, 4) SK_FP8(64, 128, 4) SK_FP8(128, 128, 2)
+#undef SK_FP8
+        TLLM_THROW("gemm_dispatch_sm120: no Stream-K instance (%d, %d, %d)", route.tile_m, route.tile_n, route.stages);
+    }
+#define ONE_FP8(TM_, TN_, ST_)                                                                                         \
+    if (is(TM_, TN_, ST_))                                                                                             \
+    {                                                                                                                  \
+        launch_sm120_gemm_kernel<TM_, TN_, ST_>(a, ld_a, stride, b, ld_b, stride, d, ld_d, stride, scales_a, stride,    \
+            scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);                        \
+        return;                                                                                                        \
+    }
+    ONE_FP8(32, 128, 4) ONE_FP8(32, 64, 4) ONE_FP8(64, 128, 4) ONE_FP8(64, 64, 4) ONE_FP8(96, 128, 2)
+    ONE_FP8(128, 128, 2) ONE_FP8(160, 128, 2)
+#undef ONE_FP8
+    TLLM_THROW("gemm_dispatch_sm120: no instance (%d, %d, %d)", route.tile_m, route.tile_n, route.stages);
 }
 
 } // namespace kernels::blockscale_gemm

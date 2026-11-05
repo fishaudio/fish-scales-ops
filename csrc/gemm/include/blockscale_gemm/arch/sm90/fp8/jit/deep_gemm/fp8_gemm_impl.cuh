@@ -33,11 +33,63 @@
 #ifndef FSO_SWAPAB_WEIGHT_EVICT_FIRST
 #define FSO_SWAPAB_WEIGHT_EVICT_FIRST 0
 #endif
+#include "fso_dense_epilogue.cuh"
 #include "tma_utils.cuh"
 #include "utils.cuh"
 
 namespace deep_gemm
 {
+
+// The dense epilogue of interface v1 (issue #12; fso_dense_epilogue.cuh) on fp8_gemm_kernel and
+// fp8_gemm_kernel_swapAB, GemmType::Normal only. The epilogue rides in the scheduler input, the kernels' one argument
+// of template type: a non-identity call is compiled with InputType = NormalSchedulerInputEpi<kBias, kAct, kResidual>
+// (fp8_gemm_kernel) or NormalSchedulerInputSwapABEpi<...> (fp8_gemm_kernel_swapAB), which extend the plain inputs by
+// the fso::DenseEpilogue the host launcher fills (runGemm / runGemmSwapAB build the matching *WithEpilogue struct:
+// the templates add no member, so the layout is the same). The scheduler is built from the base part as before. An
+// identity call keeps NormalSchedulerInput / NormalSchedulerInputSwapAB, its generated source and its kernel.
+struct NormalSchedulerInputWithEpilogue : NormalSchedulerInput
+{
+    fso::DenseEpilogue epilogue;
+};
+
+struct NormalSchedulerInputSwapABWithEpilogue : NormalSchedulerInputSwapAB
+{
+    fso::DenseEpilogue epilogue;
+};
+
+// The host (g++) and NVRTC must agree on the argument's layout: the base (16 bytes, 8-aligned), then the struct.
+static_assert(sizeof(NormalSchedulerInputWithEpilogue) == 16 + sizeof(fso::DenseEpilogue), "epilogue input layout");
+static_assert(sizeof(NormalSchedulerInputSwapABWithEpilogue) == 16 + sizeof(fso::DenseEpilogue),
+    "epilogue input layout");
+static_assert(sizeof(fso::DenseEpilogue) == 56, "fso::DenseEpilogue layout");
+
+template <bool kBias, int kAct, bool kResidual>
+struct NormalSchedulerInputEpi : NormalSchedulerInputWithEpilogue
+{
+};
+
+template <bool kBias, int kAct, bool kResidual>
+struct NormalSchedulerInputSwapABEpi : NormalSchedulerInputSwapABWithEpilogue
+{
+};
+
+template <bool kBias_, int kAct_, bool kResidual_>
+struct DenseEpilogueOf<NormalSchedulerInputEpi<kBias_, kAct_, kResidual_>>
+{
+    static constexpr bool kEnabled = true;
+    static constexpr bool kBias = kBias_;
+    static constexpr int kAct = kAct_;
+    static constexpr bool kResidual = kResidual_;
+};
+
+template <bool kBias_, int kAct_, bool kResidual_>
+struct DenseEpilogueOf<NormalSchedulerInputSwapABEpi<kBias_, kAct_, kResidual_>>
+{
+    static constexpr bool kEnabled = true;
+    static constexpr bool kBias = kBias_;
+    static constexpr int kAct = kAct_;
+    static constexpr bool kResidual = kResidual_;
+};
 
 // Programmatic dependent launch (PDL): `fso_pdl_wait` blocks until the preceding kernel in the stream has completed
 // and its memory is visible, and is a no-op when the launch carries no programmatic dependency (a plain launch, or
@@ -62,6 +114,26 @@ namespace deep_gemm
 __device__ __forceinline__ void fso_pdl_wait()
 {
     asm volatile("griddepcontrol.wait;" ::: "memory");
+}
+
+// Release of a pipeline stage whose TMA-written shared memory the warp has read with ld.shared. Every math warp of
+// these kernels reads its stage's activation scales with ld.shared before the WGMMA, and lane 0 releases the stage
+// (empty-barrier arrive) after warpgroup_wait. Nothing in that sequence makes the warp wait for the loads before the
+// arrive: ptxas places the first use of the loaded registers wherever it likes, after the arrive in the last real
+// stage of a NotDivisibleK pass of most instantiations, and an mbarrier arrive does not order an outstanding
+// generic-proxy load against the TMA (async-proxy) write that the producer issues once it sees the release. When the
+// producer refills the stage at once (the CTA's next tile) and that write lands before the load is performed, the
+// warp promotes the k-block with the scales of the stage's next fill: a forced 128 x 24 swap-AB tile on a 3-5 wave
+// launch returned one wrong 64-row block per bad call on 1 % of calls (issue #12, SW1;
+// /data/bench-runs/fso_issue12_20261028/runs/SW1). fence.proxy.async orders the thread's earlier generic-proxy
+// accesses before its later async-proxy ones, which the PTX memory model requires between a generic read and an
+// async-proxy write of the same bytes; __syncwarp then orders the other lanes' fences before lane 0's arrive. The
+// call sits between warpgroup_commit_batch and warpgroup_wait so that it overlaps the WGMMA, which the warp waits for
+// anyway, instead of delaying the release.
+__device__ __forceinline__ void fso_fence_stage_reads()
+{
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    __syncwarp();
 }
 
 enum class Layout
@@ -331,6 +403,20 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx))
         {
+            // Dense epilogue (issue #12): stage this tile's bias and residual now, in registers where the tile leaves
+            // room for them and as prefetches (bias to L1, residual to L2) where it does not, so that the main loop
+            // hides the loads (fso_dense_epilogue.cuh). For every InputType but NormalSchedulerInputEpi the registers
+            // are empty structs and the staging is discarded.
+            using FsoPolicy = DenseOperandPolicy<DenseEpilogueOf<InputType>::kBias, DenseEpilogueOf<InputType>::kResidual,
+                2 * WGMMA::kNumAccum, WGMMA::kNumAccum / 4, 2>;
+            DenseOperandRegs<FsoPolicy::kBiasInRegs, FsoPolicy::kResInRegs, WGMMA::kNumAccum / 4, 1> fso_regs;
+            if constexpr (DenseEpilogueOf<InputType>::kEnabled)
+                dense_stage_tile<DenseEpilogueOf<InputType>, FsoPolicy, BLOCK_M, BLOCK_N, kNumMathThreads,
+                    WGMMA::kNumAccum / 4, 1, 0>(fso_regs, problem_input.epilogue,
+                    scheduler.get_global_m_idx(m_block_idx), scheduler.get_global_m_idx(m_block_idx) + r_0,
+                    problem_input.shape_m, n_block_idx * BLOCK_N, n_block_idx * BLOCK_N + (lane_idx % 4) * 2, SHAPE_N,
+                    threadIdx.x);
+
             // Decide the number of scales B to load
             DG_STATIC_ASSERT(SHAPE_N % 8 == 0, "Invalid shape N");
             uint32_t num_former_iters = BLOCK_N / 8, num_full_iters = num_former_iters;
@@ -414,6 +500,7 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
                             WGMMA::wgmma(desc_a, desc_b, accum, k);
                         }
                         warpgroup_commit_batch();
+                        fso_fence_stage_reads(); // this stage's scale loads before its release
 #pragma unroll
                         for (int i = 0; i < WGMMA::kNumAccum; ++i)
                             warpgroup_fence_operand(accum[i]);
@@ -446,6 +533,19 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
                         empty_barrier_arrive(s);
                     }
                 });
+
+            // Dense epilogue (issue #12; fso_dense_epilogue.cuh): bias, erf-GELU and residual applied to the promoted
+            // fp32 accumulators, which both store paths below then round to bf16 once. Discarded for every InputType
+            // but NormalSchedulerInputEpi; the loads come after this kernel's fso_pdl_wait (above, in every thread).
+            if constexpr (DenseEpilogueOf<InputType>::kEnabled)
+            {
+                using Epi = DenseEpilogueOf<InputType>;
+                DG_STATIC_ASSERT(SchedulerType::gemm_type == GemmType::Normal, "the dense epilogue is GemmType::Normal only");
+                dense_epilogue_fragment<Epi::kBias, Epi::kAct, Epi::kResidual, WGMMA::kNumAccum / 4,
+                    FsoPolicy::kBiasInRegs, FsoPolicy::kResInRegs>(final_accum, problem_input.epilogue,
+                    fso_regs.bias.ptr(), fso_regs.res.ptr(), scheduler.get_global_m_idx(m_block_idx) + r_0,
+                    problem_input.shape_m, n_block_idx * BLOCK_N + (lane_idx % 4) * 2, SHAPE_N);
+            }
 
             // Dense GEMM with BLOCK_N a multiple of 64: the D store path of DeepGEMM v2's sm90_fp8_gemm_1d2d. STSM
             // writes D into shared memory as BLOCK_N / 64 slabs of BLOCK_M x 64 bf16 (128 bytes per row) with the
@@ -833,6 +933,21 @@ __global__ void __launch_bounds__(
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx))
         {
+            // Dense epilogue (issue #12): stage this tile's bias (two weight rows per thread, in registers) and
+            // residual (in registers where the tile leaves room, else prefetched to L2) now, so that the main loop
+            // hides the loads (fso_dense_epilogue.cuh). For every InputType but NormalSchedulerInputSwapABEpi the
+            // registers are empty structs and the staging is discarded.
+            using FsoPolicy = DenseOperandPolicy<DenseEpilogueOf<InputType>::kBias, DenseEpilogueOf<InputType>::kResidual,
+                2 * WGMMA::kNumAccum, WGMMA::kNumAccum / 4, 4>;
+            DenseOperandRegsSwapAB<DenseEpilogueOf<InputType>::kBias, FsoPolicy::kResInRegs, WGMMA::kNumAccum / 4>
+                fso_regs;
+            if constexpr (DenseEpilogueOf<InputType>::kEnabled)
+                dense_stage_tile_swapab<DenseEpilogueOf<InputType>, FsoPolicy, BLOCK_M, BLOCK_N, kNumMathThreads,
+                    WGMMA::kNumAccum / 4>(fso_regs, problem_input.epilogue, m_block_idx * BLOCK_M,
+                    m_block_idx * BLOCK_M + warp_idx * 16 + lane_idx / 4, SHAPE_M,
+                    scheduler.get_global_n_idx(n_block_idx),
+                    scheduler.get_global_n_idx(n_block_idx) + (lane_idx % 4) * 2, problem_input.shape_n, threadIdx.x);
+
             // Load weight scales (scales_a) - these are associated with tensor_map_a (weight)
             // Decide the number of scales A to load
             DG_STATIC_ASSERT(SHAPE_M % 8 == 0, "Invalid shape M");
@@ -920,6 +1035,7 @@ __global__ void __launch_bounds__(
                             WGMMA::wgmma(desc_a, desc_b, accum, k);
                         }
                         warpgroup_commit_batch();
+                        fso_fence_stage_reads(); // this stage's scale loads before its release
 #pragma unroll
                         for (int i = 0; i < WGMMA::kNumAccum; ++i)
                             warpgroup_fence_operand(accum[i]);
@@ -959,6 +1075,19 @@ __global__ void __launch_bounds__(
                 if (threadIdx.x == 0)
                     cute::tma_store_wait<0>();
                 cutlass::arch::NamedBarrier(kNumMathThreads).sync();
+            }
+
+            // Dense epilogue (issue #12; fso_dense_epilogue.cuh) on the transposed tile: this kernel's M is the
+            // weight's N, so the bias is indexed by the weight row and the residual by (token, weight row). Discarded
+            // for every InputType but NormalSchedulerInputSwapABEpi; the loads come after this kernel's fso_pdl_wait.
+            if constexpr (DenseEpilogueOf<InputType>::kEnabled)
+            {
+                using Epi = DenseEpilogueOf<InputType>;
+                DG_STATIC_ASSERT(SchedulerType::gemm_type == GemmType::Normal, "the dense epilogue is GemmType::Normal only");
+                dense_epilogue_fragment_swapab<Epi::kBias, Epi::kAct, Epi::kResidual, WGMMA::kNumAccum / 4,
+                    FsoPolicy::kResInRegs>(final_accum, problem_input.epilogue, fso_regs.bias.ptr(),
+                    fso_regs.res.ptr(), m_block_idx * BLOCK_M + warp_idx * 16 + lane_idx / 4, SHAPE_M,
+                    scheduler.get_global_n_idx(n_block_idx) + (lane_idx % 4) * 2, problem_input.shape_n);
             }
 
             // Write back to shared memory using STSM
@@ -1381,6 +1510,7 @@ __global__ void __launch_bounds__(get_num_threads_per_sm_2wg<kNumTMAThreads, kNu
                             WGMMA::wgmma(desc_a, desc_b, accum, k);
                         }
                         warpgroup_commit_batch();
+                        fso_fence_stage_reads(); // this stage's scale loads before its release
 #pragma unroll
                         for (int i = 0; i < WGMMA::kNumAccum; ++i)
                             warpgroup_fence_operand(accum[i]);
@@ -1904,6 +2034,7 @@ __global__ void __launch_bounds__(get_num_threads_per_sm_2wg<kNumTMAThreads, kNu
                             WGMMA::wgmma(desc_a, desc_b, accum, k);
                         }
                         warpgroup_commit_batch();
+                        fso_fence_stage_reads(); // this stage's scale loads before its release
 #pragma unroll
                         for (int i = 0; i < WGMMA::kNumAccum; ++i)
                             warpgroup_fence_operand(accum[i]);
@@ -2530,6 +2661,7 @@ __device__ __forceinline__ void swapab_gate_up_body(void* gmem_out, uint32_t sd_
                             WGMMA::wgmma(desc_a, desc_b, accum_u, k);
                         }
                         warpgroup_commit_batch();
+                        fso_fence_stage_reads(); // this stage's scale loads before its release
 #pragma unroll
                         for (int i = 0; i < WGMMA::kNumAccum; ++i)
                         {
@@ -3193,6 +3325,7 @@ __global__ void __launch_bounds__(384, 1)
                         WGMMA::wgmma(desc_a, desc_b, accum, k);
                     }
                     warpgroup_commit_batch();
+                    fso_fence_stage_reads(); // this stage's scale loads before its release
 #pragma unroll
                     for (int i = 0; i < WGMMA::kNumAccum; ++i)
                         warpgroup_fence_operand(accum[i]);

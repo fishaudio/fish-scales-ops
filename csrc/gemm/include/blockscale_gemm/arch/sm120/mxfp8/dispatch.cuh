@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include "blockscale_gemm/common/epilogue.cuh"
 #include "blockscale_gemm/common/kernel_utils.cuh"
 #include "blockscale_gemm/arch/sm120/common/env_overrides.cuh"
 #include "blockscale_gemm/arch/sm120/fp8/gemm_1d1d.cuh"  // SM120BlockScaledKernel<KT>
@@ -24,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <unordered_map>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -39,16 +41,29 @@ namespace kernels::blockscale_gemm
 // row capacity m_cap, which only the grid bound below reads (the cascade above the
 // launcher reads it as its tile hint), so a compact launch has the grid of the masked
 // launch it replaces.
+//
+// DenseEpi (with `epilogue`) launches the dense-epilogue instantiation of a dense tile: the kernel over
+// SM120DenseEpiBuilder<builder>, which applies epilogue->bias / residual / act to the fp32 accumulator before the
+// one rounding (fp8/gemm_1d1d.cuh, apply_dense_epilogue). Its fields are per-call pointers, patched into Params
+// after the cache lookup like grouped_layout. Every other launch passes DenseEpi = false and is the launch it was.
+//
+// DenseQuant (with DenseEpi and `epilogue`) launches the quantized-output instantiation instead: the kernel over
+// SM120DenseQuantBuilder<builder> (fso.dense.linear_quantized), which writes epilogue->out_q and its scale words
+// (epilogue->out_scale, the sm_120 contract layout) and never the bf16 D; `mat_d` is then out_q itself, only so that
+// the D descriptor Params carries is built over a valid, aligned address (the fused SwiGLU's precedent: never
+// issued, never read) and the Params cache key differs from a bf16 call's.
 template <int TileM, int TileN, int NumStages, int MinBlocksPerSm = 1, int SchedGroup = 16,
     bool SeparateSmemD = false, bool GroupedLayoutSmem = false, bool FusedSwiGLU = false,
-    bool ScatterCombine = false, bool ScatterInStoreWarp = false, bool CompactActs = false>
+    bool ScatterCombine = false, bool ScatterInStoreWarp = false, bool CompactActs = false, bool DenseEpi = false,
+    bool DenseQuant = false>
 void launch_sm120_mxfp8_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t stride_a, __nv_fp8_e4m3* mat_b,
     int64_t ld_b, int64_t stride_b, __nv_bfloat16* mat_d, int64_t ld_d, int64_t stride_d, int32_t* scales_a,
     int64_t /*stride_scales_a*/, int32_t* scales_b, int64_t /*stride_scales_b*/, uint32_t num_problems,
     uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, cudaStream_t stream, int num_device_sms = kNumDeviceSMs,
     int32_t* grouped_layout = nullptr, __nv_fp8_e4m3* out_fp8 = nullptr, int32_t* out_sf = nullptr,
     __nv_bfloat16* out_tokens = nullptr, int32_t const* row_map = nullptr, float const* weight_of_slot = nullptr,
-    uint32_t max_active_groups = 0, int32_t const* blk0 = nullptr, uint32_t act_rows = 0)
+    uint32_t max_active_groups = 0, int32_t const* blk0 = nullptr, uint32_t act_rows = 0,
+    fso::DenseEpilogue const* epilogue = nullptr)
 {
     if (num_device_sms < 0)
         num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
@@ -56,7 +71,10 @@ void launch_sm120_mxfp8_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t 
     using ElementInput = cute::float_e4m3_t;
     using ElementOutput = cute::bfloat16_t;
     using ElementBlockScale = int32_t;
-    using KT = sm120_blockscaled_gemm::SM120MxFP8BlockScaledBuilder<TileM, TileN, NumStages, MinBlocksPerSm, SchedGroup, SeparateSmemD, GroupedLayoutSmem>;
+    using KTBase = sm120_blockscaled_gemm::SM120MxFP8BlockScaledBuilder<TileM, TileN, NumStages, MinBlocksPerSm, SchedGroup, SeparateSmemD, GroupedLayoutSmem>;
+    static_assert(!DenseQuant || DenseEpi, "the quantized output is a form of the dense epilogue");
+    using KTEpi = cute::conditional_t<DenseEpi, sm120_blockscaled_gemm::SM120DenseEpiBuilder<KTBase>, KTBase>;
+    using KT = cute::conditional_t<DenseQuant, sm120_blockscaled_gemm::SM120DenseQuantBuilder<KTBase>, KTEpi>;
     using GemmKernel = sm120_blockscaled_gemm::SM120BlockScaledKernel<KT, FusedSwiGLU, ScatterCombine,
         ScatterInStoreWarp, CompactActs>;
     using Params = typename GemmKernel::Params;
@@ -173,6 +191,20 @@ void launch_sm120_mxfp8_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t 
         kernel_params.out_tokens = out_tokens;
         kernel_params.row_map = row_map;
         kernel_params.weight_of_slot = weight_of_slot;
+    }
+    if constexpr (DenseEpi)
+    {
+        // Same reason: the epilogue's operands are per-call.
+        TLLM_CHECK_WITH_INFO(epilogue != nullptr, "sm120 mxfp8 dense-epilogue launch without its epilogue");
+        kernel_params.epi_bias = epilogue->bias;
+        kernel_params.epi_residual = epilogue->residual;
+        kernel_params.epi_ld_residual = epilogue->ld_residual;
+        kernel_params.epi_act = epilogue->act;
+    }
+    if constexpr (DenseQuant)
+    {
+        kernel_params.epi_out_q = epilogue->out_q;
+        kernel_params.epi_out_scale = reinterpret_cast<int32_t*>(epilogue->out_scale);
     }
 #if defined(FSO_PROLOGUE_TRACE)
     // Scratch builds only: see the FSO_PROLOGUE_TRACE block in fp8/gemm_1d1d.cuh.
@@ -326,8 +358,52 @@ void launch_sm120_mxfp8_smallm_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, i
     cudaLaunchKernelEx(&launch_config, kernel_ptr, kernel_params);
 }
 
+// The single launch of the dense-epilogue instance (tile_m, tile_n, stages) of a dense MXFP8 tile: the kernel over
+// SM120DenseEpiBuilder<SM120MxFP8BlockScaledBuilder<tile_m, tile_n, stages>> with `epilogue`'s fields. False when the
+// tile has no such instance. Defined in ops/mxfp8_dense_epi_kernel.cu, the translation unit that holds the ten
+// instantiations (one per single-launch tile of the cascade), so that they compile in parallel with the identity
+// instances of ops/mxfp8_kernel.cu.
+bool launch_sm120_mxfp8_dense_epi_single(int tile_m, int tile_n, int stages, __nv_fp8_e4m3* mat_a,
+    __nv_fp8_e4m3* mat_b, __nv_bfloat16* mat_d, int32_t* scales_a, int32_t* scales_b, uint32_t shape_m,
+    uint32_t shape_n, uint32_t shape_k, cudaStream_t stream, int num_device_sms, fso::DenseEpilogue const& epilogue);
+
+// The quantized-output twins (fso.dense.linear_quantized), defined in ops/mxfp8_dense_quant_kernel.cu, the translation
+// unit that holds their instantiations and the Stream-K reduce kernel, so that no other unit carries their code.
+// launch_sm120_mxfp8_dense_quant_single: the single launch of the quantized-output instance (tile_m, tile_n, stages)
+// (the kernel over SM120DenseQuantBuilder<SM120MxFP8BlockScaledBuilder<...>>), writing epilogue.out_q and
+// epilogue.out_scale; false when the tile has no such instance.
+// launch_sm120_mxfp8_streamk_reduce_quant: the Stream-K route's reduce of the K_split bf16 partials into
+// epilogue.out_q / epilogue.out_scale (mxfp8/dense_quant_epi.cuh, sm120_streamk_reduce_quant_kernel).
+bool launch_sm120_mxfp8_dense_quant_single(int tile_m, int tile_n, int stages, __nv_fp8_e4m3* mat_a,
+    __nv_fp8_e4m3* mat_b, int32_t* scales_a, int32_t* scales_b, uint32_t shape_m, uint32_t shape_n,
+    uint32_t shape_k, cudaStream_t stream, int num_device_sms, fso::DenseEpilogue const& epilogue);
+void launch_sm120_mxfp8_streamk_reduce_quant(__nv_bfloat16 const* partials, int M, int N, int K_split,
+    std::size_t partial_stride, fso::DenseEpilogue const& epilogue, cudaStream_t stream);
+
+// The quantized output's own preconditions (host only), checked before anything is launched: its scale buffer in the
+// sm_120 contract layout, no residual (linear_quantized takes none), N a multiple of 128 (it is the next GEMM's K).
+inline void sm120_mxfp8_dense_require_quant_out(fso::DenseEpilogue const& epilogue, uint32_t shape_n)
+{
+    if (epilogue.out_q == nullptr)
+        return;
+    if (epilogue.residual != nullptr)
+        throw fso::DenseEpilogueNotImplemented("sm_120/sm_121 dense MXFP8 GEMM (gemm_dispatch_sm120_mxfp8): the "
+            "quantized output (linear_quantized) takes no residual");
+    TLLM_CHECK_WITH_INFO(epilogue.out_scale != nullptr && epilogue.out_scale_layout == fso::kDenseOutScaleMxSm120,
+        "sm120 mxfp8 quantized output: the scale buffer must be given in the sm_120 contract layout "
+        "(kDenseOutScaleMxSm120), got %p / layout %d", epilogue.out_scale, epilogue.out_scale_layout);
+    TLLM_CHECK_WITH_INFO(shape_n % 128 == 0, "sm120 mxfp8 quantized output: N = %u is not a multiple of 128", shape_n);
+}
+
 } // namespace kernels::blockscale_gemm
 TRTLLM_NAMESPACE_END
+
+// FSO_SM120_MXFP8_LAUNCHERS_ONLY (defined by ops/mxfp8_dense_epi_kernel.cu only): stop here, after the launchers.
+// gemm_dispatch_sm120_mxfp8 below is a non-template inline function, so every translation unit that sees its body
+// implicitly instantiates every kernel it names, launched or not; the epilogue TU must not, or it would carry a
+// third copy of each identity kernel (ops/mxfp8_kernel.cu holds the one that runs, ops/mxfp8_compact_kernel.cu a
+// second one since before issue #12).
+#if !defined(FSO_SM120_MXFP8_LAUNCHERS_ONLY)
 
 // Stream-K wrapper depends on launch_sm120_mxfp8_gemm_kernel above.
 #include "blockscale_gemm/arch/sm120/mxfp8/streamk.cuh"
@@ -336,7 +412,7 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels::blockscale_gemm
 {
 
-// Top-level dispatcher. Mirror of `gemm_dispatch_sm120` but for the
+// The dense cascade. Mirror of `gemm_dispatch_sm120` but for the
 // VS=32 (MXFP8 1×32) path. Uses the same (M, tiles_n) cascade and the
 // same `sm120_streamk_choose_k_split` heuristic — including the K≥9728
 // Stream-K gate from commit fea4158. Env-var overrides
@@ -353,18 +429,31 @@ namespace kernels::blockscale_gemm
 // captured. The other 4 tiles ((32,128,4), (96,128,2), (128,128,2),
 // (160,128,2)) fit unchanged — verified at TileM=160 N=128 ST=2:
 // 40+32+2.5+2 = 76 KB.
-inline void gemm_dispatch_sm120_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bfloat16* mat_d,
-    int32_t* scales_a, int32_t* scales_b, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
-    cudaStream_t stream, int num_device_sms = kNumDeviceSMs)
+//
+// The cascade is sm120_mxfp8_dense_route below: it returns the instance and the K split a call runs, and
+// gemm_dispatch_sm120_mxfp8 (further down) launches it. The rules are the ones this dispatcher has always applied, in
+// the same order, with each launch statement replaced by the route it launched; the launcher's own clamps of the
+// Stream-K split (sm120_streamk_effective_split) are applied here, so that the route states what runs. One source of
+// truth serves the launch, the Stream-K scratch size the op body allocates (Sm120DenseRoute::streamk_scratch_bytes)
+// and the host-side route query (sm120_mxfp8_dense_route_query in ops/mxfp8_kernel.cu).
+inline Sm120DenseRoute sm120_mxfp8_dense_route(
+    uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_device_sms)
 {
-    if (num_device_sms < 0)
-        num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
-
-    int64_t ld_a = shape_k;
-    int64_t ld_b = shape_k;
-    int64_t ld_d = shape_n;
-    constexpr int64_t stride = 0;
-    constexpr uint32_t num_problems = 1;
+    // The route of instance (tm, tn, st) with the given MinBlocksPerSm / SchedGroup, K split and SmallM flag; the
+    // split is clamped as launch_sm120_mxfp8_streamk_gemm clamps it (one slice per 128-element scale word at most,
+    // at most StreamKPool::kMaxKSplit slices; 1 means a single launch of the same tile).
+    auto mx_route = [&](int tm, int tn, int st, int mb = 1, int sg = 16, int ks = 1, bool smallm = false)
+    {
+        Sm120DenseRoute r;
+        r.tile_m = tm;
+        r.tile_n = tn;
+        r.stages = st;
+        r.min_blocks = mb;
+        r.sched_group = sg;
+        r.k_split = sm120_streamk_effective_split(ks, static_cast<int>(shape_k), /*sf_block=*/128);
+        r.smallm = smallm;
+        return r;
+    };
 
     // E15 (2026-05-10): considered routing M ≤ 4 to a hand-rolled scalar
     // GEMV (`common/gemv.cuh`) to skip TMA descriptor setup. NEGATIVE
@@ -382,7 +471,6 @@ inline void gemm_dispatch_sm120_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b
     if (force_tile_applies(forced, shape_k))
     {
         int const k_split = forced.stream_k() ? forced.ks : 1;
-        bool handled = false;
         // E28 (2026-05-11): forced SmallM variant — manual cp.async.bulk
         // A loads. **NEGATIVE RESULT — keep behind force flag.** See
         // `smallm_kernel.cuh` and `docs/skills/blockscale-gemm-tuning/
@@ -394,12 +482,7 @@ inline void gemm_dispatch_sm120_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b
         if (forced.smallm() && k_split <= 1 && forced.tm == 16)
         {
             if (forced.tn == 128 && forced.st == 4)
-            {
-                launch_sm120_mxfp8_smallm_gemm_kernel<128, 4>(mat_a, ld_a, stride, mat_b, ld_b, stride, mat_d,
-                    ld_d, stride, scales_a, stride, scales_b, stride, num_problems, shape_m, shape_n, shape_k,
-                    stream, num_device_sms);
-                return;
-            }
+                return mx_route(16, 128, 4, 1, 16, 1, /*smallm=*/true);
         }
         // E29 T4 (2026-05-12): forced scheduler-group override for TileM=16.
         // BSGEMM_FORCE_SCHED_GROUP={8,32} selects an alt-SchedGroup launcher
@@ -410,46 +493,18 @@ inline void gemm_dispatch_sm120_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b
             && (forced.sg == 8 || forced.sg == 32))
         {
             if (forced.tn == 128 && forced.st == 4)
-            {
-                if (forced.sg == 8)
-                    launch_sm120_mxfp8_gemm_kernel<16, 128, 4, 1, 8>(mat_a, ld_a, stride, mat_b, ld_b,
-                        stride, mat_d, ld_d, stride, scales_a, stride, scales_b, stride, num_problems,
-                        shape_m, shape_n, shape_k, stream, num_device_sms);
-                else
-                    launch_sm120_mxfp8_gemm_kernel<16, 128, 4, 1, 32>(mat_a, ld_a, stride, mat_b, ld_b,
-                        stride, mat_d, ld_d, stride, scales_a, stride, scales_b, stride, num_problems,
-                        shape_m, shape_n, shape_k, stream, num_device_sms);
-                return;
-            }
+                return mx_route(16, 128, 4, 1, forced.sg);
             if (forced.tn == 64 && forced.st == 4)
-            {
-                if (forced.sg == 8)
-                    launch_sm120_mxfp8_gemm_kernel<16, 64, 4, 1, 8>(mat_a, ld_a, stride, mat_b, ld_b,
-                        stride, mat_d, ld_d, stride, scales_a, stride, scales_b, stride, num_problems,
-                        shape_m, shape_n, shape_k, stream, num_device_sms);
-                else
-                    launch_sm120_mxfp8_gemm_kernel<16, 64, 4, 1, 32>(mat_a, ld_a, stride, mat_b, ld_b,
-                        stride, mat_d, ld_d, stride, scales_a, stride, scales_b, stride, num_problems,
-                        shape_m, shape_n, shape_k, stream, num_device_sms);
-                return;
-            }
+                return mx_route(16, 64, 4, 1, forced.sg);
         }
         if (k_split <= 1)
         {
-            #define DISPATCH_FORCED_MX(TM_, TN_, ST_) \
-                launch_sm120_mxfp8_gemm_kernel<TM_, TN_, ST_>(mat_a, ld_a, stride, mat_b, ld_b, stride, mat_d, \
-                    ld_d, stride, scales_a, stride, scales_b, stride, num_problems, shape_m, shape_n, shape_k, \
-                    stream, num_device_sms)
             // 16x128x4 with optional MinBlocksPerSm=2 hint (T4 experiment).
             // BSGEMM_FORCE_MIN_BLOCKS=2 selects the (16, 128, 4, 2) builder
             // instead of the default (16, 128, 4, 1). SMEM = 74 KB per CTA
             // exceeds half the per-SM SMEM budget, so 2 CTAs/SM is
             // unlikely to materialise — the hint mostly throttles
             // register usage. Treat as forced-only diagnostic.
-            #define DISPATCH_FORCED_MX_MB(TM_, TN_, ST_, MB_) \
-                launch_sm120_mxfp8_gemm_kernel<TM_, TN_, ST_, MB_>(mat_a, ld_a, stride, mat_b, ld_b, stride, mat_d, \
-                    ld_d, stride, scales_a, stride, scales_b, stride, num_problems, shape_m, shape_n, shape_k, \
-                    stream, num_device_sms)
             // 16x128x2 evaluated (2026-05-11): negative result — stage-2
             // loses 1-19% vs stage-4 on every targeted cell (e.g., wqkv M=4
             // st2=12.34 vs st4=10.39). Deeper K-pipeline at stage-4 keeps
@@ -459,65 +514,42 @@ inline void gemm_dispatch_sm120_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b
             // needs more vals per thread than 8 N-warps × TileN=64 supply
             // (TiledNumVal % AtomNumVal != 0). Keep TileM=16 to TileN=128.
             if      (forced.tm == 16 && forced.tn == 128 && forced.st == 4 && forced.min_blocks_2())
-            { DISPATCH_FORCED_MX_MB(16, 128, 4, 2); handled = true; }
-            else if (forced.tm ==  16 && forced.tn == 128 && forced.st == 4) { DISPATCH_FORCED_MX( 16, 128, 4); handled = true; }
-            else if (forced.tm ==  16 && forced.tn ==  64 && forced.st == 4) { DISPATCH_FORCED_MX( 16,  64, 4); handled = true; }
-            else if (forced.tm ==  32 && forced.tn == 128 && forced.st == 4) { DISPATCH_FORCED_MX( 32, 128, 4); handled = true; }
-            else if (forced.tm ==  32 && forced.tn ==  64 && forced.st == 4) { DISPATCH_FORCED_MX( 32,  64, 4); handled = true; }
-            else if (forced.tm ==  64 && forced.tn == 128 && forced.st == 2) { DISPATCH_FORCED_MX( 64, 128, 2); handled = true; }
-            else if (forced.tm ==  64 && forced.tn ==  64 && forced.st == 4) { DISPATCH_FORCED_MX( 64,  64, 4); handled = true; }
-            else if (forced.tm ==  96 && forced.tn == 128 && forced.st == 2) { DISPATCH_FORCED_MX( 96, 128, 2); handled = true; }
-            else if (forced.tm == 128 && forced.tn == 128 && forced.st == 2) { DISPATCH_FORCED_MX(128, 128, 2); handled = true; }
-            else if (forced.tm == 128 && forced.tn ==  64 && forced.st == 2) { DISPATCH_FORCED_MX(128,  64, 2); handled = true; }
-            else if (forced.tm == 160 && forced.tn == 128 && forced.st == 2) { DISPATCH_FORCED_MX(160, 128, 2); handled = true; }
-            #undef DISPATCH_FORCED_MX
-            #undef DISPATCH_FORCED_MX_MB
+                return mx_route(16, 128, 4, 2);
+            else if (forced.tm ==  16 && forced.tn == 128 && forced.st == 4) return mx_route( 16, 128, 4);
+            else if (forced.tm ==  16 && forced.tn ==  64 && forced.st == 4) return mx_route( 16,  64, 4);
+            else if (forced.tm ==  32 && forced.tn == 128 && forced.st == 4) return mx_route( 32, 128, 4);
+            else if (forced.tm ==  32 && forced.tn ==  64 && forced.st == 4) return mx_route( 32,  64, 4);
+            else if (forced.tm ==  64 && forced.tn == 128 && forced.st == 2) return mx_route( 64, 128, 2);
+            else if (forced.tm ==  64 && forced.tn ==  64 && forced.st == 4) return mx_route( 64,  64, 4);
+            else if (forced.tm ==  96 && forced.tn == 128 && forced.st == 2) return mx_route( 96, 128, 2);
+            else if (forced.tm == 128 && forced.tn == 128 && forced.st == 2) return mx_route(128, 128, 2);
+            else if (forced.tm == 128 && forced.tn ==  64 && forced.st == 2) return mx_route(128,  64, 2);
+            else if (forced.tm == 160 && forced.tn == 128 && forced.st == 2) return mx_route(160, 128, 2);
         }
         else
         {
-            #define DISPATCH_FORCED_SK_MX(TM_, TN_, ST_) \
-                launch_sm120_mxfp8_streamk_gemm<TM_, TN_, ST_>(mat_a, static_cast<int>(ld_a), mat_b, \
-                    static_cast<int>(ld_b), mat_d, static_cast<int>(ld_d), static_cast<int>(shape_m), \
-                    static_cast<int>(shape_n), static_cast<int>(shape_k), scales_a, scales_b, k_split, \
-                    num_device_sms, stream)
             // 16x128x4 Stream-K is a T2 experiment (forced-only). The
             // tilem16_band production gate runs single-launch only; if a
             // future tune shows Stream-K wins on narrow-N small-M K≥4096,
             // promote this to the cascade via the same gate.
-            if      (forced.tm ==  16 && forced.tn == 128 && forced.st == 4) { DISPATCH_FORCED_SK_MX( 16, 128, 4); handled = true; }
-            else if (forced.tm ==  32 && forced.tn == 128 && forced.st == 4) { DISPATCH_FORCED_SK_MX( 32, 128, 4); handled = true; }
-            else if (forced.tm ==  32 && forced.tn ==  64 && forced.st == 4) { DISPATCH_FORCED_SK_MX( 32,  64, 4); handled = true; }
-            else if (forced.tm ==  64 && forced.tn == 128 && forced.st == 2) { DISPATCH_FORCED_SK_MX( 64, 128, 2); handled = true; }
-            else if (forced.tm ==  64 && forced.tn ==  64 && forced.st == 4) { DISPATCH_FORCED_SK_MX( 64,  64, 4); handled = true; }
-            else if (forced.tm == 128 && forced.tn == 128 && forced.st == 2) { DISPATCH_FORCED_SK_MX(128, 128, 2); handled = true; }
-            else if (forced.tm == 128 && forced.tn ==  64 && forced.st == 2) { DISPATCH_FORCED_SK_MX(128,  64, 2); handled = true; }
-            #undef DISPATCH_FORCED_SK_MX
+            if      (forced.tm ==  16 && forced.tn == 128 && forced.st == 4) return mx_route( 16, 128, 4, 1, 16, k_split);
+            else if (forced.tm ==  32 && forced.tn == 128 && forced.st == 4) return mx_route( 32, 128, 4, 1, 16, k_split);
+            else if (forced.tm ==  32 && forced.tn ==  64 && forced.st == 4) return mx_route( 32,  64, 4, 1, 16, k_split);
+            else if (forced.tm ==  64 && forced.tn == 128 && forced.st == 2) return mx_route( 64, 128, 2, 1, 16, k_split);
+            else if (forced.tm ==  64 && forced.tn ==  64 && forced.st == 4) return mx_route( 64,  64, 4, 1, 16, k_split);
+            else if (forced.tm == 128 && forced.tn == 128 && forced.st == 2) return mx_route(128, 128, 2, 1, 16, k_split);
+            else if (forced.tm == 128 && forced.tn ==  64 && forced.st == 2) return mx_route(128,  64, 2, 1, 16, k_split);
         }
-        if (handled) return;
+        // unknown combo: fall through to the cascade
     }
 
-    int const tiles_n = static_cast<int>((shape_n + 127) / 128);
+        int const tiles_n = static_cast<int>((shape_n + 127) / 128);
     int const tiles_n64 = static_cast<int>((shape_n + 63) / 64);
     int const k_split = sm120_streamk_choose_k_split(static_cast<int>(shape_m), static_cast<int>(shape_n),
         static_cast<int>(shape_k), num_device_sms);
 
-#define DISPATCH_TILE_MX(TM_, TN_, ST_)                                                                                \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        if (k_split <= 1)                                                                                              \
-        {                                                                                                              \
-            launch_sm120_mxfp8_gemm_kernel<TM_, TN_, ST_>(mat_a, ld_a, stride, mat_b, ld_b, stride, mat_d, ld_d,        \
-                stride, scales_a, stride, scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream,           \
-                num_device_sms);                                                                                       \
-        }                                                                                                              \
-        else                                                                                                           \
-        {                                                                                                              \
-            launch_sm120_mxfp8_streamk_gemm<TM_, TN_, ST_>(mat_a, static_cast<int>(ld_a), mat_b,                        \
-                static_cast<int>(ld_b), mat_d, static_cast<int>(ld_d), static_cast<int>(shape_m),                      \
-                static_cast<int>(shape_n), static_cast<int>(shape_k), scales_a, scales_b, k_split, num_device_sms,     \
-                stream);                                                                                               \
-        }                                                                                                              \
-    } while (0)
+// The instance (TM_, TN_, ST_), single launch when k_split <= 1, else Stream-K with k_split slices.
+#define DISPATCH_TILE_MX(TM_, TN_, ST_) return mx_route(TM_, TN_, ST_, 1, 16, k_split)
 
     if (!read_disable_overrides())
     {
@@ -631,10 +663,7 @@ inline void gemm_dispatch_sm120_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b
 
         if (tilem16_band)
         {
-            launch_sm120_mxfp8_gemm_kernel<16, 128, 4>(mat_a, ld_a, stride, mat_b, ld_b, stride, mat_d, ld_d,
-                stride, scales_a, stride, scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream,
-                num_device_sms);
-            return;
+            return mx_route(16, 128, 4);
         }
 
         // E26 (2026-05-11): narrow-N + long-K + small-M → TileM=16 + Stream-K k=4.
@@ -663,11 +692,7 @@ inline void gemm_dispatch_sm120_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b
                                          && tiles_n >= 3 && tiles_n < 32;
         if (tilem16_narrow_streamk)
         {
-            launch_sm120_mxfp8_streamk_gemm<16, 128, 4>(mat_a, static_cast<int>(ld_a), mat_b,
-                static_cast<int>(ld_b), mat_d, static_cast<int>(ld_d), static_cast<int>(shape_m),
-                static_cast<int>(shape_n), static_cast<int>(shape_k), scales_a, scales_b,
-                /*k_split=*/4, num_device_sms, stream);
-            return;
+            return mx_route(16, 128, 4, 1, 16, /*k_split=*/4);
         }
 
         // E27 (2026-05-11): narrow-N + short-K small-M → TileM=16, TileN=64.
@@ -692,10 +717,7 @@ inline void gemm_dispatch_sm120_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b
                                         && tiles_n >= 3 && tiles_n < 32;
         if (tilem16_narrow_single)
         {
-            launch_sm120_mxfp8_gemm_kernel<16, 64, 4>(mat_a, ld_a, stride, mat_b, ld_b, stride, mat_d, ld_d,
-                stride, scales_a, stride, scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream,
-                num_device_sms);
-            return;
+            return mx_route(16, 64, 4);
         }
 
         if (short_k || small_m_mid_n || small_m_narrow_n || mid_m_narrow_n_64)
@@ -710,28 +732,17 @@ inline void gemm_dispatch_sm120_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b
             //   tn ≥ 3, M ≤ 128       → (32, 64, 4)     (E14: +42~54% over TN=128)
             //   tn ≥ 3 (short_k only) → (32, 128, 4)    (small_m_mid_n path)
             if (tiles_n == 1 && shape_m >= 4096)
-                launch_sm120_mxfp8_gemm_kernel<64, 64, 4>(mat_a, ld_a, stride, mat_b, ld_b, stride, mat_d, ld_d,
-                    stride, scales_a, stride, scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream,
-                    num_device_sms);
+                return mx_route(64, 64, 4);
             else if (tiles_n == 1 || (tiles_n == 2 && shape_m <= 1024))
-                launch_sm120_mxfp8_gemm_kernel<32, 64, 4>(mat_a, ld_a, stride, mat_b, ld_b, stride, mat_d, ld_d,
-                    stride, scales_a, stride, scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream,
-                    num_device_sms);
+                return mx_route(32, 64, 4);
             else if (mid_m_narrow_n_64)
                 // E14: M ∈ (128, 256] narrow-N → TileM=64, TileN=64.
-                launch_sm120_mxfp8_gemm_kernel<64, 64, 4>(mat_a, ld_a, stride, mat_b, ld_b, stride, mat_d, ld_d,
-                    stride, scales_a, stride, scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream,
-                    num_device_sms);
+                return mx_route(64, 64, 4);
             else if (small_m_narrow_n)
                 // E7+E14: M ≤ 128 narrow-N (any K) → TileM=32, TileN=64.
-                launch_sm120_mxfp8_gemm_kernel<32, 64, 4>(mat_a, ld_a, stride, mat_b, ld_b, stride, mat_d, ld_d,
-                    stride, scales_a, stride, scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream,
-                    num_device_sms);
+                return mx_route(32, 64, 4);
             else
-                launch_sm120_mxfp8_gemm_kernel<32, 128, 4>(mat_a, ld_a, stride, mat_b, ld_b, stride, mat_d, ld_d,
-                    stride, scales_a, stride, scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream,
-                    num_device_sms);
-            return;
+                return mx_route(32, 128, 4);
         }
     }
 
@@ -897,15 +908,9 @@ inline void gemm_dispatch_sm120_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b
                 }
             }
             if (best_k <= 1)
-                launch_sm120_mxfp8_gemm_kernel<128, 128, 2>(mat_a, ld_a, stride, mat_b, ld_b, stride, mat_d, ld_d,
-                    stride, scales_a, stride, scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream,
-                    num_device_sms);
+                return mx_route(128, 128, 2);
             else
-                launch_sm120_mxfp8_streamk_gemm<128, 128, 2>(mat_a, static_cast<int>(ld_a), mat_b,
-                    static_cast<int>(ld_b), mat_d, static_cast<int>(ld_d), static_cast<int>(shape_m),
-                    static_cast<int>(shape_n), static_cast<int>(shape_k), scales_a, scales_b, best_k,
-                    num_device_sms, stream);
-            return;
+                return mx_route(128, 128, 2, 1, 16, best_k);
         }
         if (tiles_n >= 96)
         {
@@ -1011,8 +1016,115 @@ inline void gemm_dispatch_sm120_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b
         }
     }
 #undef DISPATCH_TILE_MX
+    // Every branch above returns (the compiler proves the end unreachable).
 }
 
+// A non-identity epilogue on a route whose instance exists only behind a diagnostic knob: refused, before anything
+// is launched or allocated. Those instances (the FSO_FORCE_SMALLM kernel, the FSO_FORCE_MIN_BLOCKS=2 and
+// FSO_FORCE_SCHED_GROUP={8,32} variants of the TileM = 16 tiles) have no dense-epilogue instantiation.
+inline void sm120_mxfp8_dense_require_epilogue(Sm120DenseRoute const& route, fso::DenseEpilogue const& epilogue)
+{
+    if (epilogue.is_identity() || !route.forced_only_instance())
+        return;
+    char const* what = route.smallm ? "the SmallM kernel SM120MxFP8SmallMKernel (FSO_FORCE_SMALLM=1)"
+        : route.min_blocks != 1     ? "the MinBlocksPerSm=2 variant (FSO_FORCE_MIN_BLOCKS=2)"
+                                    : "the scheduler-group variant (FSO_FORCE_SCHED_GROUP)";
+    throw fso::DenseEpilogueNotImplemented(std::string("sm_120/sm_121 dense MXFP8 GEMM (gemm_dispatch_sm120_mxfp8): the "
+        "forced diagnostic instance ") + what + " of tile (" + std::to_string(route.tile_m) + ", "
+        + std::to_string(route.tile_n) + ", " + std::to_string(route.stages) + ") has no dense-epilogue "
+        "instantiation, so the dense epilogue (" + fso::dense_epilogue_field_names(epilogue.fields())
+        + ") is refused; unset the knob, or call without the epilogue");
+}
+
+// The dense MXFP8 GEMM on sm_120/sm_121: the route of sm120_mxfp8_dense_route, launched.
+//
+// `epilogue` (common/epilogue.cuh, interface v1): bias, residual and the erf GELU are applied on every route of the
+// cascade -- by the dense-epilogue instance of the tile on a single launch, by the Stream-K reduce after the
+// reduction on a split one -- with one rounding. A forced diagnostic instance refuses a non-identity epilogue
+// (sm120_mxfp8_dense_require_epilogue), as does any field outside kDenseEpiServedSm120Mxfp8Cascade.
+// With epilogue.out_q (fso.dense.linear_quantized; bias and act only) every route writes the quantized form instead
+// of the bf16 D: the quantized-output instance of the tile on a single launch, the quantized reduce on Stream-K; the
+// caller passes mat_d = out_q (see launch_sm120_mxfp8_gemm_kernel's DenseQuant).
+//
+// `streamk_scratch` / `streamk_scratch_bytes`: the caller's bf16 partial scratch for a Stream-K route
+// (route.streamk_scratch_bytes(M, N) bytes; the op body allocates it from the torch caching allocator on `stream`).
+// A single-launch route reads neither; a Stream-K route without enough scratch is an error.
+inline void gemm_dispatch_sm120_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bfloat16* mat_d,
+    int32_t* scales_a, int32_t* scales_b, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+    cudaStream_t stream, int num_device_sms = kNumDeviceSMs, fso::DenseEpilogue const& epilogue = fso::DenseEpilogue{},
+    void* streamk_scratch = nullptr, std::size_t streamk_scratch_bytes = 0)
+{
+    fso::require_dense_epilogue(epilogue, fso::kDenseEpiServedSm120Mxfp8Cascade,
+        "sm_120/sm_121 dense MXFP8 GEMM (gemm_dispatch_sm120_mxfp8, the CUTLASS cascade)");
+    if (num_device_sms < 0)
+        num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
+    Sm120DenseRoute const route = sm120_mxfp8_dense_route(shape_m, shape_n, shape_k, num_device_sms);
+    sm120_mxfp8_dense_require_epilogue(route, epilogue);
+    sm120_mxfp8_dense_require_quant_out(epilogue, shape_n);
+
+    int64_t ld_a = shape_k;
+    int64_t ld_b = shape_k;
+    int64_t ld_d = shape_n;
+    constexpr int64_t stride = 0;
+    constexpr uint32_t num_problems = 1;
+    auto is = [&](int tm, int tn, int st) { return route.tile_m == tm && route.tile_n == tn && route.stages == st; };
+
+    if (route.smallm)
+    {
+        launch_sm120_mxfp8_smallm_gemm_kernel<128, 4>(mat_a, ld_a, stride, mat_b, ld_b, stride, mat_d,
+            ld_d, stride, scales_a, stride, scales_b, stride, num_problems, shape_m, shape_n, shape_k,
+            stream, num_device_sms);
+        return;
+    }
+    if (route.k_split > 1)
+    {
+#define SK_MX(TM_, TN_, ST_)                                                                                           \
+    if (is(TM_, TN_, ST_))                                                                                             \
+    {                                                                                                                  \
+        launch_sm120_mxfp8_streamk_gemm<TM_, TN_, ST_>(mat_a, static_cast<int>(ld_a), mat_b, static_cast<int>(ld_b),    \
+            mat_d, static_cast<int>(ld_d), static_cast<int>(shape_m), static_cast<int>(shape_n),                        \
+            static_cast<int>(shape_k), scales_a, scales_b, route.k_split, num_device_sms, stream, streamk_scratch,     \
+            streamk_scratch_bytes, epilogue);                                                                          \
+        return;                                                                                                        \
+    }
+        SK_MX(16, 128, 4) SK_MX(32, 128, 4) SK_MX(32, 64, 4) SK_MX(64, 128, 2) SK_MX(64, 64, 4) SK_MX(128, 128, 2)
+        SK_MX(128, 64, 2)
+#undef SK_MX
+        TLLM_THROW("gemm_dispatch_sm120_mxfp8: no Stream-K instance (%d, %d, %d)", route.tile_m, route.tile_n,
+            route.stages);
+    }
+    if (epilogue.out_q != nullptr)
+    {
+        bool const launched = launch_sm120_mxfp8_dense_quant_single(route.tile_m, route.tile_n, route.stages, mat_a,
+            mat_b, scales_a, scales_b, shape_m, shape_n, shape_k, stream, num_device_sms, epilogue);
+        TLLM_CHECK_WITH_INFO(launched, "gemm_dispatch_sm120_mxfp8: no quantized-output instance (%d, %d, %d)",
+            route.tile_m, route.tile_n, route.stages);
+        return;
+    }
+    if (!epilogue.is_identity())
+    {
+        bool const launched = launch_sm120_mxfp8_dense_epi_single(route.tile_m, route.tile_n, route.stages, mat_a,
+            mat_b, mat_d, scales_a, scales_b, shape_m, shape_n, shape_k, stream, num_device_sms, epilogue);
+        TLLM_CHECK_WITH_INFO(launched, "gemm_dispatch_sm120_mxfp8: no dense-epilogue instance (%d, %d, %d)",
+            route.tile_m, route.tile_n, route.stages);
+        return;
+    }
+#define ONE_MX(TM_, TN_, ST_, MB_, SG_)                                                                                \
+    if (is(TM_, TN_, ST_) && route.min_blocks == MB_ && route.sched_group == SG_)                                      \
+    {                                                                                                                  \
+        launch_sm120_mxfp8_gemm_kernel<TM_, TN_, ST_, MB_, SG_>(mat_a, ld_a, stride, mat_b, ld_b, stride, mat_d, ld_d,  \
+            stride, scales_a, stride, scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream,               \
+            num_device_sms);                                                                                           \
+        return;                                                                                                        \
+    }
+    ONE_MX(16, 128, 4, 1, 16) ONE_MX(16, 128, 4, 2, 16) ONE_MX(16, 128, 4, 1, 8) ONE_MX(16, 128, 4, 1, 32)
+    ONE_MX(16, 64, 4, 1, 16) ONE_MX(16, 64, 4, 1, 8) ONE_MX(16, 64, 4, 1, 32)
+    ONE_MX(32, 128, 4, 1, 16) ONE_MX(32, 64, 4, 1, 16) ONE_MX(64, 128, 2, 1, 16) ONE_MX(64, 64, 4, 1, 16)
+    ONE_MX(96, 128, 2, 1, 16) ONE_MX(128, 128, 2, 1, 16) ONE_MX(128, 64, 2, 1, 16) ONE_MX(160, 128, 2, 1, 16)
+#undef ONE_MX
+    TLLM_THROW("gemm_dispatch_sm120_mxfp8: no instance (%d, %d, %d, min_blocks %d, sched_group %d)", route.tile_m,
+        route.tile_n, route.stages, route.min_blocks, route.sched_group);
+}
 // ---------------------------------------------------------------------------
 // Grouped (MoE) MXFP8 dispatch — masked layout, per-expert weights.
 //
@@ -1368,3 +1480,5 @@ inline void gemm_dispatch_sm120_mxfp8_grouped(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m
 
 } // namespace kernels::blockscale_gemm
 TRTLLM_NAMESPACE_END
+
+#endif // !FSO_SM120_MXFP8_LAUNCHERS_ONLY

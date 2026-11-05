@@ -2,7 +2,8 @@
 """The layout of an installed fish-scales-ops wheel: the files it carries so that it runs without the source tree.
 
 A wheel built by scripts/build_wheel.sh carries next to the extension: BUILD_INFO.json, the bundled NVRTC in _nvrtc/,
-every header of the sm_90 JIT in _jit_include/ and the sm_100/sm_103 CuTe-DSL kernel in _dsl/. For the imported
+every header of the sm_90 JIT in _jit_include/, the sm_100/sm_103 CuTe-DSL kernel in _dsl/ and the activation
+contract header include/fso/activation_contract.h (fso.dense.include_dir()). For the imported
 package this script checks:
 
   an installed wheel (the package holds a BUILD_INFO.json), every architecture:
@@ -39,7 +40,8 @@ KEYS = ("version", "commit", "dirty", "built_at", "image", "cuda_toolkit", "nvcc
 PACKAGED = ("BUILD_INFO.json", "_nvrtc/libnvrtc.so.13", "_nvrtc/libnvrtc-builtins.so.13.0", "_nvrtc/VERSION",
             "_jit_include/THIRD_PARTY_NOTICES", "_jit_include/deep_gemm/fp8_gemm_impl.cuh",
             "_jit_include/cuda_fp8.h", "_jit_include/cuda_bf16.h", "_jit_include/cuda_fp16.h",
-            "_jit_include/cutlass/cutlass.h", "_dsl/dense_blockscaled_gemm_persistent.py")
+            "_jit_include/cutlass/cutlass.h", "_dsl/dense_blockscaled_gemm_persistent.py",
+            "include/fso/activation_contract.h")
 INCLUDE_ORIGIN = "the include tree packaged with fish_scales_ops"
 LOG_INCLUDE_DIRS = re.compile(r"sm_90 JIT include directories \(([^)]*)\): (.*?)\s*$", re.M)
 LOG_INCLUDE = re.compile(r"^\[blockscale_gemm\]\[INFO\] -I(.+?)\s*$", re.M)

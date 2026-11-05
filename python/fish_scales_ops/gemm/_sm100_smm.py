@@ -85,6 +85,11 @@ def wave_tile_owns(m: int, n: int) -> bool:
     Both tier 1 (cuBLAS ``scaled_mm``) and tier 2 (the CuTe-DSL persistent
     kernel) decline a cell the rule owns: neither can be asked for a narrower N
     tile, so both leave SMs idle exactly where the cascade does not.
+
+    The C++ rule also takes K, for its empty-pair guard (issue #12, T1b): below
+    M = 129 with an activation under 128 KiB (M * K bytes) and K >= 1024 it hands an owned cell
+    the 1-SM 128x64 tile instead of the 2-SM 256x64 tile. That changes only the
+    tile, never which cells the rule owns, so this mirror needs no K.
     """
     if not (64 <= m <= 1024):
         return False
@@ -105,6 +110,43 @@ def wave_tile_owns(m: int, n: int) -> bool:
     if best_rows == 256 and best_n == 192:
         return False
     return True
+
+
+#: The C++ cascade's short-K tile rule (``pick_short_k_tile`` in
+#: ``csrc/gemm/include/blockscale_gemm/arch/sm100/mxfp8/dispatch.cuh``) answers K up to this bound; this tier
+#: declines the bias calls of the narrow-N cells of that rule listed by :func:`short_k_owns`.
+SHORT_K_MAX_K = 2560
+#: Shortest K at which tier 1 declines a narrow-N cell for the cascade's short-K tile (see :func:`short_k_owns`).
+SHORT_K_DECLINE_MIN_K = 1024
+#: Largest M at which tier 1 declines a narrow-N cell for the cascade's short-K tile.
+SHORT_K_DECLINE_MAX_M = 256
+#: Widest N, in 128-column tiles, at which tier 1 declines a short-K cell for the cascade.
+SHORT_K_DECLINE_MAX_TILES_N = 16
+
+
+def short_k_owns(m: int, n: int, k: int) -> bool:
+    """True on the short-K narrow-N cells whose bias calls this tier declines for the C++ cascade's short-K tile rule
+    (issue #12, T1; the router asks it in ``_sm100_dispatch._candidates`` for a call that carries a bias).
+
+    The cells: N <= 2048 (``SHORT_K_DECLINE_MAX_TILES_N`` tiles of 128), ``SHORT_K_DECLINE_MIN_K`` <= K <=
+    ``SHORT_K_MAX_K``, 64 < M <= ``SHORT_K_DECLINE_MAX_M``. There cuBLAS's kernel covers the output with 128 x 128
+    tiles, each over the whole K (12 CTAs on the 148 SMs at 1280 x 1280, M = 78, in an nsys trace), while the
+    cascade's 64-wide tiles put more SMs on the same output (``pick_short_k_tile``: the 1-SM 128 x 64 tile, 20 CTAs
+    there; from M = 129 the 2-SM 256 x 64 tile; one wave). Measured with cold weights, run ``fso_issue12_20261028/runs/T1``: a bias call is faster on the cascade on
+    both entry paths at every measured cell of these bounds (1280 x 1280 and 2048 x 1280: 8-9 % with a pre-quantized
+    x and 4-5 % with a bf16 x at M <= 128, 3-4.5 % and 0.4-1.8 % at 129 <= M <= 256; at K = 1024 and 2560 the bf16-x
+    identity call on the same 1-SM 128 x 64 tile, the closest measured proxy, was 3-12 % faster at M = 80 / 128).
+    The K floor sits between K = 768, where that bf16-x identity call tied cuBLAS at M = 80 / 128, and K = 1024; at
+    K = 512 cuBLAS was faster. Above M = 256 the cascade still wins with a pre-quantized x but not with every bf16 x
+    (2048 x 1280 at M = 364, 1280 x 1280 at M = 533 tie or lose). An identity call stays on this tier: alone it is
+    faster on the cascade too, but the serving chain that follows it with torch's own bias / GELU / residual kernels
+    measured up to 2.8 % slower there (issue-12 bench, role mode, the fso_today arm). The activation, residual and
+    quantized-output calls of every shape already run on the cascade, whose tile for them is the same rule."""
+    if not (SHORT_K_DECLINE_MIN_K <= k <= SHORT_K_MAX_K):
+        return False
+    if not (64 < m <= SHORT_K_DECLINE_MAX_M):
+        return False
+    return (n + 127) // 128 <= SHORT_K_DECLINE_MAX_TILES_N
 
 
 _AVAILABLE: Optional[bool] = None
@@ -229,11 +271,27 @@ def should_route(m: int, n: int, k: int) -> bool:
 
 
 def linear_mxfp8_smm(x_fp8: torch.Tensor, w_fp8: torch.Tensor,
-                    sx: torch.Tensor, sw: torch.Tensor) -> Optional[torch.Tensor]:
+                    sx: torch.Tensor, sw: torch.Tensor, epilogue=None) -> Optional[torch.Tensor]:
     """Run one MXFP8 GEMM through ``torch.nn.functional.scaled_mm``.
-    Returns None if the API is unavailable (caller falls through)."""
+    Returns None if the API is unavailable (caller falls through).
+
+    ``epilogue`` (``_epilogue.Epilogue`` or None): the bias is handed to
+    ``scaled_mm(..., bias=)`` and applied by cuBLAS's own epilogue — one
+    kernel, the bias added to the fp32 accumulator before the single bf16
+    rounding (probe P-A of issue #12: the ``nvjet_..._bias_TNT`` kernel; its
+    output equals RN_bf16(acc + bias) on every element and a zero bias gives
+    the bytes of no bias). ``SERVED["sm100.smm"]`` is the bias alone: cuBLAS
+    has no erf-GELU or residual epilogue for this GEMM, so the router sends a
+    call that carries either to the next tier that serves it (the C++ cascade)
+    and this function, if asked directly, refuses it with NotImplementedError
+    before it launches anything."""
     if not _init():
         return None
+    bias = None
+    if epilogue is not None:
+        from . import _epilogue
+        _epilogue.require("sm100.smm", epilogue, "linear_mxfp8")
+        bias = epilogue.bias
     m, k = x_fp8.shape
     n = w_fp8.shape[0]
     sx_view = _sf_view(sx, m, k)
@@ -243,5 +301,6 @@ def linear_mxfp8_smm(x_fp8: torch.Tensor, w_fp8: torch.Tensor,
         sx_view, _ST_BLOCKWISE1X32,
         sw_view, _ST_BLOCKWISE1X32,
         swizzle_a=_SW_32_4_4, swizzle_b=_SW_32_4_4,
+        bias=bias,
         output_dtype=torch.bfloat16,
     )

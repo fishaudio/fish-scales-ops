@@ -4,8 +4,9 @@
 
   stage     Writes into python/fish_scales_ops/, before the extension is built:
               _jit_include/    every header the sm_90 JIT compiles with, as one include root: the deep_gemm JIT
-                               headers, CUTLASS include/, and the CUDA toolkit headers with the CCCL headers merged
-                               into the root and the CUDA library headers left out; plus THIRD_PARTY_NOTICES
+                               headers, the dense epilogue blockscale_gemm/common/epilogue_device.cuh, CUTLASS
+                               include/, and the CUDA toolkit headers with the CCCL headers merged into the root and
+                               the CUDA library headers left out; plus THIRD_PARTY_NOTICES
               _dsl/            the CUTLASS CuTe-DSL kernel of the sm_100/sm_103 mid-band tier, and its notice
               BUILD_INFO.json  the build information; glibc_required stays null until finalize
             The bundled NVRTC (_nvrtc/, scripts/vendor_nvrtc.py) must already be in place: BUILD_INFO.json records it.
@@ -14,7 +15,8 @@
             RECORD) and into the source package's copy.
   check     WHEEL: the post-build checks, one line each; the exit status is 1 when any fails:
               the wheel holds the extension, _nvrtc/libnvrtc.so.13, _nvrtc/libnvrtc-builtins.so.13.0, _jit_include/,
-              _dsl/dense_blockscaled_gemm_persistent.py and BUILD_INFO.json with every key;
+              _dsl/dense_blockscaled_gemm_persistent.py, include/fso/activation_contract.h (the activation contract
+              header, a source file the package data picks up; nothing stages it) and BUILD_INFO.json with every key;
               the extension needs at most GLIBC_2.35 and GLIBCXX_3.4.30, and glibc_required names its newest GLIBC;
               it has no libnvrtc among its NEEDED libraries and no undefined nvrtc* symbol;
               it carries a cubin for every architecture of the arch list (sm_90a, the sm_100 family target sm_100f
@@ -49,6 +51,10 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 PKG = REPO / "python" / "fish_scales_ops"
 DEEP_GEMM = REPO / "csrc" / "gemm" / "include" / "blockscale_gemm" / "arch" / "sm90" / "fp8" / "jit" / "deep_gemm"
+# The one JIT header outside deep_gemm/: the dense epilogue the sm_90 kernels share with the AOT routes. It is staged
+# at this same relative path under _jit_include/, where the kernels include it from.
+JIT_EPILOGUE_HEADER = Path("blockscale_gemm") / "common" / "epilogue_device.cuh"
+JIT_EPILOGUE_SRC = REPO / "csrc" / "gemm" / "include" / JIT_EPILOGUE_HEADER
 DSL_KERNEL = Path("examples") / "python" / "CuTeDSL" / "blackwell" / "dense_blockscaled_gemm_persistent.py"
 DEFAULT_ARCH_LIST = "9.0a;10.0f;12.0a"
 
@@ -79,8 +85,9 @@ CUDA_LIBRARY_HEADERS = (
 # Files a complete packaged JIT tree must hold (relative to _jit_include/): the kernel's own headers, the CUDA headers
 # the kernels include today, and one file of every other source.
 JIT_TREE_SENTINELS = ("THIRD_PARTY_NOTICES", "deep_gemm/fp8_gemm_impl.cuh", "deep_gemm/nvrtc_cutlass.cuh",
-                      "deep_gemm/nvrtc_std.cuh", "cuda_fp8.h", "cuda_bf16.h", "cuda_fp16.h", "crt/host_defines.h",
-                      "nv/target", "cuda/std/cstdint", "cutlass/cutlass.h", "cute/tensor.hpp")
+                      "deep_gemm/nvrtc_std.cuh", JIT_EPILOGUE_HEADER.as_posix(), "cuda_fp8.h", "cuda_bf16.h",
+                      "cuda_fp16.h", "crt/host_defines.h", "nv/target", "cuda/std/cstdint", "cutlass/cutlass.h",
+                      "cute/tensor.hpp")
 
 
 class Failure(RuntimeError):
@@ -121,6 +128,18 @@ def merge_tree(src: Path, dst: Path, origin: dict, skip_top=()) -> int:
             origin[rel] = src
             copied += 1
     return copied
+
+
+def stage_file(src: Path, root: Path, rel: Path, origin: dict) -> int:
+    """Copy one file to ``root / rel`` as merge_tree copies each of its files (a path staged twice is an error)."""
+    dst = root / rel
+    if dst.exists():
+        raise Failure(f"{rel} is in both {origin[rel]} and {src}")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, dst)
+    os.chmod(dst, 0o644)
+    origin[rel] = src
+    return 1
 
 
 def first_line(cmd: list[str], pattern: str | None = None) -> str:
@@ -204,7 +223,7 @@ def stage(args) -> int:
     cutlass = Path(args.cutlass or os.environ.get("CUTLASS_DIR") or REPO / "3rdparty" / "cutlass").resolve()
     cuda_home = Path(args.cuda_home or os.environ.get("CUDA_HOME") or "/usr/local/cuda").resolve()
     arch_list = args.arch_list or os.environ.get("TORCH_CUDA_ARCH_LIST") or DEFAULT_ARCH_LIST
-    for path in (DEEP_GEMM / "fp8_gemm_impl.cuh", cutlass / "include" / "cutlass" / "cutlass.h",
+    for path in (DEEP_GEMM / "fp8_gemm_impl.cuh", JIT_EPILOGUE_SRC, cutlass / "include" / "cutlass" / "cutlass.h",
                  cutlass / "LICENSE.txt", cutlass / DSL_KERNEL, cuda_home / "include" / "cuda_fp8.h",
                  cuda_home / "include" / "cccl", cuda_home / "bin" / "nvcc"):
         if not path.exists():
@@ -223,6 +242,7 @@ def stage(args) -> int:
     origin: dict = {}
     counts = {
         "deep_gemm": merge_tree(DEEP_GEMM, stage_dir / "deep_gemm", origin),
+        "epilogue": stage_file(JIT_EPILOGUE_SRC, stage_dir, JIT_EPILOGUE_HEADER, origin),
         "cutlass": merge_tree(cutlass / "include", stage_dir, origin),
         "cuda": merge_tree(cuda_home / "include", stage_dir, origin, skip_top=CUDA_LIBRARY_HEADERS + ("cccl",)),
         "cccl": merge_tree(cuda_home / "include" / "cccl", stage_dir, origin),
@@ -352,7 +372,8 @@ def check(args) -> int:
         sos = sorted(n for n in names if re.fullmatch(r"fish_scales_ops/_C\.[^/]*\.so", n))
         record(len(sos) == 1, f"one extension: {sos}")
         for member in ("_nvrtc/libnvrtc.so.13", "_nvrtc/libnvrtc-builtins.so.13.0", "_nvrtc/VERSION",
-                       "_dsl/dense_blockscaled_gemm_persistent.py", "_dsl/THIRD_PARTY_NOTICES", "BUILD_INFO.json"):
+                       "_dsl/dense_blockscaled_gemm_persistent.py", "_dsl/THIRD_PARTY_NOTICES",
+                       "include/fso/activation_contract.h", "BUILD_INFO.json"):
             record(f"fish_scales_ops/{member}" in names,
                    f"fish_scales_ops/{member} ({sizes.get('fish_scales_ops/' + member, 0)} bytes)")
         jit = sorted(n for n in names if n.startswith("fish_scales_ops/_jit_include/"))

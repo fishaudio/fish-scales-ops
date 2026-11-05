@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "blockscale_gemm/common/epilogue.cuh"
 #include "blockscale_gemm/common/kernel_utils.cuh"
 #include "blockscale_gemm/arch/sm120/common/env_overrides.cuh" // fso_pdl_enabled (arch-agnostic)
 #include "blockscale_gemm/arch/sm90/fp8/jit/deep_gemm/fp8_gemm.cuh"
@@ -70,26 +71,80 @@ inline uint32_t sm90_dense_dg2_k()
     return k;
 }
 
+// FSO_SM90_SWAP_MAX_M=<m> and FSO_SM90_SWAP_BN=<bn>, read once per process: A/B knobs of the dense swap-AB route.
+// FSO_SM90_SWAP_MAX_M sends every dense GEMM with M <= m through swap-AB and every larger one to the main path
+// (0 or unset: the dispatcher's rule, deep_gemm::jit::use_dense_swap_ab). FSO_SM90_SWAP_BN forces the swap-AB token
+// tile (block_n, a multiple of 8 from 16 to 128) on every swap-AB call, with the stage count recomputed by the
+// picker's rule (0 or unset: deep_gemm::jit::get_dense_swap_ab_config's tile); a value outside that range is ignored
+// with one line on stderr. Neither setting changed an output byte on any cell of the measurement that set the rule
+// (runs/H2 of the issue-12 round: 4,502 GEMM and quantize -> GEMM outputs against the default route). A forced 24-token
+// tile on a launch of three or more waves did before the stage-release fence of f041cc8 (12288 x 2048 at M = 64, 66 and
+// 136: 15 of 1,800 repeated calls wrong in one 64-row by 24-token block, runs/H3/race); with the fence none of the
+// 3,988 swap-AB arm-cells of runs/H4 (token tiles 16-128, up to 19 waves) differed from the default route, and the
+// dispatcher's own swap-AB route takes two-wave launches above M = 128.
+inline uint32_t sm90_env_u32(char const* name)
+{
+    char const* e = std::getenv(name);
+    return (e != nullptr && e[0] != '\0') ? static_cast<uint32_t>(std::strtoul(e, nullptr, 10)) : 0u;
+}
+
+inline uint32_t sm90_swap_max_m_override()
+{
+    static uint32_t const v = sm90_env_u32("FSO_SM90_SWAP_MAX_M");
+    return v;
+}
+
+inline uint32_t sm90_swap_block_n_override()
+{
+    static uint32_t const v = []
+    {
+        uint32_t const bn = sm90_env_u32("FSO_SM90_SWAP_BN");
+        if (bn != 0u && (bn < 16u || bn > 128u || bn % 8u != 0u))
+        {
+            std::fprintf(stderr,
+                "[fish_scales_ops] FSO_SM90_SWAP_BN=%u is not a multiple of 8 in [16, 128]; using the picker's tile\n",
+                bn);
+            return 0u;
+        }
+        return bn;
+    }();
+    return v;
+}
+
+// `epilogue`: the dense epilogue of interface v1 (common/epilogue.cuh). Bias, residual and erf-GELU
+// (kDenseEpiServedSm90DeepGemm) are applied by each of the three kernels below to its promoted fp32 accumulator before
+// its one bf16 rounding (deep_gemm/fso_dense_epilogue.cuh), in a JIT variant of the kernel the identity call runs at
+// the same tile configuration; an identity epilogue builds and launches exactly the kernels it did before. The
+// quantized output (linear_quantized) is refused before anything is built or launched.
 inline void gemm_dispatch_sm90(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, int ld_d, float* scales_a,
     float* scales_b, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, cudaStream_t stream,
-    int num_device_sms = kNumDeviceSMs)
+    int num_device_sms = kNumDeviceSMs, fso::DenseEpilogue const& epilogue = fso::DenseEpilogue{})
 {
+    fso::require_dense_epilogue(epilogue, fso::kDenseEpiServedSm90DeepGemm,
+        "sm_90 dense block-FP8 GEMM (gemm_dispatch_sm90, the DeepGEMM JIT route)");
     if (num_device_sms < 0)
         num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
+
+    // The JIT variant key and the launch argument of the epilogue: (false, 0, false) and nullptr for the identity.
+    deep_gemm::jit::DenseEpilogueKey epi_key;
+    epi_key.bias = epilogue.bias != nullptr;
+    epi_key.act = epilogue.act;
+    epi_key.residual = epilogue.residual != nullptr;
+    fso::DenseEpilogue const* const epi = epilogue.is_identity() ? nullptr : &epilogue;
 
     constexpr uint32_t block_k = 128;
     constexpr uint32_t num_problems = 1;
 
-    // Small-M routing. The main path's block_m floor is 64 (Hopper WGMMA
-    // 2-warpgroup layout), so at M=32 it wastes half the M-tile and the grid
-    // under-fills the SMs — making M=32 a ~15% local pessimum vs both M=16
-    // (swap-A/B) and M=64 (full block_m=64). Route M<=32 through swap-A/B,
-    // which turns the small dim into the scheduler's N and recovers fill.
-    // Exclude ultra-wide N (>= 16384, e.g. Qwen3-4B gate_up N=19456): there
-    // the main path already has enough N-tiles and swap is ~2% slower.
-    // FSO (2026-06): wqkv/gate/down M=32 -15%, gate_up unchanged. M>=40
-    // keeps the main path (block_m=64 utilisation recovers, swap regresses).
-    bool const use_swap_ab = shape_m < 32u || (shape_m == 32u && shape_n < 16384u);
+    // Small-M routing. The main path's block_m floor is 64 (Hopper WGMMA 2-warpgroup layout), so below M = 64 its
+    // activation tile is partly empty, and so is its last M block up to M = 128. Swap-AB turns the small dimension
+    // into the tile's narrow side: every call below M = 32, at M = 32 for N < 16384 (the 2026-06 rule), at
+    // 32 < M < 64 and 64 < M <= 96 where the main path's tile is empty enough and the swap-AB launch fits one wave, and
+    // at 96 < M <= 100 and 128 < M <= 160 on the weight shapes where it measured faster (one or two waves)
+    // (deep_gemm::jit::use_dense_swap_ab, jit_utils.cuh, with the token tile of get_dense_swap_ab_config).
+    // FSO_SM90_SWAP_MAX_M overrides the route for A/B runs.
+    bool use_swap_ab = deep_gemm::jit::use_dense_swap_ab(shape_m, shape_n, shape_k, num_device_sms);
+    if (uint32_t const max_m = sm90_swap_max_m_override())
+        use_swap_ab = shape_m <= max_m;
 
     // Programmatic dependent launch for the dense chain (activation quantize -> GEMM): the GEMM launches while the
     // quantize runs and waits on it with griddepcontrol.wait after its prologue (fp8_gemm_impl.cuh). On for every
@@ -98,20 +153,22 @@ inline void gemm_dispatch_sm90(void* mat_a, int ld_a, void* mat_b, int ld_b, voi
 
     // Main path: DeepGEMM v2's kernel at DeepGEMM's own configuration where that configuration is one of the tile
     // classes deep_gemm::jit::use_dg2_dense accepts (256 x 128 with multicast on A and 128 x 160 / 192 from M = 512 on;
-    // every configuration but 80-wide tiles at 128 < M < 256; 64-row tiles at M = 64 / 128 with K >= 8192), else
-    // fp8_gemm_kernel. Both kernels compute the same bits; the choice depends on (M, N, K) and the SM count only.
+    // every configuration but 80-wide tiles at 128 < M < 256; 64-row tiles at M = 64 / 128 with K >= 8192), or below
+    // M = 1024 when fso's tile leaves at least 48 rows of its last M block empty (rule 5, which may run fso's tile on
+    // the v2 kernel), else fp8_gemm_kernel. Both kernels compute the same bits; the choice depends on (M, N, K) and the
+    // SM count only.
     if (!use_swap_ab && sm90_dense_dg2_mode() != Sm90DenseDg2Mode::kOff)
     {
-        deep_gemm::jit::Dg2DenseConfig const dg2
+        deep_gemm::jit::Dg2DenseConfig dg2
             = deep_gemm::jit::get_dg2_dense_config_cached(shape_m, shape_n, shape_k, num_device_sms);
         bool const all = sm90_dense_dg2_mode() == Sm90DenseDg2Mode::kAll
             && (sm90_dense_dg2_k() == 0 || sm90_dense_dg2_k() == shape_k);
-        if (all || deep_gemm::jit::use_dg2_dense(dg2, shape_m, shape_k))
+        if (all || deep_gemm::jit::use_dg2_dense(dg2, shape_m, shape_n, shape_k, num_device_sms))
         {
-            auto runtime = deep_gemm::jit::getGlobalCompiler().buildDg2(dg2);
+            auto runtime = deep_gemm::jit::getGlobalCompiler().buildDg2(dg2, epi_key);
             auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
             deep_gemm::runGemmDg2(kernel, mat_a, ld_a, mat_b, ld_b, mat_d, ld_d, scales_a, scales_b, shape_m, shape_n,
-                shape_k, dg2, stream, pdl);
+                shape_k, dg2, stream, pdl, epi);
             return;
         }
     }
@@ -121,25 +178,32 @@ inline void gemm_dispatch_sm90(void* mat_a, int ld_a, void* mat_b, int ld_b, voi
     {
         auto [bm, bn, ns, ntm, smem]
             = deep_gemm::jit::get_dense_gemm_config(shape_m, shape_n, shape_k, num_device_sms, false);
-        auto runtime = deep_gemm::jit::getGlobalCompiler().build(
-            shape_n, shape_k, bm, bn, block_k, num_problems, ns, ntm, deep_gemm::GemmType::Normal);
+        auto runtime = deep_gemm::jit::getGlobalCompiler().build(shape_n, shape_k, bm, bn, block_k, num_problems, ns,
+            ntm, deep_gemm::GemmType::Normal, false, 1, false, false, false, false, false, epi_key);
         auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
         deep_gemm::runGemm(kernel, mat_a, ld_a, mat_b, ld_b, mat_d, ld_d, scales_a, scales_b, shape_m, shape_n, shape_k,
             bm, bn, block_k, num_problems, ntm, deep_gemm::GemmType::Normal, static_cast<int*>(nullptr), stream,
-            num_device_sms, static_cast<uint32_t>(smem), pdl);
+            num_device_sms, static_cast<uint32_t>(smem), pdl, epi);
     }
     else
     {
         // Tiny M: swap A/B inside the kernel so the persistent scheduler still
         // has enough tiles along the now-M axis.
         auto [bm, bn, ns, ntm, smem]
-            = deep_gemm::jit::get_dense_gemm_config(shape_n, shape_m, shape_k, num_device_sms, true);
-        auto runtime = deep_gemm::jit::getGlobalCompiler().build(
-            shape_n, shape_k, bm, bn, block_k, num_problems, ns, ntm, deep_gemm::GemmType::Normal, true);
+            = deep_gemm::jit::get_dense_swap_ab_config(shape_m, shape_n, shape_k, num_device_sms);
+        if (uint32_t const forced_bn = sm90_swap_block_n_override())
+        {
+            bn = static_cast<int>(forced_bn);
+            deep_gemm::jit::dense_pick_stages(bm, bn, shape_k, true, ns, smem);
+        }
+        auto runtime = deep_gemm::jit::getGlobalCompiler().build(shape_n, shape_k, bm, bn, block_k, num_problems, ns,
+            ntm, deep_gemm::GemmType::Normal, true, 1, false, false, false, false, false, epi_key);
         auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
+        // The kernel's M is the weight's N here: the epilogue indexes the bias by the weight row and the residual by
+        // (token, weight row) (fso_dense_epilogue.cuh, dense_epilogue_fragment_swapab).
         deep_gemm::runGemmSwapAB(kernel, mat_b, ld_b, mat_a, ld_a, mat_d, ld_d, scales_b, scales_a, shape_n, shape_m,
             shape_k, bm, bn, block_k, num_problems, ntm, deep_gemm::GemmType::Normal, static_cast<int*>(nullptr),
-            stream, num_device_sms, static_cast<uint32_t>(smem), pdl);
+            stream, num_device_sms, static_cast<uint32_t>(smem), pdl, epi);
     }
 }
 

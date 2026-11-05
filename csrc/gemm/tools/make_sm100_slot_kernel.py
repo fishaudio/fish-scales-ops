@@ -175,7 +175,9 @@ slower than the masked kernel on the cells with the most and shortest tiles
       expert-id range check; the batch extent L is no longer the group count);
   c3  every remap site calls `fso_slot_live_compact`, which leaves the batch
       mode on the slot and returns the expert id beside the liveness verdict
-      (the per-tile skip on masked_m[expert] is unchanged);
+      (the per-tile skip on masked_m[expert] is unchanged); edit c11 below then
+      replaces every one of these calls by the facts the scheduler resolved, so
+      the helper itself is no longer emitted;
   c4  the declaration of the expert-id local next to `fso_live`;
   c5  the two `collective_mainloop.load` calls receive the load parameters
       with the weight-side tensors shifted by (expert - slot);
@@ -191,7 +193,30 @@ slower than the masked kernel on the cells with the most and shortest tiles
       before it (a dynamic scheduler's answer then overlaps the tile instead of
       delaying its start);
   c9  the load warp releases one extra scheduler query at its start, so a
-      dynamic scheduler draws two tiles ahead of the mainloop.
+      dynamic scheduler draws two tiles ahead of the mainloop;
+  (c10 is not used: issue #13's lever 1, the programmatic-launch trigger
+      right after the kernel-wide wait instead of after the MMA loop, was
+      measured and did not shorten the FC1 -> FC2 gap; run
+      fso_issue13_20261031/I13-L123)
+  c11 the tile facts come from the scheduler (issue #13 lever 2): at edit 4c
+      every thread asks the scheduler to resolve its first tile
+      (`fso_resolve_first`, which also resolves the static walk's second tile
+      when the launch never draws), and at the four loop sites every role reads
+      the expert, the store-bound rows and the liveness that the scheduler
+      published with the tile (`fso_tile_live`) instead of loading
+      slot_to_expert[slot] and masked_m[expert] itself. The two dependent global
+      loads per tile per role that this removes sat between the end of one tile
+      and the start of the next in the load warp and in the MMA warp. In
+      tile-list mode the scheduler also rewrites the coordinate to the entry's
+      block and half, so the tile-list class needs no liveness code of its own;
+  c12 the load warp tells the mainloop the tile's live token rows before its
+      two load calls (issue #13 lever 3, `fso_set_load_rows`). The stock
+      CUTLASS mainloop has no use for them and the call compiles to nothing;
+      the row-bounded mainloop of slot_rows_mainloop.cuh, which the separate
+      translation unit mxfp8_sm100_slot_rows_kernel.cu instantiates for the
+      launches that read rows past the expert's (tile-list mode, and slot mode
+      at m_cap >= 32), loads the token operand as one box of 8, 16 or 32 rows
+      covering them.
 
 The tile-list twin (fso 0.2.1, run fso_0.2.1_20261010/S10b-3b)
 ---------------------------------------------------------------
@@ -203,9 +228,11 @@ what it was: a first version that switched modes at run time inside the compact
 class measured 0.4 to 1.9 per cent slower than f6ad71a at every M from 1 to 64 of
 Family C (one layer pass; the most at M = 1, where its tiles are shortest). Its scheduler's batch coordinate
 indexes the routing op's packed list of LIVE token tiles (one N tile per entry),
-each entry names its block b, its half h and its expert e, and
-`fso_slot_live_compact_list` rewrites the coordinate to (m, h, k, b) and returns e
-for the weights and 64h plus the entry's rows as the store bound. The launcher gives
+each entry names its block b, its half h and its expert e, and the scheduler's
+tile-list mode (`FsoSlotWorkStealingListScheduler`, since edit c11; before it
+the class's own `fso_slot_live_compact_list`) rewrites the coordinate to
+(m, h, k, b) and hands out e for the weights and 64h plus the entry's rows as
+the store bound. The launcher gives
 the problem a token extent of one whole block (128 rows) per batch, so the half is
 an ordinary second N tile, and CUTLASS's own TileN-64 scale handling in the
 collective -- N tile n reads scale atom n / 2, and the MMA shifts the TMEM scale
@@ -216,9 +243,10 @@ forced slot route is bit-identical to the pointer-array route at every m_cap fro
 `slotx`); the masked class keeps its m_cap <= 64 guard.
 
   l1  the class name;
-  l2  `fso_tile_list` in Arguments / Params and its transfer into Params;
-  l3  every liveness site calls `fso_slot_live_compact_list` instead;
-  l4  a check that no slot-mode liveness call is left.
+  l4  a check that no per-class liveness decode is left (since edit c11 the
+      class differs from the compact one by its name and by the scheduler tag
+      the launcher instantiates it with; its former edits l2 / l3, the tile-list
+      pointer in Params and the class's own decode, moved into the scheduler).
 
 The compact twin is instantiated with the work-stealing tile scheduler of
 `slot_work_stealing.cuh` (a per-call counter over the live tiles) rather than
@@ -501,66 +529,38 @@ fso_slot_remap_and_live(int const* slot_to_expert, int const* masked_m, int num_
 
 
 COMPACT_HELPERS = """
-// fso slot route, compact layout (0.2.1): the liveness test of the masked helper
-// above, without its remap. The batch mode stays on the SLOT, which on this route
-// equals the expert's first 128-row block blk0[e] of the one-group compact buffer
-// (every active expert owns exactly one block, and the packed slot list and blk0
-// both run over the active experts in ascending order), i.e. the batch index the
-// tokens, their scales and the output use. The expert id, which the weights use,
-// is returned in `a_batch`, and the expert's routed row count in `rows` (the
-// epilogue's store bound, see `fso_store_shape`). Liveness is the masked helper's,
-// unchanged: the N tile against the expert's routed row count. Same totality
-// rules: a coordinate whose slot or expert is out of range is dead.
-template <class Coord>
+// fso slot route, compact layout: the facts about a tile that every warp role needs besides its coordinate, as the
+// work-stealing scheduler resolved them when it handed the tile out (slot_work_stealing.cuh, "What a handed-out tile
+// carries"): the weights' batch index (the expert id) in `a_batch`, the expert's rows that the tile stores in `rows`
+// (the epilogue's store bound, see `fso_store_shape`), and the verdict. A dead or invalid tile (a slot past the
+// active experts, a token tile past the expert's rows, a -1 list entry, the coordinate a loop is about to reject)
+// reports false and its other fields are not used. In tile-list mode the scheduler has already moved the coordinate
+// to the entry's block and half, so `work_tile_to_cta_coord` gives the coordinate the operands are sliced with.
+template <class WorkTileInfo>
 CUTLASS_DEVICE bool
-fso_slot_live_compact(int const* slot_to_expert, int const* masked_m, int num_slots, int num_groups,
-                      int tile_n_rows, Coord const& cta_coord_mnkl, int& a_batch, int& rows) {
-  if (slot_to_expert == nullptr) { return false; }
-  int const fso_slot = cute::get<3>(cta_coord_mnkl);
-  if (fso_slot < 0 || fso_slot >= num_slots) { return false; }
-  int const fso_expert = slot_to_expert[fso_slot];
-  if (fso_expert < 0 || fso_expert >= num_groups) { return false; }
-  a_batch = fso_expert;
-  rows = masked_m[fso_expert];
-  return int(cute::get<1>(cta_coord_mnkl)) * tile_n_rows < rows;
+fso_tile_live(WorkTileInfo const& w, int& a_batch, int& rows) {
+  a_batch = w.a_batch;
+  rows = w.rows;
+  return w.is_valid_tile && w.live;
 }
 
-// fso slot route, compact layout, TILE-LIST mode (FsoSm100SlotGemmCompactList; run
-// fso_0.2.1_20261010/S10b-3b): the twin past a row capacity of one token tile. The
-// scheduler's batch coordinate is an index i into the routing op's packed list of
-// LIVE 64-row token tiles and its N coordinate is 0 (the launcher gives the
-// scheduler one N tile per list entry). Entry i packs the tile as
-// q | e << 14 | (r - 1) << 24, with q = 2 * b + h (b the 128-row block of the
-// compact buffer, h the 64-row half of it), e the expert that owns the block and r
-// in 1..64 the expert's rows inside the tile; -1 marks an entry past the live
-// tiles. The coordinate is rewritten to the block and the half, (m, h, k, b): the
-// token operand, its scale factors and the output take the block as their batch
-// index (the problem's token extent per batch is one block, 128 rows, so the half is
-// an ordinary second N tile, whose scale factors are the second half of the block's
-// 128-row atom: the collective's TileN-64 handling maps N tile n to atom n / 2 on
-// load and shifts the TMEM scale address by n % 2 in the MMA), the weights take the
-// expert (`a_batch`), and the store bound `rows` is the half's first row plus r, so
-// the epilogue writes exactly the expert's rows inside the tile. Same totality rules
-// as the slot-mode helper: an index out of range, a -1 entry or an expert out of
-// range is dead.
-template <class Coord>
-CUTLASS_DEVICE bool
-fso_slot_live_compact_list(int const* tile_list, int num_slots, int num_groups, int tile_n_rows,
-                           Coord& cta_coord_mnkl, int& a_batch, int& rows) {
-  if (tile_list == nullptr) { return false; }
-  int const fso_i = cute::get<3>(cta_coord_mnkl);
-  if (fso_i < 0 || fso_i >= num_slots) { return false; }
-  int const fso_v = tile_list[fso_i];
-  if (fso_v < 0) { return false; }
-  int const fso_e = (fso_v >> 14) & 0x3ff;
-  if (fso_e >= num_groups) { return false; }
-  int const fso_q = fso_v & 0x3fff;
-  int const fso_h = fso_q & 1;
-  a_batch = fso_e;
-  rows = fso_h * tile_n_rows + ((fso_v >> 24) & 0x3f) + 1;
-  cta_coord_mnkl = cute::make_coord(cute::get<0>(cta_coord_mnkl), fso_h, cute::get<2>(cta_coord_mnkl),
-                                    fso_q >> 1);
-  return true;
+// fso slot route, compact layout: hand the mainloop the tile's live token rows (issue #13 lever 3) -- the expert's
+// rows inside the tile, its store bound minus the N tile's first row. Only a mainloop that declares
+// `kFsoRowsBounded` (FsoRowsBoundedMainloop, slot_rows_mainloop.cuh) takes them; for CUTLASS's stock collective the
+// call compiles to nothing, so the kernels of the stock instantiation keep their code.
+template <class T, class = void>
+struct fso_is_rows_bounded : cute::false_type {};
+template <class T>
+struct fso_is_rows_bounded<T, cute::void_t<decltype(T::kFsoRowsBounded)>> : cute::true_type {};
+
+template <class Mainloop, class Coord, class CtaShape>
+CUTLASS_DEVICE void
+fso_set_load_rows(Mainloop& mainloop, int rows, Coord const& cta_coord_mnkl, CtaShape) {
+  if constexpr (fso_is_rows_bounded<Mainloop>::value) {
+    int const tn = int(cute::size<1>(CtaShape{}));
+    int const live = rows - int(cute::get<1>(cta_coord_mnkl)) * tn;
+    mainloop.fso_set_tile_rows(live < 1 ? 1 : (live < tn ? live : tn));
+  }
 }
 
 // fso slot route, compact layout: the problem shape the EPILOGUE is handed, with
@@ -721,6 +721,31 @@ def _compact_class(masked_text: str, report: list[str]) -> str:
         "        }\n"
         "      }\n\n", 1, "c9 one extra scheduler-throttle release at the load warp's start")
 
+    # c11 (issue #13 lever 2): the tile facts come from the scheduler. At edit 4c's site every thread resolves its
+    # first tile through the scheduler (after the kernel-wide wait); at the four loop sites every
+    # role reads what the scheduler published with the tile.
+    s2, cnt = re.subn(r"(    cutlass::arch::wait_on_dependent_grids\(\);\n)    fso_live = fso_slot_live_compact\(.*?fso_rows\);",
+                      r"\1    scheduler.fso_resolve_first(work_tile_info);\n"
+                      r"    cta_coord_mnkl = scheduler.work_tile_to_cta_coord(work_tile_info);\n"
+                      r"    fso_live = fso_tile_live(work_tile_info, fso_a_batch, fso_rows);", s, flags=re.S)
+    assert cnt == 1, f"[c11a first tile resolved by the scheduler] applied {cnt} times, expected 1"
+    s = s2
+    report.append(f"edit c11a first tile resolved by the scheduler: {cnt} site(s)")
+    s2, cnt = re.subn(r"fso_live = fso_slot_live_compact\(.*?fso_rows\);",
+                      "fso_live = fso_tile_live(work_tile_info, fso_a_batch, fso_rows);", s, flags=re.S)
+    assert cnt == 4, f"[c11b loop sites read the published tile facts] applied {cnt} times, expected 4"
+    s = s2
+    report.append(f"edit c11b loop sites read the published tile facts: {cnt} site(s)")
+    assert "fso_slot_live_compact(" not in s, "[c11c] a per-role liveness load survived in the compact class"
+    report.append("edit c11c no per-role liveness load left: checked")
+
+    # c12 (issue #13 lever 3): the load warp hands the mainloop the tile's live rows before its two load calls.
+    lit("        auto k_tile_iter = scheduler.get_k_tile_iterator(work_tile_info, problem_shape_MNKL, CtaShape_MNK{}, "
+        "load_inputs.k_tiles);\n",
+        "        fso_set_load_rows(collective_mainloop, fso_rows, cta_coord_mnkl, CtaShape_MNK{});\n"
+        "        auto k_tile_iter = scheduler.get_k_tile_iterator(work_tile_info, problem_shape_MNKL, CtaShape_MNK{}, "
+        "load_inputs.k_tiles);\n", 1, "c12 the load warp hands the mainloop the tile's live rows")
+
     head = "class FsoSm100SlotGemmCompact {"
     start = s.index(head)
     # include the template header that precedes the class
@@ -750,16 +775,9 @@ def _compact_list_class(compact_cls: str, report: list[str]) -> str:
         report.append(f"edit {what}: {cnt} site(s)")
 
     lit("class FsoSm100SlotGemmCompact {", "class FsoSm100SlotGemmCompactList {", 1, "l1 class name")
-    lit("    int fso_num_groups{0};",
-        "    int fso_num_groups{0};\n"
-        "    // tile-list mode: the routing op's packed list of live 64-row token tiles\n"
-        "    int const* fso_tile_list{nullptr};", 2, "l2 Arguments / Params tile-list field")
-    lit("      ,args.fso_num_groups\n", "      ,args.fso_num_groups\n      ,args.fso_tile_list\n", 1,
-        "l2b to_underlying_arguments")
-    lit("fso_live = fso_slot_live_compact(params.fso_slot_to_expert, params.fso_masked_m,",
-        "fso_live = fso_slot_live_compact_list(params.fso_tile_list,", 5, "l3 tile-list liveness sites")
-    assert "fso_slot_live_compact(" not in s, "[l4] a slot-mode liveness call survived in the tile-list class"
-    report.append("edit l4 no slot-mode liveness call left: checked")
+    # l2 / l3 (the tile-list pointer and the class's own decode) moved into the scheduler with edit c11.
+    assert "fso_slot_live_compact" not in s, "[l4] a per-class liveness decode survived in the tile-list class"
+    report.append("edit l4 no per-class liveness decode left: checked")
     return s
 
 
@@ -775,14 +793,280 @@ def generate_with_compact(cutlass_dir: str) -> tuple[str, list[str], str]:
     return text, report, src_path
 
 
+MOE_HELPERS = """
+// fso fused FC1 + FC2 slot kernel (issue #13 lever 5): the tile facts of `fso_tile_live` plus the tile's phase
+// (0 = an FC1 tile, 1 = an FC2 tile) and, for a drawn FC2 tile, whether the scheduler found its entry's FC1 tiles
+// all released when it drew it (slot_moe_scheduler.cuh).
+template <class WorkTileInfo>
+CUTLASS_DEVICE bool
+fso_tile_live_moe(WorkTileInfo const& w, int& a_batch, int& rows, int& phase, bool& ready) {
+  a_batch = w.a_batch;
+  rows = w.rows;
+  phase = w.phase;
+  ready = w.ready;
+  return w.is_valid_tile && w.live;
+}
+"""
+
+
+def _moe_class(compact_cls: str, report: list[str]) -> str:
+    """Apply edits m1-m12 to the compact class and return the fused FC1 + FC2 class `FsoSm100SlotGemmMoe`.
+
+    The class serves both modes of the compact slot route, like the compact class does with its tile-list twin: the
+    scheduler tag the launcher instantiates it with (slot_moe_scheduler.cuh) selects slot mode or token-tile mode, and
+    in token-tile mode the scheduler has already moved each tile's coordinate to its block and half, so the class's
+    per-entry counter index `get<3>(cta_coord_mnkl)` is the block (issue #13 lever 5 step 3, run
+    fso_issue13_20261031/I13-L5b). The two modes' kernels are instantiated in separate translation units.
+
+    The compact class is left exactly as it is: the fused class is emitted into its own generated header, which only
+    the fused kernel's translation unit (ops/mxfp8_sm100_slot_moe_kernel.cu) includes (run
+    fso_issue12_20261028/R1). What the edits do (issue #13 lever 5, design note I13-D45 section 4):
+
+      m1  the class name and a fifth template parameter, the FC2 tiles' epilogue (`CollectiveEpilogue2_`);
+      m2  its types, and the asserts that the two epilogues partition the accumulator the same way;
+      m3  one shared-memory region for the two epilogues (they run one after the other on the same threads);
+      m4  the FC2 problem shape, mainloop arguments and epilogue arguments in Arguments and Params;
+      m5  their transfer into Params, and m6 their can_implement;
+      m7  a second mainloop object, a second epilogue object, the FC2 problem shape and its load partitioning;
+      m8  every tile-fact site also reads the tile's phase and ready bit (`fso_tile_live_moe`);
+      m9  the load warp: both phases load through one inlined copy of `fso_load_after_entry` (slot_moe_mainloop.cuh),
+          on the phase's mainloop object and partitioning: an FC2 tile with the hybrid hand-off, an FC1 tile with the
+          ready bit forced on; the spin target is the scheduler's for the tile (`done_target(work_tile_info)`: T1 in
+          slot mode, the tile's block target in token-tile mode);
+      m10 the MMA warp: the k-tile count of the tile's phase;
+      m11 the epilogue warps: an FC1 tile stores through the fused SwiGLU epilogue and then, after a named barrier
+          over the 128 epilogue threads, one thread releases the scheduler's count for the tile on the entry's done
+          counter (`red.release.gpu`, the producer half of the hand-off: one per tile in slot mode, a tile group's
+          count on its last tile in token-tile mode); an FC2 tile stores through the plain epilogue;
+      m12 the TMA descriptors of the second mainloop are prefetched too.
+    """
+    s = compact_cls
+
+    def lit(anchor, rep, n, what):
+        nonlocal s
+        cnt = s.count(anchor)
+        assert cnt == n, f"[{what}] literal found {cnt} times, expected {n}: {anchor[:70]!r}"
+        s = s.replace(anchor, rep, n)
+        report.append(f"edit {what}: {cnt} site(s)")
+
+    lit("  class TileSchedulerTag_\n>\nclass FsoSm100SlotGemmCompact {",
+        "  class TileSchedulerTag_,\n  class CollectiveEpilogue2_\n>\nclass FsoSm100SlotGemmMoe {", 1,
+        "m1 class name and the FC2 epilogue parameter")
+
+    lit("  using EpilogueParams = typename CollectiveEpilogue::Params;\n",
+        "  using EpilogueParams = typename CollectiveEpilogue::Params;\n"
+        "  // fso moe: the FC2 tiles' epilogue. The two epilogues must partition the accumulator identically (the\n"
+        "  // same TMEM load atom, epilogue tile and thread count) and keep nothing in a load or store pipeline.\n"
+        "  using CollectiveEpilogue2 = CollectiveEpilogue2_;\n"
+        "  using EpilogueArguments2 = typename CollectiveEpilogue2::Arguments;\n"
+        "  using EpilogueParams2 = typename CollectiveEpilogue2::Params;\n"
+        "  static_assert(cute::is_same_v<typename CollectiveEpilogue::CopyOpT2R, typename CollectiveEpilogue2::CopyOpT2R>,\n"
+        "    \"fso moe: the FC1 and FC2 epilogues must load the accumulator with the same TMEM atom\");\n"
+        "  static_assert(cute::is_same_v<typename CollectiveEpilogue::EpilogueTile, typename CollectiveEpilogue2::EpilogueTile>,\n"
+        "    \"fso moe: the FC1 and FC2 epilogues must walk the same epilogue tile\");\n"
+        "  static_assert(CollectiveEpilogue::ThreadCount == CollectiveEpilogue2::ThreadCount,\n"
+        "    \"fso moe: the FC1 and FC2 epilogues must run on the same threads\");\n"
+        "  static_assert(cute::is_same_v<typename CollectiveEpilogue::LoadPipeline, typename CollectiveEpilogue2::LoadPipeline>\n"
+        "      && cute::is_same_v<typename CollectiveEpilogue::StorePipeline, typename CollectiveEpilogue2::StorePipeline>,\n"
+        "    \"fso moe: the FC1 and FC2 epilogues must share the epilogue load and store pipeline types\");\n",
+        1, "m2 the FC2 epilogue's types")
+
+    lit("      EpilogueTensorStorage epilogue;\n      MainloopTensorStorage mainloop;\n",
+        "      // fso moe: the FC1 and the FC2 epilogue run one after the other on the same 128 threads, each behind the\n"
+        "      // barrier at the top of its own store, so they share one region.\n"
+        "      union EpilogueUnion {\n"
+        "        EpilogueTensorStorage epilogue1;\n"
+        "        typename CollectiveEpilogue2::TensorStorage epilogue2;\n"
+        "      } epilogue;\n"
+        "      MainloopTensorStorage mainloop;\n", 1, "m3 one region for the two epilogues")
+
+    anchor = ("    // compact layout: the expert count (the batch extent L is max(G, B_alloc))\n"
+              "    int fso_num_groups{0};\n")
+    parts = s.split(anchor)
+    assert len(parts) == 3, f"[m4 Arguments / Params fields] anchor found {len(parts) - 1} times, expected 2"
+    add_args = ("    // fso moe: the FC2 problem (N_w2, m_cap, K2, L) and its mainloop and epilogue arguments.\n"
+                "    ProblemShape problem_shape2{};\n"
+                "    MainloopArguments mainloop2{};\n"
+                "    EpilogueArguments2 epilogue2{};\n")
+    add_params = ("    // fso moe: the FC2 problem and its mainloop and epilogue parameters.\n"
+                  "    ProblemShape problem_shape2{};\n"
+                  "    MainloopParams mainloop2{};\n"
+                  "    EpilogueParams2 epilogue2{};\n")
+    s = parts[0] + anchor + add_args + parts[1] + anchor + add_params + parts[2]
+    report.append("edit m4 Arguments / Params fields: 2 site(s)")
+
+    lit("      ,args.fso_num_slots\n      ,args.fso_num_groups\n    };",
+        "      ,args.fso_num_slots\n      ,args.fso_num_groups\n"
+        "      ,args.problem_shape2\n"
+        "      ,CollectiveMainloop::to_underlying_arguments(args.problem_shape2, args.mainloop2, nullptr, args.hw_info)\n"
+        "      ,CollectiveEpilogue2::to_underlying_arguments(args.problem_shape2, args.epilogue2, nullptr)\n"
+        "    };", 1, "m5 to_underlying_arguments")
+
+    lit("    implementable &= TileScheduler::can_implement(args.scheduler);\n",
+        "    implementable &= TileScheduler::can_implement(args.scheduler);\n"
+        "    implementable &= CollectiveMainloop::can_implement(args.problem_shape2, args.mainloop2);\n"
+        "    implementable &= CollectiveEpilogue2::can_implement(args.problem_shape2, args.epilogue2);\n"
+        "    // fso moe: the FC2 epilogue gets no workspace of its own.\n"
+        "    implementable &= CollectiveEpilogue2::get_workspace_size(args.problem_shape2, args.epilogue2) == 0;\n",
+        1, "m6 can_implement")
+
+    lit("    auto problem_shape_MNKL = append<4>(params.problem_shape, Int<1>{});\n    auto [M,N,K,L] = problem_shape_MNKL;\n",
+        "    auto problem_shape_MNKL = append<4>(params.problem_shape, Int<1>{});\n    auto [M,N,K,L] = problem_shape_MNKL;\n"
+        "    // fso moe: the FC2 problem.\n"
+        "    auto problem_shape2_MNKL = append<4>(params.problem_shape2, Int<1>{});\n", 1, "m7a the FC2 problem shape")
+    lit("    CollectiveMainloop collective_mainloop(params.mainloop, cluster_shape, cta_rank_in_cluster);\n"
+        "    CollectiveEpilogue collective_epilogue(params.epilogue, shared_storage.tensors.epilogue);\n",
+        "    CollectiveMainloop collective_mainloop(params.mainloop, cluster_shape, cta_rank_in_cluster);\n"
+        "    CollectiveEpilogue collective_epilogue(params.epilogue, shared_storage.tensors.epilogue.epilogue1);\n"
+        "    // fso moe: the FC2 tiles' mainloop (same type, its own TMA descriptors) and epilogue.\n"
+        "    CollectiveMainloop collective_mainloop2(params.mainloop2, cluster_shape, cta_rank_in_cluster);\n"
+        "    CollectiveEpilogue2 collective_epilogue2(params.epilogue2, shared_storage.tensors.epilogue.epilogue2);\n",
+        1, "m7b the FC2 mainloop and epilogue objects")
+    lit("    auto load_inputs = collective_mainloop.load_init(\n        problem_shape_MNKL, shared_storage.tensors.mainloop);\n",
+        "    auto load_inputs = collective_mainloop.load_init(\n        problem_shape_MNKL, shared_storage.tensors.mainloop);\n"
+        "    auto load_inputs2 = collective_mainloop2.load_init(\n        problem_shape2_MNKL, shared_storage.tensors.mainloop);\n",
+        1, "m7c the FC2 load partitioning")
+    lit("    int fso_rows = 0;      // compact layout: the expert's routed rows (the epilogue's store bound)\n",
+        "    int fso_rows = 0;      // compact layout: the expert's routed rows (the epilogue's store bound)\n"
+        "    int fso_phase = 0;     // fso moe: 0 = an FC1 tile, 1 = an FC2 tile\n"
+        "    bool fso_ready = false; // fso moe: an FC2 tile whose entry's FC1 tiles had all released when it was drawn\n",
+        1, "m7d the phase and ready locals")
+    lit("fso_live = fso_tile_live(work_tile_info, fso_a_batch, fso_rows);",
+        "fso_live = fso_tile_live_moe(work_tile_info, fso_a_batch, fso_rows, fso_phase, fso_ready);", 5,
+        "m8 tile facts with phase and ready bit")
+
+    # m9: the load warp's tile body, ONE path for both phases. The two phases' mainloop objects and load partitionings
+    # have the same types, so the tile selects them by reference and runs one inlined copy of the load: the FC1 tiles
+    # with the ready bit forced on and no proxy fence, the FC2 tiles with the scheduler's ready bit and the fence.
+    # (A first form kept the stock two-call FC1 body and a separate FC2 body: 5600 SASS instructions against 4312 for
+    # today's row-bounded FC1 kernel, and 2.1 to 2.3 thousand L1.5 instruction misses per launch against 0.4 to 1.3
+    # thousand; run fso_issue13_20261031/I13-L5, ncu/kern.)
+    head = "       if (fso_live) {   // fso per-tile skip: a dead tile costs this CTA no mainloop traffic\n"
+    tail = "       }\n        // fso: the load-order arrival is unconditional"
+    i0 = s.index(head)
+    assert s.count(head) == 1, "[m9] load-warp tile body head not unique"
+    i1 = s.index(tail, i0)
+    body = s[i0 + len(head):i1]
+    assert body.count("collective_mainloop.load(") == 2, "[m9] the load-warp tile body does not hold the two stock load calls"
+    one = ("        // fso moe: the tile's phase selects its operands; both phases load through one inlined copy of\n"
+           "        // `fso_load_after_entry` (slot_moe_mainloop.cuh). An FC2 tile's activation (B, SFB) is what the FC1\n"
+           "        // tiles of its entry write in this kernel: it loads after the ready bit the scheduler drew it with, or\n"
+           "        // streams its weights first and waits for the entry itself; an FC1 tile loads as before.\n"
+           "        bool const fso_fc2 = fso_phase != 0;\n"
+           "        CollectiveMainloop& fso_cm = fso_fc2 ? collective_mainloop2 : collective_mainloop;\n"
+           "        auto const& fso_li = fso_fc2 ? load_inputs2 : load_inputs;\n"
+           "        auto const fso_ps = fso_fc2 ? problem_shape2_MNKL : problem_shape_MNKL;\n"
+           "        fso_set_load_rows(fso_cm, fso_rows, cta_coord_mnkl, CtaShape_MNK{});\n"
+           "        auto k_tile_iter = scheduler.get_k_tile_iterator(work_tile_info, fso_ps, CtaShape_MNK{}, fso_li.k_tiles);\n"
+           "        auto k_tile_count = TileScheduler::get_work_k_tile_count(work_tile_info, fso_ps, CtaShape_MNK{});\n"
+           "        auto [mainloop_producer_state_next, unused_] = fso_cm.fso_load_after_entry(\n"
+           "          mainloop_pipeline,\n"
+           "          mainloop_pipe_producer_state,\n"
+           "          fso_shift_weight_batch(fso_li, fso_a_batch - int(cute::get<3>(cta_coord_mnkl))),\n"
+           "          cta_coord_mnkl,\n"
+           "          k_tile_iter, k_tile_count,\n"
+           "          fso_fc2 ? fso_ready : true,\n"
+           "          fso_fc2,\n"
+           "          scheduler.done_counter(int(cute::get<3>(cta_coord_mnkl))),\n"
+           "          scheduler.done_target(work_tile_info)\n"
+           "        );\n"
+           "        mainloop_pipe_producer_state = mainloop_producer_state_next;\n")
+    s = s[:i0] + head + one + s[i1:]
+    report.append("edit m9 load warp: one load path for both phases: 1 site")
+
+    lit("      do {\n        auto k_tile_count = TileScheduler::get_work_k_tile_count(work_tile_info, problem_shape_MNKL, CtaShape_MNK{});\n",
+        "      do {\n        // fso moe: the k-tile count of the tile's phase\n"
+        "        auto k_tile_count = fso_phase == 0\n"
+        "          ? TileScheduler::get_work_k_tile_count(work_tile_info, problem_shape_MNKL, CtaShape_MNK{})\n"
+        "          : TileScheduler::get_work_k_tile_count(work_tile_info, problem_shape2_MNKL, CtaShape_MNK{});\n",
+        1, "m10 MMA warp: the phase's k-tile count")
+
+    # m11: the epilogue warps' store, split by phase.
+    st_head = ("        if (scheduler.compute_epilogue(work_tile_info)) {\n"
+               "          auto [load_state_next, store_state_next, acc_state_next] = collective_epilogue.template store<IsOverlappingAccum>(\n")
+    st_tail = "          do_tail_store = true;\n        }\n"
+    assert s.count(st_head) == 1, "[m11] epilogue store head not unique"
+    j0 = s.index(st_head)
+    j1 = s.index(st_tail, j0) + len(st_tail)
+    old_block = s[j0:j1]
+    store_call_1 = old_block[len("        if (scheduler.compute_epilogue(work_tile_info)) {\n"):old_block.index(st_tail)]
+    assert "            shared_storage.tensors.epilogue\n" in store_call_1, "[m11] the store call's shared storage"
+    assert "fso_store_shape(problem_shape_MNKL, fso_rows)" in store_call_1, "[m11] the store call's store bound"
+    store_call_1 = store_call_1.replace("            shared_storage.tensors.epilogue\n",
+                                        "            shared_storage.tensors.epilogue.epilogue1\n")
+    store_call_2 = (store_call_1.replace("collective_epilogue.template store", "collective_epilogue2.template store")
+                    .replace("shared_storage.tensors.epilogue.epilogue1", "shared_storage.tensors.epilogue.epilogue2")
+                    .replace("fso_store_shape(problem_shape_MNKL, fso_rows)", "fso_store_shape(problem_shape2_MNKL, fso_rows)"))
+    ind = lambda t: "".join("  " + ln if ln.strip() else ln for ln in t.splitlines(keepends=True))
+    new_block = ("        if (scheduler.compute_epilogue(work_tile_info)) {\n"
+                 "          if (fso_phase == 0) {   // fso moe: an FC1 tile, the fused SwiGLU + MXFP8 store\n"
+                 + ind(store_call_1) +
+                 "            // fso moe, the producer half of the FC1 -> FC2 hand-off: every epilogue thread has issued\n"
+                 "            // its stores of this tile's fp8 rows and scale bytes; after the barrier one thread releases\n"
+                 "            // the tile's count on the entry's done counter, which by cumulativity orders all 128 threads'\n"
+                 "            // stores before any thread that acquires the count (CUTLASS's GenericBarrier::arrive_inc).\n"
+                 "            // The count is the scheduler's: one per tile in slot mode; in token-tile mode a group's last\n"
+                 "            // tile releases the whole group (its earlier tiles ran on this CTA before it) and the others\n"
+                 "            // nothing.\n"
+                 "            uint32_t const fso_release = scheduler.fso_release_count(work_tile_info);\n"
+                 "            if (fso_release != 0u) {\n"
+                 "            cutlass::arch::NamedBarrier::sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);\n"
+                 "            if (threadIdx.x % NumEpilogueThreads == 0) {\n"
+                 "              cutlass::gemm::kernel::detail::fso_red_release_gpu_add(\n"
+                 "                scheduler.done_counter(int(cute::get<3>(cta_coord_mnkl))), fso_release);\n"
+                 "            }\n"
+                 "            }\n"
+                 "          } else {   // fso moe: an FC2 tile, the plain bf16 store\n"
+                 + ind(store_call_2) +
+                 "          }\n"
+                 "          do_tail_store = true;\n"
+                 "        }\n")
+    s = s[:j0] + new_block + s[j1:]
+    report.append("edit m11 epilogue warps: the phase's store and the FC1 release: 1 site")
+
+    lit("      collective_mainloop.prefetch_tma_descriptors();\n",
+        "      collective_mainloop.prefetch_tma_descriptors();\n      collective_mainloop2.prefetch_tma_descriptors();\n",
+        1, "m12 prefetch the FC2 descriptors")
+    # The epilogue-load warp is not a participant for these NoSmem epilogues, but its call must name a storage.
+    lit("            shared_storage.tensors.epilogue,\n            reverse_epi_n\n",
+        "            shared_storage.tensors.epilogue.epilogue1,\n            reverse_epi_n\n", 1,
+        "m12b the epilogue-load call names the FC1 storage")
+    assert "shared_storage.tensors.epilogue\n" not in s and "shared_storage.tensors.epilogue)" not in s \
+        and "shared_storage.tensors.epilogue," not in s, "[m-check] an unqualified epilogue storage use survived"
+    report.append("edit m-check every epilogue storage use names its epilogue: checked")
+    return s
+
+
+def generate_moe(cutlass_dir: str) -> tuple[str, list[str], str]:
+    """The fused FC1 + FC2 class in a header of its own, to be included after sm100_slot_gemm_kernel.hpp (whose
+    compact helpers it uses) by the fused kernel's translation unit only."""
+    text, _report, src_path = generate(cutlass_dir)
+    report: list[str] = []
+    cls = _compact_class(text, [])
+    moe = _moe_class(cls, report)
+    head = ("// Generated by csrc/gemm/tools/make_sm100_slot_kernel.py --moe from CUTLASS's\n"
+            "// include/cutlass/gemm/kernel/sm100_gemm_tma_warpspecialized.hpp (see that script's docstring and\n"
+            "// _moe_class). Include after blockscale_gemm/arch/sm100/mxfp8/sm100_slot_gemm_kernel.hpp.\n"
+            "#pragma once\n\n"
+            "#include \"blockscale_gemm/arch/sm100/mxfp8/sm100_slot_gemm_kernel.hpp\"\n"
+            "#include \"blockscale_gemm/arch/sm100/mxfp8/slot_moe_scheduler.cuh\"\n\n"
+            "namespace cutlass::gemm::kernel {\n")
+    out = head + MOE_HELPERS + "\n" + moe + "\n\n} // namespace cutlass::gemm::kernel\n"
+    return out, report, src_path
+
+
 def main() -> int:
-    if len(sys.argv) != 2:
+    args = sys.argv[1:]
+    moe = bool(args) and args[0] == "--moe"
+    if moe:
+        args = args[1:]
+    if len(args) != 1:
         print(__doc__.strip().splitlines()[-2], file=sys.stderr)
-        print("usage: make_sm100_slot_kernel.py <output-header>", file=sys.stderr)
+        print("usage: make_sm100_slot_kernel.py [--moe] <output-header>", file=sys.stderr)
         return 2
-    dst = sys.argv[1]
+    dst = args[0]
     cutlass_dir = _cutlass_dir()
-    text, report, src_path = generate_with_compact(cutlass_dir)
+    text, report, src_path = generate_moe(cutlass_dir) if moe else generate_with_compact(cutlass_dir)
     # Only rewrite when the content actually changes, so an incremental build
     # does not recompile the translation unit on every invocation.
     old = None
@@ -796,8 +1080,9 @@ def main() -> int:
         state = "wrote"
     else:
         state = "unchanged"
-    print("[fso] sm_100 slot kernel: " + "; ".join(report))
-    print(f"[fso] sm_100 slot kernel: {state} {dst} ({len(text)} bytes) from {src_path}")
+    what = "sm_100 fused FC1 + FC2 slot kernel" if moe else "sm_100 slot kernel"
+    print(f"[fso] {what}: " + "; ".join(report))
+    print(f"[fso] {what}: {state} {dst} ({len(text)} bytes) from {src_path}")
     return 0
 
 

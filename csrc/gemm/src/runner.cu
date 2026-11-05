@@ -27,7 +27,7 @@ namespace kernels::blockscale_gemm
 template <typename ElementA, typename ElementB, typename ElementD>
 void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::gemm(void* mat_d, void const* mat_a,
     void const* mat_b, int shape_m, int shape_n, int shape_k, cudaStream_t stream, float const* scales_a,
-    float const* scales_b)
+    float const* scales_b, fso::DenseEpilogue const& epilogue)
 {
     constexpr bool internal_quantize_a = !std::is_same_v<ElementA, __nv_fp8_e4m3>;
     constexpr bool internal_quantize_b = !std::is_same_v<ElementB, __nv_fp8_e4m3>;
@@ -64,7 +64,7 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::gemm(void* ma
         fp8_gemm_run(reinterpret_cast<__nv_bfloat16 const*>(mat_a), fp8_mat_a, shape_k, per_token_per_128c_scales,
             reinterpret_cast<__nv_bfloat16 const*>(mat_b), fp8_mat_b, shape_k, per_block_scales,
             reinterpret_cast<__nv_bfloat16*>(mat_d), shape_n, shape_m, shape_n, shape_k, stream, internal_quantize_a,
-            internal_quantize_b);
+            internal_quantize_b, epilogue, streamk_scratch_, streamk_scratch_bytes_);
     }
 
     if constexpr (internal_quantize_a && !internal_quantize_b)
@@ -72,7 +72,7 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::gemm(void* ma
         fp8_gemm_run(reinterpret_cast<__nv_bfloat16 const*>(mat_a), fp8_mat_a, shape_k, per_token_per_128c_scales,
             nullptr, reinterpret_cast<__nv_fp8_e4m3*>(const_cast<void*>(mat_b)), shape_k, const_cast<float*>(scales_b),
             reinterpret_cast<__nv_bfloat16*>(mat_d), shape_n, shape_m, shape_n, shape_k, stream, internal_quantize_a,
-            internal_quantize_b);
+            internal_quantize_b, epilogue, streamk_scratch_, streamk_scratch_bytes_);
     }
 #else  // COMPILE_HOPPER_TMA_GEMMS
     TLLM_THROW("fp8 blockscale gemm only support Hopper.");
@@ -82,11 +82,20 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::gemm(void* ma
 template <typename ElementA, typename ElementB, typename ElementD>
 void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::gemm(__nv_fp8_e4m3 const* mat_a, int ld_a,
     __nv_fp8_e4m3 const* mat_b, int ld_b, __nv_bfloat16* mat_d, int ld_d, int shape_m, int shape_n, int shape_k,
-    float const* scales_a, float const* scales_b, cudaStream_t stream)
+    float const* scales_a, float const* scales_b, cudaStream_t stream, fso::DenseEpilogue const& epilogue)
 {
 
     fp8_gemm_run(const_cast<__nv_fp8_e4m3*>(mat_a), ld_a, const_cast<__nv_fp8_e4m3*>(mat_b), ld_b, mat_d, ld_d, shape_m,
-        shape_n, shape_k, const_cast<float*>(scales_a), const_cast<float*>(scales_b), stream);
+        shape_n, shape_k, const_cast<float*>(scales_a), const_cast<float*>(scales_b), stream, epilogue,
+        streamk_scratch_, streamk_scratch_bytes_);
+}
+
+template <typename ElementA, typename ElementB, typename ElementD>
+size_t CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::getStreamKScratchSize(
+    int shape_m, int shape_n, int shape_k)
+{
+    return sm120_fp8_streamk_scratch_bytes(
+        static_cast<uint32_t>(shape_m), static_cast<uint32_t>(shape_n), static_cast<uint32_t>(shape_k));
 }
 
 template <typename ElementA, typename ElementB, typename ElementD>

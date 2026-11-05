@@ -2,7 +2,7 @@
 """run_perf.py -- run the performance tables of record on this machine, under the machine's environment lock.
 
   python3 bench/run_perf.py --machine h200 --out /data/bench-runs/<run> [--tables dense,moe,... | all]
-                            [--fso-path DIR] [--smoke] [--dry-run] [--allow-drift]
+                            [--steps NAME,...] [--fso-path DIR] [--smoke] [--dry-run] [--allow-drift]
 
 There is one command per machine (h200, 5090, b300). It reads the machine's lock, bench/env/<machine>.lock.json
 (the interpreter and the exact package versions of every environment, the driver, the card, the clock and
@@ -30,6 +30,11 @@ compute-mode policy, the GPU lock file and the bench environment), and the machi
    finally block, also on SIGTERM.
 4. After the steps it runs perf_report.py merge into <run_dir>/merged and perf_report.py diff against the
    installed baselines, and saves both outputs (merge.txt, diff_vs_baselines.txt). It never installs anything.
+
+--steps runs only the named steps of the selected tables, in the suite's order, for example a table group's fso
+steps without its comparator steps, or one group split into two runs so that each holds the card for a shorter
+time; the manifest records the selection (steps_selected), and perf_report.py install takes the files those steps
+wrote. A name that is not a step of the selected tables is a usage error.
 
 --smoke runs every step on the cells with M in {1, 64} only and marks the manifest smoke: true, so that
 perf_report.py install refuses the run. --ms LIST does the same with any M list, for analysis runs such as a serving
@@ -382,14 +387,15 @@ def validate_suite(machine, lock=None):
     return problems
 
 
-def resolve_plan(lock, run_dir, tables, ms=None, smoke=False):
+def resolve_plan(lock, run_dir, tables, ms=None, smoke=False, steps=None):
     """The machine's steps in the selected table groups, each with its full command line. ``ms``: the M list of a
-    partial run (--ms), passed to every bench as --Ms; ``smoke`` is ``ms = "1,64"``; neither for a full run."""
+    partial run (--ms), passed to every bench as --Ms; ``smoke`` is ``ms = "1,64"``; neither for a full run.
+    ``steps``: the step names to keep (--steps), or None for every step of the groups."""
     if smoke:
         ms = SMOKE_MS
     plan = []
     for s in perf_suite.SUITES[lock["machine"]]:
-        if s["group"] not in tables:
+        if s["group"] not in tables or (steps is not None and s["name"] not in steps):
             continue
         e = lock["environments"][s["env"]]
         argv = [e["python"], os.path.join(ROOT, s["script"])] + list(s["args"]) + ["--out", os.path.join(run_dir, s["out"])]
@@ -714,7 +720,7 @@ def bench_tree_identity():
 
 
 # ----------------------------------------------------------------------------- printing the plan
-def print_plan(lock, lock_file, lock_sha, plan, envs, run_dir, tables, ms, fso_path, card, tree):
+def print_plan(lock, lock_file, lock_sha, plan, envs, run_dir, tables, ms, fso_path, card, tree, steps=None):
     gpu = lock["gpu"]
     cp, cm = gpu["clock_policy"], gpu["compute_mode"]
     log(f"machine {lock['machine']} ({lock['arch']}, tables tagged sm{lock['sm']}); lock {rel(lock_file)} sha256 {lock_sha[:16]}")
@@ -724,6 +730,8 @@ def print_plan(lock, lock_file, lock_sha, plan, envs, run_dir, tables, ms, fso_p
     log(f"tree {ROOT} ({origin}); bench fingerprint {tree['fingerprint'][:16]}")
     smoke_text = "yes (M in {" + ms + "} only, never installable)" if ms else "no"
     log(f"run directory {run_dir}; tables {', '.join(tables)}; smoke {smoke_text}")
+    if steps is not None:
+        log(f"steps selected (--steps): {', '.join(steps)}; the other steps of these tables do not run")
     log(f"fish_scales_ops path {fso_path or '(none: the environments must provide fish_scales_ops)'}")
     if card:
         log(f"card {card['uuid']}, PCI {card['pci']}, index {card['index']}, {card['name']}, driver {card['driver']}, "
@@ -981,7 +989,12 @@ def run_step(s, env, run_dir, timeout):
 
 
 def acquire_flock(path, wait_s):
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o664)
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o664)
+    except PermissionError:
+        # A lock file that another user created and this one may only read (the RTX 5090 pod's .gpuc1.lock is
+        # root's, mode 0644): flock(2) works on a read-only descriptor, as flock(1) uses it.
+        fd = os.open(path, os.O_RDONLY)
     deadline = time.time() + wait_s
     while True:
         try:
@@ -1059,7 +1072,8 @@ def run(args, lock, lock_file, lock_sha, plan, envs, pre, tree, run_dir):
     man = {"schema": 1, "tool": "bench/run_perf.py", "machine": lock["machine"], "host": pre["host"],
            "run_dir": run_dir, "start_utc": iso(), "end_utc": None, "status": "running",
            "smoke": bool(args.ms), "smoke_ms": args.ms, "allow_drift": bool(args.allow_drift),
-           "tables": list(args.tables), "argv": sys.argv, "harness_python": sys.executable,
+           "tables": list(args.tables), "steps_selected": args.steps, "argv": sys.argv,
+           "harness_python": sys.executable,
            "lock_file": lock_file, "lock_sha256": lock_sha, "lock": lock,
            "suite": {"file": rel(perf_suite.__file__), "sha256": sha256_file(perf_suite.__file__)},
            "bench_tree": tree, "fso_path": args.fso_path,
@@ -1198,6 +1212,8 @@ def parse_args(argv=None):
     ap.add_argument("--lock", help="a lock file other than bench/env/<machine>.lock.json (its machine must match)")
     ap.add_argument("--out", required=True, help="the run directory; it must not exist or be empty")
     ap.add_argument("--tables", default="all", help=f"comma list of table groups ({', '.join(GROUPS)}) or 'all'")
+    ap.add_argument("--steps", default=None,
+                    help="comma list of step names of the selected tables (bench/perf_suite.py): run only these steps")
     ap.add_argument("--fso-path", help="directory put first on PYTHONPATH; it holds the fish_scales_ops package to measure")
     ap.add_argument("--smoke", action="store_true", help=f"every step on M in {{{SMOKE_MS}}} only; never installable")
     ap.add_argument("--ms", default=None,
@@ -1217,6 +1233,9 @@ def parse_args(argv=None):
     if bad or not tables:
         ap.error(f"unknown table group(s) {bad}; known: {', '.join(GROUPS)} or all")
     args.tables = tables
+    args.steps = [n.strip() for n in args.steps.split(",") if n.strip()] if args.steps is not None else None
+    if args.steps is not None and not args.steps:
+        ap.error("--steps needs at least one step name")
     args.out = os.path.abspath(os.path.expanduser(args.out))
     if args.fso_path:
         args.fso_path = os.path.abspath(os.path.expanduser(args.fso_path))
@@ -1243,7 +1262,14 @@ def main(argv=None):
         return EXIT_USAGE
     if args.smoke:
         args.ms = SMOKE_MS
-    plan = resolve_plan(lock, args.out, args.tables, args.ms)
+    if args.steps is not None:
+        known = [s["name"] for s in perf_suite.SUITES[lock["machine"]] if s["group"] in args.tables]
+        unknown = [n for n in args.steps if n not in known]
+        if unknown:
+            print(f"--steps: {', '.join(unknown)} is not a step of the tables {args.tables} of machine "
+                  f"{lock['machine']} (their steps: {', '.join(known)})", file=sys.stderr)
+            return EXIT_USAGE
+    plan = resolve_plan(lock, args.out, args.tables, args.ms, steps=args.steps)
     if not plan:
         print(f"no step of machine {lock['machine']} is in the tables {args.tables}", file=sys.stderr)
         return EXIT_USAGE
@@ -1255,7 +1281,8 @@ def main(argv=None):
     for s in plan:
         if s["env"] not in envs:
             envs[s["env"]] = step_environment(lock, s["env"], args.fso_path, cvd)[1:]
-    print_plan(lock, lock_file, lock_sha, plan, envs, args.out, args.tables, args.ms, args.fso_path, pre["card"], tree)
+    print_plan(lock, lock_file, lock_sha, plan, envs, args.out, args.tables, args.ms, args.fso_path, pre["card"], tree,
+               args.steps)
     ok = print_preflight(pre, args.allow_drift)
     if args.dry_run:
         log("preflight (json): " + json.dumps(pre, default=str, sort_keys=True))

@@ -149,6 +149,33 @@ std::string getNvccCompiler()
     return compiler;
 }
 
+// The one header of the JIT kernels outside deep_gemm/: the architecture-independent dense epilogue
+// (fso_dense_epilogue.cuh includes it), found through the include path under this name.
+inline char const* const kJitEpilogueHeader = "blockscale_gemm/common/epilogue_device.cuh";
+
+// Makes sure `includeDirs` reaches kJitEpilogueHeader. A wheel's _jit_include/ holds it and an in-place build's
+// baked default names its include root (python/setup.py); an FSO_JIT_INCLUDE_DIRS list written before the header
+// existed names only the directory that holds deep_gemm/, which in the source tree is
+// <root>/blockscale_gemm/arch/sm90/fp8/jit, so <root> (five levels up) is appended when it holds the header.
+inline void addJitEpilogueRoot(std::vector<std::filesystem::path>& includeDirs)
+{
+    std::error_code ec;
+    for (auto const& dir : includeDirs)
+    {
+        if (std::filesystem::is_regular_file(dir / kJitEpilogueHeader, ec))
+            return;
+    }
+    for (auto const& dir : includeDirs)
+    {
+        if (!std::filesystem::is_regular_file(dir / "deep_gemm" / "fp8_gemm_impl.cuh", ec))
+            continue;
+        std::filesystem::path const root = (dir / ".." / ".." / ".." / ".." / "..").lexically_normal();
+        if (std::filesystem::is_regular_file(root / kJitEpilogueHeader, ec))
+            includeDirs.push_back(root);
+        return;
+    }
+}
+
 std::vector<std::filesystem::path> getJitIncludeDirs()
 {
     static std::vector<std::filesystem::path> includeDirs;
@@ -198,6 +225,7 @@ std::vector<std::filesystem::path> getJitIncludeDirs()
 #endif
         if (!includeDirs.empty())
         {
+            addJitEpilogueRoot(includeDirs);
             if (kJitDebugging)
             {
                 std::string list;
@@ -224,8 +252,10 @@ std::vector<std::filesystem::path> getJitIncludeDirs()
                     "source tree that built it, so keep that tree in place; or install a wheel built by "
                     "scripts/build_wheel.sh, which carries them in _jit_include/ next to the extension; or set "
                     "FSO_JIT_INCLUDE_DIRS to a colon-separated list of the directory that holds deep_gemm/ "
-                    "(csrc/gemm/include/blockscale_gemm/arch/sm90/fp8/jit in the source tree), the CUDA include "
-                    "directory and its cccl/ subdirectory, and the CUTLASS include directory.\n",
+                    "(csrc/gemm/include/blockscale_gemm/arch/sm90/fp8/jit in the source tree), the directory that "
+                    "holds blockscale_gemm/common/epilogue_device.cuh (csrc/gemm/include; found by itself when it is "
+                    "the source tree's), the CUDA include directory and its cccl/ subdirectory, and the CUTLASS "
+                    "include directory.\n",
                     origin, missing.c_str());
             return includeDirs;
         }
@@ -300,6 +330,40 @@ std::vector<std::filesystem::path> getJitIncludeDirs()
     return includeDirs;
 }
 
+// The dense epilogue a JIT kernel applies (interface v1, issue #12; fso_dense_epilogue.cuh): the variant key of the
+// dense GEMMs, (has_bias, act, has_residual). The identity (the default) generates exactly the source of a build
+// without the key, and keeps the runtime name; any other value is compiled into its own variant: fp8_gemm_kernel /
+// fp8_gemm_kernel_swapAB with the scheduler input NormalSchedulerInputEpi / NormalSchedulerInputSwapABEpi, or
+// sm90_fp8_gemm_1d2d_impl_fso_epilogue with epilogue_op_t Sm90DenseEpilogueOp, under a runtime name with the suffix
+// "_e" + "b" (bias) + "g" (erf-GELU) + "r" (residual).
+struct DenseEpilogueKey
+{
+    bool bias = false;
+    int act = 0; // fso::DenseActivation
+    bool residual = false;
+
+    [[nodiscard]] bool identity() const
+    {
+        return !bias && act == 0 && !residual;
+    }
+
+    // The template arguments <kBias, kAct, kResidual> of the variant.
+    [[nodiscard]] std::string template_args() const
+    {
+        return std::string(bias ? "true" : "false") + ", " + std::to_string(act) + ", " + (residual ? "true" : "false");
+    }
+
+    // The runtime-name suffix: empty for the identity.
+    [[nodiscard]] std::string name_suffix() const
+    {
+        if (identity())
+            return std::string();
+        if (act != 0 && act != 1)
+            throw std::runtime_error("deep_gemm JIT: unknown dense epilogue activation " + std::to_string(act));
+        return std::string("_e") + (bias ? "b" : "") + (act == 1 ? "g" : "") + (residual ? "r" : "");
+    }
+};
+
 // two_wg: the non-swap GroupedContiguous FC1 with two math warp-groups split along N (fp8_gemm_kernel_2wg). Its
 // scheduler enumerates shape_n / (2 * block_n) N-blocks (one per SwiGLU column block), passed explicitly as
 // SchedulerSelector's kNumNBlocks; every other variant emits exactly the source it emitted before the flag existed.
@@ -312,10 +376,13 @@ std::vector<std::filesystem::path> getJitIncludeDirs()
 // explicitly as SchedulerSelectorSwapAB's kNumMBlocks.
 // swapab_split (requires swapab_pair and swiglu): fp8_gemm_kernel_swapAB_swiglu_split, the same fused FC1 with each
 // SwiGLU block shared by the two CTAs of a cluster (H2 Phase 2a); same scheduler, only the kernel name differs.
+// epilogue (GemmType::Normal fp8_gemm_kernel / fp8_gemm_kernel_swapAB only): the dense epilogue variant; a
+// non-identity key changes only the scheduler input type (NormalSchedulerInputEpi / NormalSchedulerInputSwapABEpi).
 std::string generateKernel(uint32_t const shape_n, uint32_t const shape_k, uint32_t const block_m,
     uint32_t const block_n, uint32_t const block_k, uint32_t const num_groups, uint32_t const num_stages,
     uint32_t const num_tma_multicast, deep_gemm::GemmType const gemm_type, bool swapAB = false, bool two_wg = false,
-    bool swiglu = false, bool swapab_pair = false, bool swapab_split = false)
+    bool swiglu = false, bool swapab_pair = false, bool swapab_split = false,
+    DenseEpilogueKey const& epilogue = DenseEpilogueKey{})
 {
     constexpr uint32_t kNumTMAThreads = 128;
     constexpr uint32_t kNumMathThreadsPerGroup = 128;
@@ -352,6 +419,13 @@ std::string generateKernel(uint32_t const shape_n, uint32_t const shape_k, uint3
         throw std::runtime_error("swap-AB gate/up pair FC1 kernel: swap-AB GroupedContiguous only");
     if (swapab_split && !(swapab_pair && swiglu))
         throw std::runtime_error("cluster-split swap-AB FC1 kernel: only as the fused swap-AB gate/up FC1");
+    if (!epilogue.identity())
+    {
+        if (gemm_type != deep_gemm::GemmType::Normal || two_wg || swiglu || swapab_pair || swapab_split)
+            throw std::runtime_error("the dense epilogue: dense (GemmType::Normal) fp8_gemm_kernel / fp8_gemm_kernel_swapAB only");
+        input_type = std::string(swapAB ? "NormalSchedulerInputSwapABEpi<" : "NormalSchedulerInputEpi<")
+            + epilogue.template_args() + ">";
+    }
 
     // Modify kernel name based on swapAB to determine which kernel function to use
     std::string const swiglu_pair_kernel
@@ -414,20 +488,26 @@ __global__ void dummy_kernel() {
 // specialize_n case (c.shape_n), one group, BLOCK_K 128, 128-byte swizzles for A and B, c.swizzle_d for D, 128 TMA
 // threads, 128 or 256 math threads, multicast on A when cluster_n > 1, the SM count, GemmType::Normal, BF16 D and the
 // identity epilogue. As in generateKernel, a dummy kernel takes the instantiation's address so that NVRTC emits it.
-inline std::string generateKernelDg2(Dg2DenseConfig const& c)
+// A non-identity `epilogue` instantiates sm90_fp8_gemm_1d2d_impl_fso_epilogue with epilogue_op_t
+// deep_gemm::Sm90DenseEpilogueOp<kBias, kAct, kResidual> instead; the identity source is unchanged.
+inline std::string generateKernelDg2(Dg2DenseConfig const& c, DenseEpilogueKey const& epilogue = DenseEpilogueKey{})
 {
+    std::string const epilogue_op = epilogue.identity()
+        ? std::string("deep_gemm::epilogue::transform::EpilogueIdentity")
+        : "deep_gemm::Sm90DenseEpilogueOp<" + epilogue.template_args() + ">";
+    std::string const kernel = epilogue.identity() ? "sm90_fp8_gemm_1d2d_impl" : "sm90_fp8_gemm_1d2d_impl_fso_epilogue";
     std::string const args = "cute::UMMA::Major::K, 0u, " + std::to_string(c.shape_n) + "u, 0u, 1u, "
         + std::to_string(c.block_m) + "u, " + std::to_string(c.block_n) + "u, 128u, 128u, 128u, "
         + std::to_string(c.swizzle_d) + "u, " + std::to_string(c.num_stages) + "u, 128u, "
         + std::to_string(c.num_math_threads()) + "u, " + std::to_string(c.cluster_size()) + "u, "
         + (c.multicast_on_a() ? "true" : "false") + ", " + std::to_string(c.num_sms)
-        + "u, deep_gemm::GemmType::Normal, cutlass::bfloat16_t, deep_gemm::epilogue::transform::EpilogueIdentity";
+        + "u, deep_gemm::GemmType::Normal, cutlass::bfloat16_t, " + epilogue_op;
     return R"(
 #include <deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh>
 
 __global__ void dummy_kernel() {
-  void *ptr = (void *)&deep_gemm::sm90_fp8_gemm_1d2d_impl<)"
-        + args + R"(>;
+  void *ptr = (void *)&deep_gemm::)"
+        + kernel + "<" + args + R"(>;
 }
 )";
 }
@@ -481,8 +561,10 @@ private:
 // The deep_gemm header directory a build compiles against and a digest of its contents. The directory is the first
 // include directory holding deep_gemm/fp8_gemm_impl.cuh, which is where NVRTC resolves the generated source's
 // <deep_gemm/...> includes (it searches the -I directories in order); the digest is an FNV-1a 64 over every regular
-// file under it, visited in sorted relative-path order, each file contributing its relative path and its contents.
-// `found` is false when no include directory holds the kernel header or a file cannot be read.
+// file under it, visited in sorted relative-path order, each file contributing its relative path and its contents,
+// followed by kJitEpilogueHeader (its name and contents, from the first include directory that holds it), the one
+// header the kernels include from outside deep_gemm/.
+// `found` is false when no include directory holds the kernel header or the epilogue header, or a file cannot be read.
 struct JitHeaderDigest
 {
     std::filesystem::path dir;
@@ -529,8 +611,25 @@ inline JitHeaderDigest computeJitHeaderDigest(std::vector<std::filesystem::path>
         h.field(rel);
         h.field(contents);
     }
+    bool epilogue_found = false;
+    for (auto const& inc : includeDirs)
+    {
+        std::error_code typeEc;
+        if (!std::filesystem::is_regular_file(inc / kJitEpilogueHeader, typeEc))
+            continue;
+        std::ifstream in(inc / kJitEpilogueHeader, std::ios::binary);
+        if (!in.is_open())
+            return digest;
+        std::string const contents((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        h.field(kJitEpilogueHeader);
+        h.field(contents);
+        epilogue_found = true;
+        break;
+    }
+    if (!epilogue_found)
+        return digest;
     digest.hash = h.value();
-    digest.numFiles = files.size();
+    digest.numFiles = files.size() + 1;
     digest.found = true;
     return digest;
 }
@@ -588,7 +687,8 @@ public:
     Runtime* build(uint32_t const shape_n, uint32_t const shape_k, uint32_t const block_m, uint32_t const block_n,
         uint32_t const block_k, uint32_t const num_groups, uint32_t const num_stages, uint32_t const num_tma_multicast,
         deep_gemm::GemmType const gemm_type, bool swapAB = false, uint32_t const ctas_per_sm = 1, bool two_wg = false,
-        bool swiglu = false, bool swapab_pair = false, bool swapab_split = false, bool weight_evict_first = false)
+        bool swiglu = false, bool swapab_pair = false, bool swapab_split = false, bool weight_evict_first = false,
+        DenseEpilogueKey const& epilogue = DenseEpilogueKey{})
     {
         int sm_version = tensorrt_llm::common::getSMVersion();
         if (sm_version != 90)
@@ -615,7 +715,7 @@ public:
             + std::to_string(block_k) + "_" + std::to_string(num_groups) + "_" + std::to_string(num_stages)
             + std::to_string(num_groups) + "_" + std::to_string(num_stages) + "_" + std::to_string(num_tma_multicast)
             + "_" + gemm_type_to_string(gemm_type) + (ctas_per_sm > 1 ? "_c" + std::to_string(ctas_per_sm) : "")
-            + (weight_evict_first ? "_ef" : "");
+            + (weight_evict_first ? "_ef" : "") + epilogue.name_suffix();
 
         // Hit path, taken by every sm_90 GEMM launch after the first one of its kernel in this process: the name
         // above and one in-memory lookup. No hashing, file-system access or environment read happens here; the rest
@@ -692,7 +792,7 @@ public:
         }
 
         std::string code = generateKernel(shape_n, shape_k, block_m, block_n, block_k, num_groups, num_stages,
-            num_tma_multicast, gemm_type, swapAB, two_wg, swiglu, swapab_pair, swapab_split);
+            num_tma_multicast, gemm_type, swapAB, two_wg, swiglu, swapab_pair, swapab_split, epilogue);
 
         return compileAndCache(name, code, flags, gemm_type);
     }
@@ -702,7 +802,7 @@ public:
     // the diagnostics it suppresses) plus what NVRTC needs for these headers: 128-bit integers (ptx/ld_st.cuh) and,
     // first on the include path, deep_gemm/nvrtc_shim/ with the two standard headers NVRTC does not have (<utility>
     // for std::integer_sequence, <cstddef>). nvcc (FSO_JIT_USE_NVCC) has both natively and gets neither.
-    Runtime* buildDg2(Dg2DenseConfig const& c)
+    Runtime* buildDg2(Dg2DenseConfig const& c, DenseEpilogueKey const& epilogue = DenseEpilogueKey{})
     {
         int sm_version = tensorrt_llm::common::getSMVersion();
         if (sm_version != 90)
@@ -711,7 +811,8 @@ public:
         }
         std::string const name = "gemm_dg2_" + std::to_string(c.block_m) + "x" + std::to_string(c.block_n) + "_s"
             + std::to_string(c.num_stages) + "_c" + std::to_string(c.cluster_m) + "x" + std::to_string(c.cluster_n)
-            + "_d" + std::to_string(c.swizzle_d) + "_n" + std::to_string(c.shape_n) + "_sm" + std::to_string(c.num_sms);
+            + "_d" + std::to_string(c.swizzle_d) + "_n" + std::to_string(c.shape_n) + "_sm" + std::to_string(c.num_sms)
+            + epilogue.name_suffix();
         auto& runtimeCache = getGlobalRuntimeCache();
         if (Runtime* cachedRuntime = runtimeCache.find(name))
         {
@@ -750,7 +851,7 @@ public:
         {
             flags.push_back("-I" + dir.string());
         }
-        return compileAndCache(name, generateKernelDg2(c), flags, deep_gemm::GemmType::Normal);
+        return compileAndCache(name, generateKernelDg2(c, epilogue), flags, deep_gemm::GemmType::Normal);
     }
 
     // Compiles `code` with `flags` (or loads it from the disk cache) into a Runtime and records it in the in-memory
@@ -775,8 +876,9 @@ public:
             if (!headers.found)
             {
                 TLLM_THROW(
-                    "deep_gemm JIT: could not read deep_gemm/fp8_gemm_impl.cuh and its directory under the JIT include "
-                    "directories (FSO_JIT_INCLUDE_DIRS or the build-time default), so the disk cache "
+                    "deep_gemm JIT: could not read deep_gemm/fp8_gemm_impl.cuh and its directory, or "
+                    "blockscale_gemm/common/epilogue_device.cuh, under the JIT include directories "
+                    "(FSO_JIT_INCLUDE_DIRS or the build-time default), so the disk cache "
                     "(FSO_JIT_DUMP_CUBIN / FSO_JIT_USE_NVCC) cannot key %s",
                     name.c_str());
             }

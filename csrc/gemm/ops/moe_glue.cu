@@ -26,6 +26,8 @@
  * combine(1) = 6 kernels, zero torch-op glue.
  */
 
+#include "input_alignment.h"
+
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/torch.h>
@@ -1510,12 +1512,24 @@ constexpr int kCompactRowShift = 7;
 constexpr int kCompactRegPairs = 8;      // pairs per thread kept in registers between counting and placing
 constexpr int kCompactMaxCluster = 8;    // portable cluster size: no cudaFuncSetAttribute, no capture hazard
 // The sm_100/103 compact slot route's work-stealing counter (tile draws, finished CTAs), emitted zeroed next to
-// the slot list (run fso_0.2.1_20261010/S10b-1; grouped_slot_dispatch.cuh / slot_work_stealing.cuh).
+// the slot list (run fso_0.2.1_20261010/S10b-1; grouped_slot_dispatch.cuh / slot_work_stealing.cuh). On sm_100/103
+// the tensor carries 2 * G more words after these two for the fused FC1 + FC2 slot kernel (issue #13 lever 5,
+// slot_moe_scheduler.cuh): G per-slot FC1 completion counters, zeroed (that kernel leaves them nonzero, so the
+// routing op of every layer call zeroes them for that call's kernel), then G packed slot facts, expert | rows << 16
+// for the active slots and -1 after them. With the token-tile list (with_tiles) B = num_blocks more words follow, one
+// per 128-row block of the compact buffer, for the same kernel's token-tile mode (issue #13 lever 5 step 3,
+// slot_moe_scheduler.cuh "The token-tile mode"): block b's word is live_halves << 20, live_halves = 1 or 2 the number of
+// the block's 64-row halves that hold rows (that kernel adds its FC1 completions into the low bits and leaves the word
+// nonzero); the words of blocks past the blocks in use (blk0[G]) are not written. Other architectures have no such
+// kernel and keep the two words.
 constexpr int kCompactSlotSchedWords = 2;
+// The live-halves field of a token-tile block word (slot_moe_scheduler.cuh, kBlockHalvesShift).
+constexpr int kCompactBlockHalvesShift = 20;
 // The sm_100/103 compact slot route's packed list of live 64-row token tiles (run fso_0.2.1_20261010/S10b-3b):
 // entry = q | e << 14 | (r - 1) << 24 with q = 2 * block + half, e the expert, r in 1..64 its rows in the tile
 // (`pack_token_tile` in grouped_slot_dispatch.cuh, which this translation unit cannot include, and the
-// generated kernel's `fso_slot_live_compact` decode the same packing). A block index must stay below 2^13.
+// work-stealing scheduler's tile-list decode in slot_work_stealing.cuh use the same packing). A block index must stay
+// below 2^13.
 constexpr int kCompactTileRows = 64;
 constexpr int kCompactTileMaxBlocks = 1 << 13;
 
@@ -1527,7 +1541,7 @@ struct CompactRoutingArgs
     int32_t* blk0;           // [G + 1]
     int32_t* slot_of_flat;   // [num_pairs]
     int32_t* slot_to_expert; // [G] or nullptr
-    int32_t* slot_sched;     // [kCompactSlotSchedWords] or nullptr: zeroed (the slot route's work-stealing counter)
+    int32_t* slot_sched;     // [kCompactSlotSchedWords + 2G] or nullptr: the slot route's counters and slot facts
     int32_t* problem_shapes; // [P, G, 3] or nullptr
     int64_t* ptr_arrays;     // [P, 3, G] or nullptr
     int32_t* row_map;        // [num_blocks * 128] or nullptr
@@ -1613,6 +1627,24 @@ __device__ __forceinline__ void compact_emit_expert(Args const& a, int g, int cn
 template <class Args>
 __device__ __forceinline__ void compact_emit_slot(Args const& a, int g, int cnt, int act_rank, int n_active)
 {
+    // The fused FC1 + FC2 slot kernel's words of slot g (see kCompactSlotSchedWords), written by the thread that owns
+    // expert g, so they are spread over the threads: its FC1 completion counter, zero for this call, and the slot's
+    // packed facts g | rows << 16 (-1 past the active experts), which give that kernel's scheduler the expert and
+    // its rows in ONE load instead of slot_to_expert[slot] and then masked_m[expert]. That kernel exists on
+    // sm_100/sm_103 only, so only those device passes write the words (and the host allocates them only there);
+    // every other architecture's routing kernels keep exactly the code they had.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030)
+    if (a.slot_sched != nullptr)
+    {
+        int32_t* const done = a.slot_sched + kCompactSlotSchedWords;
+        int32_t* const info = done + a.num_groups;
+        done[g] = 0;
+        if (cnt > 0)
+            info[act_rank] = g | ((cnt < 0xffff ? cnt : 0xffff) << 16);
+        if (g >= n_active)
+            info[g] = -1;
+    }
+#endif
     if (a.slot_to_expert == nullptr)
         return;
     if (cnt > 0)
@@ -1724,6 +1756,9 @@ __device__ __forceinline__ void compact_block_scan1(int v, int* s_wsum, int& exc
 
 // Expert g's entries of the slot route's token-tile list: its k-th 64-row token tile (rows 64k .. 64k + 63 of the
 // expert) is half k % 2 of block b0 + k / 2, i.e. q = 2 * b0 + k, holding min(64, cnt - 64k) rows.
+// On sm_100/103 also the token-tile block words of the expert's blocks (see kCompactSlotSchedWords): block b0 + j holds
+// min(128, cnt - 128j) rows, i.e. two live halves when that is more than 64, else one. Only those device passes write
+// them (and the host allocates them only there), so every other architecture's routing kernels keep their code.
 __device__ __forceinline__ void compact_emit_tiles(CompactRoutingArgs const& a, int g, int cnt, int b0, int t0)
 {
     int const nt = (cnt + kCompactTileRows - 1) / kCompactTileRows;
@@ -1735,6 +1770,18 @@ __device__ __forceinline__ void compact_emit_tiles(CompactRoutingArgs const& a, 
         if (t < a.tiles_cap)
             a.slot_tiles[t] = (2 * b0 + k) | (g << 14) | ((r - 1) << 24);
     }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030)
+    if (a.slot_sched != nullptr)
+    {
+        int32_t* const blocks = a.slot_sched + kCompactSlotSchedWords + 2 * a.num_groups;
+        int const nb = (cnt + kCompactRows - 1) / kCompactRows;
+        for (int j = 0; j < nb; ++j)
+        {
+            int const live = cnt - j * kCompactRows;
+            blocks[b0 + j] = (live > kCompactTileRows ? 2 : 1) << kCompactBlockHalvesShift;
+        }
+    }
+#endif
 }
 
 __device__ __forceinline__ void compact_cluster_arrive()
@@ -2700,8 +2747,14 @@ moe_build_routing_compact(at::Tensor topk_ids, int64_t num_groups, int64_t num_b
     auto row_map = at::empty({with_row_map ? rows : 0}, opts);
     auto weight_of_slot = at::empty({want_w ? rows : 0}, opts.dtype(at::kFloat));
     // With the slot list, the slot route's work-stealing counter, zeroed by the kernel: a per-call tensor, so two
-    // calls in flight never share one, and the slot GEMMs of this call leave it zero for each other.
-    auto slot_sched = at::empty({with_slots ? kCompactSlotSchedWords : 0}, opts);
+    // calls in flight never share one, and the slot GEMMs of this call leave its first two words zero for each other.
+    // On sm_100/103, 2 * G more words follow for the fused FC1 + FC2 slot kernel: its per-slot FC1 counters (zeroed,
+    // serving one call) and the packed per-slot facts; only those device passes write them (compact_emit_slot). With
+    // the token-tile list, num_blocks more: the same kernel's per-block words of its token-tile mode
+    // (compact_emit_tiles).
+    bool const sm100 = at::cuda::getCurrentDeviceProperties()->major == 10;
+    int64_t const slot_moe_words = sm100 ? 2 * G + (with_tiles ? num_blocks : 0) : 0;
+    auto slot_sched = at::empty({with_slots ? kCompactSlotSchedWords + slot_moe_words : 0}, opts);
     // With the token-tile list: the live 64-row token tiles of the slot route past a row capacity of 64, then -1,
     // then their count (int32 [tiles_cap + 1]).
     auto slot_tiles = at::empty({with_tiles ? tiles_cap + 1 : 0}, opts);
@@ -2867,6 +2920,12 @@ at::Tensor moe_combine(at::Tensor dn, at::Tensor slot_of_flat, at::Tensor topk_w
     TORCH_CHECK(H % 8 == 0, "H must be a multiple of 8 (16-byte vectorised combine)");
     TORCH_CHECK(slot_of_flat.numel() == static_cast<int64_t>(M) * topk,
         "slot_of_flat must have M*topk entries");
+    // The kernel reads dn and the bias rows in vectors of kCombineVec bf16 (16 bytes) from their data pointers
+    // (input_alignment.h); refused before anything is allocated or launched. With no token it reads nothing.
+    int constexpr kCombineVecBytes = kCombineVec * static_cast<int>(sizeof(__nv_bfloat16));
+    if (M > 0)
+        detail::require_bf16_vector_aligned(dn, dn.size(0) * dn.size(1), H, kCombineVecBytes,
+            "fish_scales_ops::moe_combine", "dn");
 
     __nv_bfloat16 const* bias_ptr = nullptr;
     if (bias.has_value() && bias->numel() > 0)
@@ -2875,6 +2934,7 @@ at::Tensor moe_combine(at::Tensor dn, at::Tensor slot_of_flat, at::Tensor topk_w
         TORCH_CHECK(b.is_cuda() && b.dtype() == at::kBFloat16 && b.is_contiguous(),
             "bias must be a contiguous CUDA bf16 tensor");
         TORCH_CHECK(b.dim() == 2 && b.size(0) == M && b.size(1) == H, "bias must be [M, H]");
+        detail::require_bf16_vector_aligned(b, M, H, kCombineVecBytes, "fish_scales_ops::moe_combine", "bias");
         bias_ptr = reinterpret_cast<__nv_bfloat16 const*>(b.data_ptr());
     }
     float const* bias_scale_ptr = nullptr;
@@ -2894,6 +2954,10 @@ at::Tensor moe_combine(at::Tensor dn, at::Tensor slot_of_flat, at::Tensor topk_w
         TORCH_CHECK(out.is_cuda() && out.dtype() == at::kBFloat16 && out.is_contiguous(),
             "out must be a contiguous CUDA bf16 tensor");
         TORCH_CHECK(out.dim() == 2 && out.size(0) == M && out.size(1) == H, "out must be [M, H]");
+        // The kernel writes each row of out in vectors of kCombineVec bf16 (16 bytes), as it reads dn
+        // (input_alignment.h); refused before anything is launched.
+        detail::require_out_aligned(out, M, static_cast<int64_t>(H) * 2, kCombineVecBytes,
+            "fish_scales_ops::moe_combine", "out");
     }
     else
     {
@@ -2971,6 +3035,10 @@ at::Tensor moe_combine_sorted(at::Tensor dn, at::Tensor flat_to_sorted, at::Tens
     TORCH_CHECK(H % 8 == 0, "H must be a multiple of 8 (16-byte vectorised combine)");
     TORCH_CHECK(flat_to_sorted.numel() == static_cast<int64_t>(M) * topk,
         "flat_to_sorted must have M*topk entries");
+    // moe_combine's kernel: dn is read in 16-byte vectors (see moe_combine).
+    if (M > 0)
+        detail::require_bf16_vector_aligned(dn, dn.size(0), H, kCombineVec * static_cast<int>(sizeof(__nv_bfloat16)),
+            "fish_scales_ops::moe_combine_sorted", "dn");
 
     auto out = at::empty({M, H}, dn.options());
     constexpr int threads = 256;

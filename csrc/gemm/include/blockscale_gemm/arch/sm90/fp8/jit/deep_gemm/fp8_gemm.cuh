@@ -165,11 +165,15 @@ CUtensorMap make_2d_tma_desc(T* global_address, Layout layout, uint32_t gmem_row
 // for every GEMM it launches through runGemm, runGemmSwapAB, runGemm2wg, runGemm2wgSwiglu, runGemmSwapABSwiglu and
 // runGemmSwapABSwigluSplit. The GroupedWithOffset and StridedBatched launchers below have no caller in this library and
 // launch plain (their kernels' wait is then a no-op).
+// `epilogue` (GemmType::Normal only): the dense epilogue of a kernel built with a non-identity DenseEpilogueKey
+// (Compiler::build); its scheduler input is then NormalSchedulerInputWithEpilogue, which carries the struct. nullptr
+// (the default) launches the identity kernel's argument list.
 template <typename LayoutIndexType>
 void runGemm(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, int ld_d, float* scales_a,
     float* scales_b, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, uint32_t block_m, uint32_t block_n,
     uint32_t block_k, uint32_t num_groups, uint32_t num_tma_multicast, GemmType gemm_type,
-    LayoutIndexType* grouped_layout, cudaStream_t stream, int num_sms, uint32_t smem_size, bool pdl = false)
+    LayoutIndexType* grouped_layout, cudaStream_t stream, int num_sms, uint32_t smem_size, bool pdl = false,
+    fso::DenseEpilogue const* epilogue = nullptr)
 {
     auto tma_a_desc = make_2d_tma_a_desc(
         reinterpret_cast<__nv_fp8_e4m3*>(mat_a), shape_m, shape_k, block_m, block_k, num_groups, gemm_type, ld_a);
@@ -213,8 +217,22 @@ void runGemm(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, 
     input.grouped_layout = grouped_layout;
 
     // Launch
-    auto status = cudaLaunchKernelEx(&config, kernel, reinterpret_cast<__nv_bfloat16*>(mat_d), scales_b, input,
-        tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc);
+    cudaError_t status;
+    if (epilogue != nullptr)
+    {
+        DG_HOST_ASSERT(gemm_type == GemmType::Normal);
+        NormalSchedulerInputWithEpilogue input_epi;
+        input_epi.shape_m = shape_m;
+        input_epi.grouped_layout = grouped_layout;
+        input_epi.epilogue = *epilogue;
+        status = cudaLaunchKernelEx(&config, kernel, reinterpret_cast<__nv_bfloat16*>(mat_d), scales_b, input_epi,
+            tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc);
+    }
+    else
+    {
+        status = cudaLaunchKernelEx(&config, kernel, reinterpret_cast<__nv_bfloat16*>(mat_d), scales_b, input,
+            tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc);
+    }
     DG_HOST_ASSERT(status == cudaSuccess);
 }
 
@@ -232,9 +250,11 @@ void runGemm(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, 
 // decides which L2 partition serves each tile's operands; for the 64-row tiles it made the same kernel 25 % slower
 // (Family A down GEMM, M = 160, ncu with cold caches: 22.6 against 17.2-18.2 us, 50 % more L2 lookups and fabric
 // sectors; P2, /data/bench-runs/fso_0.2.1_20261010/P2/runs/gpu2_ncu).
+// `epilogue`: the dense epilogue of a kernel built by Compiler::buildDg2 with a non-identity DenseEpilogueKey
+// (sm90_fp8_gemm_1d2d_impl_fso_epilogue, whose last argument it is); nullptr launches DeepGEMM's argument list.
 inline void runGemmDg2(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, int ld_d,
     float* scales_a, float* scales_b, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
-    jit::Dg2DenseConfig const& cfg, cudaStream_t stream, bool pdl)
+    jit::Dg2DenseConfig const& cfg, cudaStream_t stream, bool pdl, fso::DenseEpilogue const* epilogue = nullptr)
 {
     constexpr uint32_t block_k = 128;
     auto tma_a_desc = make_2d_tma_a_desc(reinterpret_cast<__nv_fp8_e4m3*>(mat_a), shape_m, shape_k, cfg.block_m,
@@ -275,17 +295,28 @@ inline void runGemmDg2(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, 
     config.numAttrs = num_attrs;
 
     int* grouped_layout = nullptr;
-    auto status = cudaLaunchKernelEx(&config, kernel, scales_b, grouped_layout, shape_m, shape_n, shape_k, tma_a_desc,
-        tma_b_desc, tma_d_desc, tma_sfa_desc);
+    cudaError_t status;
+    if (epilogue != nullptr)
+    {
+        fso::DenseEpilogue epi = *epilogue; // non-const: cudaLaunchKernelEx takes the arguments' addresses as void*
+        status = cudaLaunchKernelEx(&config, kernel, scales_b, grouped_layout, shape_m, shape_n, shape_k, tma_a_desc,
+            tma_b_desc, tma_d_desc, tma_sfa_desc, epi);
+    }
+    else
+    {
+        status = cudaLaunchKernelEx(&config, kernel, scales_b, grouped_layout, shape_m, shape_n, shape_k, tma_a_desc,
+            tma_b_desc, tma_d_desc, tma_sfa_desc);
+    }
     DG_HOST_ASSERT(status == cudaSuccess);
 }
 
-// `pdl`: as runGemm.
+// `pdl`: as runGemm. `epilogue` (GemmType::Normal only): as runGemm, with NormalSchedulerInputSwapABWithEpilogue.
 template <typename LayoutIndexType>
 void runGemmSwapAB(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, int ld_d,
     float* scales_a, float* scales_b, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, uint32_t block_m,
     uint32_t block_n, uint32_t block_k, uint32_t num_groups, uint32_t num_tma_multicast, GemmType gemm_type,
-    LayoutIndexType* grouped_layout, cudaStream_t stream, int num_sms, uint32_t smem_size, bool pdl = false)
+    LayoutIndexType* grouped_layout, cudaStream_t stream, int num_sms, uint32_t smem_size, bool pdl = false,
+    fso::DenseEpilogue const* epilogue = nullptr)
 {
     auto tma_a_desc = make_2d_tma_a_desc_swapAB(
         reinterpret_cast<__nv_fp8_e4m3*>(mat_a), shape_m, shape_k, block_m, block_k, num_groups, gemm_type, ld_a);
@@ -320,8 +351,22 @@ void runGemmSwapAB(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int 
     input.shape_n = shape_n;
     input.grouped_layout = grouped_layout;
 
-    auto status = cudaLaunchKernelEx(&config, kernel, reinterpret_cast<__nv_bfloat16*>(mat_d), scales_a, input,
-        tma_a_desc, tma_b_desc, tma_scales_b_desc, tma_d_desc);
+    cudaError_t status;
+    if (epilogue != nullptr)
+    {
+        DG_HOST_ASSERT(gemm_type == GemmType::Normal);
+        NormalSchedulerInputSwapABWithEpilogue input_epi;
+        input_epi.shape_n = shape_n;
+        input_epi.grouped_layout = grouped_layout;
+        input_epi.epilogue = *epilogue;
+        status = cudaLaunchKernelEx(&config, kernel, reinterpret_cast<__nv_bfloat16*>(mat_d), scales_a, input_epi,
+            tma_a_desc, tma_b_desc, tma_scales_b_desc, tma_d_desc);
+    }
+    else
+    {
+        status = cudaLaunchKernelEx(&config, kernel, reinterpret_cast<__nv_bfloat16*>(mat_d), scales_a, input,
+            tma_a_desc, tma_b_desc, tma_scales_b_desc, tma_d_desc);
+    }
     DG_HOST_ASSERT(status == cudaSuccess);
 }
 

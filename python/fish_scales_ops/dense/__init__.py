@@ -14,6 +14,27 @@ one code path and never names an architecture or a scale layout::
     fso.dense.supported("mxfp8")     # can this device serve the format?
     print(fso.dense.describe())      # the architecture matrix, for logs and errors
 
+Interface v1 (issue #12) adds, on the same handle:
+
+    xq, sx = fso.dense.quantize_activation(x)          # the activation contract of this device
+    y = fso.dense.linear(xq, weight, x_scale=sx)       # pre-quantized activation: no quantize inside
+    y = fso.dense.linear(x, weight, bias=b, residual=r, activation="gelu_erf")   # epilogue arguments
+    xq2, sx2 = fso.dense.linear_quantized(x, weight, bias=b, activation="gelu_erf")
+    fso.dense.activation_contract()                    # the layout and rounding rule, versioned
+    fso.dense.include_dir()                            # holds fso/activation_contract.h
+
+``x_scale`` is complete on every architecture. The epilogue arguments (``bias``, ``residual``, ``activation``)
+and ``linear_quantized`` are validated and passed down to the architecture's GEMM. In this build sm_90 (all three
+of its dense kernels), the sm_100/sm_103 C++ cascade (tier 3) and sm_120/sm_121 (every route of its MXFP8 cascade)
+apply ``bias``, ``residual`` and ``activation`` (one launch, one rounding), the sm_100/sm_103 swap-AB row (the
+M <= 64 decode band and the narrow-N long-K band above it) applies them too and tier 1 (cuBLAS ``scaled_mm``) the
+``bias``, and the sm_100/sm_103 router sends a call to the first tier of its shape that applies every field it
+carries. ``linear_quantized`` is served by every route of the
+sm_120/sm_121 MXFP8 cascade and by the sm_100/sm_103 C++ cascade, which every such call reaches through that
+fall-through (the GEMM writes the quantized result in its own launch). The routes that apply none of the fields
+(sm_120/sm_121 block-FP8 1x128), and ``linear_quantized`` on sm_90, refuse them with ``NotImplementedError`` naming
+the architecture and the route, before anything is launched.
+
 ``format`` names what the caller holds. ``"bsfp8"`` is a float8_e4m3fn weight
 with fp32 128x128 block scales (value = fp8 * scale), or a bf16 weight that is
 quantized to block-FP8 at load time. ``"mxfp8"`` is a bf16 weight that is
@@ -39,17 +60,28 @@ opaque node and the caller registers nothing. The explicit, format-specific ops
 it is built from are in :mod:`fish_scales_ops.compat`.
 """
 import dataclasses
+import math
+import os
 
 import torch
 
 from .._arch import sm_major
-from ..gemm.fp8 import quantize_128x128_fp8
-from ..gemm.mxfp8 import _ue8m0_scale_handle, linear_mxfp8, quantize_1x32_fp8
+from ..gemm import _epilogue
+from ..gemm.fp8 import _sm90_act_scale, linear_fp8, quantize_128x128_fp8
+from ..gemm.mxfp8 import _sm_count, _ue8m0_scale_handle, linear_mxfp8, quantize_1x32_fp8
 # One architecture probe and one parser of the ``arch`` argument, shared with fso.moe,
 # and the sm_90 JIT compiler line both describe() functions end with.
 from ..moe import _arch_label, _arch_major, _build_line, _device_arch, _sm90_jit_compiler_line
 
-__all__ = ["FORMATS", "DenseWeight", "prepare_weight", "linear", "supported", "describe"]
+__all__ = ["FORMATS", "ACTIVATIONS", "DenseWeight", "prepare_weight", "linear", "linear_quantized",
+           "quantize_activation", "activation_contract", "include_dir", "supported", "describe"]
+
+# The activations the epilogue knows (interface v1): None, or one of these names.
+ACTIVATIONS = _epilogue.ACTIVATIONS
+
+# The version of the activation contract (the xq / x_scale layout and the quantizer rule) that
+# quantize_activation produces, linear(x_scale=...) accepts and fso/activation_contract.h states.
+_CONTRACT_VERSION = 1
 
 # The formats prepare_weight accepts, and the architecture majors that serve each.
 FORMATS = ("bsfp8", "mxfp8")
@@ -118,11 +150,12 @@ def describe() -> str:
                "to 1x128 inside the GEMM op",
             10: "served: dequantized block by block at load time and requantized to MXFP8 1x32 (a bf16 "
                 "weight is quantized to MXFP8 directly); every call runs the 1x32 activation quantize "
-                "and the MXFP8 router (the M <= 64 decode row, cuBLAS scaled_mm, the CuTe-DSL tier, "
+                "and the MXFP8 router (the swap-AB row: the M <= 64 decode band and the narrow-N long-K "
+                "band above it; cuBLAS scaled_mm, the CuTe-DSL tier, "
                 "the C++ cascade)",
             12: "served: dequantized block by block at load time and requantized to MXFP8 1x32 (a bf16 "
-                "weight is quantized to MXFP8 directly); every call runs the 1x32 activation quantize "
-                "and the CUTLASS MXFP8 cascade",
+                "weight is quantized to MXFP8 directly); a call runs the MXFP8 routes of format 'mxfp8' "
+                "below",
         },
         "mxfp8": {
             9: "not served: sm_90 has no MXFP8 hardware; serve a block-FP8 checkpoint or a bf16 "
@@ -131,8 +164,11 @@ def describe() -> str:
                 "keeps its bytes, uint8 UE8M0 scales packed into the atom layout; every call runs the "
                 "1x32 activation quantize and the MXFP8 router",
             12: "served: a bf16 weight is quantized to MXFP8 1x32 at load time and an MXFP8 checkpoint "
-                "keeps its bytes, its scale packed or restored to the K-major layout the GEMM reads; "
-                "every call runs the 1x32 activation quantize and the CUTLASS MXFP8 cascade",
+                "keeps its bytes, its scale packed or restored to the N-fastest layout the GEMM reads; "
+                "in the decode band (M <= 64) the small-M route sm120.smallm serves the shapes its "
+                "rules pick (one launch for a bf16 x, the activation quantized inside the kernel; the "
+                "2b call likewise), every other call runs the 1x32 activation quantize and the "
+                "CUTLASS MXFP8 cascade",
         },
     }
     heads = {
@@ -154,8 +190,16 @@ def describe() -> str:
                  "prepare_weight raises and nothing falls back.")
     if major not in (9, 10, 12):
         lines.append(f"This device ({_arch_label(arch)}) serves no format.")
-    lines.append("linear(): x is bf16 [..., K] and the result bf16 [..., N]; the activation is quantized "
-                 "inside the op on every call, and there is no bias argument.")
+    lines.append("linear(): x is bf16 [..., K], quantized inside the op, or the float8_e4m3fn [M, K] of "
+                 "quantize_activation with its x_scale (activation contract v1, no quantize inside); the result "
+                 "is bf16 [..., N]. The epilogue arguments bias / residual / activation and linear_quantized are "
+                 "validated and passed to the architecture's GEMM: sm_90, the sm_100/sm_103 swap-AB row and C++ "
+                 "cascade and the sm_120/sm_121 MXFP8 cascade apply bias, residual and gelu_erf inside their GEMM, "
+                 "sm_100/sm_103 tier 1 (cuBLAS scaled_mm) the bias, and the sm_100/sm_103 router sends a call to "
+                 "the first tier of its shape that applies every field it carries; the sm_120/sm_121 MXFP8 cascade "
+                 "and the sm_100/sm_103 C++ cascade (where every such call lands) also write linear_quantized's "
+                 "result in their own launch; the routes that apply none (sm_120/sm_121 block-FP8 1x128), and "
+                 "linear_quantized on sm_90, refuse them with NotImplementedError before anything is launched.")
     if major == 9:
         lines.append(_sm90_jit_compiler_line())
     return "\n".join(lines)
@@ -181,7 +225,7 @@ class DenseWeight:
         weight: float8_e4m3fn ``[N, K]``.
         scale: the architecture-native scale tensor of ``weight``: fp32
             ``[ceil(N/128), K/128]`` for kind ``"bsfp8"``; for kind ``"mxfp8"``
-            int32 ``[N, K/128]`` in the K-major layout on sm_120/sm_121, and a
+            int32 ``[N, K/128]`` with strides ``(1, N)`` (N fastest) on sm_120/sm_121, and a
             1-D int32 tensor in the CUTLASS block-scaled atom layout on
             sm_100/sm_103.
     """
@@ -234,6 +278,20 @@ def _arch_error(fmt: str, arch: int) -> NotImplementedError:
         f"and sm_120/sm_121. Serve this weight with another GEMM here.")
 
 
+def _aligned_storage(t: torch.Tensor, align: int = 16) -> torch.Tensor:
+    """``t``, or a copy of it with the same shape, strides and bytes in an allocation of its own when its data pointer
+    is not a multiple of ``align`` bytes. :func:`prepare_weight` keeps a caller's checkpoint tensor in the handle where
+    it can, and the GEMMs read the handle's tensors in place (TMA needs 16 bytes; the CuTe-DSL tier of sm_100/sm_103
+    takes a weight scale only at 32 bytes), so a kept tensor that is a view at such an offset is copied once here, at
+    load time, and never per call. Every other tensor of a handle is a fresh allocation, which the caching allocator
+    aligns far beyond both."""
+    if t.numel() == 0 or t.data_ptr() % align == 0:
+        return t
+    out = torch.empty_strided(tuple(t.shape), tuple(t.stride()), dtype=t.dtype, device=t.device)
+    out.copy_(t)
+    return out
+
+
 def _block_scale(scale, n: int, k: int, device, ctx: str) -> torch.Tensor:
     """Validate the fp32 128x128 block scales of a block-FP8 [N, K] weight; returns
     them contiguous (the row-major layout every block-FP8 consumer reads)."""
@@ -255,13 +313,13 @@ def _mxfp8_scale(scale, n: int, k: int, device, major: int, ctx: str) -> torch.T
     layout the GEMM reads.
 
     On sm_120/sm_121 ``quantize_1x32_fp8`` returns int32 ``[N, K/128]`` with the
-    strides ``(1, N)`` (K-major: the words of one 128-wide K block are adjacent
+    strides ``(1, N)`` (N fastest: the words of one 128-wide K block are adjacent
     across rows), and the GEMM reads those bytes by raw pointer. A safetensors
     round trip stores ``.contiguous()``, which keeps every element's value but
     rewrites the bytes row-major, strides ``(K/128, 1)``; handed to the GEMM as it
     is, that tensor would be read in the wrong order and the result would be wrong
     without an error. Both forms are accepted here, and the row-major one is
-    rewritten to the K-major layout. With ``K/128 == 1`` the two forms are the
+    rewritten to the N-fastest layout. With ``K/128 == 1`` the two forms are the
     same bytes. On sm_100/sm_103 the scale is a 1-D tensor in the CUTLASS
     block-scaled atom layout, which a round trip leaves unchanged.
     """
@@ -291,11 +349,11 @@ def _mxfp8_scale(scale, n: int, k: int, device, major: int, ctx: str) -> torch.T
         if kb == 1:
             return s.contiguous()  # one word per row: both stride forms are the same bytes
         if s.stride() == (1, n):
-            return s  # the K-major form quantize_1x32_fp8 returns
+            return s  # the N-fastest form quantize_1x32_fp8 returns
         if s.stride() == (kb, 1):
-            return s.t().contiguous().t()  # the .contiguous() form of a round trip, restored to K-major
+            return s.t().contiguous().t()  # the .contiguous() form of a round trip, restored to N fastest
         raise ValueError(
-            f"{ctx}: the MXFP8 scale has strides {tuple(s.stride())}; it must be the K-major tensor "
+            f"{ctx}: the MXFP8 scale has strides {tuple(s.stride())}; it must be the N-fastest tensor "
             f"quantize_1x32_fp8 returns (strides (1, {n})) or its .contiguous() copy (strides ({kb}, 1)). "
             f"Any other view (a transpose, a slice) does not describe the scale bytes the GEMM reads")
     want = n * kb
@@ -359,8 +417,8 @@ def _requantize_block_fp8(wq: torch.Tensor, scale: torch.Tensor, major: int):
 
     The 1x32 quantizer works row by row along K, so converting in row chunks gives
     the bytes of one call over the whole weight. The chunks' scales are placed in
-    the layout one call would produce: on sm_120/sm_121 row ``r`` of the K-major
-    ``[N, K/128]`` tensor, on sm_100/sm_103 the atom layout's words of rows
+    the layout one call would produce: on sm_120/sm_121 row ``r`` of the N-fastest
+    ``[N, K/128]`` tensor (strides ``(1, N)``), on sm_100/sm_103 the atom layout's words of rows
     ``[r0, r1)``, which are the contiguous range ``[r0 * K/128, r1 * K/128)``
     because the atom layout stores each 128-row block in one contiguous run.
     """
@@ -406,8 +464,8 @@ def prepare_weight(w, *, format, scale=None) -> DenseWeight:
               bytes on every architecture; it is packed here into this device's
               layout. The arch-native form is the int32 scale that
               :func:`fish_scales_ops.compat.quantize_1x32_fp8` returns for the
-              weight on this architecture, accepted in the K-major form the
-              quantizer returns and in the ``.contiguous()`` form a safetensors
+              weight on this architecture, accepted in the N-fastest form (strides
+              ``(1, N)``) the quantizer returns and in the ``.contiguous()`` form a safetensors
               round trip produces; the latter is rewritten to the layout the GEMM
               reads.
         scale: the scale of a float8_e4m3fn weight; omitted for a bf16 one.
@@ -444,6 +502,11 @@ def prepare_weight(w, *, format, scale=None) -> DenseWeight:
     sm_100/sm_103 and sm_120/sm_121 keeps the caller's weight tensor as well; its
     scale is a new tensor when it arrives as uint8 bytes or in the row-major int32
     form.
+
+    Alignment: every tensor of the returned handle starts on a 16-byte boundary
+    (the int32 scale of sm_100/sm_103 on a 32-byte one), which the GEMMs need. A
+    kept checkpoint tensor that is a view at another offset is copied into a
+    tensor of its own here, once; :func:`linear` never copies a weight.
 
     Returns:
         :class:`DenseWeight`.
@@ -501,7 +564,7 @@ def prepare_weight(w, *, format, scale=None) -> DenseWeight:
         if is_fp8:
             s = _block_scale(scale, n, k, w.device, ctx)
             if kind == "bsfp8":
-                return DenseWeight("bsfp8", fmt, arch, k, n, wd.contiguous(), s)
+                return DenseWeight("bsfp8", fmt, arch, k, n, _aligned_storage(wd.contiguous()), _aligned_storage(s))
             q, sq = _requantize_block_fp8(wd.contiguous(), s, major)
         elif kind == "bsfp8":
             q, sq = quantize_128x128_fp8(wd)  # the sm_90 default: fp32 scales amax / 448
@@ -515,32 +578,227 @@ def prepare_weight(w, *, format, scale=None) -> DenseWeight:
             sq = _ue8m0_scale(scale, n, k, w.device, major, ctx)
         else:
             sq = _mxfp8_scale(scale, n, k, w.device, major, ctx)
-        return DenseWeight("mxfp8", fmt, arch, k, n, wd.contiguous(), sq)
+        return DenseWeight("mxfp8", fmt, arch, k, n, _aligned_storage(wd.contiguous()),
+                           _aligned_storage(sq, 32 if major == 10 else 16))
     q, sq = quantize_1x32_fp8(wd)
     return DenseWeight("mxfp8", fmt, arch, k, n, q, sq)
 
 
-@torch.library.custom_op(
-    "fish_scales_ops::dense_linear",
-    mutates_args=(),
-    schema="(Tensor x, Tensor weight, Tensor scale, str kind) -> Tensor",
-)
-def _dense_linear_op(x, weight, scale, kind):
-    """The body of ``torch.ops.fish_scales_ops.dense_linear``: check the arguments'
-    metadata, then dispatch on the handle's kind and on this device's
-    architecture. Every check reads shapes, strides and dtypes only, so the op
-    neither synchronizes the device nor depends on tensor values."""
-    major = sm_major()
-    where = _arch_label(_device_arch())
-    op = f"fish_scales_ops::dense_linear ({where}, kind {kind!r})"
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The activation contract (version 1): the xq / x_scale form quantize_activation produces and linear(x_scale=...) takes.
+# ---------------------------------------------------------------------------------------------------------------------
+
+def _align(v, a: int):
+    return (v + a - 1) // a * a
+
+
+def _act_scale_meta(major: int, m, k: int):
+    """(dtype, shape, strides) of the activation scale of an [m, k] activation on this architecture family: exactly
+    the tensor quantize_activation returns (quantize_1x128_contract on sm_90, quantize_1x32_fp8 on sm_100/sm_103
+    and sm_120/sm_121). ``m`` may be a SymInt (the fakes)."""
+    kb = k // 128
+    if major == 9:
+        mp = _align(m, 4)
+        return torch.float32, (mp, kb), (1, mp)
+    if major == 12:
+        mp = _align(m, 4)
+        return torch.int32, (mp, kb), (1, mp)
+    return torch.int32, (_align(m, 128) * kb,), (1,)
+
+
+def _empty_act_scale(major: int, m, k: int, device) -> torch.Tensor:
+    dtype, shape, strides = _act_scale_meta(major, m, k)
+    return torch.empty_strided(shape, strides, dtype=dtype, device=device)
+
+
+def _contract_layout(major: int) -> dict:
+    """The x_scale part of activation contract v1 on this architecture family, as data."""
+    if major == 9:
+        return {
+            "format": "bsfp8_1x128",
+            "x_scale_dtype": "float32",
+            "x_scale_shape": "[align(M, 4), K/128]",
+            "x_scale_strides": "(1, align(M, 4)): M fastest, so torch indexing is exact (x_scale[m, kb] is the scale "
+                               "of row m, group kb)",
+            "x_scale_index": "scale(m, kb) = x_scale[m, kb] = x_scale.data_ptr()[kb * align(M, 4) + m]",
+            "padded_rows": "zero (0.f)",
+            "rule": "per 128-element group of a row: amax = max |x| in fp32, floored at bf16(1e-10f) = 1.00044e-10 "
+                    "(fp32 bits 0x2EDC0000) for every K; qs = 448.f / amax; scale = 1.f / qs (fp32, not a power of "
+                    "two); code = cvt.rn.satfinite.e4m3(x * qs). This is the quantize linear(x, w) runs inside "
+                    "linear_qx; fso.compat.quantize_1x128_fp8 differs from it for K % 512 == 0 (it floors at 1e-10f) "
+                    "on a group whose amax is below 1.00044e-10, and leaves the padded rows unwritten when "
+                    "K % 512 != 0",
+            "header_functions": ["fso_bsfp8_amax_floor()", "fso_bsfp8_quant_scale(amax, &scale)",
+                                 "fso_bsfp8_quantize4(x0, x1, x2, x3, qs)", "fso_bsfp8_scale_index(m, kb, m_pad)"],
+        }
+    common_rule = ("per 32-element block of a row: amax = max |x| in fp32, floored at 1e-10f; q = 448.f / amax; "
+                   "d = 1.f / q; b = exp_field(d) + (mantissa(d) != 0), capped at 254; code = "
+                   "cvt.rn.satfinite.e4m3(x * 2^(127 - b)); word(m, kp) = b0 | b1 << 8 | b2 << 16 | b3 << 24 with b_i "
+                   "the byte of block 4 * kp + i; byte b means the scale 2^(b - 127)")
+    if major == 12:
+        return {
+            "format": "mxfp8_1x32",
+            "x_scale_dtype": "int32",
+            "x_scale_shape": "[align(M, 4), K/128]",
+            "x_scale_strides": "(1, align(M, 4)): M fastest, so torch indexing is exact (x_scale[m, kp] is word "
+                               "(m, kp))",
+            "x_scale_index": "word(m, kp) = x_scale[m, kp] = x_scale.data_ptr()[kp * align(M, 4) + m]",
+            "padded_rows": "zero words",
+            "rule": common_rule,
+            "header_functions": ["fso_mx_amax_floor()", "fso_e8m0_from_amax(amax, &quant_scale)",
+                                 "fso_mx_quantize4(x0, x1, x2, x3, quant_scale)", "fso_mx_pack_word(b0, b1, b2, b3)",
+                                 "fso_mx_sf_word_index_sm120(m, kp, m_pad)"],
+        }
+    return {
+        "format": "mxfp8_1x32",
+        "x_scale_dtype": "int32",
+        "x_scale_shape": "[align(M, 128) * K/128] (1-D)",
+        "x_scale_strides": "(1,)",
+        "x_scale_index": "word(m, kp) = x_scale.data_ptr()[((m / 128) * (K/128) + kp) * 128 + (m % 32) * 4 + "
+                         "(m % 128) / 32] (the CUTLASS Sm1xxBlockScaledConfig atom layout)",
+        "padded_rows": "zero words",
+        "rule": common_rule,
+        "header_functions": ["fso_mx_amax_floor()", "fso_e8m0_from_amax(amax, &quant_scale)",
+                             "fso_mx_quantize4(x0, x1, x2, x3, quant_scale)", "fso_mx_pack_word(b0, b1, b2, b3)",
+                             "fso_mx_sf_word_index_sm100(m, kp, k)"],
+    }
+
+
+def _contract_want(major: int, m: int, k: int) -> str:
+    dtype, shape, strides = _act_scale_meta(major, m, k)
+    dt = "fp32" if dtype == torch.float32 else "int32"
+    if major in (9, 12):
+        form = "M fastest: element (m, j) at j * align(M, 4) + m"
+    else:
+        form = "the 1-D Sm1xx atom layout"
+    return f"{dt} {list(shape)} with strides {tuple(strides)} ({form}) for an [M, K] = [{m}, {k}] activation"
+
+
+def activation_contract() -> dict:
+    """The activation contract of this device, as data: what :func:`quantize_activation` returns and
+    ``linear(xq, weight, x_scale=sx)`` accepts, and the quantizer rule that produces it, bit for bit. The same
+    contract is stated in C++ by ``fso/activation_contract.h`` under :func:`include_dir`, for a caller that writes the
+    quantized activation from its own kernel (``kFsoActivationContractVersion``). The version changes whenever the
+    layout or the rule does.
+
+    Keys: ``version`` (1), ``arch``, ``format`` (``"mxfp8_1x32"`` on sm_100/sm_103 and sm_120/sm_121,
+    ``"bsfp8_1x128"`` on sm_90), ``xq`` (dtype and layout of the quantized activation), ``k_multiple`` (128), the
+    ``x_scale_*`` entries (dtype, shape, strides, physical index of a scale word, padded rows), ``rule``,
+    ``header`` and ``header_functions``, ``include_dir``. Raises NotImplementedError on an architecture with no
+    dense route.
+    """
+    arch = _device_arch()
+    major = arch // 10
+    if major not in (9, 10, 12):
+        raise NotImplementedError(f"fso.dense.activation_contract: this device ({_arch_label(arch)}) has no dense "
+                                  f"route and therefore no activation contract; the contract exists on sm_90, "
+                                  f"sm_100/sm_103 and sm_120/sm_121")
+    out = {"version": _CONTRACT_VERSION, "arch": _arch_label(arch)}
+    layout = _contract_layout(major)
+    out["format"] = layout.pop("format")
+    out["xq"] = {"dtype": "float8_e4m3fn", "shape": "[M, K]", "layout": "row-major, contiguous, 16-byte aligned"}
+    out["k_multiple"] = 128
+    out.update(layout)
+    out["header"] = "fso/activation_contract.h"
+    out["include_dir"] = include_dir()
+    return out
+
+
+def include_dir() -> str:
+    """The directory that holds ``fso/activation_contract.h`` (pass it as an include path, e.g. ``-I`` or
+    ``extra_include_paths`` of ``torch.utils.cpp_extension.load_inline``). It ships inside the package."""
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "include")
+
+
+def _check_x_scale(op: str, major: int, x_scale, m: int, k: int, device) -> None:
+    """Validate ``x_scale`` against activation contract v1 from its metadata (dtype, device, shape, strides,
+    alignment); a mismatch is a ValueError naming the contract version and the expected layout."""
+    want = _contract_want(major, m, k)
+    head = f"{op}: x_scale does not follow activation contract v1 of this device (expected {want})"
+    if not isinstance(x_scale, torch.Tensor):
+        raise ValueError(f"{head}; got {type(x_scale).__name__}")
+    dtype, shape, strides = _act_scale_meta(major, m, k)
+    if x_scale.dtype != dtype:
+        raise ValueError(f"{head}; got dtype {x_scale.dtype}. Produce it with fso.dense.quantize_activation on "
+                         f"this device")
+    if x_scale.device != device:
+        raise ValueError(f"{head}; got a tensor on {x_scale.device}, the weight is on {device}")
+    if x_scale.dim() != len(shape) or tuple(x_scale.shape) != tuple(shape):
+        raise ValueError(f"{head}; got shape {list(x_scale.shape)}. A scale produced on another architecture or "
+                         f"for another M is not valid here")
+    if x_scale.numel() > 0:
+        # The [align(M, 4), K/128] layouts (sm_90, sm_120/sm_121) are M fastest: the strides are compared on the dims
+        # of size > 1, which with K/128 == 1 leaves only the unit stride of the M dim (is_contiguous).
+        if major in (9, 12) and k // 128 > 1:
+            ok = x_scale.stride() == tuple(strides)
+        else:
+            ok = x_scale.is_contiguous()
+        if not ok:
+            hint = ""
+            if major in (9, 12) and x_scale.is_contiguous():
+                hint = (". These are row-major strides (K/128, 1), the strides of a .contiguous() copy of the "
+                        "M-fastest tensor" + (" and of fso.compat.quantize_1x128_fp8's scale" if major == 9 else "")
+                        + "; pass the tensor quantize_activation returned")
+            raise ValueError(f"{head}; got strides {tuple(x_scale.stride())}{hint}")
+        if x_scale.data_ptr() % 16 != 0:
+            raise ValueError(f"{head}; its data pointer is not 16-byte aligned (offset {x_scale.data_ptr() % 16})")
+
+
+def _check_xq(op: str, x, device) -> None:
+    """The pre-quantized activation: float8_e4m3fn [M, K], 2-D, contiguous, on the weight's device, 16-byte aligned."""
+    if x.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"{op}: with x_scale, x must be the float8_e4m3fn [M, K] activation of "
+                         f"fso.dense.quantize_activation (activation contract v1), got {x.dtype}")
+    if x.device != device:
+        raise ValueError(f"{op}: x is on {x.device} and the weight on {device}")
+    if not x.is_contiguous():
+        raise ValueError(f"{op}: the float8_e4m3fn activation must be contiguous (row-major [M, K], activation "
+                         f"contract v1), got strides {tuple(x.stride())}")
+    if x.numel() > 0 and x.data_ptr() % 16 != 0:
+        raise ValueError(f"{op}: the float8_e4m3fn activation's data pointer is not 16-byte aligned (offset "
+                         f"{x.data_ptr() % 16}); activation contract v1 requires it")
+
+
+def _x_bf16_storage(x):
+    """The bf16 activation (x_scale None, and quantize_activation's x) in storage the quantize kernels can read.
+    They read it in vectors from its data pointer, and a contiguous view at an element offset that is not a multiple
+    of 8 can start below the 16-byte boundary their widest loads need (the raw ops underneath refuse what their kernel
+    cannot read, input_alignment.h). Such an x is copied into a tensor of its own (one copy kernel; the caching
+    allocator returns blocks aligned far beyond 16 bytes), so every bf16 x the interface accepts runs; a
+    non-contiguous x is copied by .contiguous() further down anyway. Called in the op bodies, which run on real
+    tensors: under torch.compile the fakes stand in for them, and inside a CUDA-graph capture the copy is captured
+    with the call."""
+    if x.numel() > 0 and x.is_contiguous() and x.data_ptr() % 16 != 0:
+        return x.clone()
+    return x
+
+
+def _check_operands(op: str, x, weight, x_scale) -> None:
+    """Shapes and dtypes of x and weight, and the pairing of an fp8 x with its x_scale."""
     if x.dim() != 2 or weight.dim() != 2 or x.shape[1] != weight.shape[1]:
         raise ValueError(f"{op}: x must be [M, K] and weight [N, K] with the same K, got "
                          f"{tuple(x.shape)} and {tuple(weight.shape)}; fso.dense.linear flattens the "
                          f"leading dimensions of x")
-    if x.dtype != torch.bfloat16 or weight.dtype != torch.float8_e4m3fn:
-        raise ValueError(f"{op}: x must be bf16 and weight float8_e4m3fn, got {x.dtype} and "
-                         f"{weight.dtype}")
-    m, n, k = int(x.shape[0]), int(weight.shape[0]), int(x.shape[1])
+    if x_scale is None:
+        if x.dtype == torch.float8_e4m3fn:
+            raise ValueError(f"{op}: x is float8_e4m3fn but no x_scale was given; a pre-quantized activation comes "
+                             f"with its scale (xq, x_scale = fso.dense.quantize_activation(x)), and a bf16 x is "
+                             f"quantized inside the op")
+        if x.dtype != torch.bfloat16 or weight.dtype != torch.float8_e4m3fn:
+            raise ValueError(f"{op}: x must be bf16 and weight float8_e4m3fn, got {x.dtype} and "
+                             f"{weight.dtype}")
+    else:
+        if x.dtype == torch.bfloat16:
+            raise ValueError(f"{op}: x_scale was given with a bf16 x; x_scale belongs to the float8_e4m3fn x that "
+                             f"fso.dense.quantize_activation returns, and a bf16 x is quantized inside the op")
+        if weight.dtype != torch.float8_e4m3fn:
+            raise ValueError(f"{op}: weight must be float8_e4m3fn, got {weight.dtype}")
+
+
+def _check_weight_scale(op: str, major: int, kind: str, scale, n: int, k: int) -> None:
+    """The handle's kind against this architecture, and its scale's metadata."""
     if kind == "bsfp8":
         if major != 9:
             raise NotImplementedError(
@@ -550,9 +808,7 @@ def _dense_linear_op(x, weight, scale, kind):
         if scale.dtype != torch.float32 or tuple(scale.shape) != ((n + 127) // 128, k // 128):
             raise ValueError(f"{op}: scale must be the fp32 [ceil(N/128), K/128] block scales, got "
                              f"{scale.dtype} {list(scale.shape)}")
-        if m == 0:
-            return x.new_empty((0, n))
-        return torch.ops.fish_scales_ops.linear_qx(x.contiguous(), weight.contiguous(), scale.contiguous())
+        return
     if kind == "mxfp8":
         if major not in (10, 12):
             raise NotImplementedError(
@@ -562,7 +818,7 @@ def _dense_linear_op(x, weight, scale, kind):
         if major == 12:
             ok = (scale.dtype == torch.int32 and tuple(scale.shape) == (n, kb)
                   and (kb == 1 or scale.stride() == (1, n)))
-            want = f"int32 [{n}, {kb}] with strides (1, {n}) (the K-major layout)"
+            want = f"int32 [{n}, {kb}] with strides (1, {n}) (N fastest)"
         else:
             ok = scale.dtype == torch.int32 and scale.dim() == 1 and scale.numel() == n * kb \
                 and scale.stride() == (1,)
@@ -570,35 +826,322 @@ def _dense_linear_op(x, weight, scale, kind):
         if not ok:
             raise ValueError(f"{op}: scale must be {want}, got {scale.dtype} {list(scale.shape)} "
                              f"strides {tuple(scale.stride())}; fso.dense.prepare_weight produces it")
-        if m == 0:
-            return x.new_empty((0, n))
-        xq, sx = quantize_1x32_fp8(x)
-        return linear_mxfp8(xq, weight, sx, scale)
+        return
     raise ValueError(f"{op}: unknown kind; the kinds are 'bsfp8' and 'mxfp8', produced by "
                      f"fso.dense.prepare_weight")
 
 
+def _check_weight_aligned(op: str, kind: str, weight, scale) -> None:
+    """The weight, and on kind ``"mxfp8"`` its int32 scale, must start on a 16-byte boundary: every route reads them in
+    place with TMA, and a weight is never copied per call. Every tensor :func:`prepare_weight` returns does. The fp32
+    block scales of kind ``"bsfp8"`` are read with plain loads, at any address. Asked before the activation quantize,
+    so a refused call launches nothing."""
+    for name, t in (("weight", weight), ("scale", scale)) if kind == "mxfp8" else (("weight", weight),):
+        if t.numel() > 0 and t.data_ptr() % 16 != 0:
+            raise ValueError(f"{op}: the {name}'s data pointer is {t.data_ptr() % 16} bytes past a 16-byte boundary; "
+                             f"the GEMM reads it in place with TMA, which needs a 16-byte aligned address. "
+                             f"fso.dense.prepare_weight returns aligned tensors; a handle built from views at other "
+                             f"offsets is refused, and a weight is never copied per call")
+
+
+def _sm120_route(m: int, n: int, k: int, bf16x: bool, quantized: bool = False, sms=None, device=None) -> str:
+    """The key of :data:`_epilogue.SERVED` of the sm_120/sm_121 route this call takes: ``"sm120.smallm"`` where the
+    small-M route's rule picks it (the bf16-x call's R2 or the 2b call's R1; host arithmetic in the extension,
+    ``sm120_smallm_rules``, on a device of ``sms`` multiprocessors, by default the SM count of ``device`` or of the
+    current device), else ``"sm120.mxfp8"``, the cascade. A ``linear_quantized`` call (``quantized``) always runs on
+    the cascade: the small-M route does not write the quantized output."""
+    if quantized:
+        return "sm120.mxfp8"
+    r = torch.ops.fish_scales_ops.sm120_smallm_rules(m, n, k, _sm_count(device) if sms is None else int(sms))
+    return "sm120.smallm" if r[1 if bf16x else 0] else "sm120.mxfp8"
+
+
+def _route_require(major: int, m: int, n: int, k: int, epilogue, op: str, bf16x: bool = False, device=None) -> None:
+    """Refuse ``epilogue`` (NotImplementedError naming the architecture and the route) unless the route this call
+    takes applies it. Host-only, and asked before the activation quantize, so a refused call launches nothing.
+    ``bf16x``: the call carries a bf16 activation (the routes of a 2b call and of a bf16-x call can differ on
+    sm_120/sm_121)."""
+    if epilogue is None:
+        return
+    if major == 9:
+        _epilogue.require("sm90", epilogue, op)
+    elif major == 12:
+        _epilogue.require(_sm120_route(m, n, k, bf16x, epilogue.quantized, device=device), epilogue, op)
+    else:
+        from ..gemm import _sm100_dispatch
+        _sm100_dispatch.require(m, n, k, epilogue, op)
+
+
+def _gemm(major: int, kind: str, x, weight, scale, x_scale, epilogue):
+    """The GEMM of one validated dense call. With x_scale the activation is already quantized; otherwise it is
+    quantized here (sm_100/sm_103, sm_120/sm_121) or inside linear_qx (sm_90)."""
+    kw = {}
+    if epilogue is not None:
+        kw = {"bias": epilogue.bias, "residual": epilogue.residual, "activation": epilogue.activation}
+    if kind == "bsfp8":
+        if x_scale is not None:
+            # sm_90: the checked M-fastest scale, relabelled in place as the buffer the GEMM reads (never permuted)
+            return linear_fp8(x, weight.contiguous(), _sm90_act_scale(x_scale), scale.contiguous(), **kw)
+        return torch.ops.fish_scales_ops.linear_qx(x.contiguous(), weight.contiguous(), scale.contiguous(),
+                                                   *(() if epilogue is None else _epilogue.raw_args(epilogue)))
+    if x_scale is not None:
+        return linear_mxfp8(x, weight, x_scale, scale, **kw)
+    if major == 12:
+        # One op for every M: the small-M route's one-launch form (the activation quantized inside the kernel) where
+        # its rule picks it, else quantize_1x32_packed + linear_mxfp8_raw inside the same op; the bytes of
+        # linear_mxfp8(quantize_1x32_fp8(x)...) either way.
+        return torch.ops.fish_scales_ops.linear_mxfp8_bf16x(
+            x.contiguous(), weight, scale, *(() if epilogue is None else _epilogue.raw_args(epilogue)))
+    xq, sx = quantize_1x32_fp8(x)
+    return linear_mxfp8(xq, weight, sx, scale, **kw)
+
+
+def _gemm_quantized(major: int, kind: str, x, weight, scale, x_scale, epilogue, op: str):
+    """The GEMM of one validated linear_quantized call, its result in this device's activation contract: a bf16 x is
+    quantized first (as for linear), then ``linear_mxfp8_quantized_raw`` writes (xq, x_scale) of the [M, N] result in
+    the GEMM's own launch(es). sm_100/sm_103: on the C++ cascade (tier 3). The call goes to the raw op directly, not
+    through ``_sm100_dispatch.route``: no other tier serves the quantized output, so the feature-aware router's plan
+    for it is always the cascade (``_route_require`` has checked that plan before this point). sm_120/sm_121: on every
+    route of the MXFP8 cascade. sm_90 does not serve it in this build (``_route_require`` refuses it before this
+    point; the raise below is the backstop)."""
+    if major == 10 and kind == "mxfp8":
+        if x_scale is None:
+            x, x_scale = quantize_1x32_fp8(x)
+        # Both scales are the 1-D atom-layout tensors of this architecture (contiguous already).
+        return torch.ops.fish_scales_ops.linear_mxfp8_quantized_raw(
+            x.contiguous(), weight.contiguous(), x_scale.contiguous(), scale.contiguous(), epilogue.bias,
+            epilogue.act_code)
+    if major == 12 and kind == "mxfp8":
+        if x_scale is None:
+            x, x_scale = quantize_1x32_fp8(x)
+        # The M- and N-fastest scales keep their byte order (see linear_mxfp8): never .contiguous() such a view.
+        return torch.ops.fish_scales_ops.linear_mxfp8_quantized_raw(
+            x.contiguous(), weight.contiguous(), x_scale.contiguous() if x_scale.is_contiguous() else x_scale,
+            scale.contiguous() if scale.is_contiguous() else scale, epilogue.bias, epilogue.act_code)
+    raise NotImplementedError(f"{op}: no route writes the quantized output on this architecture in this build "
+                              f"(interface v1)")
+
+
+# The schemas are literal strings in the decorators: scripts/gen_op_schemas.py reads them from the source.
+@torch.library.custom_op(
+    "fish_scales_ops::dense_linear",
+    mutates_args=(),
+    schema="(Tensor x, Tensor weight, Tensor scale, str kind, Tensor? bias=None, Tensor? x_scale=None, "
+           "Tensor? residual=None, str? activation=None) -> Tensor",
+)
+def _dense_linear_op(x, weight, scale, kind, bias=None, x_scale=None, residual=None, activation=None):
+    """The body of ``torch.ops.fish_scales_ops.dense_linear``: check the arguments'
+    metadata, then dispatch on the handle's kind and on this device's
+    architecture. Every check reads shapes, strides and dtypes only, so the op
+    neither synchronizes the device nor depends on tensor values. The four-argument
+    call is today's op, unchanged."""
+    major = sm_major()
+    where = _arch_label(_device_arch())
+    op = f"fish_scales_ops::dense_linear ({where}, kind {kind!r})"
+    _check_operands(op, x, weight, x_scale)
+    m, n, k = int(x.shape[0]), int(weight.shape[0]), int(x.shape[1])
+    _check_weight_scale(op, major, kind, scale, n, k)
+    epilogue = _epilogue.make(op, m=m, n=n, device=weight.device, bias=bias, residual=residual,
+                              activation=activation)
+    if m > 0:  # an empty x reads no weight
+        _check_weight_aligned(op, kind, weight, scale)
+    if x_scale is not None:
+        _check_xq(op, x, weight.device)
+        _check_x_scale(op, major, x_scale, m, k, weight.device)
+    else:
+        x = _x_bf16_storage(x)
+    if m == 0:
+        return x.new_empty((0, n), dtype=torch.bfloat16)
+    _route_require(major, m, n, k, epilogue, op, bf16x=x_scale is None, device=weight.device)
+    return _gemm(major, kind, x, weight, scale, x_scale, epilogue)
+
+
 @_dense_linear_op.register_fake
-def _dense_linear_fake(x, weight, scale, kind):
+def _dense_linear_fake(x, weight, scale, kind, bias=None, x_scale=None, residual=None, activation=None):
     if x.dim() != 2 or weight.dim() != 2:
         raise ValueError(f"fish_scales_ops::dense_linear: x must be [M, K] and weight [N, K], got "
                          f"{x.dim()}-D and {weight.dim()}-D tensors")
     return x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.bfloat16)
 
 
-def linear(x, weight) -> torch.Tensor:
-    """``y = x @ W^T`` for a weight prepared by :func:`prepare_weight`.
+@torch.library.custom_op(
+    "fish_scales_ops::dense_linear_quantized",
+    mutates_args=(),
+    schema="(Tensor x, Tensor weight, Tensor scale, str kind, Tensor? bias=None, Tensor? x_scale=None, "
+           "str? activation=None) -> (Tensor, Tensor)",
+)
+def _dense_linear_quantized_op(x, weight, scale, kind, bias=None, x_scale=None, activation=None):
+    """The body of ``torch.ops.fish_scales_ops.dense_linear_quantized``: the arguments of ``dense_linear`` (no
+    residual), and the result written in this device's activation contract instead of bf16. sm_120/sm_121 write it on
+    every route of the MXFP8 cascade and sm_100/sm_103 on the C++ cascade, where the feature-aware router sends every
+    such call; elsewhere (sm_90), after the checks, the op raises NotImplementedError naming the architecture and the
+    route, before anything is launched."""
+    major = sm_major()
+    where = _arch_label(_device_arch())
+    op = f"fish_scales_ops::dense_linear_quantized ({where}, kind {kind!r})"
+    _check_operands(op, x, weight, x_scale)
+    m, n, k = int(x.shape[0]), int(weight.shape[0]), int(x.shape[1])
+    _check_weight_scale(op, major, kind, scale, n, k)
+    if n % 128 != 0:
+        raise ValueError(f"{op}: out_features N = {n} is not a multiple of 128; the quantized result is the next "
+                         f"GEMM's activation, whose K must be a multiple of 128")
+    epilogue = _epilogue.make(op, m=m, n=n, device=weight.device, bias=bias, activation=activation,
+                              quantized=True)
+    if m > 0:  # an empty x reads no weight
+        _check_weight_aligned(op, kind, weight, scale)
+    if x_scale is not None:
+        _check_xq(op, x, weight.device)
+        _check_x_scale(op, major, x_scale, m, k, weight.device)
+    else:
+        x = _x_bf16_storage(x)
+    if m == 0:
+        return (x.new_empty((0, n), dtype=torch.float8_e4m3fn), _empty_act_scale(major, 0, n, x.device))
+    _route_require(major, m, n, k, epilogue, op)
+    return _gemm_quantized(major, kind, x, weight, scale, x_scale, epilogue, op)
+
+
+@_dense_linear_quantized_op.register_fake
+def _dense_linear_quantized_fake(x, weight, scale, kind, bias=None, x_scale=None, activation=None):
+    if x.dim() != 2 or weight.dim() != 2:
+        raise ValueError(f"fish_scales_ops::dense_linear_quantized: x must be [M, K] and weight [N, K], got "
+                         f"{x.dim()}-D and {weight.dim()}-D tensors")
+    m, n = x.shape[0], weight.shape[0]
+    return (x.new_empty((m, n), dtype=torch.float8_e4m3fn), _empty_act_scale(sm_major(), m, int(n), x.device))
+
+
+def _quantize_activation_checks(x, op: str) -> int:
+    """bf16 [..., K] on CUDA with K % 128 == 0 on an architecture with a dense route; returns this major."""
+    major = sm_major()
+    arch = _device_arch()
+    if major not in (9, 10, 12):
+        raise NotImplementedError(f"{op}: this device ({_arch_label(arch)}) has no dense route and no activation "
+                                  f"contract; quantize_activation exists on sm_90, sm_100/sm_103 and sm_120/sm_121")
+    if not isinstance(x, torch.Tensor) or x.dtype != torch.bfloat16 or x.dim() < 1:
+        got = f"{x.dtype} {tuple(x.shape)}" if isinstance(x, torch.Tensor) else type(x).__name__
+        raise ValueError(f"{op}: x must be bf16 [..., K], got {got}")
+    if not x.is_cuda:
+        raise ValueError(f"{op}: x must be on the CUDA device, got {x.device}")
+    if x.shape[-1] % 128 != 0:
+        raise ValueError(f"{op}: K = {x.shape[-1]} is not a multiple of 128, which activation contract v1 requires "
+                         f"(one scale word per 128 elements along K)")
+    return major
+
+
+@torch.library.custom_op(
+    "fish_scales_ops::dense_quantize_activation",
+    mutates_args=(),
+    schema="(Tensor x) -> (Tensor, Tensor)",
+)
+def _dense_quantize_activation_op(x):
+    """The body of ``torch.ops.fish_scales_ops.dense_quantize_activation``: this device's activation quantizer under
+    a stable name, on x flattened to [M, K]. sm_90: ``quantize_1x128_contract``, the activation quantize linear_qx
+    runs inside the op (fp32 scales, the bf16 amax floor for every K), with the padded rows' scales zeroed.
+    sm_100/sm_103 and sm_120/sm_121: ``quantize_1x32_fp8``."""
+    op = f"fish_scales_ops::dense_quantize_activation ({_arch_label(_device_arch())})"
+    major = _quantize_activation_checks(x, op)
+    k = int(x.shape[-1])
+    x2 = _x_bf16_storage(x.reshape(-1, k))
+    m = int(x2.shape[0])
+    if m == 0:
+        return (x.new_empty((0, k), dtype=torch.float8_e4m3fn), _empty_act_scale(major, 0, k, x.device))
+    if major == 9:
+        xq, sx = torch.ops.fish_scales_ops.quantize_1x128_contract(x2.contiguous())
+        # The raw op writes element (m, kb) at kb * align(M, 4) + m under row-major metadata; the contract's tensor
+        # is the M-fastest view of the same buffer (strides (1, align(M, 4))), so that x_scale[m, kb] is exact.
+        sx = sx.view(k // 128, sx.shape[0]).t()
+    else:
+        xq, sx = quantize_1x32_fp8(x2)
+    return xq.view(m, k), sx
+
+
+@_dense_quantize_activation_op.register_fake
+def _dense_quantize_activation_fake(x):
+    k = x.shape[-1]
+    m = math.prod(x.shape[:-1]) if x.dim() > 1 else 1
+    return (x.new_empty((m, k), dtype=torch.float8_e4m3fn), _empty_act_scale(sm_major(), m, int(k), x.device))
+
+
+def _trim_none(*args) -> tuple:
+    """The optional trailing arguments of an op call without its trailing Nones, so that a call without them is
+    the old four-argument call, node for node."""
+    args = list(args)
+    while args and args[-1] is None:
+        args.pop()
+    return tuple(args)
+
+
+def _check_handle(weight, where: str, ctx: str) -> None:
+    if not isinstance(weight, DenseWeight):
+        raise TypeError(f"{ctx} ({where}): weight must be the DenseWeight handle from "
+                        f"fso.dense.prepare_weight, got {type(weight).__name__}")
+    arch = _device_arch()
+    if weight.arch // 10 != arch // 10:
+        raise ValueError(
+            f"{ctx}: the weight was prepared on sm_{weight.arch} and this device is "
+            f"{where}; the weight and scale layouts are architecture-specific, so prepare it with "
+            f"fso.dense.prepare_weight on the serving device")
+
+
+def _flatten_x(x, weight, x_scale, where: str, ctx: str):
+    """x as the op's 2-D [M, K] and the leading shape of the result."""
+    if x_scale is None:
+        if isinstance(x, torch.Tensor) and x.dtype == torch.float8_e4m3fn:
+            raise ValueError(f"{ctx} ({where}, kind {weight.kind!r}): x is float8_e4m3fn but no x_scale was given; "
+                             f"pass the scale fso.dense.quantize_activation returned with it, or a bf16 x")
+        if not isinstance(x, torch.Tensor) or x.dtype != torch.bfloat16 or x.dim() < 1 \
+                or x.shape[-1] != weight.in_features:
+            got = (f"{x.dtype} {tuple(x.shape)}" if isinstance(x, torch.Tensor) else type(x).__name__)
+            raise ValueError(f"{ctx} ({where}, kind {weight.kind!r}): x must be bf16 [..., K] "
+                             f"with K = in_features = {weight.in_features}, got {got}")
+    else:
+        if not isinstance(x, torch.Tensor) or x.dtype != torch.float8_e4m3fn or x.dim() != 2 \
+                or x.shape[-1] != weight.in_features or not x.is_contiguous():
+            got = (f"{x.dtype} {tuple(x.shape)} strides {tuple(x.stride())}" if isinstance(x, torch.Tensor)
+                   else type(x).__name__)
+            raise ValueError(f"{ctx} ({where}, kind {weight.kind!r}): with x_scale, x must be the float8_e4m3fn "
+                             f"[M, K] activation of fso.dense.quantize_activation (2-D, contiguous, K = in_features = "
+                             f"{weight.in_features}; activation contract v1), got {got}")
+    if x.device != weight.weight.device:
+        raise ValueError(f"{ctx} ({where}, kind {weight.kind!r}): x is on {x.device} and the "
+                         f"weight on {weight.weight.device}")
+    lead = x.shape[:-1]
+    if x_scale is not None:
+        return x, lead  # already the op's 2-D contiguous [M, K]; nothing is copied
+    # (A misaligned x is copied in the op body, _x_bf16_storage: under torch.compile this wrapper is traced on fake
+    # tensors, which have no data pointer; reshape copies a non-contiguous x into a buffer of its own.)
+    return x.reshape(-1, weight.in_features), lead
+
+
+def linear(x, weight, *, bias=None, x_scale=None, residual=None, activation=None) -> torch.Tensor:
+    """``y = act(x @ W^T + bias) + residual`` for a weight prepared by :func:`prepare_weight`, with one rounding.
 
     Args:
-        x: bf16 ``[..., K]`` on the device the weight was prepared on. The
-            activation is quantized inside the op on every call: to 1x128
-            block-FP8 inside ``linear_qx`` on sm_90, and to MXFP8 1x32 by the
-            fused quantize kernel on sm_100/sm_103 and sm_120/sm_121.
+        x: the activation, on the device the weight was prepared on, in one of two forms:
+
+            * bf16 ``[..., K]`` with ``x_scale=None``: quantized inside the op on every call, to 1x128 block-FP8
+              inside ``linear_qx`` on sm_90 and to MXFP8 1x32 by the fused quantize kernel on sm_100/sm_103 and
+              sm_120/sm_121 (two launches, today's path);
+            * the float8_e4m3fn ``[M, K]`` activation that :func:`quantize_activation` returns (2-D, contiguous),
+              with its ``x_scale``: the GEMM alone runs, no quantize.
         weight: the :class:`DenseWeight` handle.
+        bias: bf16 ``[N]``, contiguous, on the weight's device, or None.
+        x_scale: the scale of a float8_e4m3fn ``x``, in this device's activation contract
+            (:func:`activation_contract`, version 1), or None for a bf16 ``x``.
+        residual: bf16 of the result's shape ``[..., N]``, contiguous, or None.
+        activation: None or ``"gelu_erf"`` (:data:`ACTIVATIONS`); another name is a ValueError, a name that exists
+            but is not served (``"gelu_tanh"``, ``"silu"``, ...) a NotImplementedError.
 
     Returns:
-        bf16 ``[..., N]``, a new tensor. There is no bias argument; a caller with
-        a bias adds it to the result.
+        bf16 ``[..., N]``, a new tensor: ``RN_bf16(act(acc + b) + r)`` where ``acc`` is the fp32 accumulator after
+        any split reduction, ``b`` is the bias with +0.0 replaced by -0.0 (a zero bias gives the bytes of no bias),
+        ``act`` is the identity or erf-GELU in fp32 and ``r`` is added only when given. Each term is applied once.
+
+    Interface v1 status: ``x_scale`` is served on every architecture. ``bias``, ``residual`` and ``activation`` are
+    validated (ValueError for a malformed argument) and passed to the architecture's GEMM, which applies them in
+    its own launch where the route serves them: sm_90 on all three of its dense kernels, sm_100/sm_103 on its C++
+    cascade (tier 3), sm_120/sm_121 on every route of its MXFP8 cascade. A route that does not serve a field yet
+    raises NotImplementedError naming the architecture and the route, before anything is launched. Without them the
+    call is today's, with today's bytes.
 
     The call is ``torch.ops.fish_scales_ops.dense_linear`` on the activation
     flattened to ``[M, K]``, with the result reshaped back. The op is a torch
@@ -609,25 +1152,72 @@ def linear(x, weight) -> torch.Tensor:
     pools and, on sm_90, JIT-compiles the GEMM; nothing inside the op
     synchronizes the device.
     """
-    arch = _device_arch()
-    where = _arch_label(arch)
-    if not isinstance(weight, DenseWeight):
-        raise TypeError(f"fso.dense.linear ({where}): weight must be the DenseWeight handle from "
-                        f"fso.dense.prepare_weight, got {type(weight).__name__}")
-    if weight.arch // 10 != arch // 10:
-        raise ValueError(
-            f"fso.dense.linear: the weight was prepared on sm_{weight.arch} and this device is "
-            f"{where}; the weight and scale layouts are architecture-specific, so prepare it with "
-            f"fso.dense.prepare_weight on the serving device")
-    if not isinstance(x, torch.Tensor) or x.dtype != torch.bfloat16 or x.dim() < 1 \
-            or x.shape[-1] != weight.in_features:
-        got = (f"{x.dtype} {tuple(x.shape)}" if isinstance(x, torch.Tensor) else type(x).__name__)
-        raise ValueError(f"fso.dense.linear ({where}, kind {weight.kind!r}): x must be bf16 [..., K] "
-                         f"with K = in_features = {weight.in_features}, got {got}")
-    if x.device != weight.weight.device:
-        raise ValueError(f"fso.dense.linear ({where}, kind {weight.kind!r}): x is on {x.device} and the "
-                         f"weight on {weight.weight.device}")
-    lead = x.shape[:-1]
+    where = _arch_label(_device_arch())
+    _check_handle(weight, where, "fso.dense.linear")
+    x2, lead = _flatten_x(x, weight, x_scale, where, "fso.dense.linear")
+    r2 = None
+    if residual is not None:
+        want = tuple(lead) + (weight.out_features,)
+        if not isinstance(residual, torch.Tensor) or tuple(residual.shape) != want:
+            got = list(residual.shape) if isinstance(residual, torch.Tensor) else type(residual).__name__
+            raise ValueError(f"fso.dense.linear ({where}, kind {weight.kind!r}): residual must have the result's "
+                             f"shape {list(want)}, got {got}")
+        if not residual.is_contiguous():
+            raise ValueError(f"fso.dense.linear ({where}, kind {weight.kind!r}): residual must be contiguous, got "
+                             f"strides {tuple(residual.stride())}")
+        r2 = residual.view(-1, weight.out_features)
     y = torch.ops.fish_scales_ops.dense_linear(
-        x.reshape(-1, weight.in_features), weight.weight, weight.scale, weight.kind)
+        x2, weight.weight, weight.scale, weight.kind, *_trim_none(bias, x_scale, r2, activation))
     return y.reshape(*lead, weight.out_features)
+
+
+def linear_quantized(x, weight, *, bias=None, x_scale=None, activation=None):
+    """``(xq_next, scale_next)``: the result of :func:`linear` written in this device's activation contract instead
+    of bf16, ready to be the next GEMM's ``x`` / ``x_scale``.
+
+    Bit for bit ``quantize_activation(linear(x, weight, bias=bias, x_scale=x_scale, activation=activation))`` when
+    the bf16 call runs on the same route: the epilogue rounds to bf16 first and then applies this device's activation
+    quantizer rule to the rounded values, so the fused path is checkable against the unfused one on every route. On
+    sm_90 and sm_120/sm_121 the two calls always take the same route. On sm_100/sm_103 this call always runs on the
+    C++ cascade (no other tier writes the quantized output) while the bf16 call of a decode-row, tier-1 or tier-2
+    cell runs on that tier, so there it equals ``quantize_activation`` of the cascade's bf16 result
+    (``torch.ops.fish_scales_ops.linear_mxfp8_raw``) and can differ from ``quantize_activation(linear(...))`` in
+    individual codes where that tier sums the ``K`` products in another order. ``N`` must be a multiple of 128 (it
+    is the next GEMM's ``K``). There is no residual argument. ``x``, ``bias``, ``x_scale`` and ``activation`` are
+    those of :func:`linear`; the leading dimensions of a bf16 ``x`` are flattened, and ``xq_next`` is ``[M, N]``.
+
+    Interface v1 status: sm_120/sm_121 serve it on every route of the MXFP8 cascade, and sm_100/sm_103 on the C++
+    cascade (tier 3), on every configuration its rules pick and on its two-kernel split-K; the sm_100/sm_103 router
+    sends every ``linear_quantized`` call to the cascade, also on shapes whose bf16 call takes the decode row, cuBLAS
+    or the DSL tier, since no other tier writes the quantized output. The GEMM writes ``xq_next`` and ``scale_next``
+    (padded rows' words zero) in its own launch(es), with no bf16 intermediate in memory and no quantize kernel; a
+    bf16 ``x`` is quantized first, as for :func:`linear`. sm_90 validates the arguments and raises
+    NotImplementedError naming the architecture and the route, before anything is launched. The op is
+    ``torch.ops.fish_scales_ops.dense_linear_quantized`` (a custom op with a fake that returns this device's output
+    shapes and dtypes).
+    """
+    where = _arch_label(_device_arch())
+    _check_handle(weight, where, "fso.dense.linear_quantized")
+    x2, _ = _flatten_x(x, weight, x_scale, where, "fso.dense.linear_quantized")
+    return torch.ops.fish_scales_ops.dense_linear_quantized(
+        x2, weight.weight, weight.scale, weight.kind, *_trim_none(bias, x_scale, activation))
+
+
+def quantize_activation(x):
+    """``(xq, x_scale)``: the activation ``x`` (bf16 ``[..., K]``, ``K % 128 == 0``) quantized by this device's
+    activation quantizer, in the form ``linear(xq, weight, x_scale=x_scale)`` takes.
+
+    The quantizer is the one ``linear(x, weight)`` runs inside the op, so that ``linear(xq, weight, x_scale=x_scale)``
+    gives the bytes of ``linear(x, weight)``: on sm_90 the 1x128 block-FP8 quantize of ``linear_qx`` (fp32 scales
+    ``1 / (448 / amax)``, amax floored at the bf16 value of 1e-10 for every K), with the padded rows' scales zeroed;
+    it differs from ``fso.compat.quantize_1x128_fp8`` only where that op floors at 1e-10f (K % 512 == 0) on a group
+    whose amax is below 1.00044e-10, and in the padded rows. On sm_100/sm_103 and sm_120/sm_121 it is
+    ``fso.compat.quantize_1x32_fp8`` (MXFP8, UE8M0 scales), with the same bytes. The leading dimensions of ``x`` are
+    flattened: ``xq`` is float8_e4m3fn ``[M, K]``, and
+    ``x_scale`` is the tensor of activation contract v1 for ``M`` rows (:func:`activation_contract`,
+    ``fso/activation_contract.h``). An empty ``x`` gives empty tensors and launches nothing.
+
+    The op is ``torch.ops.fish_scales_ops.dense_quantize_activation``, a custom op with a fake implementation, so
+    ``torch.compile`` keeps it as one opaque node. Nothing in it synchronizes the device.
+    """
+    return torch.ops.fish_scales_ops.dense_quantize_activation(x)

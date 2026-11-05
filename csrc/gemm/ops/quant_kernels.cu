@@ -138,6 +138,18 @@ static inline void fso_glue_launch(int64_t ctas, cudaStream_t stream, bool pdl, 
     fso_pdl_launch(kStride, dim3(static_cast<unsigned>(ctas < cap ? ctas : cap)), dim3(kThreads), stream, pdl, args...);
 }
 
+// The width of the vector loads with which the kernel fp8bs_quantize_1x128 selects for these arguments reads x: 16
+// bytes for scale_1x128_lanes_kernel (selected only when x and x_q are 16-byte aligned), 8 for the K % 512 kernel
+// (fp8bs_quantize_1x128_packed_kernel, LDG.64), 4 for scale_1x128_kernel (bf16x2). fp8bs_quantize_1x128 selects its
+// kernel with this function, and the op body (ops/fp8.cu) refuses an x whose rows that kernel cannot read
+// (ops/input_alignment.h). x_q nullptr stands for a fresh allocation (16-byte aligned).
+int fp8bs_quantize_1x128_x_vector_bytes(__nv_fp8_e4m3 const* x_q, __nv_bfloat16 const* x, int K, bool use_ue8m0)
+{
+    if (!use_ue8m0 && tensorrt_llm::kernels::blockscale_gemm::fp8_1x128_lanes_supported(x_q, x, K))
+        return 16;
+    return K % 512 == 0 ? 8 : 4;
+}
+
 void fp8bs_quantize_1x128(__nv_fp8_e4m3* x_q, float* scales, __nv_bfloat16 const* x, int M, int K, cudaStream_t stream,
     bool use_ue8m0)
 {
@@ -146,7 +158,8 @@ void fp8bs_quantize_1x128(__nv_fp8_e4m3* x_q, float* scales, __nv_bfloat16 const
     // rows: for K % 512 == 0 those of fp8bs_quantize_1x128_fp32_fast (floor 1e-10f, padding-row scales zeroed),
     // otherwise those of fp8_1x128_cs (floor at the BF16 value of 1e-10, padding rows unwritten). Launched with PDL
     // unless FSO_DISABLE_PDL=1, as the dense GEMM that consumes it.
-    if (!use_ue8m0 && tensorrt_llm::kernels::blockscale_gemm::fp8_1x128_lanes_supported(x_q, x, K))
+    int const vector_bytes = fp8bs_quantize_1x128_x_vector_bytes(x_q, x, K, use_ue8m0);
+    if (vector_bytes == 16)
     {
         bool const k512 = K % 512 == 0;
         tensorrt_llm::kernels::blockscale_gemm::fp8_1x128_lanes(
@@ -156,10 +169,53 @@ void fp8bs_quantize_1x128(__nv_fp8_e4m3* x_q, float* scales, __nv_bfloat16 const
     // UE8M0 scales (and inputs the lanes kernel cannot take). Fast path: uint64 LDG.64 + e8m0 bit-manip + larger
     // per-warp work. Requires K % 512 == 0 (4 K-blocks/warp × 128 elem/K-block). Fallback: the legacy
     // persistent-grid `fp8_1x128_cs` kernel for K only a multiple of 128.
-    if (K % 512 == 0)
+    if (vector_bytes == 8)
         fp8bs_quantize_1x128_fp32_fast(x_q, scales, x, M, K, stream, use_ue8m0);
     else
         tensorrt_llm::kernels::blockscale_gemm::fp8_1x128_cs(x_q, scales, x, K, M, stream, use_ue8m0);
+}
+
+// The sm_90 activation quantizer of activation contract v1 (fso.dense.quantize_activation; interface v1, issue #12):
+// exactly the activation quantize that linear_qx runs inside the runner (dispatch.cuh, fp8_gemm_run), so that a
+// pre-quantized call gives the bytes of linear(x, w). That is the lanes kernel with the BF16 amax floor for every K
+// (fp8bs_quantize_1x128 above uses the 1e-10f floor when K % 512 == 0), or scale_1x128_kernel, bitwise identical to it,
+// when the lanes kernel cannot take the pointers. Unlike both, the padded rows' scales are always written as 0, so the
+// output bytes are deterministic. The two kernels are the instantiations fp8_1x128_lanes and fp8_1x128_cs already
+// reference, so this function adds no device code.
+//
+// The width of its loads from x, as for fp8bs_quantize_1x128: 16 bytes for the lanes kernel (16-byte aligned x and
+// x_q), 4 for scale_1x128_kernel. x_q nullptr stands for a fresh allocation.
+int fp8bs_quantize_1x128_contract_x_vector_bytes(__nv_fp8_e4m3 const* x_q, __nv_bfloat16 const* x, int K)
+{
+    return tensorrt_llm::kernels::blockscale_gemm::fp8_1x128_lanes_supported(x_q, x, K) ? 16 : 4;
+}
+
+void fp8bs_quantize_1x128_contract(
+    __nv_fp8_e4m3* x_q, float* scales, __nv_bfloat16 const* x, int M, int K, cudaStream_t stream)
+{
+    if (fp8bs_quantize_1x128_contract_x_vector_bytes(x_q, x, K) == 16)
+    {
+        tensorrt_llm::kernels::blockscale_gemm::fp8_1x128_lanes(
+            x_q, scales, x, K, M, stream, /*bf16_amax_floor=*/true, /*zero_pad_rows=*/true, fso_pdl_enabled());
+        return;
+    }
+    int64_t const m_pad = (static_cast<int64_t>(M) + 3) / 4 * 4;
+    if (m_pad != M)
+        cudaMemsetAsync(scales, 0, static_cast<size_t>(m_pad) * (K / 128) * sizeof(float), stream);
+    tensorrt_llm::kernels::blockscale_gemm::fp8_1x128_cs(x_q, scales, x, K, M, stream, /*use_ue8m0=*/false);
+}
+
+// The width of the loads with which the activation quantize of the runner's bf16-activation path reads x
+// (linear_qx, and linear_bf16 on sm_90 and sm_120/121; the selection is fp8_gemm_run's in
+// blockscale_gemm/dispatch.cuh): 16 bytes for scale_1x128_lanes_kernel, which that function runs on sm_90 when x and
+// the runner's fp8 workspace (a fresh allocation, 16-byte aligned) are 16-byte aligned; otherwise, and always on
+// sm_120/121, 4 for scale_1x128_kernel (bf16x2). The weight quantize of linear_bf16 (scale_128x128_kernel) reads one
+// element per load and needs no alignment. Host only; the op bodies refuse an x that kernel cannot read.
+int fp8_gemm_run_quantize_a_x_vector_bytes(bool sm120, __nv_bfloat16 const* x, int K)
+{
+    if (sm120)
+        return 4;
+    return tensorrt_llm::kernels::blockscale_gemm::fp8_1x128_lanes_supported(nullptr, x, K) ? 16 : 4;
 }
 
 void fp8bs_quantize_128x128(
@@ -700,11 +756,20 @@ void launch_quantize_1x32_wide(__nv_fp8_e4m3* x_q, int32_t* packed_scales, __nv_
 
 } // anonymous namespace
 
+// The width of the loads with which the kernel fp8bs_quantize_1x32_packed selects reads x: 16 bytes for the wide
+// kernel (sm_100/sm_103, x and x_q 16-byte aligned), 8 for the narrow kernel (fp8bs_quantize_1x32_packed_kernel,
+// LDG.64). The launcher selects with this function; the op body refuses an x whose rows that kernel cannot read.
+// x_q nullptr stands for a fresh allocation (16-byte aligned).
+int fp8bs_quantize_1x32_packed_x_vector_bytes(__nv_fp8_e4m3 const* x_q, __nv_bfloat16 const* x, bool sm1xx_sf_layout)
+{
+    return sm1xx_sf_layout && wide_quant_aligned(x, x_q) ? 16 : 8;
+}
+
 void fp8bs_quantize_1x32_packed(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
     __nv_bfloat16 const* x, int M, int K, cudaStream_t stream, bool use_ue8m0, bool sm1xx_sf_layout)
 {
     // sm_100/sm_103: the wide kernel with PDL (see the block above); sm_120 keeps the narrow kernel below.
-    if (sm1xx_sf_layout && wide_quant_aligned(x, x_q))
+    if (fp8bs_quantize_1x32_packed_x_vector_bytes(x_q, x, sm1xx_sf_layout) == 16)
     {
         launch_quantize_1x32_wide<false>(x_q, packed_scales, x, M, K, stream, use_ue8m0);
         return;
@@ -867,13 +932,22 @@ __global__ void silu_chunk_mul_quantize_1x32_packed_kernel(
 
 } // anonymous namespace
 
+// The width of the loads with which the kernel fp8bs_silu_chunk_mul_quantize_1x32_packed selects reads gu: 16 bytes
+// for the wide kernel (sm_100/sm_103, gu and x_q 16-byte aligned), 8 for the narrow kernel (LDG.64), as for
+// fp8bs_quantize_1x32_packed_x_vector_bytes. x_q nullptr stands for a fresh allocation.
+int fp8bs_silu_chunk_mul_quantize_1x32_packed_x_vector_bytes(
+    __nv_fp8_e4m3 const* x_q, __nv_bfloat16 const* gu, bool sm1xx_sf_layout)
+{
+    return sm1xx_sf_layout && wide_quant_aligned(gu, x_q) ? 16 : 8;
+}
+
 void fp8bs_silu_chunk_mul_quantize_1x32_packed(
     __nv_fp8_e4m3* x_q, int32_t* packed_scales,
     __nv_bfloat16 const* gu, int M, int K, cudaStream_t stream, bool use_ue8m0, bool sm1xx_sf_layout)
 {
     // sm_100/sm_103: the wide kernel with PDL (see fp8bs_quantize_1x32_packed_wide_kernel); sm_120 keeps the
     // narrow kernel below.
-    if (sm1xx_sf_layout && wide_quant_aligned(gu, x_q))
+    if (fp8bs_silu_chunk_mul_quantize_1x32_packed_x_vector_bytes(x_q, gu, sm1xx_sf_layout) == 16)
     {
         launch_quantize_1x32_wide<true>(x_q, packed_scales, gu, M, K, stream, use_ue8m0);
         return;
@@ -1262,6 +1336,37 @@ __global__ void silu_chunk_mul_quantize_1x128_fp32_sorted_kernel(
 
 } // anonymous namespace
 
+// Below kSortedGatherMinTokens tokens fp8bs_quantize_1x128_fp32_sorted_gather runs the 0.2.0 per-pair kernel; both
+// write the same bytes and scales. Its grid, one warp per (pair, 128-K block) of fewer than kSortedGatherMinTokens
+// tokens, is bounded by that token count.
+constexpr int kSortedGatherMinTokens = 32;
+
+// The width of the loads with which the kernel fp8bs_quantize_1x128_fp32_sorted_gather selects reads x: 8 bytes for
+// the per-pair kernel (below kSortedGatherMinTokens tokens, LDG.64), and for the token kernel 16 bytes when x is
+// 16-byte aligned (its kVec16 form), else 8 (two LDG.64 per step); 2 (no vector read) when there is no routed pair.
+// The launcher selects the token kernel's form with this function, and the op body (quantize_1x128_sorted_gather_sm90,
+// ops/fp8.cu) refuses an x whose rows that kernel cannot read (ops/input_alignment.h).
+int fp8bs_quantize_1x128_fp32_sorted_gather_x_vector_bytes(__nv_bfloat16 const* x, int n_pairs, int topk)
+{
+    if (n_pairs <= 0 || topk <= 0)
+        return 2;
+    if ((n_pairs + topk - 1) / topk < kSortedGatherMinTokens)
+        return 8;
+    return (reinterpret_cast<uintptr_t>(x) & 15u) == 0u ? 16 : 8;
+}
+
+// The width of the stores with which the kernel fp8bs_quantize_1x128_fp32_sorted_gather selects writes x_q: 4 bytes for
+// the per-pair kernel (below kSortedGatherMinTokens tokens, one 32-bit word of four codes per lane), 8 for the token
+// kernel (one 64-bit word of eight codes per lane and step); 1 (no store) when there is no routed pair. Its fp32
+// scales are written one element at a time. The op body (quantize_1x128_sorted_gather_sm90, ops/fp8.cu) refuses a
+// caller-owned x_q whose rows that kernel cannot write (ops/input_alignment.h).
+int fp8bs_quantize_1x128_fp32_sorted_gather_x_q_vector_bytes(int n_pairs, int topk)
+{
+    if (n_pairs <= 0 || topk <= 0)
+        return 1;
+    return (n_pairs + topk - 1) / topk < kSortedGatherMinTokens ? 4 : 8;
+}
+
 void fp8bs_quantize_1x128_fp32_sorted_gather(__nv_fp8_e4m3* x_q, float* sfa,
     __nv_bfloat16 const* x, int32_t const* flat_to_sorted, int n_pairs, int topk,
     int sfa_ld, int K, cudaStream_t stream)
@@ -1271,9 +1376,7 @@ void fp8bs_quantize_1x128_fp32_sorted_gather(__nv_fp8_e4m3* x_q, float* sfa,
     // Both kernels are launched with PDL (unless FSO_DISABLE_PDL=1), like the routing builder before them and the
     // grouped GEMM after them.
     bool const pdl = fso_pdl_enabled();
-    // Below kSortedGatherMinTokens tokens the 0.2.0 per-pair kernel; both write the same bytes and scales. Its grid,
-    // one warp per (pair, 128-K block) of fewer than kSortedGatherMinTokens tokens, is bounded by that token count.
-    constexpr int kSortedGatherMinTokens = 32;
+    // Below kSortedGatherMinTokens tokens the per-pair kernel (see above).
     if ((n_pairs + topk - 1) / topk < kSortedGatherMinTokens)
     {
         constexpr int kPairThreads = 256, kPairWarps = kPairThreads / 32;
@@ -1302,7 +1405,8 @@ void fp8bs_quantize_1x128_fp32_sorted_gather(__nv_fp8_e4m3* x_q, float* sfa,
         ++log2_groups;
     int const pairs_per_group = ceil_div(topk, 1 << log2_groups);
     int64_t const n_items = static_cast<int64_t>(n_tokens) << (log2_chunks + log2_groups);
-    bool const vec16 = (reinterpret_cast<uintptr_t>(x) & 15u) == 0u; // 16-byte loads, else two 8-byte loads
+    // 16-byte loads, else two 8-byte loads (the width the op body checked x against)
+    bool const vec16 = fp8bs_quantize_1x128_fp32_sorted_gather_x_vector_bytes(x, n_pairs, topk) == 16;
     auto launch = [&](auto vec16T, auto inFlightT)
     {
         // One warp per item up to kFsoGlueFlatWaves waves, else the grid-stride form (fso_glue_launch).
@@ -1329,6 +1433,14 @@ void fp8bs_quantize_1x128_fp32_sorted_gather(__nv_fp8_e4m3* x_q, float* sfa,
         launch_depth(std::false_type{});
 }
 
+// The width of the loads with which silu_chunk_mul_quantize_1x128_fp32_sorted_kernel reads gu: 8 bytes (two LDG.64
+// per lane, the gate and the up words), whatever the pointer. The op body (silu_chunk_mul_quantize_1x128_sorted_sm90,
+// ops/fp8.cu) refuses a gu whose rows it cannot read.
+int fp8bs_silu_chunk_mul_quantize_1x128_fp32_sorted_x_vector_bytes()
+{
+    return 8;
+}
+
 void fp8bs_silu_chunk_mul_quantize_1x128_fp32_sorted(__nv_fp8_e4m3* x_q, float* sfa,
     __nv_bfloat16 const* gu, int32_t const* flat_to_sorted, int n_pairs, int sfa_ld, int K,
     cudaStream_t stream)
@@ -1341,6 +1453,14 @@ void fp8bs_silu_chunk_mul_quantize_1x128_fp32_sorted(__nv_fp8_e4m3* x_q, float* 
         x_q, sfa, gu, flat_to_sorted, n_pairs, sfa_ld, K);
 }
 
+// The width of the loads with which fp8bs_quantize_1x128_fp32_grouped_gather_kernel reads x: 8 bytes (LDG.64),
+// whatever the pointer. The op body (quantize_1x128_grouped_gather_sm90, ops/fp8.cu) refuses an x whose rows it
+// cannot read.
+int fp8bs_quantize_1x128_fp32_grouped_gather_x_vector_bytes()
+{
+    return 8;
+}
+
 void fp8bs_quantize_1x128_fp32_grouped_gather(__nv_fp8_e4m3* x_q, float* sfa,
     __nv_bfloat16 const* x, int32_t const* slot_of_flat, int n_pairs, int topk,
     int m_cap, int K, cudaStream_t stream)
@@ -1351,6 +1471,14 @@ void fp8bs_quantize_1x128_fp32_grouped_gather(__nv_fp8_e4m3* x_q, float* sfa,
     int const grid = static_cast<int>((total_warps + kWarps - 1) / kWarps);
     fp8bs_quantize_1x128_fp32_grouped_gather_kernel<<<grid, kThreads, 0, stream>>>(
         x_q, sfa, x, slot_of_flat, n_pairs, topk, m_cap, K);
+}
+
+// The width of the loads with which silu_chunk_mul_quantize_1x128_fp32_grouped_kernel reads gu: 8 bytes (two LDG.64
+// per lane), whatever the pointer. The op body (silu_chunk_mul_quantize_1x128_grouped_sm90, ops/fp8.cu) refuses a gu
+// whose rows it cannot read.
+int fp8bs_silu_chunk_mul_quantize_1x128_fp32_grouped_x_vector_bytes()
+{
+    return 8;
 }
 
 void fp8bs_silu_chunk_mul_quantize_1x128_fp32_grouped(__nv_fp8_e4m3* x_q, float* sfa,
@@ -2311,6 +2439,23 @@ static inline bool fso_gather_quant_use_scatter(int num_tokens, int topk, int k_
     return ctas >= static_cast<int64_t>(kFsoScatterMinWaves) * fso_device_sm_count();
 }
 
+// The width of the loads with which every kernel fp8bs_quantize_1x32_packed_grouped_gather can select reads x: 8
+// bytes (LDG.64, four bf16 per lane) in the pair-space kernel, its grid-stride form and both token-scatter forms,
+// whatever the pointer. The op bodies (quantize_1x32_grouped_gather in ops/mxfp8.cu, quantize_1x32_grouped_gather_out
+// in ops/mxfp8_compact.cu) refuse an x whose rows these kernels cannot read (ops/input_alignment.h).
+int fp8bs_quantize_1x32_packed_grouped_gather_x_vector_bytes()
+{
+    return 8;
+}
+
+// The width of the stores with which those kernels write x_q: 4 bytes (one 32-bit word of four codes per lane) in every
+// form; the packed scale words are written one int32 at a time. quantize_1x32_grouped_gather_out refuses a
+// caller-owned x_q whose rows these kernels cannot write (ops/input_alignment.h).
+int fp8bs_quantize_1x32_packed_grouped_gather_x_q_vector_bytes()
+{
+    return 4;
+}
+
 // `sm1xx_sf_layout` picks the sm_100/sm_103 per-group Sm1xx atom slab instead
 // of the sm_120 per-group K-major slab. The sm_120 instantiations are
 // unchanged (SM1XX_SF defaults to false and the generated store is the same
@@ -2413,6 +2558,24 @@ void fp8bs_quantize_1x32_packed_grouped_gather(__nv_fp8_e4m3* x_q, int32_t* pack
     };
     if (use_ue8m0) launch_sf(std::true_type{});
     else           launch_sf(std::false_type{});
+}
+
+// The width of the loads with which the kernel fp8bs_silu_chunk_mul_quantize_1x32_packed_grouped selects reads gu,
+// whatever the pointer: 16 bytes for the pairwise form (one LDG.128 of eight interleaved gate / up values per lane),
+// 8 for the [gate | up] form (two LDG.64 per lane). The op bodies (silu_chunk_mul_quantize_1x32_grouped in
+// ops/mxfp8.cu, silu_chunk_mul_quantize_1x32_grouped_out in ops/mxfp8_compact.cu) refuse a gu whose rows that kernel
+// cannot read (ops/input_alignment.h).
+int fp8bs_silu_chunk_mul_quantize_1x32_packed_grouped_x_vector_bytes(bool pairwise)
+{
+    return pairwise ? 16 : 8;
+}
+
+// The width of the stores with which that kernel writes its fp8 output: 4 bytes (one 32-bit word of four codes per
+// lane) in both row orders and both forms; the scale words are written one int32 at a time.
+// silu_chunk_mul_quantize_1x32_grouped_out refuses a caller-owned dq whose rows it cannot write.
+int fp8bs_silu_chunk_mul_quantize_1x32_packed_grouped_x_q_vector_bytes()
+{
+    return 4;
 }
 
 void fp8bs_silu_chunk_mul_quantize_1x32_packed_grouped(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
@@ -2599,6 +2762,13 @@ __global__ void fp8bs_quantize_1x128_packed_kernel(
 }
 
 } // anonymous namespace
+
+// The width of the loads with which fp8bs_quantize_1x128_packed's one kernel reads x: 8 bytes (LDG.64), whatever
+// the pointers. The op body (quantize_1x128_packed, K % 512 == 0) refuses an x whose rows it cannot read.
+int fp8bs_quantize_1x128_packed_x_vector_bytes()
+{
+    return 8;
+}
 
 void fp8bs_quantize_1x128_packed(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
     __nv_bfloat16 const* x, int M, int K, cudaStream_t stream, bool use_ue8m0, bool sm1xx_sf_layout)

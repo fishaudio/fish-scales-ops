@@ -18,7 +18,10 @@ Each mode runs in its own child process over the same cells, and the test checks
   4. a value other than 0, 1 or all prints one warning and keeps the default.
 
 The cells include off-grid M (partial 256-row and 64-row blocks, M below the tile) and an N that is not a multiple of
-the tile. sm_90 only (prints SKIP elsewhere). usage: python tests/gemm/unit/test_dense_dg2_sm90.py
+the tile, and the shapes of rule 5 (fso's tile with at least 48 rows of its last M block empty, below M = 1024: the
+v2 kernel at DeepGEMM's single-CTA pick, or at fso's tile when DeepGEMM picks a two-CTA cluster, as long as the v2
+configuration gives at least three quarters of the SMs a tile) with its controls.
+sm_90 only (prints SKIP elsewhere). usage: python tests/gemm/unit/test_dense_dg2_sm90.py
 """
 import json
 import os
@@ -40,7 +43,8 @@ CELLS = [
     (64, 2560, 9728, "dg2 64x32"),        # decode class: 64-row tile, K >= 8192
     (128, 2560, 9728, "dg2 64x48"),
     (100, 2560, 9728, "fso"),             # decode M with a partly filled last 64-row block: fso's kernel
-    (96, 2560, 9728, "fso"),
+    #                                       (fp8_gemm_kernel_swapAB with a 40-token tile since H4 of issue 12)
+    (96, 2560, 9728, "fso"),              # (fp8_gemm_kernel_swapAB with a 32-token tile since H3 of issue 12)
     (160, 19456, 2560, "dg2 128x160"),    # 128 < M < 256: DeepGEMM's pick (multicast on B)
     (160, 2560, 9728, "dg2 64x64"),
     (192, 6144, 2560, "dg2 64x144"),
@@ -53,8 +57,24 @@ CELLS = [
     (512, 19456, 2560, "fso"),            # DeepGEMM picks 256 x 112
     (2048, 2048, 4096, "fso"),            # DeepGEMM picks one wave of 256 x 128 without multicast
     (64, 2560, 4096, "fso"),              # 64-row tile but K < 8192
+    # rule 5: fso's tile leaves at least 48 rows of its last M block empty (below M = 1024)
+    (80, 5120, 2048, "dg2 64x80"),        # DeepGEMM's single-CTA pick (fso: 128 x 40, 48 rows empty)
+    (136, 2048, 2048, "dg2 64x48"),       # DeepGEMM's single-CTA pick (fso: 64 x 32, 56 rows empty)
+    (136, 2048, 4096, "fso"),             # the same at K = 4096: fp8_gemm_kernel_swapAB (40 tokens) since H4
+    # rule-5 shapes that the swap-AB route takes since H3 of issue 12 (64 < M <= 96 with a 64-row weight tile:
+    # fp8_gemm_kernel_swapAB, which this test counts as "fso"): the v2 kernel's 64 x 32 tile at M = 78 / 80
+    (80, 2048, 4096, "fso"),
+    (78, 2048, 1280, "fso"),
+    (78, 1280, 5120, "fso"),              # (was fp8_gemm_kernel: 80 tiles of the v2 kernel, under three quarters)
+    (288, 5120, 2048, "dg2 128x128"),     # DeepGEMM picks a two-CTA cluster: fso's one-wave tile on the v2 kernel
+    (416, 5120, 2048, "dg2 128x160"),     # one wave instead of fso's two
+    (533, 1280, 5120, "dg2 64x96"),
+    (533, 5120, 1280, "fso"),             # DeepGEMM's pick clustered and fso's tile two waves: fso's kernel
+    (576, 5120, 2048, "fso"),
+    (112, 5120, 2048, "fso"),             # 16 rows empty: below the threshold
+    (1079, 1280, 5120, "fso"),            # from M = 1024 the v2 classes alone decide
 ]
-GRAPH_CELLS = [(1024, 19456, 2560), (128, 2560, 9728)]
+GRAPH_CELLS = [(1024, 19456, 2560), (128, 2560, 9728), (80, 5120, 2048), (288, 5120, 2048)]
 
 
 def kernel_of(names):

@@ -115,8 +115,8 @@ the source tree.
 
 - **Constraints.** `K % 128 == 0` everywhere. On sm_100/103 and sm_120/121, also `N % 128 == 0`.
 - **MXFP8 checkpoints written through safetensors.** Such a checkpoint holds its scale in row-major order
-  instead of the K-major order the quantizer produced. `prepare_weight` recognises both forms and
-  restores the K-major one. Do not reorder the scale by hand: a GEMM handed the row-major scale computes
+  instead of the N-fastest order (strides `(1, N)`) the quantizer produced. `prepare_weight` recognises
+  both forms and restores the N-fastest one. Do not reorder the scale by hand: a GEMM handed the row-major scale computes
   a wrong result without an error.
 - **The handle.** It is valid only on the architecture family it was prepared on. Prepare on the serving
   device.
@@ -126,14 +126,15 @@ the source tree.
 ```python
 y = fso.dense.linear(x, w)   # x: bf16 [..., K]  ->  y: bf16 [..., N]
 if bias is not None:
-    y = y + bias             # there is no bias argument
+    y = y + bias             # on sm_90, fso.dense.linear(x, w, bias=bias) applies it in the GEMM instead
 ```
 
 The activation is quantized inside the op on every call:
 - 1×128 block-FP8 on sm_90, through `linear_qx`;
 - MXFP8 1×32 on the Blackwell parts, followed by the architecture's MXFP8 GEMM router.
 
-On B200/B300 the router includes the M ≤ 64 decode row and the cuBLAS and CuTe-DSL tiers.
+On B200/B300 the router includes the CuTe-DSL swap-AB row (the M ≤ 64 decode band and the narrow-N long-K band
+above it) and the cuBLAS and CuTe-DSL tiers.
 
 **Tensor parallelism.** A column-parallel shard is `[N/tp, K]` and a row-parallel shard is
 `[N, K/tp]`. Each rank prepares its own shard, and the per-rank `K` and, on Blackwell, `N` must stay
@@ -216,7 +217,6 @@ variable.
 | `FSO_MOE_FUSED_COMBINE=1` | sm_120/121: allows the fused-combine FC2 on the buckets whose down-projection slab would dominate the layer's memory. Those buckets are then not bit-reproducible run to run. `transient_bytes` follows the setting |
 | `FSO_JIT_INCLUDE_DIRS=a:b:c` | sm_90, an in-place build: the source tree that built the extension moved. A wheel carries its headers |
 | `FSO_JIT_NVRTC_LIB=/path/to/libnvrtc.so` | sm_90: compile with another NVRTC library than the bundled 13.0.88. A version other than 13.0 prints one notice. A path that cannot be loaded raises; nothing falls back to torch's NVRTC |
-| `FSO_STREAMK_POOL_MB=<n>` | sm_120/121: the dense GEMM's Stream-K scratch is allocated once. A later shape that needs more aborts the process. Size it for the largest dense shape, or make that shape's call the first |
 | `FSO_GROUPED_ARG_POOL_MB=<n>` | sm_100/103: the per-thread arena that every captured MoE GEMM pins a block of. Raise it if the process captures very many graphs |
 | `FSO_FC1_FUSED=0` | A/B runs only: the unfused FC1 on every architecture. Set it before `prepare_experts`, because it decides the weight layout |
 

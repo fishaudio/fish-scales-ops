@@ -10,7 +10,9 @@
  * C++ namespace stays blockscale_gemm).
  */
 
+#include "input_alignment.h"
 #include "blockscale_gemm/runner.h"
+#include "dense_epilogue_args.h"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -28,8 +30,19 @@ namespace detail
 // Defined in quant_kernels.cu.
 void fp8bs_quantize_1x128(__nv_fp8_e4m3* x_q, float* scales, __nv_bfloat16 const* x, int M, int K, cudaStream_t stream,
     bool use_ue8m0);
+// The sm_90 quantizer of activation contract v1: linear_qx's internal activation quantize, padded-row scales zeroed.
+void fp8bs_quantize_1x128_contract(
+    __nv_fp8_e4m3* x_q, float* scales, __nv_bfloat16 const* x, int M, int K, cudaStream_t stream);
 void fp8bs_quantize_1x128_packed(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
     __nv_bfloat16 const* x, int M, int K, cudaStream_t stream, bool use_ue8m0, bool sm1xx_sf_layout);
+// The width of the vector loads with which the kernel each launcher above selects reads its bf16 input (16, 8 or 4
+// bytes; x_q nullptr stands for a fresh allocation), and the same for the runner's activation quantize in
+// fp8_gemm_run (linear_qx, linear_bf16 on sm_90 / sm_120). The op bodies refuse an input whose rows that kernel
+// cannot read (input_alignment.h), before anything is allocated or launched.
+int fp8bs_quantize_1x128_x_vector_bytes(__nv_fp8_e4m3 const* x_q, __nv_bfloat16 const* x, int K, bool use_ue8m0);
+int fp8bs_quantize_1x128_contract_x_vector_bytes(__nv_fp8_e4m3 const* x_q, __nv_bfloat16 const* x, int K);
+int fp8bs_quantize_1x128_packed_x_vector_bytes();
+int fp8_gemm_run_quantize_a_x_vector_bytes(bool sm120, __nv_bfloat16 const* x, int K);
 void fp8bs_quantize_128x128(
     __nv_fp8_e4m3* w_q, float* scales, __nv_bfloat16 const* w, int N, int K, cudaStream_t stream, bool use_ue8m0);
 // sm_100 / sm_103 block-FP8: 1x128 / 128x128 UE8M0 FP32 scales -> Sm1xx atom layout, each byte replicated
@@ -38,9 +51,12 @@ void repack_ue8m0_scales_1x128_for_sm1xx(int32_t* dst, float const* src, int M, 
     cudaStream_t stream);
 void repack_ue8m0_scales_128x128_for_sm1xx(int32_t* dst, float const* src, int N, int N_blocks, int K_blocks,
     cudaStream_t stream);
-// In mxfp8_sm100_kernel.cu (sm_100/sm_103 tcgen05 BlockScaled path).
+// In mxfp8_sm100_kernel.cu (sm_100/sm_103 tcgen05 BlockScaled path). The dense cascade takes its per-call
+// scratch from the caller: ask for the size, allocate it on the launch stream, pass it down.
 cudaError_t launch_sm100_mxfp8_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D,
-    int32_t* SFA, int32_t* SFB, int M, int N, int K, cudaStream_t stream);
+    int32_t* SFA, int32_t* SFB, int M, int N, int K, cudaStream_t stream, fso::DenseEpilogue const& epilogue,
+    void* workspace, std::size_t workspace_bytes);
+std::size_t launch_sm100_mxfp8_dispatch_workspace_bytes(int M, int N, int K, fso::DenseEpilogue const& epilogue);
 bool sm100_mxfp8_compiled();
 // sm_90 (H200) grouped block-scale FP8 masked — fp8_grouped_sm90_kernel.cu.
 cudaError_t launch_sm90_fp8_grouped_masked_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D,
@@ -51,6 +67,16 @@ void fp8bs_quantize_1x128_fp32_grouped_gather(__nv_fp8_e4m3* x_q, float* sfa, __
     int32_t const* slot_of_flat, int n_pairs, int topk, int m_cap, int K, cudaStream_t stream);
 void fp8bs_silu_chunk_mul_quantize_1x128_fp32_grouped(__nv_fp8_e4m3* x_q, float* sfa, __nv_bfloat16 const* gu,
     int32_t const* slot_of_flat, int n_pairs, int m_cap, int K, cudaStream_t stream);
+// The width of the vector loads with which the kernel each of these MoE quantizers launches (the two above and the
+// two sorted ones below) reads its bf16 input; the op bodies refuse an input whose rows that kernel cannot read
+// (input_alignment.h), before anything is allocated or launched.
+int fp8bs_quantize_1x128_fp32_grouped_gather_x_vector_bytes();
+int fp8bs_silu_chunk_mul_quantize_1x128_fp32_grouped_x_vector_bytes();
+int fp8bs_quantize_1x128_fp32_sorted_gather_x_vector_bytes(__nv_bfloat16 const* x, int n_pairs, int topk);
+int fp8bs_silu_chunk_mul_quantize_1x128_fp32_sorted_x_vector_bytes();
+// The width of the stores with which the sorted gather's kernel writes a caller-owned x_q (quantize_1x128_sorted_gather
+// _sm90 refuses one that kernel cannot write).
+int fp8bs_quantize_1x128_fp32_sorted_gather_x_q_vector_bytes(int n_pairs, int topk);
 // H4 contiguous (sorted-layout) siblings.
 cudaError_t launch_sm90_fp8_grouped_contiguous_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D,
     float* SFA, float* SFB, int32_t* sorted_expert_ids, int num_groups, int p_max, int N, int K, int block_m,
@@ -121,7 +147,33 @@ static bool is_sm100_family_cached()
 std::tuple<at::Tensor, at::Tensor> quantize_1x128_packed(at::Tensor x, bool use_ue8m0);
 std::tuple<at::Tensor, at::Tensor> quantize_128x128(at::Tensor w, bool use_ue8m0);
 at::Tensor repack_fp8_wgt_scales(at::Tensor sw_f32, bool check);
-at::Tensor linear_fp8(at::Tensor x_fp8, at::Tensor w_fp8, at::Tensor sx, at::Tensor sw);
+
+// The width of the loads with which quantize_1x128_packed reads x: its own kernel when K % 512 == 0, otherwise the
+// kernel quantize_1x128 selects (the op's two-step path).
+static int quantize_1x128_packed_x_vector_bytes(at::Tensor const& x, int K, bool use_ue8m0)
+{
+    if (K % 512 == 0)
+        return detail::fp8bs_quantize_1x128_packed_x_vector_bytes();
+    return detail::fp8bs_quantize_1x128_x_vector_bytes(
+        nullptr, reinterpret_cast<__nv_bfloat16 const*>(x.data_ptr()), K, use_ue8m0);
+}
+at::Tensor linear_fp8(at::Tensor x_fp8, at::Tensor w_fp8, at::Tensor sx, at::Tensor sw, std::optional<at::Tensor> bias,
+    std::optional<at::Tensor> residual, int64_t act);
+
+// sm_120/121: the Stream-K partial scratch of this call's route, from the torch caching allocator on the current
+// stream (graph-private inside a capture), handed to the runner; an undefined tensor when the route is a single
+// launch. The caller keeps the tensor alive until the runner has enqueued its kernels; every kernel that touches it
+// is ordered before the op's last kernel on that stream, so the allocator may reuse it after the op returns.
+template <class Runner>
+at::Tensor sm120_streamk_scratch_for(Runner& runner, int M, int N, int K, at::TensorOptions const& opts)
+{
+    std::size_t const bytes = runner.getStreamKScratchSize(M, N, K);
+    if (bytes == 0)
+        return at::Tensor();
+    at::Tensor t = at::empty({static_cast<int64_t>(bytes)}, opts.dtype(at::kByte));
+    runner.configureStreamKScratch(t.data_ptr(), bytes);
+    return t;
+}
 
 at::Tensor linear_bf16(at::Tensor x, at::Tensor w)
 {
@@ -133,6 +185,14 @@ at::Tensor linear_bf16(at::Tensor x, at::Tensor w)
     int const K = x.size(1);
     int const N = w.size(0);
     TORCH_CHECK(w.size(1) == K, "w.size(1) must match x.size(1)");
+    // The activation quantize reads x in vectors (sm_100/sm_103: quantize_1x128_packed's kernels; sm_90 and
+    // sm_120/121: the runner's, fp8_gemm_run); the weight quantize reads w one element at a time.
+    detail::require_bf16_vector_aligned(x, M, K,
+        is_sm100_family_cached()
+            ? quantize_1x128_packed_x_vector_bytes(x, K, /*use_ue8m0=*/true)
+            : detail::fp8_gemm_run_quantize_a_x_vector_bytes(at::cuda::getCurrentDeviceProperties()->major == 12,
+                reinterpret_cast<__nv_bfloat16 const*>(x.data_ptr()), K),
+        "fish_scales_ops::linear_bf16", "x");
 
     if (is_sm100_family_cached())
     {
@@ -143,7 +203,8 @@ at::Tensor linear_bf16(at::Tensor x, at::Tensor w)
         // the host, which would synchronize every call and break a capture.
         auto [xq, sx] = quantize_1x128_packed(x.contiguous(), /*use_ue8m0=*/true);
         auto [wq, sw_f32] = quantize_128x128(w.contiguous(), /*use_ue8m0=*/true);
-        return linear_fp8(xq, wq, sx, repack_fp8_wgt_scales(sw_f32, /*check=*/false));
+        return linear_fp8(xq, wq, sx, repack_fp8_wgt_scales(sw_f32, /*check=*/false), std::nullopt, std::nullopt,
+            fso::kDenseActNone);
     }
 
     auto y = at::empty({M, N}, x.options());
@@ -153,6 +214,9 @@ at::Tensor linear_bf16(at::Tensor x, at::Tensor w)
     std::size_t ws_bytes = runner.getWorkspaceSize(M, N, K);
     auto ws = at::empty({static_cast<int64_t>(ws_bytes)}, x.options().dtype(at::kByte));
     runner.configureWorkspace(reinterpret_cast<char*>(ws.data_ptr()));
+    at::Tensor sk;
+    if (at::cuda::getCurrentDeviceProperties()->major == 12)
+        sk = sm120_streamk_scratch_for(runner, M, N, K, x.options());
 
     auto stream = at::cuda::getCurrentCUDAStream();
     runner.gemm(reinterpret_cast<void*>(y.data_ptr()), reinterpret_cast<void const*>(x.data_ptr()),
@@ -179,7 +243,13 @@ void repack_ue8m0_scales_sfb_for_sm120(int32_t* dst, float const* src, int N_pad
 char const* sm100_mxfp8_error_hint(cudaError_t err);
 }
 
-at::Tensor linear_fp8(at::Tensor x_fp8, at::Tensor w_fp8, at::Tensor sx, at::Tensor sw)
+// bias / residual / act: the dense epilogue of interface v1 (dense_epilogue_args.h). sm_90 applies all three in its
+// GEMM (gemm_dispatch_sm90); on sm_100/sm_103 the block-FP8 call runs the MXFP8 cascade, which applies bias, erf-GELU
+// and the residual; the sm_120/sm_121 block-FP8 route applies none yet. A field the route does not serve is refused
+// with NotImplementedError before anything is launched or allocated. sm_100/sm_103 workspace: as in linear_mxfp8_raw
+// (ops/mxfp8.cu), from the torch caching allocator on the launch stream.
+at::Tensor linear_fp8(at::Tensor x_fp8, at::Tensor w_fp8, at::Tensor sx, at::Tensor sw, std::optional<at::Tensor> bias,
+    std::optional<at::Tensor> residual, int64_t act)
 {
     check_cuda_fp8(x_fp8, "x_fp8");
     check_cuda_fp8(w_fp8, "w_fp8");
@@ -191,14 +261,24 @@ at::Tensor linear_fp8(at::Tensor x_fp8, at::Tensor w_fp8, at::Tensor sx, at::Ten
     int const N = w_fp8.size(0);
     TORCH_CHECK(w_fp8.size(1) == K, "w.size(1) must match x.size(1)");
     TORCH_CHECK(K % 128 == 0, "K must be a multiple of 128 (1x128 activation scale blocks); got K=", K);
+    // TMA reads the activation on every architecture, and its scale where the GEMM takes it as given: the fp32 scale
+    // on sm_90 (DeepGEMM's scales_a descriptor) and the int32 pre-packed one on sm_100/sm_103 and sm_120/sm_121 (an
+    // fp32 scale is repacked into a buffer of its own there first). input_alignment.h.
+    detail::require_tma_aligned(x_fp8, "fish_scales_ops::linear_fp8", "x_fp8");
+    if (sx.dtype() == at::kInt || at::cuda::getCurrentDeviceProperties()->major == 9)
+        detail::require_tma_aligned(sx, "fish_scales_ops::linear_fp8", "sx");
+    // TMA reads the weight on every architecture, and its scale where the GEMM takes it as given: the int32 pre-packed
+    // one on sm_100/sm_103 and sm_120/sm_121. An fp32 weight scale is read with plain loads on sm_90 and repacked into
+    // a buffer of its own on the other architectures, so it is not checked. With M == 0 nothing is read.
+    if (M > 0)
+    {
+        detail::require_tma_aligned(w_fp8, "fish_scales_ops::linear_fp8", "w_fp8");
+        if (sw.dtype() == at::kInt)
+            detail::require_tma_aligned(sw, "fish_scales_ops::linear_fp8", "sw");
+    }
+    fso::DenseEpilogue const epilogue
+        = detail::make_dense_epilogue("fish_scales_ops::linear_fp8", bias, residual, act, M, N, x_fp8.device());
 
-    auto y = at::empty({M, N}, x_fp8.options().dtype(at::kBFloat16));
-
-    // Single FP8 path per arch via CUTLASS BlockScaled (sm_120) or
-    // deep_gemm JIT (sm_90). On sm_120 the kernel reads scales as int32
-    // with 4 UE8M0 bytes packed per word; our `quantize_1x128(use_ue8m0=
-    // True)` produces UE8M0-quantised values stored in FP32. Repack here
-    // before calling the runner.
     // Cache sm_major in a function-local static — cudaDeviceGetAttribute
     // is forbidden during CUDA graph stream capture, so we resolve it
     // once at first call and reuse. Assumes a single GPU per process
@@ -210,7 +290,30 @@ at::Tensor linear_fp8(at::Tensor x_fp8, at::Tensor w_fp8, at::Tensor sx, at::Ten
         cudaDeviceGetAttribute(&v, cudaDevAttrComputeCapabilityMajor, dev);
         return v;
     }();
+    // The route's refusal comes before the per-call scale repacks below, so a refused call launches nothing.
+    if (sm_major == 10)
+        detail::require_dense_epilogue_op(epilogue, fso::kDenseEpiServedSm100Cascade,
+            "fish_scales_ops::linear_fp8 (sm_100/sm_103, the C++ CUTLASS cascade gemm_dispatch_sm100_mxfp8)");
+    else if (sm_major == 12)
+        detail::require_dense_epilogue_op(epilogue, fso::kDenseEpiServedSm120Fp8Cascade,
+            "fish_scales_ops::linear_fp8 (sm_120/sm_121, the block-FP8 1x128 CUTLASS cascade gemm_dispatch_sm120)");
+    else
+        detail::require_dense_epilogue_op(epilogue, fso::kDenseEpiServedSm90DeepGemm,
+            "fish_scales_ops::linear_fp8 (sm_90, the DeepGEMM JIT route gemm_dispatch_sm90)");
+    // sm_100 / sm_103: the cascade's workspace size, asked before anything is allocated (it refuses a forced
+    // configuration that cannot apply the epilogue).
+    std::size_t sm100_ws_bytes = 0;
+    if (sm_major == 10 && N % 128 == 0 && detail::sm100_mxfp8_compiled())
+        sm100_ws_bytes = detail::dense_epilogue_refusing(
+            [&] { return detail::launch_sm100_mxfp8_dispatch_workspace_bytes(M, N, K, epilogue); });
 
+    auto y = at::empty({M, N}, x_fp8.options().dtype(at::kBFloat16));
+
+    // Single FP8 path per arch via CUTLASS BlockScaled (sm_120) or
+    // deep_gemm JIT (sm_90). On sm_120 the kernel reads scales as int32
+    // with 4 UE8M0 bytes packed per word; our `quantize_1x128(use_ue8m0=
+    // True)` produces UE8M0-quantised values stored in FP32. Repack here
+    // before calling the runner.
     at::Tensor sx_use = sx;
     at::Tensor sw_use = sw;
     if (sm_major == 10)
@@ -246,10 +349,15 @@ at::Tensor linear_fp8(at::Tensor x_fp8, at::Tensor w_fp8, at::Tensor sx, at::Ten
         }
         TORCH_CHECK(detail::sm100_mxfp8_compiled(),
             "block-FP8 on sm_100/sm_103 requires the extension to be built with TORCH_CUDA_ARCH_LIST including 10.0f");
-        cudaError_t const err = detail::launch_sm100_mxfp8_dispatch(
-            reinterpret_cast<__nv_fp8_e4m3*>(x_fp8.data_ptr()), reinterpret_cast<__nv_fp8_e4m3*>(w_fp8.data_ptr()),
-            reinterpret_cast<__nv_bfloat16*>(y.data_ptr()), reinterpret_cast<int32_t*>(sx_use.data_ptr()),
-            reinterpret_cast<int32_t*>(sw_use.data_ptr()), M, N, K, stream);
+        at::Tensor workspace;
+        if (sm100_ws_bytes > 0)
+            workspace = at::empty({static_cast<int64_t>(sm100_ws_bytes)}, x_fp8.options().dtype(at::kByte));
+        cudaError_t const err = detail::dense_epilogue_refusing([&] {
+            return detail::launch_sm100_mxfp8_dispatch(reinterpret_cast<__nv_fp8_e4m3*>(x_fp8.data_ptr()),
+                reinterpret_cast<__nv_fp8_e4m3*>(w_fp8.data_ptr()), reinterpret_cast<__nv_bfloat16*>(y.data_ptr()),
+                reinterpret_cast<int32_t*>(sx_use.data_ptr()), reinterpret_cast<int32_t*>(sw_use.data_ptr()), M, N, K,
+                stream, epilogue, sm100_ws_bytes > 0 ? workspace.data_ptr() : nullptr, sm100_ws_bytes);
+        });
         TORCH_CHECK(err == cudaSuccess, "sm100 block-FP8 kernel error: ", cudaGetErrorString(err),
             detail::sm100_mxfp8_error_hint(err));
         return y;
@@ -314,13 +422,16 @@ at::Tensor linear_fp8(at::Tensor x_fp8, at::Tensor w_fp8, at::Tensor sx, at::Ten
     using Runner = runtime::CutlassFp8BlockScaleGemmRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_bfloat16>;
     Runner runner;
     runner.configureWorkspace(nullptr);
+    at::Tensor sk;
+    if (sm_major == 12)
+        sk = sm120_streamk_scratch_for(runner, M, N, K, x_fp8.options());
 
     auto stream = at::cuda::getCurrentCUDAStream();
     runner.gemm(reinterpret_cast<__nv_fp8_e4m3 const*>(x_fp8.data_ptr()), /*ld_a=*/K,
         reinterpret_cast<__nv_fp8_e4m3 const*>(w_fp8.data_ptr()), /*ld_b=*/K,
         reinterpret_cast<__nv_bfloat16*>(y.data_ptr()), /*ld_d=*/N, M, N, K,
         reinterpret_cast<float const*>(sx_use.data_ptr()),
-        reinterpret_cast<float const*>(sw_use.data_ptr()), stream);
+        reinterpret_cast<float const*>(sw_use.data_ptr()), stream, epilogue);
     return y;
 }
 
@@ -331,6 +442,10 @@ std::tuple<at::Tensor, at::Tensor> quantize_1x128(at::Tensor x, bool use_ue8m0)
     int const K = x.size(-1);
     int const M = x.numel() / K;
     auto x2 = x.view({M, K});
+    detail::require_bf16_vector_aligned(x2, M, K,
+        detail::fp8bs_quantize_1x128_x_vector_bytes(nullptr, reinterpret_cast<__nv_bfloat16 const*>(x2.data_ptr()), K,
+            use_ue8m0),
+        "fish_scales_ops::quantize_1x128", "x");
 
     auto x_q = at::empty({M, K}, x.options().dtype(at::kFloat8_e4m3fn));
     int const m_pad = ceil_div(M, 4) * 4;
@@ -342,6 +457,37 @@ std::tuple<at::Tensor, at::Tensor> quantize_1x128(at::Tensor x, bool use_ue8m0)
         reinterpret_cast<float*>(scales.data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(x2.data_ptr()), M, K,
         stream, use_ue8m0);
     return {x_q.view(x.sizes()), scales};
+}
+
+
+// quantize_1x128_contract: the sm_90 quantizer of activation contract v1 (fso.dense.quantize_activation; interface v1,
+// issue #12). BF16 [M, K] -> FP8 [M, K] + FP32 scales [pad(M,4), K/128] (row-major metadata, written K-major:
+// scale(m, kb) at element kb * pad(M,4) + m), with exactly the codes and scales linear_qx computes inside the op: the
+// BF16 amax floor for every K, scale = 1 / (448 / amax). The padded rows' scales are 0. Differs from quantize_1x128
+// (use_ue8m0=False) only where that op floors at 1e-10f (K % 512 == 0) on a group whose amax is below the BF16 value
+// of 1e-10, and in the padded rows, which quantize_1x128 leaves unwritten when K % 512 != 0. sm_90 only.
+std::tuple<at::Tensor, at::Tensor> quantize_1x128_contract(at::Tensor x)
+{
+    check_cuda_bf16(x, "x");
+    TORCH_CHECK_VALUE(x.dim() == 2, "quantize_1x128_contract: x must be 2-D [M, K], got ", x.dim(), "-D");
+    TORCH_CHECK_NOT_IMPLEMENTED(at::cuda::getCurrentDeviceProperties()->major == 9,
+        "quantize_1x128_contract is the activation quantizer of the sm_90 contract (fso.dense.quantize_activation); "
+        "this device is sm_", at::cuda::getCurrentDeviceProperties()->major, "x, whose contract is MXFP8 1x32 "
+        "(quantize_1x32_packed)");
+    int const M = x.size(0);
+    int const K = x.size(1);
+    TORCH_CHECK_VALUE(K % 128 == 0, "quantize_1x128_contract: K must be a multiple of 128; got K=", K);
+    detail::require_bf16_vector_aligned(x, M, K,
+        detail::fp8bs_quantize_1x128_contract_x_vector_bytes(
+            nullptr, reinterpret_cast<__nv_bfloat16 const*>(x.data_ptr()), K),
+        "fish_scales_ops::quantize_1x128_contract", "x");
+    auto x_q = at::empty({M, K}, x.options().dtype(at::kFloat8_e4m3fn));
+    auto scales = at::empty({ceil_div(M, 4) * 4, K / 128}, x.options().dtype(at::kFloat));
+    if (M > 0)
+        detail::fp8bs_quantize_1x128_contract(reinterpret_cast<__nv_fp8_e4m3*>(x_q.data_ptr()),
+            reinterpret_cast<float*>(scales.data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(x.data_ptr()), M, K,
+            at::cuda::getCurrentCUDAStream());
+    return {x_q, scales};
 }
 
 
@@ -359,6 +505,8 @@ std::tuple<at::Tensor, at::Tensor> quantize_1x128_packed(at::Tensor x, bool use_
     TORCH_CHECK(x.dim() >= 2, "x must be at least 2D");
     int const K = x.size(-1);
     TORCH_CHECK(K % 128 == 0, "K must be a multiple of 128 (1x128 scale blocks); got K=", K);
+    detail::require_bf16_vector_aligned(x, x.numel() / K, K, quantize_1x128_packed_x_vector_bytes(x, K, use_ue8m0),
+        "fish_scales_ops::quantize_1x128_packed", "x");
     bool const sm1xx = is_sm100_family_cached();
     if (K % 512 != 0)
     {
@@ -536,7 +684,12 @@ at::Tensor repack_fp8_wgt_scales(at::Tensor sw_f32, bool check)
 // internally). On sm_90 and sm_120 the result is bit-identical to
 // quantize_1x128_fp8 + linear_fp8 (tests/gemm/unit/test_linear_qx.py); sm_100/103
 // refuse the op below.
-at::Tensor linear_qx(at::Tensor x_bf16, at::Tensor w_fp8, at::Tensor sw)
+//
+// bias / residual / act: the dense epilogue of interface v1 (dense_epilogue_args.h). sm_90 applies all three in its
+// GEMM (gemm_dispatch_sm90), after the activation quantize; sm_120 refuses a non-identity epilogue with
+// NotImplementedError before the activation quantize is launched.
+at::Tensor linear_qx(at::Tensor x_bf16, at::Tensor w_fp8, at::Tensor sw, std::optional<at::Tensor> bias,
+    std::optional<at::Tensor> residual, int64_t act)
 {
     check_cuda_bf16(x_bf16, "x_bf16");
     check_cuda_fp8(w_fp8, "w_fp8");
@@ -549,6 +702,26 @@ at::Tensor linear_qx(at::Tensor x_bf16, at::Tensor w_fp8, at::Tensor sw)
     int const K = x_bf16.size(1);
     int const N = w_fp8.size(0);
     TORCH_CHECK(w_fp8.size(1) == K, "w.size(1) must match x.size(1)");
+    // The runner's activation quantize (fp8_gemm_run) reads x in vectors.
+    detail::require_bf16_vector_aligned(x_bf16, M, K,
+        detail::fp8_gemm_run_quantize_a_x_vector_bytes(at::cuda::getCurrentDeviceProperties()->major == 12,
+            reinterpret_cast<__nv_bfloat16 const*>(x_bf16.data_ptr()), K),
+        "fish_scales_ops::linear_qx", "x_bf16");
+    // TMA reads the weight (input_alignment.h); the fp32 weight scale is read with plain loads (sm_90) or packed by
+    // the runner into a buffer of its own (sm_120/sm_121), so it is not checked. With M == 0 nothing is read.
+    if (M > 0)
+        detail::require_tma_aligned(w_fp8, "fish_scales_ops::linear_qx", "w_fp8");
+    fso::DenseEpilogue const epilogue
+        = detail::make_dense_epilogue("fish_scales_ops::linear_qx", bias, residual, act, M, N, x_bf16.device());
+    if (!epilogue.is_identity())
+    {
+        if (at::cuda::getCurrentDeviceProperties()->major == 12)
+            detail::require_dense_epilogue_op(epilogue, fso::kDenseEpiServedSm120Fp8Cascade,
+                "fish_scales_ops::linear_qx (sm_120/sm_121, the block-FP8 1x128 CUTLASS cascade gemm_dispatch_sm120)");
+        else
+            detail::require_dense_epilogue_op(epilogue, fso::kDenseEpiServedSm90DeepGemm,
+                "fish_scales_ops::linear_qx (sm_90, the DeepGEMM JIT route gemm_dispatch_sm90)");
+    }
 
     auto y = at::empty({M, N}, x_bf16.options());
 
@@ -557,15 +730,31 @@ at::Tensor linear_qx(at::Tensor x_bf16, at::Tensor w_fp8, at::Tensor sw)
     std::size_t ws_bytes = runner.getWorkspaceSize(M, N, K);
     auto ws = at::empty({static_cast<int64_t>(ws_bytes)}, x_bf16.options().dtype(at::kByte));
     runner.configureWorkspace(reinterpret_cast<char*>(ws.data_ptr()));
+    at::Tensor sk;
+    if (at::cuda::getCurrentDeviceProperties()->major == 12)
+        sk = sm120_streamk_scratch_for(runner, M, N, K, x_bf16.options());
 
     auto stream = at::cuda::getCurrentCUDAStream();
     runner.gemm(reinterpret_cast<void*>(y.data_ptr()), reinterpret_cast<void const*>(x_bf16.data_ptr()),
         reinterpret_cast<void const*>(w_fp8.data_ptr()), M, N, K, stream,
         /*scales_a=*/nullptr, // produced internally
-        reinterpret_cast<float const*>(sw.data_ptr()));
+        reinterpret_cast<float const*>(sw.data_ptr()), epilogue);
     return y;
 }
 
+
+// The operands every sm_90 grouped GEMM reads with TMA: the fp8 activation, its fp32 scale and the fp8 weights
+// (input_alignment.h; a misaligned one fails the descriptor encode). The fp32 weight scale is read with plain loads, so
+// it is not checked. Without an activation row nothing is read.
+static void require_sm90_grouped_tma_operands(at::Tensor const& a_fp8, at::Tensor const& sa, at::Tensor const& w_fp8,
+    char const* op)
+{
+    if (a_fp8.numel() == 0)
+        return;
+    detail::require_tma_aligned(a_fp8, op, "a_fp8");
+    detail::require_tma_aligned(sa, op, "sa");
+    detail::require_tma_aligned(w_fp8, op, "w_fp8");
+}
 
 // ---------------------------------------------------------------------------
 // Grouped (MoE, masked) block-scale FP8 on sm_90 (H200). Revives the in-tree
@@ -595,6 +784,7 @@ at::Tensor linear_fp8_grouped_masked(at::Tensor a_fp8, at::Tensor w_fp8, at::Ten
     TORCH_CHECK(masked_m.numel() == G, "masked_m must have G entries");
     TORCH_CHECK(K % 128 == 0 && N % 128 == 0, "N and K must be multiples of 128");
     TORCH_CHECK(expected_m >= 1, "expected_m must be >= 1");
+    require_sm90_grouped_tma_operands(a_fp8, sa, w_fp8, "fish_scales_ops::linear_fp8_grouped_masked");
 
     auto y = at::empty({G, m_cap, N}, a_fp8.options().dtype(at::kBFloat16));
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -631,6 +821,8 @@ std::tuple<at::Tensor, at::Tensor> quantize_1x128_grouped_gather_sm90(
     TORCH_CHECK(K % 128 == 0, "K must be a multiple of 128");
     TORCH_CHECK(m_cap >= 1 && m_cap % 4 == 0, "m_cap must be a positive multiple of 4");
     TORCH_CHECK(slot_of_flat.numel() == static_cast<int64_t>(M) * topk, "slot_of_flat must be [M*topk]");
+    detail::require_bf16_vector_aligned(x, M, K, detail::fp8bs_quantize_1x128_fp32_grouped_gather_x_vector_bytes(),
+        "fish_scales_ops::quantize_1x128_grouped_gather_sm90", "x");
 
     auto x_q = at::empty({G, m_cap, K}, x.options().dtype(at::kFloat8_e4m3fn));
     auto sfa = at::empty({G, Kb, m_cap}, x.options().dtype(at::kFloat));  // K-major
@@ -659,6 +851,10 @@ std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x128_grouped_sm90(
     int const Kb = INTER / 128;
     TORCH_CHECK(INTER % 128 == 0, "INTER must be a multiple of 128");
     TORCH_CHECK(m_cap % 4 == 0, "m_cap must be a multiple of 4");
+    if (slot_of_flat.numel() > 0) // no routed pair: the kernel reads nothing
+        detail::require_bf16_vector_aligned(gu, static_cast<int64_t>(G) * m_cap, TWO_INTER,
+            detail::fp8bs_silu_chunk_mul_quantize_1x128_fp32_grouped_x_vector_bytes(),
+            "fish_scales_ops::silu_chunk_mul_quantize_1x128_grouped_sm90", "gu");
 
     auto x_q = at::empty({G, m_cap, INTER}, gu.options().dtype(at::kFloat8_e4m3fn));
     auto sfa = at::empty({G, Kb, m_cap}, gu.options().dtype(at::kFloat));
@@ -721,8 +917,12 @@ at::Tensor linear_fp8_grouped_contiguous(at::Tensor a_fp8, at::Tensor w_fp8, at:
     TORCH_CHECK(sorted_expert_ids.numel() == P_max, "sorted_expert_ids must have P_max entries");
     TORCH_CHECK(K % 128 == 0 && N % 128 == 0, "N and K must be multiples of 128");
     TORCH_CHECK(block_m == 64, "H4a supports block_m = 64 only");
+    require_sm90_grouped_tma_operands(a_fp8, sa, w_fp8, "fish_scales_ops::linear_fp8_grouped_contiguous");
 
     auto y = sm90_out_or_empty(out, {P_max, N}, at::kBFloat16, a_fp8, "linear_fp8_grouped_contiguous", "out");
+    // The GEMM stores its result with TMA. A given out is checked here, before anything is launched; without one, y
+    // is a fresh allocation.
+    detail::require_tma_store_aligned(y, "fish_scales_ops::linear_fp8_grouped_contiguous", "out");
     auto stream = at::cuda::getCurrentCUDAStream();
     auto err = detail::launch_sm90_fp8_grouped_contiguous_dispatch(
         reinterpret_cast<__nv_fp8_e4m3*>(a_fp8.data_ptr()),
@@ -764,6 +964,7 @@ at::Tensor linear_fp8_grouped_contiguous_2wg(at::Tensor a_fp8, at::Tensor w_fp8,
     TORCH_CHECK(N % 256 == 0, "N = 2I must be a multiple of 256 (each warp-group half is whole 128-row blocks)");
     TORCH_CHECK(sw.numel() == static_cast<int64_t>(G) * (N / 128) * (K / 128), "sw must be [G, N/128, K/128]");
     TORCH_CHECK(block_m == 64, "two-warp-group FC1 supports block_m = 64 only");
+    require_sm90_grouped_tma_operands(a_fp8, sa, w_fp8, "fish_scales_ops::linear_fp8_grouped_contiguous_2wg");
 
     auto y = at::empty({P_max, N}, a_fp8.options().dtype(at::kBFloat16));
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -808,6 +1009,7 @@ std::tuple<at::Tensor, at::Tensor> linear_fp8_grouped_contiguous_swiglu(at::Tens
     TORCH_CHECK(N % 256 == 0, "N = 2I must be a multiple of 256 (each warp-group half is whole 128-row blocks)");
     TORCH_CHECK(sw.numel() == static_cast<int64_t>(G) * (N / 128) * (K / 128), "sw must be [G, N/128, K/128]");
     TORCH_CHECK(block_m == 64, "fused SwiGLU FC1 supports block_m = 64 only");
+    require_sm90_grouped_tma_operands(a_fp8, sa, w_fp8, "fish_scales_ops::linear_fp8_grouped_contiguous_swiglu");
     int const INTER = N / 2;
     int const sfa_ld = align_up4(P_max);
     TORCH_CHECK(sa.numel() >= static_cast<int64_t>(K / 128) * sfa_ld, "sa must be [K/128, align4(P_max)]");
@@ -854,8 +1056,11 @@ at::Tensor linear_fp8_grouped_contiguous_swapab(at::Tensor a_fp8, at::Tensor w_f
     TORCH_CHECK(K % 128 == 0 && N % 128 == 0, "N and K must be multiples of 128");
     TORCH_CHECK(block_n == 16 || block_n == 32 || block_n == 64,
         "swap-AB grouped GEMM: block_n must be 16, 32 or 64 (= the moe_build_sorted padding)");
+    require_sm90_grouped_tma_operands(a_fp8, sa, w_fp8, "fish_scales_ops::linear_fp8_grouped_contiguous_swapab");
 
     auto y = sm90_out_or_empty(out, {P_max, N}, at::kBFloat16, a_fp8, "linear_fp8_grouped_contiguous_swapab", "out");
+    // The GEMM stores its result with TMA (see linear_fp8_grouped_contiguous).
+    detail::require_tma_store_aligned(y, "fish_scales_ops::linear_fp8_grouped_contiguous_swapab", "out");
     auto stream = at::cuda::getCurrentCUDAStream();
     auto err = detail::launch_sm90_fp8_grouped_contiguous_swapab_dispatch(
         reinterpret_cast<__nv_fp8_e4m3*>(a_fp8.data_ptr()),
@@ -898,6 +1103,7 @@ at::Tensor linear_fp8_grouped_contiguous_swapab_pair(at::Tensor a_fp8, at::Tenso
     TORCH_CHECK(sw.numel() == static_cast<int64_t>(G) * (N / 128) * (K / 128), "sw must be [G, N/128, K/128]");
     TORCH_CHECK(block_n == 16 || block_n == 32 || block_n == 64,
         "swap-AB gate/up pair FC1: block_n must be 16, 32 or 64 (= the moe_build_sorted padding)");
+    require_sm90_grouped_tma_operands(a_fp8, sa, w_fp8, "fish_scales_ops::linear_fp8_grouped_contiguous_swapab_pair");
 
     auto y = at::empty({P_max, N}, a_fp8.options().dtype(at::kBFloat16));
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -943,6 +1149,7 @@ std::tuple<at::Tensor, at::Tensor> linear_fp8_grouped_contiguous_swapab_swiglu(a
     TORCH_CHECK(sw.numel() == static_cast<int64_t>(G) * (N / 128) * (K / 128), "sw must be [G, N/128, K/128]");
     TORCH_CHECK(block_n == 16 || block_n == 32 || block_n == 64,
         "fused SwiGLU swap-AB FC1: block_n must be 16, 32 or 64 (= the moe_build_sorted padding)");
+    require_sm90_grouped_tma_operands(a_fp8, sa, w_fp8, "fish_scales_ops::linear_fp8_grouped_contiguous_swapab_swiglu");
     TORCH_CHECK(P_max % block_n == 0, "P_max must be a multiple of block_n (the moe_build_sorted padding)");
     int const INTER = N / 2;
     int const sfa_ld = align_up4(P_max);
@@ -985,8 +1192,17 @@ std::tuple<at::Tensor, at::Tensor> quantize_1x128_sorted_gather_sm90(
     int const Kb = K / 128;
     int const sfa_ld = align_up4(P_max);
     TORCH_CHECK(K % 128 == 0, "K must be a multiple of 128");
+    detail::require_bf16_vector_aligned(x, x.size(0), K,
+        detail::fp8bs_quantize_1x128_fp32_sorted_gather_x_vector_bytes(
+            reinterpret_cast<__nv_bfloat16 const*>(x.data_ptr()), R, static_cast<int>(topk)),
+        "fish_scales_ops::quantize_1x128_sorted_gather_sm90", "x");
 
     auto x_q = sm90_out_or_empty(x_q_out, {P_max, K}, at::kFloat8_e4m3fn, x, "quantize_1x128_sorted_gather_sm90", "x_q");
+    // A given x_q is written in the stores of the kernel this call selects (4 or 8 bytes, quant_kernels.cu), checked
+    // before anything else is allocated or launched; without one, x_q is a fresh allocation. The fp32 sa is written one
+    // element at a time.
+    detail::require_out_aligned(x_q, P_max, K, detail::fp8bs_quantize_1x128_fp32_sorted_gather_x_q_vector_bytes(R,
+        static_cast<int>(topk)), "fish_scales_ops::quantize_1x128_sorted_gather_sm90", "x_q");
     auto sfa = sm90_out_or_empty(sa_out, {Kb, sfa_ld}, at::kFloat, x, "quantize_1x128_sorted_gather_sm90", "sa");
     auto stream = at::cuda::getCurrentCUDAStream();
     detail::fp8bs_quantize_1x128_fp32_sorted_gather(
@@ -1016,6 +1232,10 @@ std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x128_sorted_sm90(
     int const Kb = INTER / 128;
     int const sfa_ld = align_up4(P_max);
     TORCH_CHECK(INTER % 128 == 0, "INTER must be a multiple of 128");
+    if (R > 0) // no routed pair: the kernel reads nothing
+        detail::require_bf16_vector_aligned(gu, P_max, TWO_INTER,
+            detail::fp8bs_silu_chunk_mul_quantize_1x128_fp32_sorted_x_vector_bytes(),
+            "fish_scales_ops::silu_chunk_mul_quantize_1x128_sorted_sm90", "gu");
 
     auto x_q = at::empty({P_max, INTER}, gu.options().dtype(at::kFloat8_e4m3fn));
     auto sfa = at::empty({Kb, sfa_ld}, gu.options().dtype(at::kFloat));

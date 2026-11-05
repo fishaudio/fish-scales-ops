@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "blockscale_gemm/common/epilogue.cuh"
 #include "blockscale_gemm/common/kernel_utils.cuh"
 #include "blockscale_gemm/common/scale_kernels.cuh"
 #include "blockscale_gemm/arch/sm120/common/scale_repack.cuh"
@@ -32,17 +33,40 @@ namespace kernels::blockscale_gemm
 // On sm_120 the kernel reinterprets scales_a/b as int32-packed UE8M0; callers
 // must pass the int32-packed buffers (typed as float* for layering reasons).
 // The bf16-input overload below handles the repack so the Runner-internal
-// path needs no further changes.
+// path needs no further changes. `epilogue` (common/epilogue.cuh) goes to the
+// arch dispatch, which refuses the fields its route does not apply.
+// `streamk_scratch` / `streamk_scratch_bytes`: the caller's Stream-K partial
+// scratch on sm_120/121 (sm120_fp8_streamk_scratch_bytes); sm_90 reads neither.
 inline void fp8_gemm_run(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4m3* mat_b, int ld_b, __nv_bfloat16* mat_d, int ld_d,
-    uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, float* scales_a, float* scales_b, cudaStream_t stream)
+    uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, float* scales_a, float* scales_b, cudaStream_t stream,
+    fso::DenseEpilogue const& epilogue = fso::DenseEpilogue{}, void* streamk_scratch = nullptr,
+    std::size_t streamk_scratch_bytes = 0)
 {
     if (shape_m == 0)
         return;
     int const arch = tensorrt_llm::common::getSMVersion();
     if (arch == 120 || arch == 121)
-        gemm_dispatch_sm120(mat_a, mat_b, mat_d, scales_a, scales_b, shape_m, shape_n, shape_k, stream);
+        gemm_dispatch_sm120(mat_a, mat_b, mat_d, scales_a, scales_b, shape_m, shape_n, shape_k, stream, kNumDeviceSMs,
+            epilogue, streamk_scratch, streamk_scratch_bytes);
     else
-        gemm_dispatch_sm90(mat_a, ld_a, mat_b, ld_b, mat_d, ld_d, scales_a, scales_b, shape_m, shape_n, shape_k, stream);
+        gemm_dispatch_sm90(mat_a, ld_a, mat_b, ld_b, mat_d, ld_d, scales_a, scales_b, shape_m, shape_n, shape_k, stream,
+            kNumDeviceSMs, epilogue);
+}
+
+// The bytes of bf16 Stream-K partial scratch the sm_120/121 block-FP8 cascade needs for one [M, K] x [N, K] call
+// (0 when the route is a single launch, and on every other architecture). Host only; the op bodies allocate it from
+// the torch caching allocator on the caller's stream and hand it to the runner (configureStreamKScratch).
+inline std::size_t sm120_fp8_streamk_scratch_bytes(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k)
+{
+    if (shape_m == 0)
+        return 0;
+    int const arch = tensorrt_llm::common::getSMVersion();
+    if (arch != 120 && arch != 121)
+        return 0;
+    if (kNumDeviceSMs < 0)
+        kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
+    return sm120_fp8_dense_route(shape_m, shape_n, shape_k, kNumDeviceSMs)
+        .streamk_scratch_bytes(static_cast<int>(shape_m), static_cast<int>(shape_n));
 }
 
 namespace detail
@@ -134,10 +158,16 @@ private:
 // final UE8M0 value); SFB uses raw `scale_128x128_kernel` (arbitrary FP32)
 // and the repack rounds DOWN to nearest power of 2 — same trade-off as the
 // pre-quantized `linear_fp8` path.
+//
+// `epilogue` (common/epilogue.cuh) is checked against the route's capability
+// here, before the activation quantize is launched, so a refused call launches
+// nothing; the arch dispatch checks it again. `streamk_scratch` /
+// `streamk_scratch_bytes`: as for the FP8/FP8 overload above.
 inline void fp8_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, int ld_a, float* scales_a,
     __nv_bfloat16 const* mat_b, __nv_fp8_e4m3* fp8_mat_b, int ld_b, float* scales_b, __nv_bfloat16* mat_d, int ld_d,
     uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, cudaStream_t stream, bool internal_quantize_a = true,
-    bool internal_quantize_b = true)
+    bool internal_quantize_b = true, fso::DenseEpilogue const& epilogue = fso::DenseEpilogue{},
+    void* streamk_scratch = nullptr, std::size_t streamk_scratch_bytes = 0)
 {
     if (shape_m == 0)
         return;
@@ -146,6 +176,12 @@ inline void fp8_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, i
 
     int const arch = tensorrt_llm::common::getSMVersion();
     bool const is_sm120 = (arch == 120 || arch == 121);
+    if (is_sm120)
+        fso::require_dense_epilogue(epilogue, fso::kDenseEpiServedSm120Fp8Cascade,
+            "sm_120/sm_121 block-FP8 1x128 GEMM (gemm_dispatch_sm120, the CUTLASS cascade)");
+    else
+        fso::require_dense_epilogue(epilogue, fso::kDenseEpiServedSm90DeepGemm,
+            "sm_90 dense block-FP8 GEMM (gemm_dispatch_sm90, the DeepGEMM JIT route)");
 
     if (internal_quantize_a)
     {
@@ -199,12 +235,13 @@ inline void fp8_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, i
         // gemm_dispatch_sm120 takes scales typed as float* but reinterprets to
         // int32* internally; pass the packed buffers through that channel.
         gemm_dispatch_sm120(fp8_mat_a, fp8_mat_b, mat_d, reinterpret_cast<float*>(packed_sfa),
-            reinterpret_cast<float*>(packed_sfb), shape_m, shape_n, shape_k, stream);
+            reinterpret_cast<float*>(packed_sfb), shape_m, shape_n, shape_k, stream, kNumDeviceSMs, epilogue,
+            streamk_scratch, streamk_scratch_bytes);
     }
     else
     {
         gemm_dispatch_sm90(fp8_mat_a, ld_a, fp8_mat_b, ld_b, mat_d, ld_d, scales_a, scales_b, shape_m, shape_n,
-            shape_k, stream);
+            shape_k, stream, kNumDeviceSMs, epilogue);
     }
 }
 

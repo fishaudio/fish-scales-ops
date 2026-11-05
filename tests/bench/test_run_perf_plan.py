@@ -11,6 +11,8 @@ bench/run_perf.py resolves from them, and the raw-file manifest of bench/gemm/py
     render_perf_docs.py joins them to the Family A table only once that file has timed cells.
   - The plan resolves for every machine (no preflight), a smoke plan adds --Ms 1,64 to every step, and the step
     environment drops every FSO_* knob but the lock's bench environment.
+  - --steps keeps only the named steps of the selected groups, in the suite's order, and a name that is not a step
+    of those groups is a usage error before any preflight.
   - The preflight's drift detection lists a package whose version differs from the lock.
   - A step's clock summary carries the busy power, the mean busy clock and the throttle shares, every key the
     provenance already reads stays, and a step whose busy samples hit the power cap gets a power flag.
@@ -121,6 +123,11 @@ def test_plan_resolution_for_every_machine():
         assert dense and all(s["group"] == "dense" for s in dense) and len(dense) == 4
         groups = {s["group"] for s in full}
         assert groups <= set(run_perf.GROUPS) and {"dense", "moe", "moe_ref", "shared", "mlp_ref"} <= groups, (m, groups)
+        # --steps: the serving group's fso steps without its comparator steps, in the suite's order
+        srv = [s["name"] for s in perf_suite.SUITES[m] if s["group"] == "serving"]
+        fso_srv = [n for n in srv if "_ref" not in n]
+        sel = run_perf.resolve_plan(lock, run_dir, ["serving"], steps=list(reversed(fso_srv)))
+        assert [s["name"] for s in sel] == fso_srv and 0 < len(sel) < len(srv), (m, [s["name"] for s in sel])
         mlp = run_perf.resolve_plan(lock, run_dir, ["mlp_ref"], smoke=False)
         assert mlp and all(s["group"] == "mlp_ref" and s["script"] == perf_suite.MLP and "--dtypes" in s["argv"]
                            for s in mlp), (m, mlp)
@@ -137,6 +144,43 @@ def test_plan_resolution_for_every_machine():
             assert env.get("LD_LIBRARY_PATH") == e["env"].get("LD_LIBRARY_PATH")
             assert env["HOME"] == "/home/u"
     print("  plans: " + ", ".join(f"{m} {len(perf_suite.SUITES[m])} steps" for m in run_perf.MACHINES))
+
+
+def test_steps_outside_the_tables_are_refused():
+    """A --steps name that is not a step of the selected groups stops the run with a usage error, before the
+    preflight (no nvidia-smi, no probe), on any host."""
+    for m in run_perf.MACHINES:
+        moe_step = next(s["name"] for s in perf_suite.SUITES[m] if s["group"] == "moe")
+        rc = run_perf.main(["--machine", m, "--out", f"/nonexistent/steps_{m}", "--tables", "dense",
+                            "--steps", moe_step, "--dry-run"])
+        assert rc == run_perf.EXIT_USAGE, (m, rc)
+
+
+def test_card_lock_on_a_read_only_file():
+    """The card lock works on a lock file this user may only read (the RTX 5090 pod's .gpuc1.lock is root's, mode
+    0644): run_perf.acquire_flock takes it through a read-only descriptor, and a second taker waits and gives up."""
+    import fcntl
+    d = tempfile.mkdtemp()
+    try:
+        path = os.path.join(d, "card.lock")
+        open(path, "w").close()
+        os.chmod(path, 0o444)
+        fd = run_perf.acquire_flock(path, 5)
+        assert fd is not None
+        try:
+            other = os.open(path, os.O_RDONLY)
+            try:
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = False
+            except OSError:
+                held = True
+            os.close(other)
+            assert held, "the lock taken through a read-only descriptor is not exclusive"
+            assert run_perf.acquire_flock(path, 2) is None
+        finally:
+            os.close(fd)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def test_mlp_ref_merge_and_render():

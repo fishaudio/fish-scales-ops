@@ -22,10 +22,14 @@ swapped in under an existing public op:
    sum the same FP32 K-slice partials in the same order.
 
 2. **Routing.** The decode row must fire exactly where it is meant to: M ≤ 64
-   with a tactic its own kernels accept, and nowhere else. The M > 64 band, the
+   with a tactic its own kernels accept, and above M = 64 only the narrow-N
+   long-K band (issue #12, P5: N ≤ 4096 with K ≥ 4096, up to where tier 1's
+   grid fills the machine, outside the cascade's two-kernel split-K and wave
+   tile), each cell on its expected form. The rest of the M > 64 band, the
    long-K narrow-N and short-K cells above M = 32, the shapes whose K does not
    divide into the split-K tiling, and every architecture other than
-   sm_100/103 must be untouched. The version gate is checked by mocking an old
+   sm_100/103 must be untouched. Accuracy is checked on the band too, against
+   the tier that served each cell before. The version gate is checked by mocking an old
    `nvidia-cutlass-dsl` in a subprocess and confirming that `route` then
    returns bit-identical results to the shipped path and that `pick_config`
    declines every cell; `FSO_DISABLE_DECODE_DSL=1` must do the same.
@@ -271,12 +275,15 @@ def test_routing() -> None:
     print("  routing  32 < M <= 64 takes the wide-token form except long-K "
           "narrow-N  OK")
 
-    # Out of the band.
+    # Above the decode band the row takes only the narrow-N long-K band (issue #12, P5). On the Family A shapes of
+    # this file that leaves every one of these M to the tiers below: the wide-N shapes are not the band, the
+    # cascade's wave tile owns wo / down to M = 256, and from M = 1024 tier 1's grid fills the machine.
     for tag, N, K in SHAPES:
         for M in (65, 96, 128, 256, 1024, 4096):
             assert _sm100_decode.pick_config(M, N, K) is None, \
-                f"{tag} M={M}: the decode row took a cell above M = 64"
-    print("  routing  nothing above M = 64 is taken  OK")
+                f"{tag} M={M}: the row took a cell above M = 64 outside the narrow-N long-K band"
+    print("  routing  Family A above M = 64: wave-owned and tier-1 cells untouched  OK")
+    test_band_routing()
 
     # Shapes the kernels cannot serve are declined, not forced.
     assert _sm100_decode.pick_config(1, 2560, 2560 + 64) is None, \
@@ -307,10 +314,102 @@ def test_routing() -> None:
     assert _sm100_smm.wave_tile_owns(160, 2048) is False   # 64 CTAs leave half the SMs idle
     assert _sm100_smm.should_route(160, 2560, 9728) is False
     assert _sm100_smm.should_route(257, 2560, 9728) is True
+    # (issue #12, T1) the bias calls of the narrow-N short-K cells just above the decode row go to the cascade's
+    # short-K tile: N <= 2048, 1024 <= K <= 2560, 64 < M <= 256; K = 512, a wide N, M = 257 and the decode band stay
+    # put. The identity calls of those cells stay on tier 1 (should_route is shape-only and unchanged).
+    assert _sm100_smm.short_k_owns(78, 1280, 1280) is True
+    assert _sm100_smm.should_route(78, 1280, 1280) is True
+    assert _sm100_smm.short_k_owns(128, 2048, 2048) is True
+    assert _sm100_smm.short_k_owns(65, 1024, 2560) is True
+    assert _sm100_smm.short_k_owns(256, 1280, 1280) is True
+    assert _sm100_smm.short_k_owns(257, 1280, 1280) is False
+    assert _sm100_smm.should_route(257, 1280, 1280) is True
+    assert _sm100_smm.short_k_owns(64, 1280, 1280) is False
+    assert _sm100_smm.short_k_owns(78, 2048, 512) is False
+    assert _sm100_smm.should_route(78, 2048, 512) is True
+    assert _sm100_smm.short_k_owns(78, 1280, 4096) is False
+    assert _sm100_smm.short_k_owns(78, 2176, 1280) is False
+    assert _sm100_smm.short_k_owns(78, 5120, 1280) is False
     assert _sm100_dsl.pick_config(1, 6144, 2560) is None
     assert _sm100_dsl.pick_config(64, 6144, 2560) is None
     assert _sm100_dsl.pick_config(4096, 19456, 2560) is not None
     print("  routing  tier 1 and tier 2 predicates unchanged  OK")
+
+
+# The narrow-N long-K band above the decode band (issue #12, P5): (tag, N, K, M, expected tactic).
+def SPLIT_T64(s):
+    return ((128, 64), (1, 1), True, s)
+
+
+PERSIST_T64 = ((256, 64), (2, 1), True, 1)
+BAND_CELLS = [
+    ("o",        2048, 4096,  65, SPLIT_T64(2)),   # K / 4 = 1024 < the four-way floor: two slices
+    ("o",        2048, 4096,  80, SPLIT_T64(2)),
+    ("o",        2048, 4096, 256, SPLIT_T64(2)),   # 64 clusters of two, one wave
+    ("o",        2048, 4096, 288, PERSIST_T64),    # 80 clusters of two would be two waves
+    ("o",        2048, 4096, 576, PERSIST_T64),    # 72 clusters of two
+    ("fc2",      1280, 5120,  78, SPLIT_T64(4)),   # 20 clusters of four
+    ("fc2",      1280, 5120, 182, SPLIT_T64(4)),   # 30 clusters of four
+    ("fc2",      1280, 5120, 364, SPLIT_T64(2)),   # 60 clusters: four-way would be two waves
+    ("fc2",      1280, 5120, 533, PERSIST_T64),
+    ("conv_out", 1280, 7680, 117, SPLIT_T64(4)),
+    ("conv_out", 1280, 7680, 364, SPLIT_T64(2)),
+    ("wo",       2560, 4096, 257, PERSIST_T64),    # above the wave tile's M = 256
+    ("wo",       2560, 4096, 448, PERSIST_T64),    # 70 clusters of two
+    ("down",     2560, 9728, 384, PERSIST_T64),
+]
+# Cells of the class the band leaves to the tiers below.
+BAND_OUT = [
+    ("o",        2048, 4096, 640),    # the 64-wide form would be two waves; tier 1 keeps it
+    ("o",        2048, 4096, 768),
+    ("fc2",      1280, 5120, 1079),   # tier 1's grid (90 CTAs) fills the machine
+    ("wo",       2560, 4096, 512),
+    ("down",     2560, 9728, 104),    # the cascade's two-kernel split-K (K >= 8192, M <= 104)
+    ("down",     2560, 9728, 200),    # the cascade's wave tile
+    ("fc1",      5120, 1280, 182),    # short K
+    ("qkv",      5120, 2048, 128),    # short K
+    ("wide",     5120, 4096, 182),    # 40 weight tiles: not narrow
+]
+
+
+def test_band_routing() -> None:
+    from fish_scales_ops.gemm import _sm100_decode
+    for tag, N, K, M, want in BAND_CELLS:
+        got = _sm100_decode.pick_config(M, N, K)
+        assert got == want, f"{tag} M={M}: band tactic {got}, expected {want}"
+    for tag, N, K, M in BAND_OUT:
+        got = _sm100_decode.pick_config(M, N, K)
+        assert got is None, f"{tag} M={M}: the band took a cell it must leave to the tiers below ({got})"
+    # A narrow token tile never serves a problem it does not cover in one tile (wrong output, gate 1).
+    from fish_scales_ops.gemm._vendor.flashinfer_sm100_blockscaled.dense_blockscaled_gemm_sm100_splitk import \
+        Sm100BlockScaledSplitKGemmKernel as SK
+    for tile_n in (8, 16, 32):
+        assert SK.supports_tile(tile_n, tile_n) and not SK.supports_tile(tile_n + 1, tile_n)
+    assert SK.supports_tile(1079, 64) and SK.supports_tile(1079, 128)
+    print(f"  routing  the narrow-N long-K band: {len(BAND_CELLS)} cells take their form, {len(BAND_OUT)} stay "
+          "with the tiers below  OK")
+
+
+def test_band_accuracy() -> None:
+    """The band's output against the path that served the cell before (tier 1 or the C++ cascade): the cosine
+    against the fp32 reference agrees to five decimals and every element within one bf16 ulp (the K split differs,
+    so the bytes are not expected to match)."""
+    from fish_scales_ops.gemm import _sm100_decode
+    for tag, N, K, M, want in BAND_CELLS:
+        x, w, xq, sx, wq, sw = _inputs(M, N, K)
+        assert _sm100_decode.pick_config(M, N, K) == want
+        y_new = fso.compat.linear_mxfp8(xq, wq, sx, sw)
+        y_old, tier = _baseline(xq, sx, wq, sw)
+        ref = x.float() @ w.float().t()
+        torch.cuda.synchronize()
+        c_new, c_old = _cos(y_new, ref), _cos(y_old, ref)
+        assert c_new >= 0.999 and round(c_new, 5) == round(c_old, 5), \
+            f"{tag} M={M}: band cos {c_new:.6f}, shipped path {c_old:.6f}"
+        diff = (y_new.float() - y_old.float()).abs()
+        ulp = _bf16_tolerance(y_old)
+        assert bool((diff <= ulp).all()), f"{tag} M={M}: band output differs from {tier} by more than one bf16 ulp"
+        print(f"  band {tag:>8} M={M:>4}  {want}  cos={c_new:.6f} (was {c_old:.6f} on {tier}) "
+              f"maxdiff={diff.max().item():.3e}  OK")
 
 
 def test_capture() -> None:
@@ -320,7 +419,9 @@ def test_capture() -> None:
     # form at the top of the row on a narrow-N and a wide-N shape.
     for tag, N, K, ms in (("wo", 2560, 4096, (1, 32, 64)),
                           ("gate_up", 19456, 2560, (1, 32)),
-                          ("wqkv", 6144, 2560, (64,))):
+                          ("wqkv", 6144, 2560, (64,)),
+                          ("fc2", 1280, 5120, (129,)),     # the band above M = 64: split-K, 64-wide token tiles
+                          ("o", 2048, 4096, (384,))):      # and its persistent 2-CTA form
         for M in ms:
             x, w, xq0, sx0, wq, sw = _inputs(M, N, K)
             xq, sx = xq0.clone(), sx0.clone()
@@ -510,6 +611,8 @@ def main() -> int:
 
     print("== accuracy vs the shipped path ==")
     test_accuracy()
+    print("\n== accuracy vs the shipped path, the narrow-N long-K band above M = 64 ==")
+    test_band_accuracy()
     print("\n== routing ==")
     test_routing()
     print("\n== CUDA-graph capture ==")

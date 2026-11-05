@@ -87,6 +87,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         cluster_shape_mn: Tuple[int, int],
         use_prefetch: bool = False,
         enable_pdl: bool = True,
+        fso_epilogue: Optional[Tuple[bool, int, bool]] = None,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -104,9 +105,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
             sf_vec_size (int): Scalefactor vector size.
             mma_tiler_mn (Tuple[int, int]): Shape of the Matrix Multiply-Accumulate (MMA) tile (M, N).
             cluster_shape_mn (Tuple[int, int]): Cluster dimensions (M, N) for parallel processing.
+            fso_epilogue: fso-epilogue, None (today's kernel) or (has_bias, act, has_residual);
+                see _Sm100BlockScaledGemmCommon.
         """
 
         self.acc_dtype = cutlass.Float32
+        self._fso_set_epilogue(fso_epilogue)  # fso-epilogue
         self.sf_vec_size = sf_vec_size
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
@@ -326,6 +330,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        fso_bias: Optional[cute.Tensor] = None,  # fso-epilogue: bias as (m, n, l), stride 0 along n
+        fso_res: Optional[cute.Tensor] = None,  # fso-epilogue: residual with C's layout
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -451,6 +457,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
             self.tile_sched_params,
             epilogue_op,
             alpha,
+            fso_bias,  # fso-epilogue
+            fso_res,  # fso-epilogue
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -489,6 +497,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         tile_sched_params: utils.PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
         alpha: cute.Tensor,
+        fso_bias: Optional[cute.Tensor],  # fso-epilogue
+        fso_res: Optional[cute.Tensor],  # fso-epilogue
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -669,6 +679,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
         # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
         tCgC = thr_mma.partition_C(gC_mnl)
+        # fso-epilogue: the coordinate tensor of C, partitioned like C (layouts only).
+        fso_tCcC = None
+        if cutlass.const_expr(self.fso_epi):
+            fso_tCcC = self._fso_epi_partition_mma(thr_mma, mC_mnl)
 
         #
         # Partition global/shared tensor for TMA load A/B
@@ -1225,6 +1239,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                     epi_tidx, tma_atom_c, tCgC, epi_tile, sC
                 )
             )
+            # fso-epilogue: this thread's coordinate fragment and fp32 scratch. The bias / residual loads happen
+            # per subtile below, in the epilogue warps, after the griddepcontrol_wait above.
+            fso_epi = None
+            if cutlass.const_expr(self.fso_epi):
+                fso_epi = self._fso_epi_setup(
+                    tiled_copy_t2r, tiled_copy_r2s, epi_tidx, epi_tile, tTR_rAcc, mC_mnl, fso_tCcC
+                )
 
             #
             # Persistent tile scheduling loop
@@ -1269,6 +1290,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                         *mma_tile_coord_mnl,
                     )
                 ]
+                # fso-epilogue: the same tile of the coordinate fragment.
+                fso_tile = None
+                if cutlass.const_expr(self.fso_epi):
+                    fso_tile = self._fso_epi_tile(fso_epi, mma_tile_coord_mnl)
 
                 if cutlass.const_expr(self.overlapping_accum):
                     acc_stage_index = acc_consumer_state.phase
@@ -1328,10 +1353,17 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                     #
                     # Convert to C type
                     #
-                    acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
-                    # Multiply alpha in FP32 before converting to c_dtype to
-                    # avoid overflow when c_dtype is FP16 and acc values are large.
-                    acc_vec = epilogue_op((alpha_value * acc_vec).to(self.c_dtype))
+                    if cutlass.const_expr(self.fso_epi):
+                        # fso-epilogue: bias / GELU / residual in fp32 on the accumulator, one bf16 rounding.
+                        acc_vec = self._fso_epi_apply(
+                            fso_epi, fso_tile, real_subtile_idx, tTR_rAcc, alpha_value, epilogue_op,
+                            fso_bias, fso_res,
+                        )
+                    else:
+                        acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
+                        # Multiply alpha in FP32 before converting to c_dtype to
+                        # avoid overflow when c_dtype is FP16 and acc values are large.
+                        acc_vec = epilogue_op((alpha_value * acc_vec).to(self.c_dtype))
                     tRS_rC.store(acc_vec)
 
                     #

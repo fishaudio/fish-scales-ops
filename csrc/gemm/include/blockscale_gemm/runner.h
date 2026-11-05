@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/config.h"
+#include "blockscale_gemm/common/epilogue.cuh"
 
 #include <cstdint>
 #include <cuda_fp8.h>
@@ -36,13 +37,16 @@ public:
 
     virtual ~CutlassFp8BlockScaleGemmRunnerInterface() {}
 
+    // `epilogue` (common/epilogue.cuh, interface v1) reaches the arch dispatch, which refuses the fields its route
+    // does not apply before it launches anything; the default is today's epilogue.
     virtual void gemm(void* mat_d, void const* mat_a, void const* mat_b, int shape_m, int shape_n, int shape_k,
-        cudaStream_t stream, float const* scales_a = nullptr, float const* scales_b = nullptr)
+        cudaStream_t stream, float const* scales_a = nullptr, float const* scales_b = nullptr,
+        fso::DenseEpilogue const& epilogue = fso::DenseEpilogue{})
         = 0;
 
     virtual void gemm(__nv_fp8_e4m3 const* mat_a, int ld_a, __nv_fp8_e4m3 const* mat_b, int ld_b, __nv_bfloat16* mat_d,
         int ld_d, int shape_m, int shape_n, int shape_k, float const* scales_a, float const* scales_b,
-        cudaStream_t stream)
+        cudaStream_t stream, fso::DenseEpilogue const& epilogue = fso::DenseEpilogue{})
         = 0;
 
     // Backward compatibility to support old signature
@@ -70,6 +74,19 @@ public:
         workspace_ = ws_ptr;
     }
 
+    // sm_120/121: the bf16 partial scratch of a Stream-K route, getStreamKScratchSize bytes, which the caller
+    // allocates per call (the op bodies: the torch caching allocator on the call's stream). No route keeps a
+    // process-wide scratch (issue #12, charter 7.5). Unused on a single-launch route and on sm_90.
+    void configureStreamKScratch(void* ptr, size_t bytes)
+    {
+        streamk_scratch_ = ptr;
+        streamk_scratch_bytes_ = bytes;
+    }
+
+    // The bytes configureStreamKScratch must provide for one [M, K] x [N, K] call (0 when the call's route does not
+    // split K, and on every architecture but sm_120/121). Host only.
+    virtual size_t getStreamKScratchSize(int shape_m, int shape_n, int shape_k) = 0;
+
     virtual size_t getFP8DataSize(int shape_m, int shape_n, bool is_act) = 0;
     virtual size_t getActScaleSize(int shape_m, int shape_k) = 0;
     virtual size_t getWeightScaleSize(int shape_n, int shape_k) = 0;
@@ -78,6 +95,8 @@ public:
 
 protected:
     char* workspace_ = nullptr;
+    void* streamk_scratch_ = nullptr;
+    size_t streamk_scratch_bytes_ = 0;
 };
 
 template <typename ElementA, typename ElementB, typename ElementD>
@@ -88,11 +107,12 @@ public:
     ~CutlassFp8BlockScaleGemmRunner() override = default;
 
     void gemm(void* mat_d, void const* mat_a, void const* mat_b, int shape_m, int shape_n, int shape_k,
-        cudaStream_t stream, float const* scales_a = nullptr, float const* scales_b = nullptr) override;
+        cudaStream_t stream, float const* scales_a = nullptr, float const* scales_b = nullptr,
+        fso::DenseEpilogue const& epilogue = fso::DenseEpilogue{}) override;
 
     void gemm(__nv_fp8_e4m3 const* mat_a, int ld_a, __nv_fp8_e4m3 const* mat_b, int ld_b, __nv_bfloat16* mat_d,
         int ld_d, int shape_m, int shape_n, int shape_k, float const* scales_a, float const* scales_b,
-        cudaStream_t stream) override;
+        cudaStream_t stream, fso::DenseEpilogue const& epilogue = fso::DenseEpilogue{}) override;
 
     void fp8CS1x128(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_y,
         cudaStream_t stream) override
@@ -111,6 +131,8 @@ public:
     size_t getWorkspaceSizeBase(size_t max_shape_m, size_t shape_n, size_t shape_k, size_t num_problems = 1) override;
     size_t getWorkspaceSize(
         size_t shape_m, size_t shape_n, size_t shape_k, size_t top_k = 1, size_t num_problems = 1) override;
+
+    size_t getStreamKScratchSize(int shape_m, int shape_n, int shape_k) override;
 
     size_t getFP8DataSize(int shape_m, int shape_n, bool is_act) override;
     size_t getActScaleSize(int shape_m, int shape_k) override;

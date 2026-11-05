@@ -117,7 +117,9 @@ python3 bench/run_perf.py --machine h200 --out /data/bench-runs/<run> --fso-path
   A difference is drift, and the run refuses it. `--dry-run` prints the plan and that verdict without touching a GPU.
 - **Steps.** The steps of every table of record are listed once, in `bench/perf_suite.py`. `--tables` selects
   table groups; `serving` is the serving-shaped cases of the MoE layer (skewed routing, padded buckets, one
-  expert-parallel rank; `docs/perf/README.md`, Routing).
+  expert-parallel rank; `docs/perf/README.md`, Routing). `--steps` runs only the named steps of those groups, for
+  example a group's fso steps without its comparator steps, or one group split into two runs that each hold the
+  card for a shorter time; the manifest records the selection.
 - **Manifest.** `manifest.json` in the run directory records what ran and on what. Per step it also records the
   clocks, power and throttling the sampler saw: the SM clock over the busy samples (median, minimum, mean,
   maximum), the board power (busy mean and maximum, and the card's limit), and the share of busy samples that a

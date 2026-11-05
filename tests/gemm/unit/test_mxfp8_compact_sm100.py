@@ -53,11 +53,33 @@ Cases (each runs in its own process, so the process-static knobs
                 from the host, or from the op itself (none passed), by turns; and
                 nothing outside the live rows is written;
 * ``sched``     ``FSO_GROUPED_SLOT=force``: the slot route's work-stealing
-                counter (``slot_sched``): the routing op returns it zero, every
-                slot GEMM leaves it zero, and one counter serves consecutive
+                counter (``slot_sched``; its first 2 + G words, the rest are the
+                fused FC1 + FC2 kernel's packed slot facts): the routing op returns
+                it zero, every slot GEMM leaves it zero, and one counter serves consecutive
                 slot GEMMs eagerly and inside one captured graph (every call
                 writes its own poisoned output, so a tile a later call skipped
                 would show), with the bytes of a call that passes none.
+* ``fc1fc2``    the MoE layer's fused FC1 + FC2 kernel (issue #13 lever 5,
+                ``linear_mxfp8_grouped_compact_fc1_fc2``, the default rule): its
+                dq, sd and dn equal, byte for byte at every live row, what the
+                two slot GEMMs it replaces (``linear_mxfp8_grouped_compact_swiglu``
+                then ``linear_mxfp8_grouped_compact``) write, and it writes no row
+                outside the live rows, at every M of the grid the layer plan takes
+                it at -- slot mode (m_cap <= 64) and token-tile mode (past it, the
+                routing op's token-tile list by turns from the op and from the
+                host, both checked against the contract) -- under uniform, hot,
+                padded, expert-parallel, all-padded and eight-expert routing (every
+                token on the same eight experts, where FC2 tiles wait the most),
+                plus graded-skew and top-1 routing in token-tile mode, Families B
+                and C, two or three runs per cell with fresh counters; the plan
+                leaves it at the first M past the slot rule's bound; the counter
+                head is left zero and every token-tile block word ends at
+                live_halves << 20 | T1 * live_halves; a dn that overlaps the
+                activation, a token-tile call without the list and one with a
+                counter tensor too short for the block words are refused.
+* ``fc1fc2x``   ``FSO_GROUPED_SLOT=force``: the same comparison in token-tile
+                mode at the slotx case's row capacities and routings and past the
+                rule's bound (M = 1024, 2048), Families B and C (I13-L5b).
 
 The routing is built in torch, exactly to the contract of
 ``moe_build_routing_compact`` (S3): masked_m, blk0 (exclusive prefix of
@@ -368,8 +390,8 @@ def child_sched():
                 out = fso.compat.moe_build_routing_compact(ids, E, rt.b_max, with_slots=True)
                 sched = out[8]
                 rec = dict(case="sched", fam=fam, M=M, routing=kind)
-                rec["routing_zero"] = bool(sched.dtype == torch.int32 and sched.numel() == 2
-                                           and not bool((sched != 0).any()))
+                rec["routing_zero"] = bool(sched.dtype == torch.int32 and sched.numel() == 2 + 2 * E
+                                           and not bool((sched[: 2 + E] != 0).any()))
                 torch.manual_seed(M * 7 + E)
                 x = torch.randn(M, H, device="cuda", dtype=torch.bfloat16) * 0.1
                 _, _, hq, sh = gather_both(x, rt, H)
@@ -417,7 +439,7 @@ def child_sched():
                     d = new_fc2_out()
                     fc2(dq_ref, sd_ref, d, sched)
                     torch.cuda.synchronize()
-                    ok_eager = ok_eager and same1(dq, sd) and same2(d) and not bool((sched != 0).any())
+                    ok_eager = ok_eager and same1(dq, sd) and same2(d) and not bool((sched[: 2 + E] != 0).any())
                 bufs1 = [new_fc1_out() for _ in range(reps)]
                 bufs2 = [new_fc2_out() for _ in range(reps)]
                 g = torch.cuda.CUDAGraph()
@@ -438,7 +460,7 @@ def child_sched():
                     g.replay()
                     torch.cuda.synchronize()
                     ok_graph = ok_graph and all(same1(dq, sd) for dq, sd in bufs1) and all(same2(d) for d in bufs2)
-                    ok_graph = ok_graph and not bool((sched != 0).any())
+                    ok_graph = ok_graph and not bool((sched[: 2 + E] != 0).any())
                 del g
                 # Without a counter the op takes a zeroed one from the caching allocator; inside a capture that is a
                 # captured fill, so every replay starts from zero again.
@@ -461,6 +483,225 @@ def child_sched():
                 rec.update(eager=ok_eager, graph=ok_graph, graph_own_counter=ok_own, live=int(live.numel()))
                 rec["ok"] = rec["routing_zero"] and ok_eager and ok_graph and ok_own
                 results.append(rec)
+        _W_CACHE.pop(fam, None)
+        torch.cuda.empty_cache()
+    return results
+
+
+# ---- fc1fc2 ----------------------------------------------------------------
+
+FC1FC2_ROUTINGS = ["uniform", "hot", "padded", "ep", "allpad", "narrow"]
+# The token-tile mode (I13-L5b) adds the graded skew and every pair on one expert (top-1), where an expert spans many
+# 128-row blocks and the FC2 tiles of a block wait for both of its halves.
+FC1FC2_LIST_ROUTINGS = FC1FC2_ROUTINGS + ["skew", "one"]
+
+
+def fc1fc2_ids(M, E, topk, kind, seed):
+    if kind == "allpad":
+        return torch.full((M, topk), E, dtype=torch.int32, device="cuda")
+    if kind == "narrow":
+        g = torch.Generator(device="cpu").manual_seed(seed)
+        eight = torch.randperm(E, generator=g)[:topk]
+        return eight.view(1, topk).expand(M, topk).contiguous().int().cuda()
+    if kind in ("skew", "one"):
+        return slotx_ids(M, E, topk, kind, seed)
+    return make_topk(M, E, topk, kind, seed)
+
+
+def fc1fc2_sched(rt, list_mode):
+    """The counter tensor exactly as moe_build_routing_compact(with_slots=True[, with_tiles=True]) returns it: zeros,
+    the packed slot facts, and in token-tile mode one word per block, live_halves << 20 for the blocks in use (the
+    op asks for B_alloc - 1 of them; the test allocates B_alloc)."""
+    E = rt.G
+    info = torch.full((E,), -1, dtype=torch.int64, device="cuda")
+    act = rt.slots[rt.slots >= 0].long()
+    info[: act.numel()] = act | (rt.cnt.long()[act] << 16)
+    sched = torch.zeros(2 + 2 * E + (rt.b_alloc if list_mode else 0), device="cuda", dtype=torch.int32)
+    sched[2 + E: 2 + 2 * E] = info.int()
+    if list_mode:
+        sched[2 + 2 * E:] = fc1fc2_block_words(rt, 0)
+    return sched
+
+
+def fc1fc2_block_words(rt, t1):
+    """Per block of the compact buffer: live_halves << 20 | t1 * live_halves for the blocks in use, 0 for the rest."""
+    words = torch.zeros(rt.b_alloc, dtype=torch.int32)
+    for g, (c, b0) in enumerate(zip(rt.cnt.cpu().tolist(), rt.blk0.cpu().tolist())):
+        for j in range((c + 127) // 128):
+            h = 2 if c - 128 * j > 64 else 1
+            words[b0 + j] = (h << 20) | (t1 * h)
+    return words.cuda()
+
+
+def fc1fc2_cells(fam, ms, routings, case, reps, forced):
+    """The fused FC1 + FC2 op against the two slot GEMMs it replaces at each (M, routing) of one family, in whichever
+    of its modes the row capacity selects. `forced`: the child runs with FSO_GROUPED_SLOT=force, so both GEMMs take the
+    slot route wherever it is legal and the layer plan's own verdict is not required."""
+    results = []
+    f = FAMILIES[fam]
+    E, H, I = f["E"], f["H"], f["I"]
+    w13q, sw13, w2q, sw2, inter = weights(fam)
+    num_kp = I // 128
+    t1 = 2 * I // 128
+    n = 0
+    for M in ms:
+        for kind in routings:
+            topk = 1 if kind == "one" else f["topk"]
+            plan = mx._mxfp8_layer_plan(M, topk, E, 2 * I, H, I, inter, False)
+            ids = fc1fc2_ids(M, E, topk, kind, seed=M * 977 + E)
+            rt = Routing(ids, E)
+            list_mode = rt.m_cap > 64
+            both_slot = (slot_taken(rt, 2 * I, H, True, compact=True)
+                         and slot_taken(rt, H, I, False, compact=True))
+            rec = dict(case=case, fam=fam, M=M, routing=kind, mode="token-tile" if list_mode else "slot",
+                       plan_fused_slot=bool(plan.fused_slot), both_slot=both_slot, cnt_max=int(rt.cnt.max()))
+            if not both_slot:
+                rec.update(ok=False, note="a GEMM is not on the slot route")
+                results.append(rec)
+                continue
+            torch.manual_seed(M * 13 + E)
+            x = torch.randn(M, H, device="cuda", dtype=torch.bfloat16) * 0.1
+            _, _, hq, sh = gather_both(x, rt, H)
+            live = rt.slot_c[rt.valid].long()
+            dead = torch.ones(rt.R, dtype=torch.bool, device="cuda")
+            dead[live] = False
+            wl = atom_words(live, num_kp).flatten()
+            # the token-tile list: from the routing op (checked against the contract) or built on the host, by turns
+            tiles = None
+            tiles_ok = True
+            if list_mode:
+                if n % 2 == 0:
+                    out = fso.compat.moe_build_routing_compact(ids, E, rt.b_max, with_slots=True, with_tiles=True)
+                    tiles = out[9]
+                    tiles_ok = torch.equal(tiles.cpu(), tile_list_ref(rt))
+                    # the routing op's per-block words, the ones the fused op reads
+                    blk = out[8][2 + 2 * E:]
+                    used = int(rt.blk0[E])
+                    tiles_ok = tiles_ok and blk.numel() == rt.b_max and torch.equal(
+                        blk[:used].cpu(), fc1fc2_block_words(rt, 0)[:used].cpu())
+                else:
+                    tiles = tile_list_ref(rt).cuda()
+                n += 1
+
+            def outs():
+                dq = torch.empty(rt.R, I, device="cuda", dtype=torch.float8_e4m3fn)
+                dq.view(torch.uint8).fill_(0xA5)
+                sd = torch.full((rt.R * num_kp,), 0x5A5A5A5A, device="cuda", dtype=torch.int32)
+                dn = torch.empty(rt.R, H, device="cuda", dtype=torch.bfloat16)
+                dn.view(torch.int16).fill_(0x7FC1)
+                return dq, sd, dn
+
+            dq_r, sd_r, dn_r = outs()
+            ops.linear_mxfp8_grouped_compact_swiglu(hq, w13q, sh, sw13, rt.cnt, rt.blk0, rt.m_cap,
+                                                    rt.expected_m, rt.max_active, rt.slots, None, None,
+                                                    dq_r, sd_r, None, tiles)
+            ops.linear_mxfp8_grouped_compact(dq_r, w2q, sd_r, sw2, rt.cnt, rt.blk0, rt.m_cap, rt.expected_m,
+                                             rt.max_active, rt.slots, None, None, dn_r, None, tiles)
+            ok_runs = True
+            head_zero = True
+            blocks_ok = True
+            blk_after = fc1fc2_block_words(rt, t1) if list_mode else None
+            for _ in range(reps):
+                sched = fc1fc2_sched(rt, list_mode)
+                dq, sd, dn = outs()
+                ops.linear_mxfp8_grouped_compact_fc1_fc2(hq, w13q, sh, sw13, w2q, sw2, rt.cnt, rt.blk0, rt.m_cap,
+                                                         rt.expected_m, rt.max_active, rt.slots, sched, dq, sd, dn,
+                                                         tiles)
+                torch.cuda.synchronize()
+                ok_runs = ok_runs and bool(
+                    torch.equal(dq.view(torch.uint8)[live], dq_r.view(torch.uint8)[live])
+                    and torch.equal(sd[wl], sd_r[wl])
+                    and torch.equal(dn[live].view(torch.int16), dn_r[live].view(torch.int16))
+                    and not bool((dq.view(torch.uint8)[dead] != 0xA5).any())
+                    and not bool((dn.view(torch.int16)[dead] != 0x7FC1).any()))
+                head_zero = head_zero and not bool((sched[:2] != 0).any())
+                if list_mode:
+                    # every FC1 tile of every block in use released exactly once into the block's word
+                    blocks_ok = blocks_ok and torch.equal(sched[2 + 2 * E:], blk_after)
+            rec.update(live=int(live.numel()), equal=ok_runs, counter_head_zero=head_zero, block_words=blocks_ok,
+                       tiles_contract=tiles_ok)
+            rec["ok"] = ok_runs and head_zero and blocks_ok and tiles_ok and (forced or rec["plan_fused_slot"])
+            results.append(rec)
+        torch.cuda.empty_cache()
+    return results
+
+
+def child_fc1fc2(quick):
+    """The fused FC1 + FC2 op against the two slot GEMMs it replaces (issue #13 lever 5), under the default rule, in
+    both modes: slot mode at every M of the grid with m_cap <= 64, token-tile mode at every M of the grid the plan
+    takes it at; at the first M past the rule's bound the plan must not take it."""
+    results = []
+    for fam in ("B", "C"):
+        f = FAMILIES[fam]
+        E, H, I, topk = f["E"], f["H"], f["I"], f["topk"]
+        w13q, sw13, w2q, sw2, inter = weights(fam)
+        num_kp = I // 128
+        taken = [m for m in M_GRID if mx._mxfp8_layer_plan(m, topk, E, 2 * I, H, I, inter, False).fused_slot]
+        slot_ms = [m for m in taken if (m + 3) // 4 * 4 <= 64]
+        list_ms = [m for m in taken if (m + 3) // 4 * 4 > 64]
+        if quick:
+            slot_ms = [m for m in slot_ms if m in (1, 2, 4, 8, 16, 64)]
+            list_ms = list_ms[:2] + list_ms[-1:]
+        results += fc1fc2_cells(fam, slot_ms, FC1FC2_ROUTINGS, "fc1fc2", 3, False)
+        results += fc1fc2_cells(fam, list_ms, FC1FC2_LIST_ROUTINGS, "fc1fc2", 2, False)
+        # the plan's boundary: the first M of the grid past the last one it takes
+        past = [m for m in M_GRID if m > max(taken)][:1]
+        for m in past:
+            plan = mx._mxfp8_layer_plan(m, topk, E, 2 * I, H, I, inter, False)
+            results.append(dict(case="fc1fc2", fam=fam, M=m, check="plan leaves the fused route past the slot rule",
+                                plan_fused_slot=bool(plan.fused_slot), ok=not plan.fused_slot))
+        # The op refuses a dn that overlaps the gathered activation (the two-kernel path's shared region).
+        ids = make_topk(16, E, topk, "uniform", seed=5)
+        rt = Routing(ids, E)
+        x = torch.randn(16, H, device="cuda", dtype=torch.bfloat16) * 0.1
+        _, _, hq, sh = gather_both(x, rt, H)
+        region = torch.empty(2 * rt.R * H, device="cuda", dtype=torch.uint8)
+        hq_alias = region[: rt.R * H].view(torch.float8_e4m3fn).view(rt.R, H)
+        hq_alias.copy_(hq)
+        dn_alias = region.view(torch.bfloat16).view(rt.R, H)
+        dq = torch.empty(rt.R, I, device="cuda", dtype=torch.float8_e4m3fn)
+        sd = torch.empty(rt.R * num_kp, device="cuda", dtype=torch.int32)
+        try:
+            ops.linear_mxfp8_grouped_compact_fc1_fc2(hq_alias, w13q, sh, sw13, w2q, sw2, rt.cnt, rt.blk0, rt.m_cap,
+                                                     rt.expected_m, rt.max_active, rt.slots,
+                                                     torch.zeros(2 + 2 * E, device="cuda", dtype=torch.int32),
+                                                     dq, sd, dn_alias)
+            refused = False
+        except RuntimeError as e:
+            refused = "must not overlap" in str(e)
+        results.append(dict(case="fc1fc2", fam=fam, check="aliased dn refused", ok=refused))
+        # Past one token tile of row capacity the op needs the token-tile list and the per-block words.
+        ids = make_topk(256, E, topk, "uniform", seed=6)
+        rt = Routing(ids, E)
+        x = torch.randn(256, H, device="cuda", dtype=torch.bfloat16) * 0.1
+        _, _, hq, sh = gather_both(x, rt, H)
+        dq = torch.empty(rt.R, I, device="cuda", dtype=torch.float8_e4m3fn)
+        sd = torch.empty(rt.R * num_kp, device="cuda", dtype=torch.int32)
+        dn = torch.empty(rt.R, H, device="cuda", dtype=torch.bfloat16)
+        for what, sched, tiles, needle in (
+                ("no token-tile list refused", fc1fc2_sched(rt, True), None, "pass `slot_tiles`"),
+                ("short counter tensor refused", fc1fc2_sched(rt, False), tile_list_ref(rt).cuda(), "slot_sched")):
+            try:
+                ops.linear_mxfp8_grouped_compact_fc1_fc2(hq, w13q, sh, sw13, w2q, sw2, rt.cnt, rt.blk0, rt.m_cap,
+                                                         rt.expected_m, rt.max_active, rt.slots, sched, dq, sd, dn,
+                                                         tiles)
+                refused = False
+            except RuntimeError as e:
+                refused = needle in str(e)
+            results.append(dict(case="fc1fc2", fam=fam, check=what, ok=refused))
+        _W_CACHE.pop(fam, None)
+        torch.cuda.empty_cache()
+    return results
+
+
+def child_fc1fc2x(quick):
+    """The fused op in token-tile mode with FSO_GROUPED_SLOT=force (the slotx case's routings and row capacities, run
+    fso_issue13_20261031/I13-L5b): bit-equal to the two forced slot GEMMs at m_cap 65 to 512 and past the rule's
+    bound, under uniform, hot, graded-skew, top-1, padded and expert-parallel routing, E = 128 and 256."""
+    results = []
+    ms = [80, 256] if quick else SLOTX_M + [1024, 2048]
+    for fam in ("B", "C"):
+        results += fc1fc2_cells(fam, ms, SLOTX_ROUTINGS, "fc1fc2x", 2, True)
         _W_CACHE.pop(fam, None)
         torch.cuda.empty_cache()
     return results
@@ -1010,6 +1251,10 @@ def child_main(args):
         res = child_slack_guarded(int(slack), tile, which)
     elif case == "sched":
         res = child_sched()
+    elif case == "fc1fc2":
+        res = child_fc1fc2(quick)
+    elif case == "fc1fc2x":
+        res = child_fc1fc2x(quick)
     elif case in ("slotx", "slotx_ref"):
         res = child_slotx(os.environ["FSO_TEST_SLOTX_REF"], case == "slotx_ref", quick)
     else:
@@ -1026,7 +1271,7 @@ def case_env(case):
     env = {}
     if case == "ptrarray":
         env["FSO_GROUPED_SLOT"] = "0"
-    elif case in ("slot", "sched", "slotx"):
+    elif case in ("slot", "sched", "slotx", "fc1fc2x"):
         env["FSO_GROUPED_SLOT"] = "force"
     elif case == "slotx_ref":
         env["FSO_GROUPED_SLOT"] = "0"
@@ -1080,7 +1325,7 @@ def run_child(case, args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--child", default=None)
-    ap.add_argument("--cases", default="rule,ptrarray,slot,slotx,sched,tiles,ref020,chain,arena")
+    ap.add_argument("--cases", default="rule,ptrarray,slot,slotx,sched,fc1fc2,fc1fc2x,tiles,ref020,chain,arena")
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--ref", default=None, help="path of the 0.2.0 layer reference file (ref020 writes, chain reads)")
     ap.add_argument("--out", default=None, help="write the per-case JSON here")

@@ -107,8 +107,11 @@ Rules worth knowing up front:
      lists a few hot shapes with absolute µs and TFLOPS, and contains NO
      comparison against any other library. -->
 
-CUDA-graph replay medians with cold weights, for the 0.2.0 release wheel; the
-H200 runs at its natural clock and the RTX 5090 under its clock lock. The
+CUDA-graph replay medians with cold weights: the H200 rows measured with the
+0.2.3 release wheel at the card's natural clock, the RTX 5090 dense rows with
+the 0.2.3 release candidate on card C1 and its MoE rows with the 0.2.2 build,
+both under the card's clock lock
+([`docs/perf/README.md`](docs/perf/README.md), Runs behind the tables). The
 B300 tables, the comparisons against vLLM, SGLang, TensorRT-LLM and
 torch/cuBLAS, and a per-machine summary of where fso is faster or slower are
 in [`docs/perf/`](docs/perf/README.md).
@@ -117,20 +120,20 @@ in [`docs/perf/`](docs/perf/README.md).
 
 | family            | op                                             | shape                                                        | M / S  | dtype           |     µs | TFLOPS |
 |-------------------|------------------------------------------------|--------------------------------------------------------------|--------|-----------------|-------:|-------:|
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | block-FP8 1×128 |  17.38 |      6 |
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 333.39 |   1224 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | block-FP8 1×128 |  17.68 |      6 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 351.90 |   1159 |
 | B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | block-FP8 1×128 |   20.1 |    3.8 |
-| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | block-FP8 1×128 |  331.7 |  466.1 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | block-FP8 1×128 |   27.6 |    2.1 |
-| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | block-FP8 1×128 |  360.4 |  321.8 |
+| B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | block-FP8 1×128 |  338.8 |  456.3 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | block-FP8 1×128 |   27.7 |    2.0 |
+| C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=2048 | block-FP8 1×128 |  361.6 |  320.7 |
 
 ### sm_120 — NVIDIA RTX 5090 (170 SMs, 2400 MHz locked)
 
 | family            | op                                             | shape                                                        | M / S  | dtype           |     µs | TFLOPS |
 |-------------------|------------------------------------------------|--------------------------------------------------------------|--------|-----------------|-------:|-------:|
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | MXFP8 1×32      |  35.72 |      3 |
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | MXFP8 1×32      | 667.01 |    612 |
-| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 653.93 |    624 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=1    | MXFP8 1×32      |  35.81 |      3 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | MXFP8 1×32      | 706.70 |    577 |
+| A Qwen3-4B        | `gate_up`                                      | 19456×2560                                                   | M=4096 | block-FP8 1×128 | 693.02 |    589 |
 | B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=1    | MXFP8 1×32      |   33.2 |    2.3 |
 | B Qwen3-30B-A3B   | MoE layer (routed, E=128, top-8)               | 1536×2048 + 2048×768 per expert                              | M=2048 | MXFP8 1×32      |  552.5 |  279.8 |
 | C Qwen3.5-35B-A3B | MoE block (routed E=256 top-8 + shared expert) | 1024×2048 + 2048×512 per expert, shared 1024×2048 + 2048×512 | M=1    | MXFP8 1×32      |   39.9 |    1.4 |
@@ -138,9 +141,10 @@ in [`docs/perf/`](docs/perf/README.md).
 
 ## TODO
 
-Open items after 0.2.2: the known issues of [`CHANGELOG.md`](CHANGELOG.md),
+Open items after 0.2.3: the known issues of [`CHANGELOG.md`](CHANGELOG.md),
 whose measured gaps are in the summaries of [`docs/perf/`](docs/perf/README.md),
-two items from the #11 fix (one performance, one formal ordering), two planned items, and two build items.
+the cost of the two stage-release fences (#11 on sm_120, the H200 race fix on sm_90), the next round's dense FP8
+work on the B300, planned items, and two build items.
 
 - **Win back the sm_120 fence cost elsewhere.** The `fence.proxy.async.shared::cta` that 0.2.2 issues before every
   stage release of the sm_120 block-scaled GEMM (the #11 fix) costs the narrow-N decode GEMMs of the RTX 5090 tables
@@ -148,14 +152,19 @@ two items from the #11 fix (one performance, one formal ordering), two planned i
   known issues). Candidates: release a stage
   one k-tile later, behind loads the mainloop already waits on, so that one fence covers several stages; or a
   documented ordering primitive cheaper than a per-stage proxy fence.
-- **sm_90 scale-factor read ordering.** The DeepGEMM sm_90 kernels read a stage's scale factors with `ld.shared`
-  before the WGMMA batch and release the stage after `warpgroup_wait<0>()` without a proxy fence, so that release is
-  not formally ordered after the scale load (the operand tiles are read by the WGMMA itself, in the async proxy, so
-  the #11 race does not apply there). A stress test under the #11 conditions on an H200 found no wrong output in
-  4,205,661 compared replays of the 0.2.1 kernels. Order the scale-factor reads before the stage release with a
-  documented primitive, if one costs less than a per-stage proxy fence (which cost up to 9 % on the H200 dense
-  decode cells).
-- **H200 dense MLP block at M = 96, 160 and 192 (6–12 %) and at M = 64, 128, 256, 1024 and 8192 (1–3 %)**, against
+- **Win back the sm_90 fence cost.** The `fence.proxy.async.shared::cta` and `__syncwarp` that 0.2.3 issues before
+  every stage release of the sm_90 FP8 GEMMs (the H200 race fix) cost the 128-row swap-AB decode GEMMs 1.0–3.6 %
+  (CHANGELOG, 0.2.3 Fixed). Candidates: scale stages of their own, double-buffered, so that a release no longer frees
+  scales still being read; or an ordering primitive cheaper than a proxy fence, if one exists.
+- **Dense FP8 on the B300 (the next round).** The short-K narrow GEMMs of the issue-12 audio tower are bound by fixed
+  costs that cuBLAS bf16 pays as well, and the separate activation-quantize launch costs more than FP8 saves there.
+  Candidates: a producer LayerNorm that writes the MXFP8 activation, a cheaper erf-GELU epilogue, swap-AB routes for
+  the bands where they measured faster, and the weights loaded before the PDL wait in a translation unit of its own.
+- **The fused FC1 + FC2 MoE kernel at very few live rows (B300).** With one token on an expert-parallel rank, or one
+  live row in a padded bucket, FC2 waits inside the kernel for its expert's FC1 tiles and loses the overlap the
+  two-kernel path gets from PDL (CHANGELOG, 0.2.3 Known issues). Candidate: a CTA that waits for its expert's FC1
+  tiles prefetches its FC2 weight panel and scales meanwhile; they do not depend on FC1.
+- **H200 dense MLP block at M = 160 and 192 (7–12 %) and at M = 96, 128, 256 and 1024 (1–4 %)**, against
   sglang's block-FP8 linear (DeepGEMM) ([`docs/perf/layer/sm90.md`](docs/perf/layer/sm90.md), Family A).
   Candidates: a fused SwiGLU and 1×128 quantize kernel, and a DeepGEMM tile order whose L2 traffic does not depend
   on the SMs that the early-started GEMM's thread blocks land on.
@@ -170,7 +179,7 @@ two items from the #11 fix (one performance, one formal ordering), two planned i
   [`docs/perf/layer/sm120.md`](docs/perf/layer/sm120.md), Family A). On the B300 the 2560-wide down projection at
   96–112 tokens needs a swap-AB kernel with small token tiles, or a split-K that reduces inside the cluster.
 - **The direct block-FP8 GEMM on Blackwell** (`fso.compat.linear_fp8`), against sglang's DeepGEMM linear on the
-  B300 (16–21 % from M = 32 to M = 192) and vLLM's on the RTX 5090 (5–14 % from M = 512). `fso.dense` serves
+  B300 (9 % at M = 32, 18–21 % from M = 64 to M = 192) and vLLM's on the RTX 5090 (5–14 % from M = 512). `fso.dense` serves
   block-FP8 checkpoints through the MXFP8 path there; this item concerns callers who pass block-FP8 operands
   themselves. Candidates on the B300: the path's own 1×128 activation quantizer and its cuBLAS launches.
 - **MoE layer transient memory at decode batch sizes.** On Blackwell the compact layout reserves a whole 128-row

@@ -51,7 +51,8 @@ protocol from NVIDIA DKG's FP8 split-K tutorial". That statement is preserved.
   its own TMEM, and the peers push their partials into the owner CTA's shared
   memory over `mapa.shared::cluster` +
   `st.async.shared::cluster.mbarrier::complete_tx.bytes.v4.b32`. No workspace,
-  no second reduction kernel. Used for narrow-N decode shapes.
+  no second reduction kernel. Used for narrow-N decode shapes, and (P5, below)
+  for the narrow-N long-K cells above the decode band.
 
 `dense_blockscaled_gemm_sm100.py`
 : `Sm100BlockScaledPersistentDenseGemmKernel` — the plain persistent
@@ -117,12 +118,113 @@ Note that after trim (2) the `sf_vec_size = 16` and `sf_dtype = Float8E4M3FN`
 cases in the same method are already unreachable — they are only legal
 together with FP4 operands — so they were left in place rather than unwound.
 
+## What was added: the fso dense epilogue (issue #12, S1b1, 2026-10-29)
+
+fish-scales-ops' interface v1 gives every dense GEMM an optional epilogue,
+`y = RN_bf16(act(acc + b) + r)` with one rounding (`b` the bias with +0.0
+replaced by -0.0, `act` the identity or erf-GELU in fp32, `r` the residual),
+and the decode row has to apply it inside these kernels, because as shipped
+they cast to bf16 first (`epilogue_op((alpha * acc).to(c_dtype))`) and a
+second kernel on the bf16 result would round twice. The additions keep the
+shipped behaviour byte for byte: a kernel built without the new constructor
+argument generates exactly the MLIR, PTX and cubin it generated before (checked
+on every tactic of the decode row, run `fso_issue12_20261028/runs/S1b1`,
+`identity_compare.json`), and the compiled entry of such a kernel is the
+unchanged `wrapper`. Every edit site carries an `fso-epilogue` comment, so the
+additions are greppable like the trims.
+
+1. `dense_blockscaled_gemm_sm100_common.py`: module-level device helpers
+   `_fso_add_rn`, `_fso_mul_rn` (fp32 add / multiply through
+   `cute.math.add/mul(..., rounding=NEAREST_EVEN)`, which lower to the NVVM
+   `add.rn.f32` / `mul.rn.f32` intrinsics that ptxas never contracts into an
+   fma), `_fso_select`, `_fso_bias_term` (the -0.0 rule), `_fso_clamp_index`,
+   `_fso_fma_rn`, `_fso_erff` (the CUDA 13.0 toolkit's `erff` written out
+   operation for operation, with the coefficients nvcc 13.0 emits — the DSL's
+   own `cute.math.erf` is another libdevice revision and differs in the last
+   fp32 bit on a few per cent of inputs, which would break the byte equality
+   with the C++ routes), `_fso_gelu_erf` (`0.5f * v * (1.f + erff(v *
+   0.70710678f))` in the operation order of fso's `epilogue_device.cuh`),
+   `fso_epilogue_supported()`; on
+   `_Sm100BlockScaledGemmCommon` the attributes `fso_epi*`, `_fso_set_epilogue`
+   and the methods `_fso_epi_partition_mma` (the coordinate tensor of C,
+   partitioned like `tCgC`), `_fso_epi_setup`, `_fso_epi_tile`,
+   `_fso_epi_apply` (per subtile: bias / residual read at the clamped
+   coordinate of each accumulator element with plain coherent loads, then the
+   fp32 formula, then the one bf16 conversion); the abstract `__call__` gains
+   `fso_bias` / `fso_res`; and a second compiled entry `wrapper_epilogue`,
+   which is `wrapper` with the bias and residual pointers after alpha (the
+   bias seen as an `(m, n, l)` tensor with stride 0 along n, the residual with
+   C's layout).
+2. `dense_blockscaled_gemm_sm100.py` and `dense_blockscaled_gemm_sm100_splitk.py`:
+   the constructor argument `fso_epilogue=None` (`(has_bias, act, has_residual)`
+   selects the variant); `__call__` and `kernel` take `fso_bias` / `fso_res`
+   (None in the identity); in the kernel prologue the coordinate partition
+   (behind `const_expr(self.fso_epi)`), in the epilogue warps the per-CTA
+   setup and the per-tile slice, and at the one place each kernel converts the
+   accumulator (the persistent kernel's convert step; the split-K kernel's
+   owner branch, after the in-cluster fp32 sum, so a term is never added per
+   slice) the fused formula in place of the alpha-multiply-and-cast. The bias
+   and residual are read by the epilogue warps only, after the kernel's
+   `griddepcontrol_wait()` (which precedes the role split), so a producer that
+   writes them under programmatic dependent launch is read correctly.
+
+## What was changed: the split-K kernel's wide token tiles (issue #12, P5, 2026-11-02)
+
+The swap-AB row of fish-scales-ops also takes the narrow-N long-K cells above
+M = 64 (N ≤ 4096 with K ≥ 4096: on those every other sm_100 kernel runs 10-64
+CTAs, each over the whole K), and it runs the split-K kernel there with 64-wide
+token tiles. That needed four edits, all in
+`dense_blockscaled_gemm_sm100_splitk.py`, each site marked `fso-p5`:
+
+1. Token tiles (128, 64) and (128, 128) in `SUPPORTED_MMA_TILER_MN`, which may
+   repeat along the token dimension (several token tiles per problem on grid Y;
+   the scheduler, the grid and the scale-factor path already index them).
+   `supports_tile(m, tile_n)` and an optional `tile_n` argument of
+   `is_valid_tactic` say which tile serves which M: a narrow tile (8/16/32)
+   only a problem it covers in one tile, because the scale-factor slice of a
+   second narrow tile does not exist and such a launch computes wrong output
+   (measured in the scratch fork, run `fso_issue12_20261028/runs/P5g1`).
+   `MAX_M`, `supports_m` and `mma_tiler_mn_for_m` keep their meaning (the
+   narrow tiles).
+2. A compact reduction mailbox: a CTA only receives the subtiles it owns (one
+   in `split_k_slices`, round-robin), so the mailbox holds that many slots,
+   indexed by the owned subtile's ordinal, instead of the whole tile. On the
+   one-subtile tiles (token tile ≤ 32) the size, and so the stage count, is the
+   shipped one; on a 128-token four-way split the shipped reserve left no
+   shared memory for a single mainloop stage.
+3. A chunk-interleaved mailbox layout: 16-byte chunk c of epilogue thread t at
+   `c * (threads * 4) + t * 4` floats, so a warp's chunk c is 512 contiguous
+   bytes. The shipped layout (thread t's values contiguous) put a warp's 32
+   lanes 128 bytes apart, i.e. in one bank group, and every remote `st.async`
+   and every owner `LDS.128` was a 16-32-way bank conflict (ncu, run P5g1:
+   2048 wavefronts per `LDS.128` against 256 ideal).
+4. A push-first epilogue walk: every CTA first pushes all the subtiles it does
+   not own, then waits for, sums, finishes and stores the ones it owns, so that
+   no owner's wait sits behind its own previous add and store. The staging
+   buffer of an owned subtile follows its ordinal among the CTA's owned
+   subtiles, so consecutive stores of one CTA alternate buffers for any split.
+   The walk does not implement the overlapping accumulator's early release, and
+   `_setup_attributes` refuses a configuration that would need it (none of the
+   supported token tiles does).
+
+The sum is unchanged — the owner's own slice, then the peers in rank order, in
+fp32, before the one conversion — so a tactic's output bytes are those of the
+shipped kernel at the same token tile and split (checked on 67 cells against
+the scratch fork's shipped walk and layout, and on the decode band against the
+previous fish-scales-ops build, run `fso_issue12_20261028/runs/P5int`).
+
+`TRIM.diff` is the diff of the three files against the wheel's (the trims
+above and these additions together); the first column of `MANIFEST.md5` is
+the md5 of the files as they are here.
+
 ## Keeping this in step with upstream
 
 There is no build step and no patch queue: the files are the unit of vendoring.
 To refresh them, extract the same three paths from a newer `flashinfer-python`
-wheel, re-apply the three trims above (they are small and each is one
-contiguous hunk), update the version, date and md5 table here and in
-`MANIFEST.md5`, and re-run
-`tests/gemm/unit/test_mxfp8_decode_sm100.py` plus the decode band of
+wheel, re-apply the three trims, the fso epilogue additions and the split-K
+changes above (`TRIM.diff` holds all of them; the trims are one contiguous hunk
+each, the additions are the `fso-epilogue` and `fso-p5` sites), update the version, date and md5 table
+here and in `MANIFEST.md5`, regenerate `TRIM.diff`, and re-run
+`tests/gemm/unit/test_mxfp8_decode_sm100.py`, case q of
+`tests/gemm/unit/test_dense_v1.py` and the decode band of
 `bench/gemm/python/bench_qwen3_4b_mlp.py` on an sm_100/sm_103 device.

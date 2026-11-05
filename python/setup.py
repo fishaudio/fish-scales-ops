@@ -105,11 +105,21 @@ def _explicit_gencode_flags() -> list[str]:
 # only the translation units that include them get that directory on their
 # include path.
 SLOT_TU = CSRC / "gemm" / "ops" / "mxfp8_sm100_slot_kernel.cu"
+# The compact slot GEMMs with the row-bounded token load (issue #13 lever 3), in their own unit so that SLOT_TU keeps
+# its device code (run fso_issue12_20261028/R1); it needs both slot headers too.
+SLOT_ROWS_TU = CSRC / "gemm" / "ops" / "mxfp8_sm100_slot_rows_kernel.cu"
 GROUPED_TU = CSRC / "gemm" / "ops" / "mxfp8_sm100_grouped_kernel.cu"
+# The persistent FC1 + FC2 slot kernel of the MoE layer (issue #13 lever 5), in its own unit for the same reason; it
+# needs both slot headers and the fused class's own generated header.
+SLOT_MOE_TU = CSRC / "gemm" / "ops" / "mxfp8_sm100_slot_moe_kernel.cu"
+# The same kernel's token-tile mode (issue #13 lever 5 step 3), in a unit of its own so that the slot mode's unit keeps
+# its device code (run fso_issue12_20261028/R1); the same three generated headers.
+SLOT_MOE_LIST_TU = CSRC / "gemm" / "ops" / "mxfp8_sm100_slot_moe_list_kernel.cu"
 
 # (generator script, header path inside the generated-include root, the
-# translation unit that includes it). The TU column is what scopes the include
-# path; a second entry for the same TU would simply add a second header.
+# translation unit that includes it[, extra generator arguments]). The TU column
+# is what scopes the include path; a second entry for the same TU would simply
+# add a second header.
 GENERATED_HEADERS = [
     (CSRC / "gemm" / "tools" / "make_sm100_slot_kernel.py",
      Path("blockscale_gemm/arch/sm100/mxfp8/sm100_slot_gemm_kernel.hpp"),
@@ -123,6 +133,30 @@ GENERATED_HEADERS = [
     (CSRC / "gemm" / "tools" / "make_sm100_fused_swiglu_slot_epilogue.py",
      Path("blockscale_gemm/arch/sm100/mxfp8/sm100_fused_swiglu_slot_epilogue.hpp"),
      SLOT_TU),
+    (CSRC / "gemm" / "tools" / "make_sm100_slot_kernel.py",
+     Path("blockscale_gemm/arch/sm100/mxfp8/sm100_slot_gemm_kernel.hpp"),
+     SLOT_ROWS_TU),
+    (CSRC / "gemm" / "tools" / "make_sm100_fused_swiglu_slot_epilogue.py",
+     Path("blockscale_gemm/arch/sm100/mxfp8/sm100_fused_swiglu_slot_epilogue.hpp"),
+     SLOT_ROWS_TU),
+    (CSRC / "gemm" / "tools" / "make_sm100_slot_kernel.py",
+     Path("blockscale_gemm/arch/sm100/mxfp8/sm100_slot_gemm_kernel.hpp"),
+     SLOT_MOE_TU),
+    (CSRC / "gemm" / "tools" / "make_sm100_fused_swiglu_slot_epilogue.py",
+     Path("blockscale_gemm/arch/sm100/mxfp8/sm100_fused_swiglu_slot_epilogue.hpp"),
+     SLOT_MOE_TU),
+    (CSRC / "gemm" / "tools" / "make_sm100_slot_kernel.py",
+     Path("blockscale_gemm/arch/sm100/mxfp8/sm100_slot_moe_kernel.hpp"),
+     SLOT_MOE_TU, ("--moe",)),
+    (CSRC / "gemm" / "tools" / "make_sm100_slot_kernel.py",
+     Path("blockscale_gemm/arch/sm100/mxfp8/sm100_slot_gemm_kernel.hpp"),
+     SLOT_MOE_LIST_TU),
+    (CSRC / "gemm" / "tools" / "make_sm100_fused_swiglu_slot_epilogue.py",
+     Path("blockscale_gemm/arch/sm100/mxfp8/sm100_fused_swiglu_slot_epilogue.hpp"),
+     SLOT_MOE_LIST_TU),
+    (CSRC / "gemm" / "tools" / "make_sm100_slot_kernel.py",
+     Path("blockscale_gemm/arch/sm100/mxfp8/sm100_slot_moe_kernel.hpp"),
+     SLOT_MOE_LIST_TU, ("--moe",)),
 ]
 
 
@@ -132,10 +166,15 @@ def _generate_headers(gen_root: Path) -> None:
     build here, naming the edit, rather than producing a silently different
     kernel."""
     env = dict(os.environ, CUTLASS_DIR=str(CUTLASS))
-    for generator, header, _tu in GENERATED_HEADERS:
+    done = set()
+    for generator, header, _tu, *extra in GENERATED_HEADERS:
+        if header in done:  # a header two translation units include is generated once
+            continue
+        done.add(header)
         dst = gen_root / header
         dst.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run([sys.executable, str(generator), str(dst)], check=True, env=env)
+        flags = list(extra[0]) if extra else []
+        subprocess.run([sys.executable, str(generator), *flags, str(dst)], check=True, env=env)
 
 
 class FsoBuildExtension(BuildExtension):
@@ -156,7 +195,7 @@ class FsoBuildExtension(BuildExtension):
     def build_extension(self, ext) -> None:
         gen_root = Path(self.build_temp).resolve() / "fso_generated"
         _generate_headers(gen_root)
-        gen_srcs = {os.path.normpath(_rel(tu)) for _g, _h, tu in GENERATED_HEADERS}
+        gen_srcs = {os.path.normpath(_rel(row[2])) for row in GENERATED_HEADERS}
         original_compile = self.compiler.compile
 
         def split_compile(sources, **kwargs):
@@ -183,11 +222,36 @@ def _gemm_sources() -> list[str]:
         _rel(base / "ops" / "fp8.cu"),
         _rel(base / "ops" / "mxfp8.cu"),
         _rel(base / "ops" / "mxfp8_kernel.cu"),
+        _rel(base / "ops" / "mxfp8_dense_epi_kernel.cu"),
+        # The quantized-output (linear_quantized) instances of the sm_120 cascade and their Stream-K reduce.
+        _rel(base / "ops" / "mxfp8_dense_quant_kernel.cu"),
+        # The sm_120 small-M route of the decode band: its host entry and its kernels, one unit per (form, epilogue).
+        _rel(base / "ops" / "mxfp8_smallm_kernel.cu"),
+        _rel(base / "ops" / "mxfp8_smallm_q_kernel.cu"),
+        _rel(base / "ops" / "mxfp8_smallm_q_epi_kernel.cu"),
+        _rel(base / "ops" / "mxfp8_smallm_bf16_kernel.cu"),
+        _rel(base / "ops" / "mxfp8_smallm_bf16_epi_kernel.cu"),
         _rel(base / "ops" / "mxfp8_compact.cu"),
         _rel(base / "ops" / "mxfp8_compact_kernel.cu"),
         _rel(base / "ops" / "mxfp8_sm100_kernel.cu"),
+        # The dense-epilogue (bias / erf-GELU / residual) kernels of the sm_100 cascade, one configuration group
+        # per unit so they compile in parallel (blockscale_gemm/arch/sm100/mxfp8/dense_common.cuh).
+        _rel(base / "ops" / "mxfp8_sm100_epi_kernel_1sm.cu"),
+        _rel(base / "ops" / "mxfp8_sm100_epi_kernel_2sm.cu"),
+        _rel(base / "ops" / "mxfp8_sm100_epi_kernel_nosmem.cu"),
+        # The split-K reduce that applies the dense epilogue, in its own unit so the identity kernels' unit
+        # (mxfp8_sm100_kernel.cu) keeps exactly the device code it had before the epilogue (issue #12, R1).
+        _rel(base / "ops" / "mxfp8_sm100_splitk_epi_kernel.cu"),
+        # The quantized-output (linear_quantized) kernels of the same configurations, grouped the same way, plus the
+        # quantized reduce of the two-kernel split-K (in the nosmem unit).
+        _rel(base / "ops" / "mxfp8_sm100_epi_quant_kernel_1sm.cu"),
+        _rel(base / "ops" / "mxfp8_sm100_epi_quant_kernel_2sm.cu"),
+        _rel(base / "ops" / "mxfp8_sm100_epi_quant_kernel_nosmem.cu"),
         _rel(GROUPED_TU),
         _rel(SLOT_TU),
+        _rel(SLOT_ROWS_TU),
+        _rel(SLOT_MOE_TU),
+        _rel(SLOT_MOE_LIST_TU),
         _rel(base / "ops" / "quant_kernels.cu"),
         _rel(base / "ops" / "moe_glue.cu"),
         _rel(base / "src" / "runner.cu"),
@@ -239,13 +303,25 @@ if CUDA_HOME:
     cccl = Path(CUDA_HOME) / "include" / "cccl"
     if cccl.is_dir():
         JIT_INCLUDE_DIRS.append(str(cccl))
+# The include root of blockscale_gemm/common/epilogue_device.cuh, the dense epilogue the sm_90 JIT kernels share with
+# the AOT routes (the only JIT header outside deep_gemm/). Last, so that it shadows nothing.
+JIT_INCLUDE_DIRS.append(str(CSRC / "gemm/include"))
 
+
+# fso/activation_contract.h (the published activation contract; it ships in the package): the quantized-output
+# epilogues (sm_120: blockscale_gemm/arch/sm120/mxfp8/dense_quant_epi.cuh; sm_100:
+# blockscale_gemm/arch/sm100/mxfp8/dense_epilogue_gemm.cuh and the split-K reduce of
+# ops/mxfp8_sm100_epi_quant_kernel_nosmem.cu) quantize with its functions. Last, so that it shadows nothing.
+ACTIVATION_CONTRACT_INCLUDE = Path(__file__).resolve().parent / "fish_scales_ops" / "include"
 
 include_dirs = [
     str(CSRC / "gemm/include"),
+    # fso/activation_contract.h (the activation quantizer rule; the sm_120 small-M route quantizes with it)
+    str(HERE / "fish_scales_ops" / "include"),
     str(CSRC / "common/compat/include"),
     str(CUTLASS / "include"),
     str(CUTLASS / "tools/util/include"),
+    str(ACTIVATION_CONTRACT_INCLUDE),  # fso/activation_contract.h
 ]
 
 nvcc_flags = (

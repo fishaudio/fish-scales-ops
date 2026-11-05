@@ -59,12 +59,14 @@ GEMM_GROUPS = (
 # Explicit membership. Anything not listed falls to the name rules in _group_of.
 GEMM_MEMBERS = {
     "dense_fp8": {
-        "linear_bf16", "linear_fp8", "linear_qx", "quantize_1x128", "quantize_1x128_packed",
+        "linear_bf16", "linear_fp8", "linear_qx", "quantize_1x128", "quantize_1x128_contract", "quantize_1x128_packed",
         "quantize_128x128", "repack_fp8_act_scales", "repack_fp8_wgt_scales",
     },
     "dense_mxfp8": {
         "quantize_1x32", "quantize_1x32_packed", "silu_chunk_mul_quantize_1x32", "repack_mxfp8_scales",
-        "linear_mxfp8_raw",
+        "linear_mxfp8_raw", "linear_mxfp8_quantized_raw", "mxfp8_dense_route_sm120",
+        # the sm_120/sm_121 small-M route (issue #12 decision 3)
+        "linear_mxfp8_bf16x", "mxfp8_dense_smallm_route_sm120", "sm120_smallm_rules",
     },
     "moe_mxfp8": {
         "linear_mxfp8_grouped_masked", "linear_mxfp8_grouped_masked_swiglu",
@@ -78,6 +80,8 @@ GEMM_MEMBERS = {
         # the compact activation layout (0.2.1, charter D4)
         "linear_mxfp8_grouped_compact", "linear_mxfp8_grouped_compact_swiglu",
         "linear_mxfp8_grouped_compact_combine", "quantize_1x32_grouped_gather_out",
+        # internal: the MoE layer's fused FC1 + FC2 slot kernel (sm_100/103, issue #13 lever 5)
+        "linear_mxfp8_grouped_compact_fc1_fc2",
         "silu_chunk_mul_quantize_1x32_grouped_out",
     },
     "moe_sm90": {

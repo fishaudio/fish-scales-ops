@@ -330,12 +330,28 @@ def pick_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
 
 def linear_mxfp8_dsl(x_fp8: torch.Tensor, w_fp8: torch.Tensor,
                      sx: torch.Tensor, sw: torch.Tensor,
-                     config: _ConfigT) -> Optional[torch.Tensor]:
+                     config: _ConfigT, epilogue=None) -> Optional[torch.Tensor]:
     """Run one MXFP8 GEMM through the DSL kernel. Returns None when the DSL
-    stack is unavailable (caller falls back to the C++ op)."""
+    stack is unavailable (caller falls back to the C++ op).
+
+    ``epilogue`` (``_epilogue.Epilogue`` or None): this tier applies no field
+    of it yet and refuses a non-identity one with NotImplementedError before it
+    compiles, allocates or launches anything.
+
+    The kernel takes both scales through pointers it assumes 32-byte aligned
+    (``assumed_align=32`` below; CuTe asserts it). ``linear_mxfp8`` accepts any
+    16-byte aligned ``sx`` and ``sw``, so a scale that is not also 32-byte
+    aligned returns None here and the call runs on the next tier (the C++
+    cascade), which reads it with TMA (issue #12 CL1 for ``sx``, CL2 for
+    ``sw``)."""
     st = _init()
     if st is None:
         return None
+    if sx.data_ptr() % 32 != 0 or sw.data_ptr() % 32 != 0:
+        return None
+    if epilogue is not None:
+        from . import _epilogue
+        _epilogue.require("sm100.dsl", epilogue, "linear_mxfp8")
     m, k = x_fp8.shape
     n = w_fp8.shape[0]
     tile, cluster = config[0], config[1]

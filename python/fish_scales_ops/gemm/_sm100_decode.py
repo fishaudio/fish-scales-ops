@@ -1,19 +1,30 @@
-"""Dense MXFP8 decode kernels for sm_100/sm_103 (M ≤ 64).
+"""Dense MXFP8 swap-AB kernels for sm_100/sm_103: the decode band (M ≤ 64) and
+the narrow-N long-K band above it.
 
-This module is the tier-2 *decode* row of the sm_100/sm_103 MXFP8 router. It
-sits in front of the three tiers described in :mod:`._sm100_dispatch` and takes
-only the band M ≤ 64, which none of the three shipped tiers fits:
+This module is the swap-AB row of the sm_100/sm_103 MXFP8 router (named the
+*decode* row after its first band). It sits in front of the three tiers
+described in :mod:`._sm100_dispatch` and takes two bands that none of the
+three shipped tiers fits:
 
-* cuBLAS ``scaled_mm`` (tier 1) picks a 128- or 256-wide N tile and cannot be
-  asked for a narrower one, so on a decode shape it leaves most of the machine
-  idle and still pays a full-width epilogue.
-* the persistent CuTe-DSL kernel of :mod:`._sm100_dsl` (tier 2) declines the
-  whole band — its ``pick_config`` returns None below M = 256.
-* the C++ cascade (tier 3) answers a narrow-N decode cell with a *two-kernel*
-  split-K: one GemmUniversal launch writes FP32 partials to a workspace and a
-  second launch reduces them. The second launch cannot start before the first
-  drains, and at M = 1 it occupies 3 of 148 SMs, so the op serialises two grid
-  launches and pays an extra L2 round trip for the partials.
+* **The decode band, M ≤ 64.** cuBLAS ``scaled_mm`` (tier 1) picks a 128- or
+  256-wide N tile and cannot be asked for a narrower one, so on a decode shape
+  it leaves most of the machine idle and still pays a full-width epilogue; the
+  persistent CuTe-DSL kernel of :mod:`._sm100_dsl` (tier 2) declines the whole
+  band — its ``pick_config`` returns None below M = 256; and the C++ cascade
+  (tier 3) answers a narrow-N decode cell with a *two-kernel* split-K: one
+  GemmUniversal launch writes FP32 partials to a workspace and a second launch
+  reduces them. The second launch cannot start before the first drains, and at
+  M = 1 it occupies 3 of 148 SMs, so the op serialises two grid launches and
+  pays an extra L2 round trip for the partials.
+* **The narrow-N long-K band above it (issue #12, P5),** N ≤ 4096 (32 weight
+  tiles) with K ≥ 4096 at M > 64, up to where tier 1's own grid fills the
+  machine (``_narrow_long_k_config``). There every other kernel runs 10-64
+  CTAs, each over the whole K; the split-K kernel with a 64-wide token tile
+  puts two to four times the CTAs on the same output tiles, and the persistent
+  2-CTA form takes the cells whose split would not fit one wave. A call
+  carrying a field tier 1 does not apply (residual, erf-GELU) on a narrow-N
+  long-K cell above that band is taken by the persistent form too, ahead of the
+  C++ cascade (``pick_fallthrough_config``).
 
 The kernels used here come from the vendored NVIDIA/FlashInfer package in
 ``_vendor/flashinfer_sm100_blockscaled`` (BSD-3-Clause; see its README and
@@ -27,7 +38,11 @@ LICENSE). Two classes are used, and which one runs is decided by the shape:
     ``mapa.shared::cluster`` + ``st.async.shared::cluster.mbarrier::complete_tx``.
     Nothing but the final BF16 output is ever written to global memory, so the
     reduction costs neither a workspace nor a second launch. This is what the
-    narrow-N shapes (``wo``, ``down``) want.
+    narrow-N shapes (``wo``, ``down``) want. Above M = 64 the class runs a
+    64-wide token tile, several of them per problem on grid Y; a narrower token
+    tile serves only a problem it covers in one tile (``SK.supports_tile``: the
+    scale-factor slice of a second narrow tile does not exist, and such a launch
+    computes wrong output).
 ``Sm100BlockScaledPersistentDenseGemmKernel``
     The plain persistent block-scaled kernel at the same narrow token tile. On
     a wide-N shape the tile grid already fills the machine, so splitting K only
@@ -45,8 +60,8 @@ LICENSE). Two classes are used, and which one runs is decided by the shape:
 
 Both are driven in SWAP-AB orientation: the kernel's A operand is the weight
 ``[N, K]`` and its B operand is the activation ``[M, K]``, so the narrow token
-dimension becomes the kernel's N and the 8/16/32/64-wide MMA tile is the token
-tile. fso's ``quantize_1x32_fp8`` already emits its opaque int32 UE8M0 buffer
+dimension becomes the kernel's N and the 8/16/32/64/128-wide MMA tile is the
+token tile. fso's ``quantize_1x32_fp8`` already emits its opaque int32 UE8M0 buffer
 in the CUTLASS ``Sm1xxBlockScaledConfig<32>`` atom layout, which is
 byte-identical to the 128×4 swizzled layout these kernels read, so the scale
 buffers are handed over as raw pointers — no repack, no copy, no extra memory.
@@ -67,13 +82,21 @@ Contracts and gates:
   or a failed import of the vendored kernels warns once per process with
   one ``fso:`` line on stderr, ``FSO_LOG`` or not.
 * **Capture.** ``cute.compile`` runs on the first call for a given tactic and
-  is cached per (kernel class, tiler, cluster, split_k, pdl), so the eager
-  warm-up every caller already performs before ``torch.cuda.graph`` capture
-  covers it; nothing compiles, allocates or synchronises inside capture. The
-  launch binds ``data_ptr()`` values, so for the life of a captured graph the
-  activation, the weight, the OUTPUT **and both scale buffers** must keep their
-  addresses — the scale buffers are the part that is new relative to the rest
-  of fso, because they are passed as bare pointers rather than as tensors.
+  is cached per (kernel class, tiler, cluster, split_k, pdl, epilogue), so the
+  eager warm-up every caller already performs before ``torch.cuda.graph``
+  capture covers it, as it covers the tactic cache and the one occupancy query
+  per cluster size that the band above M = 64 asks (``_max_active_clusters``);
+  nothing compiles, allocates or synchronises inside capture. The launch binds
+  ``data_ptr()`` values, so for the life of a captured graph the activation,
+  the weight, the OUTPUT, **both scale buffers** and the bias / residual of a
+  fused call must keep their addresses — the scale
+  buffers and the epilogue tensors are the part that is new relative to the
+  rest of fso, because they are passed as bare pointers rather than as tensors.
+* **Epilogue (issue #12, S1b1).** The dense epilogue of interface v1 (bias,
+  erf-GELU, residual; ``_epilogue.SERVED["sm100.decode"]``) is applied inside
+  both vendored kernels, in fp32 after the reduction and before the one bf16
+  rounding, by the epilogue variant of the kernel (``_get_compiled``); the
+  identity variant is today's kernel, compiled through the unchanged entry.
 * **Env kills.** ``FSO_DISABLE_DSL=1`` (shared with tier 2) and
   ``FSO_DISABLE_DECODE_DSL=1`` (this module only) both make it inert.
   ``FSO_PRINT_TILE_INFO=1`` prints the picked tactic once per distinct
@@ -87,7 +110,10 @@ tactic the split-K kernel accepts), the calling-convention A/B in ``M-D3``, the
 DSL version table in ``M-D2``, and for the 32 < M ≤ 64 band the persistent
 kernel sweep in ``b300_round3_20260922/M-D5`` (every tiler, cluster,
 orientation and prefetch setting the kernel accepts, four shapes × four M,
-two passes).
+two passes); for the narrow-N long-K band above M = 64 the design note and
+gate-1 sweep of issue #12 (``fso_issue12_20261028/runs/P5`` and ``P5g1``:
+every split-K and persistent tactic on o, fc2 and conv_out at M = 78-1079,
+two to four passes per arm, cold weights).
 """
 from __future__ import annotations
 
@@ -103,9 +129,10 @@ _ConfigT = Tuple[Tuple[int, int], Tuple[int, int], bool, int]
 
 #: First nvidia-cutlass-dsl release that runs the vendored kernels (M-D2).
 MIN_DSL_VERSION = (4, 5, 0)
-#: Width of this router row. Up to the split-K kernel's own MAX_M (32) the
-#: narrow-N shapes split K in-cluster; from there to 64 the persistent kernel
-#: runs a 64-wide token tile (see ``_compute_config``).
+#: Width of this router row's decode band. Up to the split-K kernel's own
+#: MAX_M (32) the narrow-N shapes split K in-cluster; from there to 64 the
+#: persistent kernel runs a 64-wide token tile (see ``_compute_config``). Above
+#: it the row takes only the narrow-N long-K band (``_narrow_long_k_config``).
 MAX_DECODE_M = 64
 #: Token tile of the persistent kernel above the split-K class's MAX_M, and
 #: the widest token count the row takes at one tile.
@@ -121,7 +148,20 @@ MIN_WIDE_TOKEN_K = 1024
 #: griddepcontrol pair (wait at entry, launch-dependents at the end of the
 #: mainloop), which is what makes it capture-safe here; this is unrelated to
 #: the closed "PDL on a CUTLASS GEMM with no GDC compiled in" item.
+#: ``FSO_DISABLE_PDL=1`` (read once per process, like the C++ launches) drops
+#: the attribute from the launch; the kernels' griddepcontrol instructions are
+#: then no-ops and the bytes are unchanged (test_dense_v1, case q).
 _ENABLE_PDL = True
+_PDL: Optional[bool] = None
+
+
+def _pdl_enabled() -> bool:
+    global _PDL
+    if _PDL is None:
+        _PDL = _ENABLE_PDL and not env_flag("FSO_DISABLE_PDL")
+    return _PDL
+
+
 #: Shortest K slice worth giving a CTA, in elements: four mainloop K-tiles of
 #: 128. Splitting K costs a wider cluster launch and an in-cluster reduction,
 #: and below four tiles the mainloop is shorter than the pipeline that fills it,
@@ -133,8 +173,29 @@ MIN_SLICE_K = 512
 #: ``_operand_tensor``); one device buffer is retained per occupied slot.
 _ARG_CACHE_LIMIT = 64
 
+# The narrow-N long-K band above the decode band (issue #12, P5; ``_narrow_long_k_config``).
+#: Shallowest K of the band: the long-K narrow-N class, where every other tier runs 10-64 CTAs each over the
+#: whole K (gate 1 measured the band on K = 4096, 5120 and 7680).
+NARROW_LONG_K_MIN_K = 4096
+#: Widest N of the band, in 128-row weight tiles (the narrow-N class of the other tiers' rules).
+NARROW_LONG_K_MAX_TILES_N = 32
+#: The band's top: a cell whose cuBLAS grid of 128 x 128 tiles, ``tiles_n * ceil(M / 128)`` CTAs, exceeds this
+#: is tier 1's. Gate 1 measured tier 1 winning against every swap-AB form once its grid reached 90-96 CTAs (o
+#: [2048 x 4096] at M = 768, fc2 / conv_out [1280 x 5120 / 7680] at M = 1079) and losing at 80 and below (o at
+#: M = 256-640, fc2 / conv_out at M = 182-533). On the shapes measured the one-wave bound of the forms binds
+#: first; this bound keeps a narrower N, whose forms would fit one wave far higher up, off tier 1's cells.
+NARROW_LONG_K_MAX_CUBLAS_CTAS = 80
+#: Token tile of the band's split-K form: the narrowest that may repeat along M (``SK.supports_tile``).
+NARROW_LONG_K_TOKEN_TILE = 64
+#: Shallowest K slice of a four-way split in the band: ten mainloop K-tiles. Gate 1 measured the four-way split
+#: against the two-way one at the same grid: slower on o (K = 4096, slices of 1024: 5.66 against 5.39 us at
+#: M = 80), faster on fc2 (K = 5120, 1280: 5.54 against 5.71) and conv_out (K = 7680, 1920: 6.49 against 7.37).
+NARROW_LONG_K_MIN_SPLIT4_SLICE_K = 1280
+
 _STATE: Optional[dict] = None
 _CFG_CACHE: dict = {}
+_FT_CACHE: dict = {}
+_CLUSTERS: dict = {}
 _ARG_CACHE: dict = {}
 _ALPHA: dict = {}
 _LOGGED: set = set()
@@ -235,11 +296,18 @@ def _init() -> Optional[dict]:
             import Sm100BlockScaledPersistentDenseGemmKernel as PK
         from ._vendor.flashinfer_sm100_blockscaled.dense_blockscaled_gemm_sm100_splitk \
             import Sm100BlockScaledSplitKGemmKernel as SK
+        from ._vendor.flashinfer_sm100_blockscaled.dense_blockscaled_gemm_sm100_common \
+            import fso_epilogue_supported
 
         _STATE.update(ok=True, cuda=cuda_drv, cutlass=cutlass, cute=cute,
                       utils=dsl_utils, from_dlpack=from_dlpack,
                       make_ptr=make_ptr, PK=PK, SK=SK, compiled={},
-                      dsl_version=getattr(cutlass, "__version__", "?"))
+                      dsl_version=getattr(cutlass, "__version__", "?"),
+                      epilogue=fso_epilogue_supported())
+        if not _STATE["epilogue"]:
+            _log_once("sm_100 MXFP8 decode row: this nvidia-cutlass-dsl (%s) lacks the explicit-rounding math "
+                      "surface the fused epilogue needs; calls with bias / residual / activation leave the "
+                      "M <= %d band to the tiers behind it" % (_STATE["dsl_version"], MAX_DECODE_M))
         return _STATE
     except Exception as exc:                                 # pragma: no cover
         _warn_unavailable("importing the vendored kernels failed: %s: %s"
@@ -252,6 +320,13 @@ def enabled() -> bool:
     return _init() is not None
 
 
+def epilogue_available() -> bool:
+    """True when the row can build its epilogue variants (``_epilogue.SERVED["sm100.decode"]``) on the installed
+    DSL; False makes the router hand fused calls of the band to the next tier. Cheap after the first call."""
+    st = _init()
+    return st is not None and bool(st.get("epilogue"))
+
+
 # ---------------------------------------------------------------------------
 # Routing
 # ---------------------------------------------------------------------------
@@ -261,10 +336,11 @@ def pick_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
     The rule is expressed in ``m``, ``tiles_n`` and ``k`` and then checked
     against the kernels' own validity predicates; there is no per-shape table.
 
-    * ``m > 64`` → None. Above the band the C++ cascade's two-kernel split-K
-      keeps the narrow-N long-K cells (its route extends to M ≤ 104), its
-      wave-tile rule keeps the cells it was measured to win from M = 64 up, and
-      tier 1 keeps the rest. Nothing measured above M = 64 asked for a change.
+    * ``m > 64`` → the narrow-N long-K band (``_narrow_long_k_config``): only
+      ``tiles_n <= 32`` with ``k >= 4096``, up to where tier 1's own grid fills
+      the machine, outside the C++ cascade's two measured rules (its two-kernel
+      split-K at ``k >= 8192, m <= 104`` and its wave tile); None everywhere
+      else, so the tiers below see every other cell exactly as before.
     * ``32 < m <= 64`` runs on the persistent kernel with a 64-wide token tile
       and the 2-CTA 256-row weight tile in a cluster of two, swap-AB, one K
       slice (``_wide_token_config``); the split-K class refuses the band and the
@@ -300,23 +376,55 @@ def pick_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
     for M ≤ 8, 16 for M ≤ 16, 32 for M ≤ 32, always with an M tile of 128 (the
     weight side) and cluster (1, 1).
     """
-    if m <= 0 or m > MAX_DECODE_M:
+    if m <= 0:
         return None
     key = (m, n, k)
     hit = _CFG_CACHE.get(key, _MISSING)
     if hit is not _MISSING:
         return hit
-    cfg = _compute_config(m, n, k)
+    cfg = _compute_config(m, n, k) if m <= MAX_DECODE_M else _narrow_long_k_config(m, n, k)
     _CFG_CACHE[key] = cfg
+    _print_tactic("", m, n, k, cfg)
+    return cfg
+
+
+def pick_fallthrough_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
+    """Tactic for a call that tier 1 (cuBLAS ``scaled_mm``) owns by shape but cannot serve, or None.
+
+    Tier 1 applies the bias alone; a residual or erf-GELU call on one of its cells falls through to the next tier
+    that serves every field. On the cells of the narrow-N long-K class that ``pick_config`` leaves to tier 1
+    (above the band's top, or where its forms do not fit one wave) that tier was the C++ cascade, which runs a 256-row tile per 128 x 128 x K chain there (fc2 [1280 x 5120] at M = 1079 with bias and
+    residual: 18.0 us against tier 1's identity 8.4 us, issue #12 run S1b1-r3). This row's persistent form, the
+    2-CTA 256-row weight tile in a cluster of two (``_persistent_wide``; at that cell the 128-wide token tile, 8.98 us
+    identity, gate 1), takes such a call while its clusters fit one wave of resident clusters; beyond that the
+    cascade keeps it.
+    The router asks this only for a call carrying a field tier 1 does not serve, so the identity and bias-only
+    calls of these cells stay on tier 1.
+    """
+    if m <= MAX_DECODE_M:
+        return None
+    key = (m, n, k)
+    hit = _FT_CACHE.get(key, _MISSING)
+    if hit is not _MISSING:
+        return hit
+    cfg = None
+    st = _init()
+    if st is not None and n % 128 == 0 and k % 128 == 0 and _narrow_long_k_class(m, n, k):
+        cfg = _persistent_wide(m, n, k, (64, 128), st)
+    _FT_CACHE[key] = cfg
+    _print_tactic(" fall-through", m, n, k, cfg)
+    return cfg
+
+
+def _print_tactic(what: str, m: int, n: int, k: int, cfg: Optional[_ConfigT]) -> None:
     if cfg is not None and env_flag("FSO_PRINT_TILE_INFO"):
         # stderr, like the C++ tile-info prints of the same knob and like
         # `_log_once` above: stdout is the benches' per-cell JSON channel.
         tile, cluster, swap_ab, split_k = cfg
-        print("[fso sm100 decode] M=%d N=%d K=%d -> %s tiler=%s cluster=%s "
+        print("[fso sm100 decode%s] M=%d N=%d K=%d -> %s tiler=%s cluster=%s "
               "swap_ab=%s split_k=%d" % (
-                  m, n, k, "splitk" if split_k > 1 else "persistent",
+                  what, m, n, k, "splitk" if split_k > 1 else "persistent",
                   tile, cluster, swap_ab, split_k), file=sys.stderr, flush=True)
-    return cfg
 
 
 def _compute_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
@@ -429,11 +537,127 @@ def _wide_token_config(m: int, n: int, k: int, tiles_n: int,
     return (tile, cluster, True, 1)
 
 
+def _max_active_clusters(st: dict, size: int) -> int:
+    """Clusters of ``size`` CTAs the device keeps resident at one CTA per SM (the vendored kernels' occupancy:
+    their shared-memory stages fill an SM), from the DSL's occupancy query; cached per process. 148 / 74 / 33 for
+    sizes 1 / 2 / 4 on a B300. Asked on the first eager call of a cell, like the compile."""
+    hit = _CLUSTERS.get(size)
+    if hit is None:
+        # The query goes through the driver API on the current context; a host-only caller
+        # (``_sm100_dispatch.plan`` before any device work) may not have one yet, and cudaSetDevice makes the
+        # device's primary context current without allocating or synchronising anything.
+        torch.cuda.set_device(torch.cuda.current_device())
+        hit = int(st["utils"].HardwareInfo().get_max_active_clusters(size))
+        _CLUSTERS[size] = hit
+    return hit
+
+
+def _narrow_long_k_class(m: int, n: int, k: int) -> bool:
+    """The cells above the decode band that the swap-AB kernels may take: narrow N (``tiles_n <= 32``) with long
+    K (``k >= 4096``), minus the two rules of the C++ cascade that were measured to win there: its two-kernel
+    split-K (``k >= 8192`` at ``m <= 104``, ``dispatch.cuh``) and its wave tile (``_sm100_smm.wave_tile_owns``:
+    the 2-SM 256 x 64 tile for N = 2560 up to M = 256)."""
+    from . import _sm100_smm
+    if m <= MAX_DECODE_M or k < NARROW_LONG_K_MIN_K:
+        return False
+    if (n + 127) // 128 > NARROW_LONG_K_MAX_TILES_N:
+        return False
+    if k >= 8192 and m <= 104:
+        return False
+    return not _sm100_smm.wave_tile_owns(m, n)
+
+
+def _narrow_long_k_config(m: int, n: int, k: int) -> Optional[_ConfigT]:
+    """The M > 64 band of the row (issue #12, P5): narrow-N long-K cells, swap-AB, one launch, no workspace.
+
+    Why. On N = 1280 / 2048 at M = 78-640 every other kernel puts 10-64 CTAs on the 148 SMs, each over the whole
+    K: the cascade's 256-row tile (fc2 / conv_out at M <= 128, o at M = 80-128) runs a 128 x 128 x K tensor chain
+    on a tile that is 50-70 % padding, tier 1's 128 x 128 tiles stream one K-long weight slice per CTA (design
+    note ``fso_issue12_20261028/runs/P5/design.md``). Splitting K inside a cluster puts 2-4 times the CTAs on the
+    same tiles.
+
+    The form, in order:
+
+    * the split-K kernel with a 64-wide token tile (several token tiles per problem) while its clusters, one per
+      (weight tile, token tile), fit one wave of resident clusters: four slices when each slice keeps at least
+      ``NARROW_LONG_K_MIN_SPLIT4_SLICE_K`` of K and the clusters of four fit, else two. The kernel's grid is not
+      persistent, so a second wave would run the whole K chain again for the tail.
+    * otherwise the persistent kernel's 2-CTA 256-row weight tile in a cluster of two with the 64-wide token tile
+      (the decode row's form at 32 < M <= 64) while its ``ceil(N / 256) * ceil(M / 64)`` clusters fit one wave
+      (``_persistent_wide``);
+    * None (tier 1 or the cascade) where neither fits, and above the band's top
+      (``NARROW_LONG_K_MAX_CUBLAS_CTAS``). The same form with a 128-wide token tile, which would fit one wave
+      further up, is not used here: on its 40-cluster grid it beat tier 1 on o [2048 x 4096] at M = 640 (7.91
+      against 8.50 us, gate 1) and lost on the Family A projections with the same grid and work, wo [2560 x 4096]
+      and down [2560 x 9728] at M = 512 (8.02 against 7.55 and 14.70 against 14.26 us, run P5int famA, two passes):
+      the difference is tier 1's own time at those cells, not anything the shape predicts. It serves the
+      fall-through instead (``pick_fallthrough_config``), where the alternative is the cascade.
+
+    Gate 1 (``fso_issue12_20261028/runs/P5g1``, two to four passes per arm, cold weights, graph replay) measured
+    every form on o [2048 x 4096], fc2 [1280 x 5120] and conv_out [1280 x 7680] at M = 78-1079: the split-K form at
+    o M = 80-256 (5.4-5.5 us, against 8.4-8.5 on the cascade and 7.2 on tier 1), fc2 / conv_out M = 78-364 (5.5-5.9
+    / 6.5-7.4 us, against 8.2-9.8 / 11.0-13.5); the persistent form at o M = 384-512 (6.4-6.5 us against 7.5)
+    and fc2 / conv_out M = 533 (7.2 / 9.4 against 8.5 / 11.4); on the Family A wo / down it took M = 257-448 at
+    0.78-0.93 of tier 1's time (run P5int famA). A token tile narrower than 64 with M above it is never used: the
+    kernel computes wrong output there (``SK.supports_tile``).
+    """
+    st = _init()
+    if st is None or n % 128 != 0 or k % 128 != 0:
+        return None
+    if not _narrow_long_k_class(m, n, k):
+        return None
+    tiles_n = (n + 127) // 128
+    if tiles_n * ((m + 127) // 128) > NARROW_LONG_K_MAX_CUBLAS_CTAS:
+        return None
+    SK, cutlass = st["SK"], st["cutlass"]
+    tile_n = NARROW_LONG_K_TOKEN_TILE
+    clusters = tiles_n * ((m + tile_n - 1) // tile_n)
+    for split_k in (4, 2):
+        if k // split_k < (NARROW_LONG_K_MIN_SPLIT4_SLICE_K if split_k == 4 else MIN_SLICE_K):
+            continue
+        if clusters > _max_active_clusters(st, split_k):
+            continue
+        if SK.is_valid_tactic(m, k, cutlass.Float8E4M3FN, split_k, tile_n):
+            return ((128, tile_n), (1, 1), True, split_k)
+    return _persistent_wide(m, n, k, (NARROW_LONG_K_TOKEN_TILE,), st)
+
+
+def _persistent_wide(m: int, n: int, k: int, token_tiles, st: dict) -> Optional[_ConfigT]:
+    """The persistent kernel's 2-CTA 256-row weight tile in a cluster of two at the first token tile of
+    ``token_tiles`` whose ``ceil(N / 256) * ceil(M / tile)`` clusters fit one wave of resident clusters of two
+    (the persistent scheduler would run the excess as a second round on an otherwise idle machine), after the
+    kernel's own ``can_implement`` in the swapped orientation; None when none fits."""
+    PK, cutlass = st["PK"], st["cutlass"]
+    resident = _max_active_clusters(st, 2)
+    for tile_n in token_tiles:
+        if ((n + 255) // 256) * ((m + tile_n - 1) // tile_n) > resident:
+            continue
+        tile, cluster = (256, tile_n), (2, 1)
+        if PK.can_implement(cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, 32, cutlass.BFloat16,
+                            tile, cluster, n, m, k, 1, "k", "k", "m"):
+            return (tile, cluster, True, 1)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Launch
 # ---------------------------------------------------------------------------
-def _get_compiled(st: dict, cfg: _ConfigT, sf_m: int, sf_n: int, sf_k: int):
-    """One ``cute.compile`` per tactic; the problem shape stays symbolic.
+_EpiFlagsT = Optional[Tuple[bool, int, bool]]
+
+
+def _epi_flags(epilogue) -> _EpiFlagsT:
+    """The compile-time epilogue of a call: None for the identity, else
+    ``(has_bias, act, has_residual)`` — the arguments the vendored kernels take
+    as ``fso_epilogue``. Part of the compile cache key."""
+    if epilogue is None:
+        return None
+    flags = (epilogue.bias is not None, int(epilogue.act_code), epilogue.residual is not None)
+    return flags if any(flags) else None
+
+
+def _get_compiled(st: dict, cfg: _ConfigT, sf_m: int, sf_n: int, sf_k: int,
+                  epi: _EpiFlagsT = None):
+    """One ``cute.compile`` per (tactic, epilogue); the problem shape stays symbolic.
 
     The compiled entry takes the three operands as CuTe tensors with dynamic
     extents and the three scale-factor extents as ``Int64`` runtime arguments,
@@ -441,19 +665,33 @@ def _get_compiled(st: dict, cfg: _ConfigT, sf_m: int, sf_n: int, sf_k: int):
     the extents passed here — those of whichever cell compiled first — do not
     enter the cache key. Compiling happens on the first eager call, never
     inside a capture.
+
+    ``epi`` (``_epi_flags``) selects the epilogue variant of the kernel. The
+    identity (``None``) constructs the kernel and calls ``cute.compile`` exactly
+    as before the epilogue existed, through the vendored ``wrapper`` entry, so
+    it generates the same code; a non-identity epilogue constructs the kernel
+    with ``fso_epilogue`` and compiles its ``wrapper_epilogue`` entry, which
+    takes the bias and the residual as raw bf16 pointers (``None`` for a field
+    the variant does not apply) after alpha. The bias pointer is the ``[N]``
+    tensor's; the residual pointer is read with the output's layout (under
+    swap-AB the kernel's (N, M) view with unit stride on its first mode, which
+    is a row-major ``[M, N]``). Both are assumed 2-byte aligned only, since
+    the kernels read them element by element.
     """
     tile, cluster, swap_ab, split_k = cfg
-    key = (tile, cluster, swap_ab, split_k, _ENABLE_PDL)
+    pdl = _pdl_enabled()
+    key = (tile, cluster, swap_ab, split_k, pdl, epi)
     fn = st["compiled"].get(key)
     if fn is not None:
         return fn
     cutlass, cute, utils = st["cutlass"], st["cute"], st["utils"]
     make_ptr, cuda_drv = st["make_ptr"], st["cuda"]
 
+    kw = {} if epi is None else {"fso_epilogue": epi}
     if split_k > 1:
-        gemm = st["SK"](32, tile, split_k, _ENABLE_PDL)
+        gemm = st["SK"](32, tile, split_k, pdl, **kw)
     else:
-        gemm = st["PK"](32, tile, cluster, False, _ENABLE_PDL)
+        gemm = st["PK"](32, tile, cluster, False, pdl, **kw)
     mac = utils.HardwareInfo().get_max_active_clusters(
         cluster[0] * cluster[1] * split_k)
 
@@ -475,9 +713,17 @@ def _get_compiled(st: dict, cfg: _ConfigT, sf_m: int, sf_n: int, sf_k: int):
         cutlass.Float32, (1,), assumed_align=4, memspace=ms)
     stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    fn = cute.compile(gemm.wrapper, a_fake, b_fake, c_fake, sf_m, sf_n, sf_k,
-                      1, a_sf_fake, b_sf_fake, alpha_fake, mac, stream,
-                      swap_ab, options="--opt-level 2")
+    if epi is None:
+        fn = cute.compile(gemm.wrapper, a_fake, b_fake, c_fake, sf_m, sf_n, sf_k,
+                          1, a_sf_fake, b_sf_fake, alpha_fake, mac, stream,
+                          swap_ab, options="--opt-level 2")
+    else:
+        has_bias, _act, has_res = epi
+        bias_fake = make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, 2) if has_bias else None
+        res_fake = make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, 2) if has_res else None
+        fn = cute.compile(gemm.wrapper_epilogue, a_fake, b_fake, c_fake, sf_m, sf_n, sf_k,
+                          1, a_sf_fake, b_sf_fake, alpha_fake, bias_fake, res_fake, mac,
+                          stream, swap_ab, options="--opt-level 2")
     st["compiled"][key] = fn
     return fn
 
@@ -566,15 +812,27 @@ def _alpha(st: dict, device: torch.device):
 
 def linear_mxfp8_decode(x_fp8: torch.Tensor, w_fp8: torch.Tensor,
                         sx: torch.Tensor, sw: torch.Tensor,
-                        config: _ConfigT) -> Optional[torch.Tensor]:
+                        config: _ConfigT, epilogue=None) -> Optional[torch.Tensor]:
     """Run one decode-band MXFP8 GEMM. None → the caller falls through.
+
+    ``epilogue`` (``_epilogue.Epilogue`` or None): bias, residual and erf-GELU
+    are applied inside the kernel (``SERVED["sm100.decode"]``), in fp32 after
+    the fp32 reduction (in the split-K class after the in-cluster sum, by the
+    owner of each subtile, never per slice) and before the one bf16 rounding;
+    the bias and residual are read by the epilogue warps after the kernel's
+    griddepcontrol.wait with coherent loads. A field this row does not apply
+    (the quantized output) is refused with NotImplementedError after the
+    availability checks (so an unavailable row still falls through) and before
+    anything is allocated or launched. The epilogue selects a compile variant
+    (``_get_compiled``); the identity variant is today's kernel.
 
     The operands are handed over swapped: the weight ``[N, K]`` is the kernel's
     A and the activation ``[M, K]`` its B, with the two scale buffers following
     their operands. The BF16 output is allocated ``[M, N]`` row-major as usual
     and passed as the column-major view of itself, which is the layout the
     kernel writes in the swapped orientation; the buffer the caller receives is
-    an ordinary row-major ``[M, N]``.
+    an ordinary row-major ``[M, N]``. The residual, of the output's shape and
+    contiguous, is read through the same view.
     """
     st = _init()
     if st is None:
@@ -583,6 +841,10 @@ def linear_mxfp8_decode(x_fp8: torch.Tensor, w_fp8: torch.Tensor,
         return None
     if x_fp8.stride(1) != 1 or w_fp8.stride(1) != 1:
         return None
+    if epilogue is not None:
+        from . import _epilogue
+        _epilogue.require("sm100.decode", epilogue, "linear_mxfp8")
+    epi = _epi_flags(epilogue)
     m, k = x_fp8.shape
     n = w_fp8.shape[0]
     tile, cluster, swap_ab, split_k = config
@@ -598,7 +860,7 @@ def linear_mxfp8_decode(x_fp8: torch.Tensor, w_fp8: torch.Tensor,
     sf_n = (kernel_n + 127) // 128
     sf_k = (k // 32 + 3) // 4
 
-    fn = _get_compiled(st, config, sf_m, sf_n, sf_k)
+    fn = _get_compiled(st, config, sf_m, sf_n, sf_k, epi)
     cutlass, make_ptr = st["cutlass"], st["make_ptr"]
     gmem = st["cute"].AddressSpace.gmem
     ct_a = _operand_tensor(st, kernel_a, cutlass.Float8E4M3FN, 1)
@@ -611,5 +873,15 @@ def linear_mxfp8_decode(x_fp8: torch.Tensor, w_fp8: torch.Tensor,
     # stream is the capture side stream, and a hoisted stream object would
     # record the launch on the wrong one.
     stream = st["cuda"].CUstream(torch.cuda.current_stream().cuda_stream)
-    fn(ct_a, ct_b, ct_c, sf_m, sf_n, sf_k, p_sfa, p_sfb, ct_alpha, stream)
+    if epi is None:
+        fn(ct_a, ct_b, ct_c, sf_m, sf_n, sf_k, p_sfa, p_sfb, ct_alpha, stream)
+        return out
+    # The epilogue variant: the bias and the residual follow alpha as raw bf16
+    # pointers; a field the variant does not apply is passed as None, the value
+    # its slot was compiled with. The kernel binds the addresses, so a captured
+    # graph reads the bias / residual at the addresses they had at capture,
+    # like the operands and the scales.
+    p_bias = make_ptr(cutlass.BFloat16, epilogue.bias.data_ptr(), gmem, assumed_align=2) if epi[0] else None
+    p_res = make_ptr(cutlass.BFloat16, epilogue.residual.data_ptr(), gmem, assumed_align=2) if epi[2] else None
+    fn(ct_a, ct_b, ct_c, sf_m, sf_n, sf_k, p_sfa, p_sfb, ct_alpha, p_bias, p_res, stream)
     return out

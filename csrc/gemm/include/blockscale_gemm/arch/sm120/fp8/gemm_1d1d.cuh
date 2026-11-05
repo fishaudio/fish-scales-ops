@@ -18,7 +18,11 @@
 
 #include "blockscale_gemm/arch/sm120/fp8/utils.cuh"
 #include "blockscale_gemm/arch/sm120/mxfp8/fused_combine_epi.cuh"
+#include "blockscale_gemm/arch/sm120/mxfp8/dense_quant_epi.cuh"
 #include "blockscale_gemm/arch/sm120/mxfp8/fused_swiglu_epi.cuh"
+#include "blockscale_gemm/common/epilogue.cuh"
+
+#include <type_traits>
 
 #if defined(FSO_PROLOGUE_TRACE)
 #include <cstdint>
@@ -201,6 +205,68 @@ struct CompactActsParams<true>
     int view_rows = 0;
 };
 
+// The dense epilogue of interface v1 (issue #12; common/epilogue.cuh): bias, erf GELU and residual applied to the
+// fp32 accumulator before the one rounding to bf16. The flag rides on the builder type rather than on a new template
+// parameter of SM120BlockScaledKernel, so that every existing instantiation keeps its exact type, its symbol name and
+// its machine code: SM120DenseEpiBuilder<KT> is KT with kDenseEpi = true, and only the kernels built over it carry
+// the epilogue's Params fields and code. The fields are runtime values (one instantiation per tile serves every
+// combination of bias, residual and activation); the launcher fills them per call.
+template <class KT_>
+struct SM120DenseEpiBuilder : KT_
+{
+    static constexpr bool kDenseEpi = true;
+};
+
+template <class KT, class = void>
+struct KtDenseEpi : std::false_type
+{
+};
+
+template <class KT>
+struct KtDenseEpi<KT, std::void_t<decltype(KT::kDenseEpi)>> : std::integral_constant<bool, KT::kDenseEpi>
+{
+};
+
+// The Params fields of the epilogue instances (on top of the compact-layout base every Params derives from).
+template <bool CompactActs>
+struct DenseEpiParams : CompactActsParams<CompactActs>
+{
+    __nv_bfloat16 const* epi_bias = nullptr;     // [N], or nullptr
+    __nv_bfloat16 const* epi_residual = nullptr; // [M, epi_ld_residual] row-major, or nullptr
+    int64_t epi_ld_residual = 0;
+    int epi_act = 0;                             // fso::DenseActivation
+};
+
+// The quantized-output form of the dense epilogue (fso.dense.linear_quantized, interface v1; mxfp8/dense_quant_epi.cuh):
+// the dense epilogue's bias and activation, the one rounding to bf16, and then the activation quantizer of contract v1
+// on the rounded values, written as the next GEMM's activation (xq [M, N] and its K-major scale words) instead of the
+// bf16 tile. Like SM120DenseEpiBuilder, a flag on the builder type: SM120DenseQuantBuilder<KT> is KT with kDenseEpi
+// and kDenseQuantOut, so that only the kernels built over it carry the extra Params fields and code, and every other
+// instantiation (the bf16 epilogue instances included) keeps its type, its symbol name and its machine code.
+template <class KT_>
+struct SM120DenseQuantBuilder : SM120DenseEpiBuilder<KT_>
+{
+    static constexpr bool kDenseQuantOut = true;
+};
+
+template <class KT, class = void>
+struct KtDenseQuantOut : std::false_type
+{
+};
+
+template <class KT>
+struct KtDenseQuantOut<KT, std::void_t<decltype(KT::kDenseQuantOut)>> : std::integral_constant<bool, KT::kDenseQuantOut>
+{
+};
+
+// The Params fields of the quantized-output instances, on top of the epilogue's.
+template <bool CompactActs>
+struct DenseQuantParams : DenseEpiParams<CompactActs>
+{
+    __nv_fp8_e4m3* epi_out_q = nullptr;  // [M, N] row-major: the next GEMM's xq
+    int32_t* epi_out_scale = nullptr;    // [align(M, 4), N / 128] int32 words, K-major (activation contract v1, sm_120)
+};
+
 // FusedSwiGLUEpi turns the epilogue into the MoE layer's FC1 tail: instead of
 // staging the bf16 tile for a TMA store into a [G, m_cap, 2*INTER] slab, the math
 // warps read the staged tile back, compute silu(gate) * up, requantize to MXFP8
@@ -249,6 +315,17 @@ struct SM120BlockScaledKernel
     static_assert(!CompactActs || KT::kGroupedLayoutSmem,
         "the compact activation layout is a grouped (MoE) form: it needs the grouped scheduler path, "
         "whose plain epilogue (store_rows) bounds every store by masked_m");
+    // The dense epilogue (SM120DenseEpiBuilder); false for every builder without kDenseEpi.
+    static constexpr bool kDenseEpi = KtDenseEpi<KT>::value;
+    static_assert(!kDenseEpi || !(FusedSwiGLUEpi || ScatterCombineEpi || CompactActs || KT::kGroupedLayoutSmem),
+        "the dense epilogue belongs to the dense plain epilogue (bf16 tile, TMA store): no fused epilogue, no "
+        "grouped scheduler");
+    // The quantized output (SM120DenseQuantBuilder); false for every other builder. Its math warps consume the
+    // staged tile themselves and hand smem_D back to the load warps through store_empty, which the load warps wait
+    // on only when smem_D aliases the A/B stages (the union storage every dense tile uses).
+    static constexpr bool kDenseQuantOut = KtDenseQuantOut<KT>::value;
+    static_assert(!kDenseQuantOut || (kDenseEpi && !KT::kSeparateSmemD),
+        "the quantized output is a form of the dense epilogue on a union-storage tile (smem_D aliases the A/B stages)");
     static constexpr int kNumTMAThreads = 128;
     static constexpr int kNumScatterThreads = 64;   // store warp + the spare 4th TMA warp
     static constexpr int kScatterBarrierId = 1;     // 0 belongs to the math warps
@@ -346,7 +423,11 @@ struct SM120BlockScaledKernel
         block = row >> 7;
     }
 
-    struct Params : CompactActsParams<CompactActs>
+    // Every instance without the dense epilogue keeps the base it always had (the same type, so the same layout).
+    using ParamsBase = cute::conditional_t<kDenseQuantOut, DenseQuantParams<CompactActs>,
+        cute::conditional_t<kDenseEpi, DenseEpiParams<CompactActs>, CompactActsParams<CompactActs>>>;
+
+    struct Params : ParamsBase
     {
         typename KT::TMA_A tma_load_a;
         typename KT::TMA_B tma_load_b;
@@ -462,8 +543,8 @@ struct SM120BlockScaledKernel
         auto tensor_d = make_tensor(make_gmem_ptr(args.ptr_D), make_layout(make_shape(M_a, N, L_a), args.dD));
         auto tma_store_d = make_tma_copy_C_sm90(
             typename KT::CopyOpS2G{}, tensor_d, take<0, 2>(typename KT::SmemLayoutD{}), typename KT::EpilogueTile_MN{});
-        // The leading {} initialises the CompactActsParams base (empty for every
-        // non-compact instantiation).
+        // The leading {} initialises the base (CompactActsParams, empty for every non-compact
+        // instantiation; DenseEpiParams for the epilogue instances, whose fields the launcher sets).
         Params params{{}, tma_load_a, tma_load_b, tma_load_sfa, tma_load_sfb, tma_store_d, problem_shape,
             args.grouped_layout, args.out_fp8, args.out_sf, args.m_cap, args.inter, args.out_tokens, args.row_map,
             args.weight_of_slot, args.group_perm, args.group_block, args.ptr_D, cute::get<0>(args.dD),
@@ -878,6 +959,57 @@ struct SM120BlockScaledKernel
         cute::copy(tma_copy_sfb, tBgSFB(_, _, _, 0), tBsSFB(_, _, _, Int<0>{}));
     }
 
+    // The dense epilogue (kDenseEpi instances only). Each accumulator element becomes
+    //     v = acc; v += bias_term(bias[n]); v = act(v); [v += residual[m, n]]
+    // in fp32 (common/epilogue.cuh), in place, so that the conversion to bf16 that follows in mma() is the one
+    // rounding. (m, n) is the element's coordinate in the output: the tile origin plus its coordinate in the tile,
+    // which the MMA's C partition of an identity tensor gives element for element (the same partition the
+    // accumulator fragment and the R2S copy use). Rows m >= M are never read from the residual (the TMA store does
+    // not write them either), and nothing is read for a column n >= N.
+    //
+    // PDL: the dense instances make every thread wait in cudaGridDependencySynchronize() at kernel entry (see
+    // operator()), and this runs after the k-loop, so bias and residual -- possibly the outputs of the kernel
+    // launched just before -- are read after the wait.
+    template <class AccumTensor, class ThrMma>
+    CUTE_DEVICE static void apply_dense_epilogue(
+        AccumTensor& accum, ThrMma const& thr_mma, Params const& params, int m_block, int n_block)
+    {
+        auto const cD = make_identity_tensor(take<0, 2>(typename KT::TileShape{})); // (BLK_M,BLK_N) -> (m,n)
+        auto const tCcD = thr_mma.partition_C(cD);                                  // (MMA,MMA_M,MMA_N)
+        CUTE_STATIC_ASSERT_V(size(tCcD) == size(accum));
+        int const M = cute::get<0>(params.problem_shape);
+        int const N = cute::get<1>(params.problem_shape);
+        int const m0 = m_block * KT::kTileM;
+        int const n0 = n_block * KT::kTileN;
+        __nv_bfloat16 const* const bias = params.epi_bias;
+        __nv_bfloat16 const* const residual = params.epi_residual;
+        int64_t const ld_residual = params.epi_ld_residual;
+        int const act = params.epi_act;
+        bool const has_bias = bias != nullptr;
+        bool const has_residual = residual != nullptr;
+        CUTE_UNROLL
+        for (int i = 0; i < size(accum); ++i)
+        {
+            int const m = m0 + cute::get<0>(tCcD(i));
+            int const n = n0 + cute::get<1>(tCcD(i));
+            bool const col_ok = n < N;
+            bool const res_ok = has_residual && col_ok && m < M;
+            // Ordinary (coherent) loads, not __ldg: ld.global.nc requires the data to be read-only for the whole
+            // lifetime of the kernel, and under PDL that lifetime overlaps the kernel that writes bias / residual.
+            __nv_bfloat16 b = __ushort_as_bfloat16(0);
+            __nv_bfloat16 r = __ushort_as_bfloat16(0);
+            if (has_bias && col_ok)
+            {
+                b = bias[n];
+            }
+            if (res_ok)
+            {
+                r = residual[int64_t(m) * ld_residual + n];
+            }
+            accum(i) = fso::dense_epilogue_value_rt(accum(i), has_bias, b, act, res_ok, r);
+        }
+    }
+
     CUTE_DEVICE
     static void mma(SharedStorage& shared_storage, int32_t sf_tile_count, int32_t k_tile_count, uint32_t& sf_phase,
         uint32_t& ab_phase, uint32_t& store_phase, Params const& params = Params{}, int m_block = 0, int n_block = 0,
@@ -1058,6 +1190,10 @@ struct SM120BlockScaledKernel
 #endif
 
         // epilogue
+        if constexpr (kDenseEpi)
+        {
+            apply_dense_epilogue(accum, thr_mma, params, m_block, n_block);
+        }
         auto accum_frg = recast<Array<typename KT::ElementAccum, 2>>(accum);
         auto epi = make_fragment_like<typename KT::ElementD>(accum);
         auto epi_frg = recast<Array<typename KT::ElementD, 2>>(epi);
@@ -1121,6 +1257,20 @@ struct SM120BlockScaledKernel
                     cute::get<1>(params.problem_shape));
             }
             cutlass::arch::NamedBarrier::sync(KT::kNumMathThreads, 0);
+        }
+        else if constexpr (kDenseQuantOut)
+        {
+            // fso.dense.linear_quantized (mxfp8/dense_quant_epi.cuh): the staged bf16 tile is this tile's output
+            // rounded once; the math warps read it back, quantize it by activation contract v1 and write xq and its
+            // scale words. One barrier publishes the staging to every math thread; then each thread releases smem_D
+            // to the load warps (store_empty, kNumMathThreads arrivals) as soon as its own reads are done, behind the
+            // proxy fence of release_stage, and quantizes from registers while the next tile's loads proceed. There
+            // is no TMA store, and the store warp does not run.
+            cutlass::arch::NamedBarrier::sync(KT::kNumMathThreads, 0);
+            dense_quant::store_tile<KT::kTileM, KT::kTileN, KT::kNumMathThreads>(sD_epi(_, _, Int<0>{}),
+                params.epi_out_q, params.epi_out_scale, thread_idx, m_block * KT::kTileM, n_block * KT::kTileN,
+                cute::get<0>(params.problem_shape), cute::get<1>(params.problem_shape),
+                [&] { release_stage(store_empty_mbar[0]); });
         }
         else if constexpr (FusedSwiGLUEpi)
         {
@@ -1477,7 +1627,15 @@ struct SM120BlockScaledKernel
                 ab_empty_mbar[i].init(KT::kNumMathThreads);
             }
             store_full_mbar[0].init(KT::kNumMathThreads);
-            store_empty_mbar[0].init(1);
+            if constexpr (kDenseQuantOut)
+            {
+                // Released by every math thread after its reads of smem_D (mma(), the quantized output).
+                store_empty_mbar[0].init(KT::kNumMathThreads);
+            }
+            else
+            {
+                store_empty_mbar[0].init(1);
+            }
             cutlass::arch::fence_barrier_init();
         }
         __syncthreads();
@@ -1933,7 +2091,7 @@ struct SM120BlockScaledKernel
                     }
                     __syncwarp();
                 }
-                if (warp_idx == epi_warp_idx && !FusedSwiGLUEpi && !ScatterCombineEpi)
+                if (warp_idx == epi_warp_idx && !FusedSwiGLUEpi && !ScatterCombineEpi && !kDenseQuantOut)
                 {
                     uint32_t phase = 0;
                     if constexpr (KT::kGroupedLayoutSmem)

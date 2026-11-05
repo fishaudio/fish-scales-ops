@@ -84,6 +84,25 @@
 //     ahead and was waited for before each tile's MMA: Family C M = 1 FC1 / FC2
 //     20 / 30 per cent slower than the static scheduler.)
 //
+// What a handed-out tile carries (issue #13 lever 2)
+// ------------------------------------------------
+// Every warp role needs three facts about a tile besides its coordinate: the expert whose weights it streams (the
+// weights' batch index), the expert's rows inside the tile (the epilogue's store bound) and whether the tile is live
+// at all. They used to be looked up by each role after it took the tile -- in slot mode slot_to_expert[slot] and
+// then masked_m[expert], two dependent global loads, in tile-list mode one load of the list entry -- which put one
+// or two memory round trips between the end of one tile and the start of the next in the load warp and in the MMA
+// warp. The scheduler now resolves them ONCE per tile, where the latency is off that path, and hands them out with
+// the coordinate:
+//   * a drawn tile: the scheduler warp's leader resolves it right after the draw, while the CTA is still two tiles
+//     behind (generator edit c9), and publishes the facts in the same 16-byte response as the coordinate;
+//   * the CTA's first tile, and on a call that never draws (all_static) its second one: resolved by every thread
+//     after the kernel-wide griddepcontrol.wait (generator edit 4c), both tiles' loads in flight together, and kept
+//     in registers, so the static walk's second tile costs no load either.
+// In tile-list mode the scheduler also rewrites the coordinate to the entry's 128-row block and 64-row half, which
+// the kernel used to do itself. Every lookup reads a routing product and therefore sits after a
+// griddepcontrol.wait: the scheduler warp's own (CUTLASS's sched role waits before its first query) or the
+// kernel-wide one of edit 4c.
+//
 // Who zeroes the counter: `moe_build_routing_compact(..., with_slots=True)`
 // returns it zeroed as its ninth output (`slot_sched`, int32 [2]), a per-call
 // tensor, so two layer calls replayed concurrently from two graphs never share
@@ -106,8 +125,12 @@
 
 namespace cutlass::gemm
 {
-// The tag the slot launcher hands the forked kernel as its TileSchedulerTag.
+// The tags the slot launcher hands the forked kernel as its TileSchedulerTag: slot mode (a slot is one active expert,
+// m_cap <= 64) and tile-list mode (a slot is one entry of the routing op's packed list of live 64-row token tiles).
 struct FsoSlotWorkStealingScheduler
+{
+};
+struct FsoSlotWorkStealingListScheduler
 {
 };
 } // namespace cutlass::gemm
@@ -115,13 +138,16 @@ struct FsoSlotWorkStealingScheduler
 namespace cutlass::gemm::kernel::detail
 {
 
-template <class ClusterShape_, uint32_t Stages_>
+template <class ClusterShape_, uint32_t Stages_, bool ListMode_ = false>
 class FsoSlotWorkStealingTileScheduler
 {
 public:
     using ClusterShape = ClusterShape_;
     static constexpr bool IsDynamicPersistent = true;
     static constexpr uint32_t Stages = Stages_;
+    // Tile-list mode: the slot index is an entry of the packed list of live token tiles, whose packing is
+    // q | e << 14 | (r - 1) << 24 with q = 2 * block + half (grouped_slot_dispatch.cuh, pack_token_tile).
+    static constexpr bool ListMode = ListMode_;
     static_assert(cute::is_static_v<ClusterShape> && cute::size(ClusterShape{}) == 1,
         "the fso slot work-stealing scheduler publishes each drawn tile to its own CTA only (cluster 1x1x1)");
 
@@ -137,6 +163,12 @@ public:
         int32_t N_idx = 0;
         int32_t L_idx = 0;
         bool is_valid_tile = false;
+        // Resolved by the scheduler (see "What a handed-out tile carries"): whether the tile is live, the weights'
+        // batch index (the expert) and the expert's rows that the tile's epilogue stores (in tile-list mode the
+        // half's first row plus the entry's rows). Meaningful only when `live`.
+        bool live = false;
+        int32_t a_batch = 0;
+        int32_t rows = 0;
 
         CUTLASS_HOST_DEVICE bool is_valid() const
         {
@@ -145,7 +177,7 @@ public:
 
         CUTLASS_HOST_DEVICE static WorkTileInfo invalid_work_tile()
         {
-            return {-1, -1, -1, false};
+            return {-1, -1, -1, false, false, 0, 0};
         }
 
         CUTLASS_HOST_DEVICE bool is_final_split(uint32_t) const
@@ -170,8 +202,19 @@ public:
         int static_waves = 1;
         // N tiles per slot when > 0, instead of ceil(N / TileN). The compact kernel's tile-list mode (any row
         // capacity) gives each entry of its live token-tile list one N tile: the slot IS a 64-row token tile, and
-        // the kernel rewrites the coordinate to that tile's block and half itself.
+        // the scheduler rewrites the coordinate to that tile's block and half when it resolves the tile.
         int tiles_n = 0;
+        // What the tile lookups read (routing products, all read after a griddepcontrol.wait). Slot mode: the
+        // packed active-expert list (-1 past the active experts) and the per-expert routed row counts. Tile-list
+        // mode: the packed live token-tile list (-1 past the live tiles).
+        int const* slot_to_expert = nullptr;
+        int const* masked_m = nullptr;
+        int const* tile_list = nullptr;
+        // Range bounds of the lookups: entries of the slot / tile list, and experts.
+        int num_slots = 0;
+        int num_groups = 0;
+        // Token rows per N tile (TileN).
+        int tile_n_rows = 64;
     };
 
     struct Params
@@ -184,6 +227,12 @@ public:
         int32_t grid = 1;
         int32_t bound_tiles = 1;  // tiles of the host-static slot bound
         int32_t static_tiles = 1; // tiles below this are handed out statically
+        int const* slot_to_expert = nullptr;
+        int const* masked_m = nullptr;
+        int const* tile_list = nullptr;
+        int32_t num_slots = 0;
+        int32_t num_groups = 0;
+        int32_t tile_n_rows = 64;
     };
 
     using Pipeline = PipelineCLCFetchAsync<Stages, ClusterShape>;
@@ -212,6 +261,12 @@ public:
         long long const waves = args.static_waves > 0 ? args.static_waves : 1;
         long long const st = waves * p.grid;
         p.static_tiles = static_cast<int32_t>(st < p.bound_tiles ? st : p.bound_tiles);
+        p.slot_to_expert = args.slot_to_expert;
+        p.masked_m = args.masked_m;
+        p.tile_list = args.tile_list;
+        p.num_slots = static_cast<int32_t>(args.num_slots);
+        p.num_groups = static_cast<int32_t>(args.num_groups);
+        p.tile_n_rows = static_cast<int32_t>(args.tile_n_rows);
         return p;
     }
 
@@ -238,7 +293,10 @@ public:
 
     static bool can_implement(Arguments const& args)
     {
-        return args.counter != nullptr && args.live_slots != nullptr;
+        bool const lookups = ListMode ? args.tile_list != nullptr
+                                      : (args.slot_to_expert != nullptr && args.masked_m != nullptr);
+        return args.counter != nullptr && args.live_slots != nullptr && lookups && args.num_slots > 0
+            && args.num_groups > 0 && args.tile_n_rows > 0;
     }
 
     //
@@ -261,12 +319,89 @@ public:
         return {m, n, l, valid};
     }
 
-    // CTA b's first tile is tile b, no draw; the grid never exceeds the bound tiles, so it is in range. Whether it is
-    // LIVE is the kernel's own per-tile test (a slot past the live prefix holds -1 in the slot list).
+    // The tile lookups, split at the memory access so that two tiles' loads can be in flight together.
+    // They are TOTAL over whatever tile they are handed: an invalid tile, a slot or list index outside the list, a
+    // -1 entry or an expert id out of range all resolve to a dead tile without a load past the failed check, and a
+    // dead tile's other fields are never read. (The same totality rules as the per-role helpers they replace.)
+    //   first hop: slot mode slot_to_expert[slot], tile-list mode the list entry; -1 when there is nothing to load.
+    CUTLASS_DEVICE int32_t lookup_first(WorkTileInfo const& w) const
+    {
+        if (!w.is_valid_tile || w.L_idx < 0 || w.L_idx >= params_.num_slots)
+            return -1;
+        return ListMode ? params_.tile_list[w.L_idx] : params_.slot_to_expert[w.L_idx];
+    }
+
+    //   second hop (slot mode only): the expert's routed row count; 0 for an expert out of range.
+    CUTLASS_DEVICE int32_t lookup_rows(int32_t expert) const
+    {
+        if constexpr (ListMode)
+            return 0;
+        else
+            return (expert >= 0 && expert < params_.num_groups) ? params_.masked_m[expert] : 0;
+    }
+
+    // Fill the resolved fields of `w` from the loads above. Slot mode: live when the slot holds an active expert and
+    // the tile's N index starts below the expert's rows (the routed token rows are on the N axis). Tile-list mode:
+    // every non-negative entry is a live tile; the coordinate moves to the entry's block (L) and half (N).
+    CUTLASS_DEVICE void finish(WorkTileInfo& w, int32_t first, int32_t rows) const
+    {
+        w.live = false;
+        if constexpr (ListMode)
+        {
+            if (first < 0)
+                return;
+            int32_t const e = (first >> 14) & 0x3ff;
+            if (e >= params_.num_groups)
+                return;
+            int32_t const q = first & 0x3fff;
+            int32_t const h = q & 1;
+            w.N_idx = h;
+            w.L_idx = q >> 1;
+            w.a_batch = e;
+            w.rows = h * params_.tile_n_rows + ((first >> 24) & 0x3f) + 1;
+            w.live = true;
+        }
+        else
+        {
+            if (first < 0 || first >= params_.num_groups)
+                return;
+            w.a_batch = first;
+            w.rows = rows;
+            w.live = w.N_idx * params_.tile_n_rows < rows;
+        }
+    }
+
+    CUTLASS_DEVICE void resolve(WorkTileInfo& w) const
+    {
+        int32_t const first = lookup_first(w);
+        finish(w, first, lookup_rows(first));
+    }
+
+    // CTA b's first tile is tile b, no draw; the grid never exceeds the bound tiles, so it is in range. It is
+    // returned unresolved: this runs in the kernel's prologue, ahead of any griddepcontrol.wait, and the lookups
+    // read routing products. The kernel resolves it with `fso_resolve_first` after its kernel-wide wait.
     template <class ClusterShapeMNK>
     CUTLASS_DEVICE WorkTileInfo initial_work_tile_info(ClusterShapeMNK)
     {
         return decode(static_cast<int32_t>(blockIdx.x), true);
+    }
+
+    // Called by every thread right after the kernel-wide griddepcontrol.wait (generator edit 4c): resolve the
+    // CTA's first tile and, when the launch never draws (all_static), the second tile of its static walk too, with
+    // both tiles' loads issued before either is used. The second one is kept for `fetch_next_work`.
+    CUTLASS_DEVICE void fso_resolve_first(WorkTileInfo& w)
+    {
+        WorkTileInfo w2 = WorkTileInfo::invalid_work_tile();
+        int32_t const t2 = static_cast<int32_t>(blockIdx.x) + params_.grid;
+        if (all_static() && t2 < params_.bound_tiles)
+            w2 = decode(t2, true);
+        int32_t const f1 = lookup_first(w);
+        int32_t const f2 = lookup_first(w2);
+        int32_t const r1 = lookup_rows(f1);
+        int32_t const r2 = lookup_rows(f2);
+        finish(w, f1, r1);
+        finish(w2, f2, r2);
+        next_static_info_ = w2;
     }
 
     CUTLASS_DEVICE auto work_tile_to_cta_coord(WorkTileInfo const& w) const
@@ -315,6 +450,8 @@ public:
                 else
                     last_draw = true;
             }
+            // The tile's facts, resolved here, two tiles ahead of the roles that use them.
+            resolve(w);
         }
         __syncwarp();
         // Wait until every consumer released this response slot. `producer_acquire` would also arm 16
@@ -331,7 +468,7 @@ public:
             // scope, and the consumers' wait on the barrier an acquire, so they read the stored response.
             asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};\n" ::"r"(dst),
                 "r"(static_cast<uint32_t>(w.M_idx)), "r"(static_cast<uint32_t>(w.N_idx)),
-                "r"(static_cast<uint32_t>(w.L_idx)), "r"(w.is_valid_tile ? 1u : 0u)
+                "r"(static_cast<uint32_t>(w.L_idx)), "r"(pack_flags(w))
                 : "memory");
             asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];\n" ::"r"(full) : "memory");
             if (last_draw)
@@ -361,10 +498,17 @@ public:
         if (all_static())
         {
             // The next tile of this CTA's static walk, with no pipeline step (the `false` tells the kernel not to
-            // advance its pipeline state, and the scheduler warp then stops querying).
-            int32_t const t = (current.L_idx * params_.tiles_n + current.N_idx) * params_.tiles_m + current.M_idx
-                + params_.grid;
-            WorkTileInfo const w = t < params_.bound_tiles ? decode(t, true) : WorkTileInfo::invalid_work_tile();
+            // advance its pipeline state, and the scheduler warp then stops querying). The walk is CTA b's tiles
+            // b, b + grid, b + 2 * grid, ...; the second one was resolved with the first (`fso_resolve_first`), any
+            // later one (a launch with more than two static waves, which the launcher does not make) is resolved
+            // here. The walk is counted rather than derived from `current`, whose coordinate tile-list mode rewrote.
+            (void) current;
+            ++static_fetches_;
+            if (static_fetches_ == 1)
+                return cute::make_tuple(next_static_info_, false);
+            int32_t const t = static_cast<int32_t>(blockIdx.x) + static_fetches_ * params_.grid;
+            WorkTileInfo w = t < params_.bound_tiles ? decode(t, true) : WorkTileInfo::invalid_work_tile();
+            resolve(w);
             return cute::make_tuple(w, false);
         }
         pipeline.consumer_wait(state);
@@ -376,7 +520,8 @@ public:
                      : "memory");
         cutlass::arch::fence_view_async_shared();
         pipeline.consumer_release(state);
-        WorkTileInfo const w{static_cast<int32_t>(m), static_cast<int32_t>(n), static_cast<int32_t>(l), v != 0u};
+        WorkTileInfo const w{static_cast<int32_t>(m), static_cast<int32_t>(n), static_cast<int32_t>(l), (v & 1u) != 0u,
+            (v & 2u) != 0u, static_cast<int32_t>((v >> 2) & 0x3fffu), static_cast<int32_t>(v >> 16)};
         return cute::make_tuple(w, true);
     }
 
@@ -433,18 +578,38 @@ public:
     }
 
 private:
+    // The response's fourth word: valid (bit 0), live (bit 1), the weights' batch index (bits 2-15; experts < 1024)
+    // and the store-bound rows (bits 16-31).
+    CUTLASS_DEVICE static uint32_t pack_flags(WorkTileInfo const& w)
+    {
+        uint32_t const rows = static_cast<uint32_t>(w.rows < 0 ? 0 : (w.rows > 0xffff ? 0xffff : w.rows));
+        return (w.is_valid_tile ? 1u : 0u) | (w.live ? 2u : 0u) | ((static_cast<uint32_t>(w.a_batch) & 0x3fffu) << 2)
+            | (rows << 16);
+    }
+
     CLCResponse* clc_response_ptr_ = nullptr;
     Params const& params_;
     int32_t live_tiles_ = -1;
     int32_t next_static_ = -1;
+    // all_static only: the second tile of the static walk (resolved by fso_resolve_first) and how many tiles of the
+    // walk fetch_next_work has handed out.
+    WorkTileInfo next_static_info_ = WorkTileInfo::invalid_work_tile();
+    int32_t static_fetches_ = 0;
 };
 
-// Bind the tag for the sm_100 kernel layer.
+// Bind the tags for the sm_100 kernel layer.
 template <class TileShape, class ClusterShape, uint32_t SchedulerPipelineStageCount>
 struct TileSchedulerSelector<FsoSlotWorkStealingScheduler, arch::Sm100, TileShape, ClusterShape,
     SchedulerPipelineStageCount>
 {
-    using Scheduler = FsoSlotWorkStealingTileScheduler<ClusterShape, SchedulerPipelineStageCount>;
+    using Scheduler = FsoSlotWorkStealingTileScheduler<ClusterShape, SchedulerPipelineStageCount, false>;
+};
+
+template <class TileShape, class ClusterShape, uint32_t SchedulerPipelineStageCount>
+struct TileSchedulerSelector<FsoSlotWorkStealingListScheduler, arch::Sm100, TileShape, ClusterShape,
+    SchedulerPipelineStageCount>
+{
+    using Scheduler = FsoSlotWorkStealingTileScheduler<ClusterShape, SchedulerPipelineStageCount, true>;
 };
 
 } // namespace cutlass::gemm::kernel::detail

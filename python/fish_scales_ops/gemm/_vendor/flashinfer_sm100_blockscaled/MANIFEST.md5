@@ -1,7 +1,7 @@
 # vendored file md5                     wheel file md5                       file
-1abeb63cf4646f1801eaf86085bb6982  99892be684e2b5af81662ed0768ce9bb  dense_blockscaled_gemm_sm100.py
-cf5abea42ad30c91a0c22359925090cd  dba4261b2cac84e24bcf79bc46dcb0ba  dense_blockscaled_gemm_sm100_common.py
-d2f29587f1247136bab1acd37bca040a  d2f29587f1247136bab1acd37bca040a  dense_blockscaled_gemm_sm100_splitk.py
+3619419e680053251672a5527d6f23bd  99892be684e2b5af81662ed0768ce9bb  dense_blockscaled_gemm_sm100.py
+9ab726f0c11ba1ea4ff8ad5a71e1d242  dba4261b2cac84e24bcf79bc46dcb0ba  dense_blockscaled_gemm_sm100_common.py
+ed9e551341941d50ea1df1e7100b379f  d2f29587f1247136bab1acd37bca040a  dense_blockscaled_gemm_sm100_splitk.py
 
 # source: flashinfer-python 0.6.18.post1, flashinfer/gemm/kernels/<file>, copied 2026-09-22
 # the wheel md5 column is what a fresh extraction of that wheel must hash to;

@@ -35,10 +35,14 @@
 
 #pragma once
 
+#include "blockscale_gemm/common/epilogue.cuh"
+#include "tensorrt_llm/common/assert.h"
+
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <cstddef>
 #include <cstdlib>
 
 namespace tensorrt_llm::kernels::blockscale_gemm
@@ -66,24 +70,22 @@ inline int sk_round_up(int a, int b)
     return sk_ceil_div(a, b) * b;
 }
 
-// Persistent pool of side streams + events + auto-growing scratch buffer.
-// Cap at 8 side streams (matches max k_split). Scratch is sized to fit
-// k_split * M * N BF16 elements; grows on demand.
+// Persistent pool of side streams + events (process-wide). Cap at 8 side streams (matches max k_split).
 //
-// CUDA-graph compatibility (added 2026-05-06):
-//   1. Side streams + events created lazily — the host-side `cudaStreamCreate`
-//      / `cudaEventCreateWithFlags` calls happen at first launch, OUTSIDE
-//      any active capture. Subsequent capture-mode launches reuse the
-//      pre-created handles.
-//   2. Fork-join is now expressed via `fork_event`: at every launch we
-//      record an event on the main stream and have each side stream wait
-//      on it before launching. Capture then sees the cross-stream
+// The bf16 partial scratch is NOT here any more (issue #12, charter 7.5: no workspace shared by two streams). It
+// used to be one process-wide buffer, allocated at the first Stream-K call and shared by every caller stream, so two
+// Stream-K calls on two streams (or two graphs replayed concurrently) wrote the same partials. Every caller now
+// passes its own scratch, allocated by the op body from the torch caching allocator on the caller's current stream
+// (graph-private inside a capture): Sm120DenseRoute::streamk_scratch_bytes gives its size. The side streams stay
+// shared: inside a graph they become nodes, and outside one each slice is ordered after the caller's prior work by
+// the fork event below.
+//
+// CUDA-graph compatibility:
+//   1. Side streams + events are created lazily — the host-side `cudaStreamCreate` / `cudaEventCreateWithFlags`
+//      calls happen at the first Stream-K launch, which must be OUTSIDE any capture (one eager call first).
+//   2. Fork-join: every launch records `fork_event` on the caller's stream and has each side stream wait on it
+//      before its slice, then joins the side streams back with `side_done`. Capture sees the cross-stream
 //      dependencies and stitches them into the graph.
-//   3. Scratch buffer is pre-allocated big enough for the max shape on
-//      first call. To avoid `cudaMalloc` during capture, warm the kernel
-//      with the largest shape before capture starts (test_dualar's
-//      `for _ in range(2): run_once()` warmup before `cuda.graph` does
-//      this). If a later launch needs more, it asserts.
 struct StreamKPool
 {
     static constexpr int kMaxKSplit = 8;
@@ -91,8 +93,6 @@ struct StreamKPool
     cudaEvent_t side_done[kMaxKSplit - 1];
     cudaEvent_t fork_event = nullptr;  // recorded on main, waited on side
     bool streams_initialized = false;
-    void* d_partial = nullptr;
-    std::size_t partial_capacity_bytes = 0;
 
     static StreamKPool& instance()
     {
@@ -111,46 +111,6 @@ struct StreamKPool
         }
         cudaEventCreateWithFlags(&fork_event, cudaEventDisableTiming);
         streams_initialized = true;
-    }
-
-    // Default pool capacity covers k_split=8 × M=128 × N=32768 × bf16 = 64 MB
-    // — enough for any prod inference shape we care about. Override with
-    // FSO_STREAMK_POOL_MB env var if you push beyond this. Allocating
-    // once at first init avoids the cudaFree+cudaMalloc-on-grow pattern
-    // that would invalidate already-captured CUDA graphs.
-    static constexpr std::size_t kDefaultPoolBytes = 64ULL * 1024 * 1024;
-
-    __nv_bfloat16* ensure_partial_capacity(std::size_t needed_bytes)
-    {
-        if (d_partial == nullptr)
-        {
-            char const* env = std::getenv("FSO_STREAMK_POOL_MB");
-            std::size_t target = kDefaultPoolBytes;
-            if (env != nullptr)
-            {
-                int mb = std::atoi(env);
-                if (mb > 0)
-                    target = static_cast<std::size_t>(mb) * 1024 * 1024;
-            }
-            if (target < needed_bytes)
-                target = needed_bytes;  // first call already needs more; grant.
-            partial_capacity_bytes = target;
-            cudaMalloc(&d_partial, partial_capacity_bytes);
-        }
-        // After first init the pool never grows — `cudaMalloc` / `cudaFree`
-        // are forbidden during stream capture, and re-allocation would
-        // invalidate captured graphs holding the old pointer. The caller
-        // must size the pool at startup; a hard error here surfaces the
-        // misuse instead of silent corruption.
-        if (partial_capacity_bytes < needed_bytes)
-        {
-            fprintf(stderr,
-                "[blockscale_gemm] StreamKPool capacity exhausted: need %zu, "
-                "have %zu. Bump FSO_STREAMK_POOL_MB.\n",
-                needed_bytes, partial_capacity_bytes);
-            std::abort();
-        }
-        return reinterpret_cast<__nv_bfloat16*>(d_partial);
     }
 };
 
@@ -175,17 +135,103 @@ __global__ inline void sm120_streamk_reduce_kernel(__nv_bfloat16 const* __restri
     out[tid] = __float2bfloat16_rn(acc);
 }
 
-// Concurrent-stream Stream-K launcher. Scratch buffer is auto-managed by
-// the global StreamKPool (lazy-allocated, grows on demand).
+// The epilogue twin of the reduce (interface v1, common/epilogue.cuh): the same fp32 sum of the K_split partials, in
+// the same order, then v += bias_term(bias[n]); v = act(v); [v += residual[m, n]] and the one rounding. The slices
+// keep the identity epilogue, so every term is applied once, after the reduction. Launched only for a non-identity
+// epilogue; the identity reduce above is unchanged. Launched without PDL after the join, so bias and residual (the
+// caller's tensors, possibly produced by the kernel before the GEMM) are complete when it runs.
+// A template only so that no translation unit carries its code unless it launches it.
+template <int kUnused = 0>
+__global__ void sm120_streamk_reduce_epi_kernel(__nv_bfloat16 const* __restrict__ partials,
+    __nv_bfloat16* __restrict__ out, int M, int N, int K_split, std::size_t partial_stride,
+    __nv_bfloat16 const* __restrict__ bias, __nv_bfloat16 const* __restrict__ residual, int64_t ld_residual, int act)
+{
+    std::size_t const tid
+        = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    std::size_t const total = static_cast<std::size_t>(M) * static_cast<std::size_t>(N);
+    if (tid >= total)
+        return;
+    float acc = 0.f;
+    for (int s = 0; s < K_split; ++s)
+    {
+        acc += __bfloat162float(partials[static_cast<std::size_t>(s) * partial_stride + tid]);
+    }
+    std::size_t const m = tid / static_cast<std::size_t>(N);
+    std::size_t const n = tid - m * static_cast<std::size_t>(N);
+    bool const has_bias = bias != nullptr;
+    bool const has_residual = residual != nullptr;
+    __nv_bfloat16 const b = has_bias ? bias[n] : __ushort_as_bfloat16(0);
+    __nv_bfloat16 const r = has_residual ? residual[m * static_cast<std::size_t>(ld_residual) + n] : __ushort_as_bfloat16(0);
+    out[tid] = __float2bfloat16_rn(fso::dense_epilogue_value_rt(acc, has_bias, b, act, has_residual, r));
+}
+
+// The route of one dense sm_120 GEMM call, as its cascade decides it (sm120_mxfp8_dense_route in
+// mxfp8/dispatch.cuh, sm120_fp8_dense_route in fp8/dispatch.cuh): the kernel instance and the K split. The
+// dispatchers launch exactly this, the op bodies size the Stream-K scratch from it, and the host-side route queries
+// report it.
+struct Sm120DenseRoute
+{
+    int tile_m = 0;
+    int tile_n = 0;
+    int stages = 0;
+    int min_blocks = 1;   // MinBlocksPerSm; 2 only under the FSO_FORCE_MIN_BLOCKS=2 diagnostic
+    int sched_group = 16; // persistent-scheduler group; 8 / 32 only under FSO_FORCE_SCHED_GROUP
+    int k_split = 1;      // > 1: Stream-K over this many K slices (the launcher's clamps applied); 1: single launch
+    bool smallm = false;  // the FSO_FORCE_SMALLM diagnostic kernel (MXFP8 only)
+
+    // An instance that exists only behind a diagnostic knob (no dense-epilogue instantiation).
+    bool forced_only_instance() const
+    {
+        return smallm || min_blocks != 1 || sched_group != 16;
+    }
+
+    // Bytes of the bf16 partial scratch the route needs: k_split slices of [M, N], or 0 for a single launch.
+    std::size_t streamk_scratch_bytes(int M, int N) const
+    {
+        return k_split > 1 ? static_cast<std::size_t>(k_split) * static_cast<std::size_t>(M)
+                * static_cast<std::size_t>(N) * sizeof(__nv_bfloat16)
+                           : 0;
+    }
+};
+
+// The K split a Stream-K launcher runs for a requested `k_split`: at most one slice per `sf_block`-element K chunk
+// (one int32 scale word: 128 for MXFP8, 512 for block-FP8 1x128), and at most StreamKPool::kMaxKSplit slices; 1 means
+// the launcher falls back to a single launch of the same tile. The same clamps the launchers have always applied, in
+// the same order.
+inline int sm120_streamk_effective_split(int k_split, int K, int sf_block)
+{
+    int const k_chunks_total = detail::sk_ceil_div(K, sf_block);
+    if (k_split > k_chunks_total)
+        k_split = k_chunks_total;
+    if (k_split <= 1)
+        return 1;
+    if (k_split > detail::StreamKPool::kMaxKSplit)
+        k_split = detail::StreamKPool::kMaxKSplit;
+    return k_split;
+}
+
+// The caller-provided scratch of one Stream-K call, checked against the route's need.
+inline __nv_bfloat16* sm120_streamk_scratch(void* scratch, std::size_t scratch_bytes, std::size_t needed)
+{
+    TLLM_CHECK_WITH_INFO(scratch != nullptr && scratch_bytes >= needed,
+        "sm_120 Stream-K: the caller's partial scratch holds %zu bytes at %p, the route needs %zu (the op body "
+        "allocates it from the route's streamk_scratch_bytes)",
+        scratch_bytes, scratch, needed);
+    return reinterpret_cast<__nv_bfloat16*>(scratch);
+}
+
+// Concurrent-stream Stream-K launcher (block-FP8 1x128). `scratch` / `scratch_bytes` is the caller's bf16 partial
+// scratch (Sm120DenseRoute::streamk_scratch_bytes of the route: k_split slices of [M, N]), allocated by the op body
+// from the torch caching allocator on `stream`.
 template <int TileM, int TileN, int Stages>
 void launch_sm120_streamk_gemm(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4m3* mat_b, int ld_b, __nv_bfloat16* mat_d,
-    int ld_d, int M, int N, int K, float* scales_a, float* scales_b, int k_split, int sm_count, cudaStream_t stream)
+    int ld_d, int M, int N, int K, float* scales_a, float* scales_b, int k_split, int sm_count, cudaStream_t stream,
+    void* scratch, std::size_t scratch_bytes)
 {
     constexpr int kSfBlock = 512; // SF granularity per int32 word
 
     int const k_chunks_total = detail::sk_ceil_div(K, kSfBlock);
-    if (k_split > k_chunks_total)
-        k_split = k_chunks_total;
+    k_split = sm120_streamk_effective_split(k_split, K, kSfBlock);
     if (k_split <= 1)
     {
         // Single launch using the full GPU.
@@ -197,10 +243,8 @@ void launch_sm120_streamk_gemm(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4m3* ma
 
     auto& pool = detail::StreamKPool::instance();
     pool.ensure_streams_initialized();
-    if (k_split > detail::StreamKPool::kMaxKSplit)
-        k_split = detail::StreamKPool::kMaxKSplit;
     std::size_t const needed = static_cast<std::size_t>(k_split) * M * N * sizeof(__nv_bfloat16);
-    __nv_bfloat16* d_partial = pool.ensure_partial_capacity(needed);
+    __nv_bfloat16* d_partial = sm120_streamk_scratch(scratch, scratch_bytes, needed);
 
     int const sfa_pad_m = detail::sk_round_up(M, 4);
     int const sfb_pad_n = detail::sk_round_up(N, 4);
@@ -208,18 +252,14 @@ void launch_sm120_streamk_gemm(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4m3* ma
     int const sm_per_slice = std::max(1, sm_count / k_split);
     std::size_t const partial_stride = static_cast<std::size_t>(M) * N;
 
-    // CUDA-graph fork point: when capturing, side streams must depend on
-    // the main stream via an event so capture stitches them into the
-    // graph (otherwise capture errors with StreamCaptureInvalidated).
-    // Outside capture, the fork+wait pair only adds host overhead and
-    // serializes side-stream launches — costly on small-M shapes (M=1
-    // K=12288: 0.027 → 0.072 ms, -62%). Detect capture state and skip
-    // the fork on the non-capture path.
-    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-    cudaStreamIsCapturing(stream, &capture_status);
-    bool const is_capturing = (capture_status == cudaStreamCaptureStatusActive);
-    if (is_capturing)
-        cudaEventRecord(pool.fork_event, stream);
+    // Fork point. Every side-stream slice waits on an event recorded on the caller's stream, eager or capturing.
+    // Under capture this is what stitches the side streams into the graph. Outside capture it orders each slice
+    // after the caller's prior work: the slices read A / SFA, which the caller's stream may still be producing, and
+    // write the caller's scratch, which the caching allocator may just have handed back from a tensor an earlier
+    // kernel of that stream still reads. (Until issue #12 the fork was skipped outside capture to save host time,
+    // which raced on any non-default caller stream: side streams only synchronise implicitly with the legacy
+    // default stream.)
+    cudaEventRecord(pool.fork_event, stream);
 
     int actual_splits = 0;
     for (int s = 0; s < k_split; ++s)
@@ -241,10 +281,7 @@ void launch_sm120_streamk_gemm(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4m3* ma
         __nv_bfloat16* part_d = d_partial + static_cast<std::size_t>(actual_splits) * partial_stride;
 
         cudaStream_t this_stream = (s == 0) ? stream : pool.side_streams[s - 1];
-        // Side streams wait on the fork event only when capturing (see
-        // above). Outside capture, the join at the end of the launcher
-        // is enough to sequence them back to the main stream.
-        if (s != 0 && is_capturing)
+        if (s != 0)
             cudaStreamWaitEvent(this_stream, pool.fork_event, 0);
 
         launch_sm120_gemm_kernel<TileM, TileN, Stages>(a_off, ld_a, 0, b_off, ld_b, 0, part_d, /*ld_d=*/N, 0, sa_off, 0,

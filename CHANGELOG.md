@@ -2,6 +2,108 @@
 
 Performance figures are in `docs/perf/`, not here.
 
+## 0.2.3 — 2026-11-05
+
+The dense linear interface for issue #12, the B300 MoE layer work of issue #13, faster sm_90, sm_100 and sm_120 dense
+routes (a small-M decode route on the RTX 5090), alignment checks on every op, and a fix for a shared-memory race in the
+H200 FP8 GEMMs.
+
+### New
+
+- **`fso.dense` interface v1 (#12).** `linear` applies a bias, the erf-GELU and a residual inside the GEMM, and takes
+  a pre-quantized activation with its scale (`x_scale`); `linear_quantized` writes its output as the next GEMM's MXFP8
+  activation; `quantize_activation` is the matching activation quantizer; `activation_contract()` and `include_dir()`
+  publish the activation contract (`fish_scales_ops/include/fso/activation_contract.h`,
+  [`docs/api/dense.md`](docs/api/dense.md)). On sm_90 and sm_120/sm_121 `x_scale` is `[align(M, 4), K/128]` with
+  strides `(1, align(M, 4))`, M fastest, so `x_scale[m, kb]` is the scale of row `m`, group `kb`; on sm_100/sm_103
+  it is the 1-D CUTLASS atom layout. On sm_90 `fso.compat.linear_fp8` reads that tensor in place, as it reads the
+  row-major-labelled scale of `fso.compat.quantize_1x128_fp8`.
+- sm_90: the bias, erf-GELU and residual epilogue on the DeepGEMM v2, v1 and swap-AB kernels, on every shape.
+- sm_120/sm_121: the same epilogue on every tile of the MXFP8 cascade and on its Stream-K route.
+- sm_100/sm_103: the same epilogue on the CuTe-DSL swap-AB row and on the C++ cascade, and the bias on tier 1
+  (cuBLAS); a call carrying a field its shape's tier does not apply runs on the next tier that applies it.
+- sm_120/sm_121 (every route of the MXFP8 cascade) and sm_100/sm_103 (the C++ cascade): `linear_quantized` writes the
+  next GEMM's MXFP8 activation in the GEMM's own launch. On sm_90 it raises `NotImplementedError`.
+- `bench/gemm/python/bench_issue12_dense.py`: the issue-12 dense bench (tower and LLM projections, per-role arms,
+  composite tables, cold weights).
+- `bench/run_perf.py --steps` runs only the named steps of the selected table groups, and
+  `bench/env/5090.lock.json` names card C1 of the RTX 5090 pod.
+- sm_120/sm_121 raw ops: `linear_mxfp8_bf16x`, the bf16-x dense MXFP8 GEMM as one op; `sm120_smallm_rules` and
+  `mxfp8_dense_smallm_route_sm120`, the small-M route's rules and the route of one call (host only); the switch
+  `FSO_SMALLM_ROUTE={rules,0,1}` ([`docs/api/compat.md`](docs/api/compat.md)).
+
+### Faster
+
+- sm_120/sm_121 dense: a tensor-core route of its own for the decode band (`M <= 64`, `sm120.smallm`): the 2b call
+  where its rule R1 picks it, and the bf16-x call in one launch that quantizes the activation inside the kernel where
+  its rule R2 picks it, with the bytes of `quantize_activation` + the 2b call; the rules were fitted on library
+  timings of the RTX 5090 (`FSO_SMALLM_ROUTE=0` turns the route off).
+- sm_90 dense: cells whose last M block is mostly empty take the DeepGEMM v2 kernel.
+- sm_90 dense: swap-AB at 32 < M < 64 where the 64-row tile is mostly empty.
+- sm_90 dense: swap-AB at 64 < M <= 96 where the main path's last M block is mostly empty.
+- sm_90 dense: swap-AB at 96 < M <= 100 and 128 < M <= 160 on the shapes where it measured faster.
+- sm_100 dense: swap-AB split-K and persistent kernels for the narrow-N long-K cells above M = 64.
+- sm_100 dense: a short-K tile rule in the cascade, and the bias calls of narrow-N short-K cells leave cuBLAS.
+- sm_100 dense: the wave rule takes the 1-SM 128x64 tile below M = 129 when the activation is under 128 KiB.
+- sm_100 dense cascade epilogue: fewer instructions per element, and the activation is tested once per fragment.
+- sm_100 MoE layer (#13): the slot GEMM's tile scheduler resolves each tile's expert, rows and liveness, and the
+  compact route loads only an expert's live token rows.
+- sm_100 MoE layer: FC1 and FC2 run as one persistent kernel on the compact slot route and on the token-tile route
+  (`FSO_MOE_SLOT_FUSED=0` keeps the two kernels).
+- sm_100 MoE layer: the token-tile kernel prefetches its first weight panel into the L2 after its wait
+  (`FSO_MOE_FIRST_PANEL_PREFETCH=0` turns this off).
+
+### Fixed
+
+- **sm_90 (H200): a shared-memory race in the FP8 GEMMs.** Every DeepGEMM kernel that fish-scales-ops runs on sm_90
+  (the dense v1, swap-AB and DeepGEMM v2 kernels and the MoE grouped kernels) read the activation scales of a pipeline
+  stage, which a TMA load had written, with `ld.shared`, and then released the stage to the producer without waiting
+  for those loads to complete. The producer could then refill the stage with the next tile's data, and if that TMA
+  write landed before a delayed load had read the scales, the warp scaled the tile's last k-block with the next tile's
+  scales, so one 64-row block of the output was wrong. This was reproduced on two H200 cards with a forced multi-wave
+  tile and was not observed on a default route. Every math warp now executes `fence.proxy.async.shared::cta` and
+  `__syncwarp` before it releases a stage, issued while its WGMMA batch is still running; the outputs are bit for bit
+  the same. Against 0.2.2 the fence costs the 128-row swap-AB decode GEMMs 1.0–3.6 % each and an LLM decode step
+  (the issue-12 LLM projections, M <= 32) 0.7–1.3 %.
+
+### Changed
+
+- **Misaligned inputs raise `ValueError`.** A misaligned activation or scale of the raw dense GEMMs, a misaligned
+  input of the MoE gather / SwiGLU quantizers and of the combines, and a misaligned weight, int32 weight scale,
+  grouped-GEMM operand or caller-owned output are refused with `ValueError` before anything is allocated or
+  launched. `linear_mxfp8` applies the 16-byte rule to `x_fp8` and `sx` before it chooses a tier
+  ([`docs/api/compat.md`](docs/api/compat.md)).
+- `fso.dense` copies a misaligned bf16 activation, and `fso.moe.layer` copies a `hidden` that is misaligned or not
+  contiguous (and, with MXFP8 experts, a misaligned `bias`); neither refuses one.
+- `fso.dense.prepare_weight` and `fso.moe.prepare_experts` copy a misaligned checkpoint view once, at load time, so
+  every handle is 16-byte aligned and no layer call copies a weight.
+- The sm_120 Stream-K and sm_100 split-K routes take their scratch per call from the torch caching allocator, so no
+  workspace is shared by two streams.
+- sm_100/sm_103: on the fused FC1 + FC2 routes the down projection's output has an allocation of its own, so one
+  layer call's transient memory (`fso.moe.transient_bytes`) grows by up to about 100 MiB at up to 2048 tokens
+  (`FSO_MOE_SLOT_FUSED=0` keeps the shared region).
+
+### Known issues
+
+- **B300: the short-K narrow tower GEMMs are not faster in FP8 than cuBLAS in bf16.** On the 1280-wide projections
+  of the issue-12 audio tower at M = 78–533 the FP8 GEMM is not faster than cuBLAS bf16, and the separate
+  activation-quantize launch costs more than the FP8 GEMM saves. The next round targets this.
+- H200: the issue-12 audio tower's `conv_out` projection at M = 364 is about 4 % slower than in 0.2.2; the cause is
+  not established.
+- B300: the Family B MoE layer at M = 1024 with Zipf-skewed routing (exponent 1.2) is about 0.6 % slower, the cost of
+  the first-panel prefetch there (`FSO_MOE_FIRST_PANEL_PREFETCH=0` removes it).
+- **sm_100/sm_103: the MoE layer with very few live (expert, row) pairs per call is slower than in 0.2.1.** One token
+  on an expert-parallel rank (Family B, one rank of two, M = 1) takes 1.4 µs (8.8 %) longer per layer, and a padded
+  M = 128 bucket with one live row 0.7 µs (3.6 %) longer, measured against 0.2.1 on the same card. With so few tiles,
+  the fused FC1 + FC2 kernel runs FC2 after its expert's FC1 tiles without the overlap that the two-kernel path gets
+  from programmatic dependent launch. `FSO_MOE_SLOT_FUSED=0` runs the two-kernel path. Every other MoE cell is
+  faster; the layer rows are 6.8 % (Family B) and 7.0 % (Family C) faster at the median.
+
+### Install
+
+As 0.2.2: install the wheel attached to the GitHub release with `pip install --no-deps` into an environment with
+torch 2.13.0+cu130.
+
 ## 0.2.2 — 2026-10-15
 
 A patch release: one fix, no API change, no new kernel.

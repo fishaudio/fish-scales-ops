@@ -2,7 +2,8 @@
 """The public surface of fish_scales_ops, pinned: the exported names of every
 namespace and the top-level build_info(), the deprecated fso.gemm path of the
 45 names that now live in fso.compat, the removal of fso.moe.lowlevel, the
-torch ops the two stable entries register, the arguments removed on
+torch ops the two stable entries register (with the dense schemas of interface v1,
+and the defaulted epilogue arguments of the raw dense GEMM ops), the arguments removed on
 2026-09-30, and the architecture refusals of the entries that exist on some
 architectures only. The package version is checked against python/pyproject.toml
 in the source tree, or against BUILD_INFO.json in an installed wheel. Runs on
@@ -25,7 +26,21 @@ import fish_scales_ops as fso
 from fish_scales_ops._arch import sm_major
 
 TOP = ["dense", "moe", "attention", "compat", "build_info"]
-DENSE = {"FORMATS", "DenseWeight", "prepare_weight", "linear", "supported", "describe"}
+DENSE = {"FORMATS", "DenseWeight", "prepare_weight", "linear", "supported", "describe",
+         # interface v1 (issue #12)
+         "ACTIVATIONS", "linear_quantized", "quantize_activation", "activation_contract", "include_dir"}
+# The torch ops the stable entries register from Python, with their schemas (interface v1 for the dense ones).
+PY_OPS = {
+    "dense_linear": "fish_scales_ops::dense_linear(Tensor x, Tensor weight, Tensor scale, str kind, "
+                    "Tensor? bias=None, Tensor? x_scale=None, Tensor? residual=None, str? activation=None) -> Tensor",
+    "dense_linear_quantized": "fish_scales_ops::dense_linear_quantized(Tensor x, Tensor weight, Tensor scale, "
+                              "str kind, Tensor? bias=None, Tensor? x_scale=None, str? activation=None) "
+                              "-> (Tensor, Tensor)",
+    "dense_quantize_activation": "fish_scales_ops::dense_quantize_activation(Tensor x) -> (Tensor, Tensor)",
+}
+# The raw dense GEMM ops whose schemas gained the epilogue arguments of interface v1 as defaulted trailing
+# arguments, so that their old positional calls keep working.
+RAW_EPILOGUE_TAIL = ", Tensor? bias=None, Tensor? residual=None, int act=0) -> Tensor"
 MOE = {"FORMATS", "MoeExperts", "prepare_experts", "layer", "transient_bytes", "supported",
        "describe"}
 # The eleven explicit dense ops, in the order of fso.gemm's former __all__.
@@ -66,6 +81,9 @@ ATTENTION = {"flash_attn_fwd", "FlashAttnDispatch", "mxfp8_fwd", "pre_quantize_q
 # own for them, or the caller's registration raises.
 CALLER_FAKED = ["linear_qx", "linear_fp8", "linear_mxfp8_raw", "quantize_1x128", "quantize_1x32",
                 "repack_mxfp8_scales", "repack_fp8_act_scales", "repack_fp8_wgt_scales"]
+# Internal C++ ops that only the library's own custom ops call, with a fake of the library's (issue #13 lever 5:
+# the MoE layer's fused FC1 + FC2 slot kernel). Not in fso.compat, so no caller registers one for them.
+INTERNAL_FAKED = ["linear_mxfp8_grouped_compact_fc1_fc2"]
 
 
 def check(cond, what, failures):
@@ -209,16 +227,20 @@ def main():
 
     print("== torch ops ==")
     ops = torch.ops.fish_scales_ops
-    for name in ("dense_linear", "moe_layer"):
+    for name in tuple(PY_OPS) + ("moe_layer",):
         try:
             getattr(ops, name)
             ok = True
         except (AttributeError, RuntimeError):
             ok = False
         check(ok, f"torch.ops.fish_scales_ops.{name} is registered", failures)
-    schema = str(ops.dense_linear.default._schema)
-    check(schema == "fish_scales_ops::dense_linear(Tensor x, Tensor weight, Tensor scale, str kind) -> Tensor",
-          f"dense_linear schema: {schema}", failures)
+    for name, want in PY_OPS.items():
+        schema = str(getattr(ops, name).default._schema)
+        check(schema == want, f"{name} schema: {schema}", failures)
+    for name in ("linear_fp8", "linear_qx", "linear_mxfp8_raw"):
+        schema = str(getattr(ops, name).default._schema)
+        check(schema.endswith(RAW_EPILOGUE_TAIL), f"{name} schema ends with the defaulted epilogue arguments: "
+                                                  f"{schema}", failures)
 
     print("== arguments removed on 2026-09-30 ==")
     for fn, gone in ((fso.compat.moe_layer_mxfp8_sm120, ("on_output", "chunk_tokens")),
@@ -273,9 +295,11 @@ def main():
     # A caller that registers its own fakes for the raw ops it calls (apex does, for
     # CALLER_FAKED) must not meet a registration of fish_scales_ops. Recent torch lets a
     # second register_fake override the first, so the check reads the registrations
-    # instead: only the two Python custom ops, dense_linear and moe_layer, may carry a
-    # Meta kernel or a fake, and they must (the positive control of the check).
-    print("== fake implementations: only the two Python custom ops ==")
+    # instead: only the Python custom ops (the three dense ops of interface v1 and
+    # moe_layer) and the internal ops the library calls inside them (INTERNAL_FAKED, never
+    # in fso.compat) may carry a Meta kernel or a fake, and they must (the positive control of
+    # the check).
+    print("== fake implementations: only the Python custom ops and the internal ops ==")
     names = sorted(n for n in torch._C._dispatch_get_all_op_names() if n.startswith("fish_scales_ops::"))
     with_meta = [n for n in names if torch._C._dispatch_has_kernel_for_dispatch_key(n, "Meta")]
     try:
@@ -284,10 +308,11 @@ def main():
     except Exception as e:  # noqa: BLE001 - an internal registry that moved is reported, not fatal
         print(f"  note: torch's fake registry is not readable here ({type(e).__name__}); Meta kernels only")
         with_fake = with_meta
-    want = ["fish_scales_ops::dense_linear", "fish_scales_ops::moe_layer"]
+    want = sorted([f"fish_scales_ops::{n}" for n in PY_OPS] + ["fish_scales_ops::moe_layer"]
+                  + [f"fish_scales_ops::{n}" for n in INTERNAL_FAKED])
     check(with_meta == want and with_fake == want and all(f"fish_scales_ops::{n}" in names for n in CALLER_FAKED),
-          f"of the {len(names)} fish_scales_ops ops only dense_linear and moe_layer carry a Meta kernel or a "
-          f"fake, so a caller's fakes for {', '.join(CALLER_FAKED)} meet no registration of ours"
+          f"of the {len(names)} fish_scales_ops ops only {', '.join(n.split('::')[1] for n in want)} carry a "
+          f"Meta kernel or a fake, so a caller's fakes for {', '.join(CALLER_FAKED)} meet no registration of ours"
           + ("" if with_meta == want and with_fake == want else f" (Meta: {with_meta}, fake: {with_fake})"),
           failures)
 

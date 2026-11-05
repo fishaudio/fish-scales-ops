@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fish-scales-ops"
-version = "0.2.2"
+version = "0.2.3"
 description = "Block-scaled FP8 / MXFP8 GEMM, MoE layer and attention kernels for sm_90, sm_100/sm_103 and sm_120/sm_121."
 requires-python = ">=3.10"
 dependencies = ["torch>=2.11"]
@@ -48,8 +48,11 @@ packages = [
 #   _jit_include/  every header those kernels compile with: deep_gemm/, CUTLASS include/ and the CUDA headers
 #   _dsl/          the CUTLASS CuTe-DSL kernel of the sm_100/sm_103 mid-band tier
 #   BUILD_INFO.json  how the wheel was built; fish_scales_ops.build_info() returns it
-"fish_scales_ops" = ["_nvrtc/*", "_jit_include/**/*", "_dsl/*", "BUILD_INFO.json"]
-# The vendored kernels are BSD-3-Clause; their notice travels with them.
+#   include/fso/   the activation contract header (fso/activation_contract.h), a source file of the package that
+#                  fish_scales_ops.dense.include_dir() points at; it is in the source tree, so nothing stages it
+"fish_scales_ops" = ["_nvrtc/*", "_jit_include/**/*", "_dsl/*", "BUILD_INFO.json", "include/fso/*.h"]
+# The vendored kernels are BSD-3-Clause; their notice travels with them, and so does TRIM.diff, the record of every
+# change made to the upstream files (README.md and MANIFEST.md5 name it).
 "fish_scales_ops.gemm._vendor.flashinfer_sm100_blockscaled" = [
-    "LICENSE", "README.md", "MANIFEST.md5",
+    "LICENSE", "README.md", "MANIFEST.md5", "TRIM.diff",
 ]

@@ -112,7 +112,10 @@ runs a few experts at a time under a fixed scratch budget, so preparing a layer
 never holds a second full copy of its weights. On sm_90 the handle keeps the
 caller's own block-FP8 tensors, so freeing the source parameters afterwards
 releases no memory there; on the MXFP8 architectures it does, except for an
-MXFP8 checkpoint (below).
+MXFP8 checkpoint (below). Every tensor of the handle starts on a 16-byte
+boundary, which the grouped GEMMs need: a caller's tensor that the handle would
+keep but that is a view at another offset is copied into a tensor of its own
+here, once.
 
 **MXFP8 checkpoints as stored.** An MXFP8 checkpoint holds the 1×32 encoding
 itself: float8_e4m3fn weights and one UE8M0 scale byte per 32 elements along K,
@@ -149,6 +152,26 @@ sglang top-k produces int64) and is narrowed to int32 inside the call, and
 per token, which is where a shared expert's output and its sigmoid gate go;
 `bias_scale` requires `bias`. The result is a new bf16 `[M, H]` tensor.
 
+*Alignment.* A `hidden` that is not contiguous, or whose data pointer is not
+16-byte aligned (a view that starts at an element offset that is not a multiple
+of 8, such as `buf[3:].view(M, H)`), is copied into a tensor of its own first, at
+the cost of one copy kernel, on every architecture; so is such a `bias` on
+sm_100/103 and sm_120/121, whose combine kernel reads it (on sm_90 the bias fold
+below is a torch pass that reads any bias). The gather-quantize kernels read
+`hidden` in vectors of at least 8 bytes and the combine reads `bias` in 16-byte
+vectors, straight from their data pointers. The copy happens inside the op, on real
+tensors: `torch.compile` traces the op's fake implementation, and a CUDA-graph
+capture records the copy with the call. The raw glue ops underneath
+(`fso.compat`, `torch.ops.fish_scales_ops`) do not copy; they refuse with
+`ValueError` what their kernel cannot read ([`compat.md`](compat.md),
+*Constraints*; `tests/gemm/unit/test_misaligned_x.py`). The experts are never
+copied: the grouped GEMMs read them in place with TMA, which needs a 16-byte
+aligned address, and `layer` refuses, with `ValueError` naming the tensor and
+before anything is launched, a handle whose `w13` or `w2` (and, on kind
+`"mxfp8"`, whose `sw13` or `sw2`) does not start on a 16-byte boundary. A handle
+from `prepare_experts` always does. The fp32 block scales of kind `"bsfp8"` are
+read with plain loads and are accepted at any address.
+
 *Skipped ids.* Every id outside `[0, E_local)` is skipped at no expert cost on
 every architecture. That covers the padded rows of a graph bucket, which sglang
 labels `num_experts` or −1, the entries an expert-parallel dispatcher maps to −1
@@ -179,8 +202,12 @@ tensor is charged as the caching allocator can charge it — 512-byte blocks, an
 to 1 MiB more for a tensor above 1 MiB that a cached block serves without splitting
 — so the figure is an upper bound, tight to about 1 MiB per large tensor. The gathered activation (with its
 scales, and the gate/up output when the FC1 is not fused) and the down-projection output are never live at the
-same time, so they share one allocation, which the figure counts once. It does not count the inputs,
-the weights, a `bias` or the library's persistent pools. The intermediates are
+same time, so they share one allocation, which the figure counts once; on sm_100/103, where the layer runs its FC1 and FC2
+as one kernel (see the table below), the down-projection output gets an allocation of its own instead, because in
+one kernel an FC2 tile may store while an FC1 tile of another expert still reads the gathered activation. It does not count the inputs,
+the weights, a `bias` or the library's persistent pools. The copy that `layer` makes of a `hidden` (or `bias`) that
+is not contiguous or not 16-byte aligned (*Alignment* above) is an allocation of that input's size, from the caching
+allocator on the current stream, and `transient_bytes` does not count it. The intermediates are
 freed when the call returns, so one reservation for the largest bucket a forward
 can carry covers every MoE layer of a model. Both layouts grow with the routed rows:
 sm_90's expert-sorted layout with `tokens · topk` plus per-expert padding to its
@@ -201,7 +228,7 @@ device's architecture:
 |---|---|---|
 | `"bsfp8"` | sm_90 | `moe_layer_fp8_sm90` (the expert-sorted contiguous layout, swap-AB or non-swap picked from `M`), then the bias fold above |
 | `"mxfp8"` | sm_120 / sm_121 | the compact-layout chain of `moe_layer_mxfp8_sm120` (`moe_build_routing_compact`, the out-style gather, the compact grouped GEMMs, `moe_combine`), with `w13_interleaved` from the handle and the fused combine allowed (see below); one call per bucket |
-| `"mxfp8"` | sm_100 / sm_103 | the same chain, with the routing kernel asked for exactly the tensors this architecture's grouped routes read (and, for the pointer-array cascade, the per-call activation pointer arrays): per GEMM, `mxfp8_grouped_slot_possible` and `mxfp8_grouped_problem_shapes_consumed` (the FC1 asked under the kernel it will run, and every query under the layout the layer runs: `compact=True` on the compact layout, whose slot route has its own rule) choose between the packed active-expert list for the slot-bound decode route (with, past a row capacity of 64, its packed list of live token tiles) and the per-group problem shapes for the pointer-array cascade, which is the composition `bench/gemm/python/bench_moe_qwen3_30a3.py` (`fso_mxfp8_layer`) drives. The fused FC1 is taken where `mxfp8_grouped_swiglu_fused_route` says so and there is no fused combine; one call per bucket |
+| `"mxfp8"` | sm_100 / sm_103 | the same chain, with the routing kernel asked for exactly the tensors this architecture's grouped routes read (and, for the pointer-array cascade, the per-call activation pointer arrays): per GEMM, `mxfp8_grouped_slot_possible` and `mxfp8_grouped_problem_shapes_consumed` (the FC1 asked under the kernel it will run, and every query under the layout the layer runs: `compact=True` on the compact layout, whose slot route has its own rule) choose between the packed active-expert list for the slot-bound decode route (with, past a row capacity of 64, its packed list of live token tiles) and the per-group problem shapes for the pointer-array cascade, which is the composition `bench/gemm/python/bench_moe_qwen3_30a3.py` (`fso_mxfp8_layer`) drives. The fused FC1 is taken where `mxfp8_grouped_swiglu_fused_route` says so and there is no fused combine. Where both GEMMs then take the compact slot route, in either of its modes (slot mode at a row capacity `align(tokens, 4) <= 64`, the token-tile mode past it), the layer runs the FC1 and the FC2 as ONE persistent kernel (`linear_mxfp8_grouped_compact_fc1_fc2`, internal): every FC2 tile starts as soon as the FC1 tiles of its own expert (token-tile mode: of its own 128-row block) have stored, instead of after the whole FC1 grid, and the outputs are the two kernels' bit for bit; `FSO_MOE_SLOT_FUSED=0` runs the two kernels instead. One call per bucket |
 | anything else | any | `NotImplementedError` naming the architecture and the format to use instead, or `ValueError` for an unknown kind |
 
 *The fused combine.* On sm_120/121 the fused-combine FC2 adds each routed row

@@ -10,10 +10,10 @@
     "select": {
       "by": "uuid",
       "uuids": [
-        "GPU-9860e51e-04ef-c66a-f09f-e3d4680ea4df"
+        "GPU-f04f899f-ca4e-0bb3-5701-c25637789af8"
       ]
     },
-    "lock_file": "/data/bench-runs/.gpu3.lock",
+    "lock_file": "/data/bench-runs/.h200_gpu7.lock",
     "l2_bytes": 62914560,
     "clock_policy": {
       "mode": "natural",
@@ -58,6 +58,7 @@
     "The sm_90 kernels are compiled by the NVRTC bundled with fish_scales_ops (since 9cf0a46), never by the copy torch loads. Since 2026-10-05 the bundled NVRTC is 13.0.88, the same version the torch 2.13.0+cu130 wheel depends on, so jit_compiler_sm90() must name NVRTC 13.0 and the bundled path.",
     "2026-10-05: the card is GPU 0 (PCI 8F:00.0, GPU-e87af6ea), granted for the 0.2.0 tables measured from the release wheel. The card of the 2026-10-01 runs, GPU 6 (PCI CB:00.0, GPU-f7556d6e), has run another tenant's service since 2026-10-01, and the harness refuses a card with a compute process.",
     "2026-10-12: the card is GPU 3 (PCI 97:00.0, GPU-9860e51e), granted for the 0.2.1 tables. GPU 0 runs another session's service, so every H200 table of 0.2.1, fso and comparators alike, is measured on GPU 3, and no table compares cells from two cards.",
+    "2026-11-04: the card is GPU 7 (PCI CC:00.0, GPU-f04f899f), granted for the 0.2.3 tables, with the lock file /data/bench-runs/.h200_gpu7.lock that the 0.2.3 round shares on this card. GPU 3 is not ours any more and has reported \"Unknown Error\" since 2026-11-03. 0.2.3 measures on GPU 7 only the tables whose machine code changed; every other H200 table, the comparator files among them, keeps the 0.2.1 numbers that were measured on GPU 3, and docs/perf/README.md names the card of every file. While a card of this host reports \"Unknown Error\", nvidia-smi -i <UUID> fails for every card and -i <PCI bus id> works.",
     "2026-10-05: The sglang Triton comparators read their MoE tile configs from SGLANG_MOE_CONFIG_DIR, a pinned copy of apex's own config tree (apex-fish-inference cfed1d25, sglang_fish/sglang_fish/layers/moe/moe_runner/triton_utils/configs; 370 files, MANIFEST.md5 sha256 prefix 366a34a36d026df0), so the comparator column runs the configs apex serves with when it does not use fso. Each comparator row records the file sglang resolved for the gate_up and the down GEMM (moe_config)."
   ],
   "suite": {

@@ -9,12 +9,31 @@ from __future__ import annotations
 
 import torch
 
+from . import _epilogue
+
+
+def _sm90_act_scale(sx: torch.Tensor) -> torch.Tensor:
+    """sm_90: the fp32 1x128 activation scale as the sm_90 GEMM reads it. The GEMM reads the buffer from its data
+    pointer, element ``kb * pad(M, 4) + m`` for row ``m``, group ``kb``; ``quantize_1x128_fp8`` returns that buffer
+    under row-major ``[pad(M, 4), K/128]`` metadata. The M-fastest view of the same buffer (shape
+    ``[pad(M, 4), K/128]``, strides ``(1, pad(M, 4))``, the tensor ``fso.dense.quantize_activation`` returns) is
+    relabelled in place: ``.contiguous()`` would permute it into row-major order, which the GEMM would read wrongly.
+    Any other tensor is made contiguous, as before."""
+    if sx.dim() == 2 and sx.shape[1] > 1 and sx.stride() == (1, sx.shape[0]):
+        mp, kb = sx.shape
+        return sx.t().view(kb * mp).view(mp, kb)
+    return sx.contiguous()
+
 
 def linear_fp8(
     x_fp8: torch.Tensor,
     w_fp8: torch.Tensor,
     sx: torch.Tensor,
     sw: torch.Tensor,
+    *,
+    bias: torch.Tensor | None = None,
+    residual: torch.Tensor | None = None,
+    activation: str | None = None,
 ) -> torch.Tensor:
     """Block-scaled FP8 (E4M3) GEMM. Auto-dispatches sm_90 / sm_100 / sm_120.
 
@@ -34,6 +53,10 @@ def linear_fp8(
     ``repack_fp8_wgt_scales`` (which does check) saves the per-call packing.
     On sm_90 (Hopper / H200) the scales are FP32 as the quantizers produce them
     there; the int32 pre-packed forms are the Blackwell layout and are refused.
+    The sm_90 activation scale is read in place in either form of its buffer
+    (element ``kb * pad(M, 4) + m``): the row-major ``[pad(M, 4), K/128]``
+    tensor of ``quantize_1x128_fp8``, or the M-fastest view with strides
+    ``(1, pad(M, 4))`` that ``fso.dense.quantize_activation`` returns.
 
     Args:
         x_fp8: float8_e4m3fn [M, K], contiguous.
@@ -41,6 +64,14 @@ def linear_fp8(
         sx:    float32 dequant scales for x (see quantize helper output), or
                the pre-packed int32 form.
         sw:    float32 dequant scales for w, or the pre-packed int32 form.
+        bias, residual, activation: the dense epilogue of interface v1
+            (bf16 ``[N]``, bf16 ``[M, N]``, ``None`` or ``"gelu_erf"``;
+            ``fish_scales_ops/gemm/_epilogue.py``). Keyword-only. sm_90
+            applies it inside the GEMM, sm_100/sm_103 where the MXFP8 router
+            takes its C++ cascade (tier 3); on the other routes anything but
+            the defaults raises ``NotImplementedError`` naming the
+            architecture and the route, before anything (a scale repack
+            included) is launched.
 
     Returns:
         bfloat16 [M, N].
@@ -52,6 +83,16 @@ def linear_fp8(
             "linear_fp8 on sm_90 takes FP32 scales from quantize_1x128_fp8 / quantize_128x128_fp8; "
             f"got sx {sx.dtype} and sw {sw.dtype}. The int32 pre-packed scales are the Blackwell "
             "(sm_100/103, sm_120/121) layout.")
+    epilogue = None
+    if bias is not None or residual is not None or activation is not None:
+        m = int(x_fp8.shape[0]) if x_fp8.dim() == 2 else -1
+        epilogue = _epilogue.make("linear_fp8", m=m, n=int(w_fp8.shape[0]), device=w_fp8.device, bias=bias,
+                                  residual=residual, activation=activation)
+        if major == 10 and x_fp8.dim() == 2:
+            from . import _sm100_dispatch
+            _sm100_dispatch.require(m, int(w_fp8.shape[0]), int(x_fp8.shape[1]), epilogue, "linear_fp8")
+        elif major != 10:
+            _epilogue.require("sm120.fp8" if major == 12 else "sm90", epilogue, "linear_fp8")
     if major == 10:
         # sm_100 / sm_103: expand 1x128 scales to the atom layout, then take the
         # MXFP8 router (the CuTe-DSL decode row, cuBLAS scaled_mm, the CuTe DSL
@@ -65,12 +106,14 @@ def linear_fp8(
         if sw.dtype == torch.float32:
             sw = ops.repack_fp8_wgt_scales(sw.contiguous(), False)
         from .mxfp8 import linear_mxfp8
-        return linear_mxfp8(x_fp8.contiguous(), w_fp8.contiguous(), sx, sw)
+        return linear_mxfp8(x_fp8.contiguous(), w_fp8.contiguous(), sx, sw, bias=bias, residual=residual,
+                            activation=activation)
     return torch.ops.fish_scales_ops.linear_fp8(
         x_fp8.contiguous(),
         w_fp8.contiguous(),
-        sx.contiguous(),
+        _sm90_act_scale(sx) if major == 9 else sx.contiguous(),
         sw.contiguous(),
+        *(() if epilogue is None else _epilogue.raw_args(epilogue)),
     )
 
 
@@ -201,7 +244,9 @@ def repack_fp8_wgt_scales(sw_f32: torch.Tensor) -> torch.Tensor:
     return torch.ops.fish_scales_ops.repack_fp8_wgt_scales(sw_f32.contiguous())
 
 
-def linear_qx(x_bf16: torch.Tensor, w_fp8: torch.Tensor, sw: torch.Tensor) -> torch.Tensor:
+def linear_qx(x_bf16: torch.Tensor, w_fp8: torch.Tensor, sw: torch.Tensor, *,
+              bias: torch.Tensor | None = None, residual: torch.Tensor | None = None,
+              activation: str | None = None) -> torch.Tensor:
     """y = x @ w.T with x quantized inside the op and w pre-quantized.
 
     Equivalent to ``linear_fp8(*quantize_1x128_fp8(x), w_fp8, sw)`` but
@@ -210,10 +255,31 @@ def linear_qx(x_bf16: torch.Tensor, w_fp8: torch.Tensor, sw: torch.Tensor) -> to
     on the same device.
 
     sm_90 and sm_120 / sm_121, where the result is bit-identical to the
-    two-step form (``tests/gemm/unit/test_linear_qx.py``). On sm_100 / sm_103
+    two-step form (``tests/gemm/unit/test_linear_qx.py``), except on sm_90 on a
+    128-element group whose amax is below 1.00044e-10 when K % 512 == 0, which
+    quantize_1x128_fp8 floors at 1e-10f and linear_qx at the bf16 value of
+    1e-10 (fso.dense.quantize_activation follows linear_qx). On sm_100 / sm_103
     the op raises ``RuntimeError``; use :func:`quantize_1x128_fp8_packed` and
     :func:`linear_fp8` with pre-packed weight scales there.
+
+    ``bias``, ``residual``, ``activation``: the dense epilogue of interface v1
+    (bf16 ``[N]``, bf16 ``[M, N]``, ``None`` or ``"gelu_erf"``;
+    ``fish_scales_ops/gemm/_epilogue.py``), keyword-only. sm_90 applies it
+    inside the GEMM; on sm_120 / sm_121 anything but the defaults raises
+    ``NotImplementedError`` naming the architecture and the route, before the
+    activation quantize is launched.
     """
+    epilogue = None
+    if bias is not None or residual is not None or activation is not None:
+        from .._arch import sm_major
+        major = sm_major()
+        epilogue = _epilogue.make("linear_qx", m=int(x_bf16.shape[0]) if x_bf16.dim() == 2 else -1,
+                                  n=int(w_fp8.shape[0]), device=w_fp8.device, bias=bias, residual=residual,
+                                  activation=activation)
+        if major in (9, 12):
+            _epilogue.require("sm120.fp8" if major == 12 else "sm90", epilogue, "linear_qx")
+        return torch.ops.fish_scales_ops.linear_qx(
+            x_bf16.contiguous(), w_fp8.contiguous(), sw.contiguous(), *_epilogue.raw_args(epilogue))
     return torch.ops.fish_scales_ops.linear_qx(
         x_bf16.contiguous(), w_fp8.contiguous(), sw.contiguous()
     )

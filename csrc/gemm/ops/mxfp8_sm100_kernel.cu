@@ -28,6 +28,7 @@
 #define FSO_SM100_DENSE_GDC 1
 
 #include "cutlass/arch/config.h"
+#include "blockscale_gemm/common/epilogue.cuh"
 
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 #include "blockscale_gemm/arch/sm100/mxfp8/dispatch.cuh"
@@ -36,6 +37,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <cstddef>
 #include <cstdint>
 
 namespace blockscale_gemm::detail
@@ -50,28 +52,53 @@ bool sm100_mxfp8_compiled()
 #endif
 }
 
+// `epilogue` (common/epilogue.cuh): the dispatch throws fso::DenseEpilogueNotImplemented for a field or a forced
+// configuration its route does not serve, before it launches anything; the op bodies (ops/mxfp8.cu, ops/fp8.cu)
+// turn that into NotImplementedError. `workspace` / `workspace_bytes`: the caller's device scratch for this call,
+// at least launch_sm100_mxfp8_dispatch_workspace_bytes(M, N, K, epilogue) bytes, allocated on `stream` (issue #12,
+// charter 7.5: the torch caching allocator on the caller's stream).
 cudaError_t launch_sm100_mxfp8_dispatch(__nv_fp8_e4m3* A, __nv_fp8_e4m3* B, __nv_bfloat16* D,
-    int32_t* SFA, int32_t* SFB, int M, int N, int K, cudaStream_t stream)
+    int32_t* SFA, int32_t* SFB, int M, int N, int K, cudaStream_t stream, fso::DenseEpilogue const& epilogue,
+    void* workspace, std::size_t workspace_bytes)
 {
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-    return sm100_blockscaled_gemm::gemm_dispatch_sm100_mxfp8(A, B, D, SFA, SFB, M, N, K, stream);
+    sm100_blockscaled_gemm::Sm100DenseWorkspace ws;
+    ws.ptr = workspace;
+    ws.bytes = workspace_bytes;
+    return sm100_blockscaled_gemm::gemm_dispatch_sm100_mxfp8(A, B, D, SFA, SFB, M, N, K, stream, epilogue, ws);
 #else
     (void) A; (void) B; (void) D; (void) SFA; (void) SFB;
-    (void) M; (void) N; (void) K; (void) stream;
+    (void) M; (void) N; (void) K; (void) stream; (void) epilogue; (void) workspace; (void) workspace_bytes;
     return cudaErrorNotSupported;
 #endif
 }
 
+// The device scratch launch_sm100_mxfp8_dispatch needs for this call, in bytes (0 for every plain tile; the FP32
+// partials for the two-kernel split-K). Host-only. Throws fso::DenseEpilogueNotImplemented exactly when the
+// dispatch would, so an op body that asks first refuses before it allocates or launches anything.
+std::size_t launch_sm100_mxfp8_dispatch_workspace_bytes(int M, int N, int K, fso::DenseEpilogue const& epilogue)
+{
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+    return sm100_blockscaled_gemm::gemm_workspace_sm100_mxfp8(M, N, K, epilogue);
+#else
+    (void) M; (void) N; (void) K; (void) epilogue;
+    return 0;
+#endif
+}
+
 // Guidance appended to the op's error message for the one launch error a
-// caller can act on: the dense cascade's split-K workspace would have had to
-// grow inside a CUDA-graph capture (Sm100WorkspacePool::ensure in
-// arch/sm100/mxfp8/dispatch.cuh refuses that). Empty for every other error.
+// caller can act on: a forced Stream-K variant (FSO_FORCE_TILE codes 7 / 8,
+// sweep-only) needed its per-thread workspace to grow inside a CUDA-graph
+// capture (Sm100WorkspacePool::ensure in arch/sm100/mxfp8/dispatch.cuh refuses
+// that). The dense split-K of the cascade takes its workspace from the caller
+// and never raises this. Empty for every other error.
 char const* sm100_mxfp8_error_hint(cudaError_t err)
 {
     if (err == cudaErrorStreamCaptureUnsupported)
-        return ": the sm_100/103 dense GEMM needed a larger split-K workspace inside a CUDA-graph "
-               "capture, where it cannot allocate. Run the same call once eagerly on this thread "
-               "before capturing it; graphs captured earlier stay valid when the workspace grows.";
+        return ": the sm_100/103 dense GEMM forced to a Stream-K variant (FSO_FORCE_TILE codes 7 / 8) needed a "
+               "larger workspace inside a CUDA-graph capture, where it cannot allocate. Run the same call once "
+               "eagerly on this thread before capturing it; graphs captured earlier stay valid when the workspace "
+               "grows.";
     return "";
 }
 

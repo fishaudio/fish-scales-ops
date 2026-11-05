@@ -28,7 +28,11 @@
 namespace blockscale_gemm
 {
 at::Tensor linear_bf16(at::Tensor x, at::Tensor w);
-at::Tensor linear_fp8(at::Tensor x_fp8, at::Tensor w_fp8, at::Tensor sx, at::Tensor sw);
+// linear_fp8 / linear_qx / linear_mxfp8_raw: `bias`, `residual`, `act` are the dense epilogue of interface v1
+// (ops/dense_epilogue_args.h, common/epilogue.cuh); no route applies it yet, and a non-identity one raises
+// NotImplementedError before anything is launched.
+at::Tensor linear_fp8(at::Tensor x_fp8, at::Tensor w_fp8, at::Tensor sx, at::Tensor sw, std::optional<at::Tensor> bias,
+    std::optional<at::Tensor> residual, int64_t act);
 // Grouped (MoE, masked) block-scale FP8 on sm_90 (H200).
 at::Tensor linear_fp8_grouped_masked(at::Tensor a_fp8, at::Tensor w_fp8, at::Tensor sa,
     at::Tensor sw, at::Tensor masked_m, int64_t expected_m);
@@ -61,8 +65,12 @@ std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x128_sorted_sm90(
     at::Tensor gu, at::Tensor flat_to_sorted);
 // The compiler of the sm_90 deep_gemm JIT in this process: "NVRTC 13.0 (<path>)", or "nvcc <path>".
 std::string jit_compiler_sm90();
-at::Tensor linear_qx(at::Tensor x_bf16, at::Tensor w_fp8, at::Tensor sw);
+at::Tensor linear_qx(at::Tensor x_bf16, at::Tensor w_fp8, at::Tensor sw, std::optional<at::Tensor> bias,
+    std::optional<at::Tensor> residual, int64_t act);
 std::tuple<at::Tensor, at::Tensor> quantize_1x128(at::Tensor x, bool use_ue8m0);
+// The sm_90 quantizer of activation contract v1 (fso.dense.quantize_activation): linear_qx's internal activation
+// quantize (BF16 amax floor for every K), padded-row scales zeroed.
+std::tuple<at::Tensor, at::Tensor> quantize_1x128_contract(at::Tensor x);
 std::tuple<at::Tensor, at::Tensor> quantize_1x128_packed(at::Tensor x, bool use_ue8m0);
 std::tuple<at::Tensor, at::Tensor> quantize_128x128(at::Tensor w, bool use_ue8m0);
 at::Tensor repack_fp8_act_scales(at::Tensor sx_f32, bool check);
@@ -72,8 +80,13 @@ std::tuple<at::Tensor, at::Tensor> quantize_1x32(at::Tensor x, bool use_ue8m0);
 std::tuple<at::Tensor, at::Tensor> quantize_1x32_packed(at::Tensor x, bool use_ue8m0);
 std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x32(at::Tensor gu, bool use_ue8m0);
 at::Tensor repack_mxfp8_scales(at::Tensor scales_f32);
-at::Tensor linear_mxfp8_raw(at::Tensor x_fp8, at::Tensor w_fp8,
-                            at::Tensor sx_int32, at::Tensor sw_int32);
+at::Tensor linear_mxfp8_raw(at::Tensor x_fp8, at::Tensor w_fp8, at::Tensor sx_int32, at::Tensor sw_int32,
+    std::optional<at::Tensor> bias, std::optional<at::Tensor> residual, int64_t act);
+// The same GEMM with its result written in activation contract v1 (fso.dense.linear_quantized): (xq, x_scale) of the
+// [M, N] result, bias / act as above, no residual (ops/mxfp8.cu). Served by the sm_100/sm_103 C++ cascade (issue #12
+// S3b) and by every route of the sm_120/sm_121 MXFP8 cascade (S3c).
+std::tuple<at::Tensor, at::Tensor> linear_mxfp8_quantized_raw(at::Tensor x_fp8, at::Tensor w_fp8, at::Tensor sx_int32,
+    at::Tensor sw_int32, std::optional<at::Tensor> bias, int64_t act);
 // Grouped (MoE, masked layout) MXFP8 (sm_100/103 and sm_120/121), and the
 // router moe_topk_from_logits, which runs on every architecture.
 at::Tensor linear_mxfp8_grouped_masked(at::Tensor a_fp8, at::Tensor w_fp8, at::Tensor sa_int32,
@@ -94,6 +107,19 @@ std::tuple<at::Tensor, at::Tensor> linear_mxfp8_grouped_masked_swiglu(at::Tensor
 bool mxfp8_grouped_swiglu_fused_route(int64_t m_cap, int64_t n_w, int64_t k, int64_t num_groups,
     int64_t max_active_groups, bool compact, int64_t expected_m);
 bool mxfp8_grouped_swiglu_available(int64_t n_w, int64_t k);
+// The route of the sm_120/sm_121 dense MXFP8 cascade for one call (ops/mxfp8.cu): [tile_m, tile_n, stages,
+// min_blocks, sched_group, k_split, smallm, streamk_scratch_bytes]. Host only.
+std::vector<int64_t> mxfp8_dense_route_sm120(int64_t M, int64_t N, int64_t K);
+// The bf16-x dense MXFP8 GEMM of sm_120/sm_121 as one op (ops/mxfp8.cu): the small-M route's one-launch form G2 in the
+// decode band where its rule R2 says so, else quantize_1x32_packed + linear_mxfp8_raw.
+at::Tensor linear_mxfp8_bf16x(at::Tensor x, at::Tensor w_fp8, at::Tensor sw_int32, std::optional<at::Tensor> bias,
+    std::optional<at::Tensor> residual, int64_t act);
+// The small-M route of one sm_120/sm_121 dense call: [use, nc, rt, wk, cj, layout_smem, launch_smem, grid, r1, r2]
+// (host only, reads the device's SM count), and its rules alone without a device, for a device of `sms`
+// multiprocessors: [takes_2b, takes_bf16x, r1, r2, nc, rt, wk, cj, layout_smem] (all 0 for a shape the kernel does not
+// serve).
+std::vector<int64_t> mxfp8_dense_smallm_route_sm120(int64_t M, int64_t N, int64_t K, bool bf16x);
+std::vector<int64_t> sm120_smallm_rules(int64_t M, int64_t N, int64_t K, int64_t sms);
 // Would this grouped GEMM shape take the slot-bound decode route? The only
 // consumer of moe_build_routing's packed active-expert list, so a caller uses
 // it to decide whether to ask for that list at all. `compact` names the layout the
@@ -132,6 +158,13 @@ void linear_mxfp8_grouped_compact_swiglu(at::Tensor a, at::Tensor b, at::Tensor 
 void linear_mxfp8_grouped_compact_combine(at::Tensor a, at::Tensor b, at::Tensor sa, at::Tensor sb,
     at::Tensor masked_m, at::Tensor blk0, at::Tensor row_map, at::Tensor weight_of_slot, int64_t m_cap,
     int64_t expected_m, int64_t max_active_groups, at::Tensor out);
+// Internal (the MoE layer's own call, sm_100/103; ops/mxfp8.cu): FC1 + FC2 on the compact slot route as one
+// persistent kernel (issue #13 lever 5), in slot mode or, with the routing op's token-tile list, token-tile mode.
+// Writes what linear_mxfp8_grouped_compact_swiglu + linear_mxfp8_grouped_compact write, bit for bit.
+void linear_mxfp8_grouped_compact_fc1_fc2(at::Tensor a, at::Tensor w13, at::Tensor sa, at::Tensor sw13, at::Tensor w2,
+    at::Tensor sw2, at::Tensor masked_m, at::Tensor blk0, int64_t m_cap, int64_t expected_m, int64_t max_active_groups,
+    at::Tensor slot_to_expert, at::Tensor slot_sched, at::Tensor dq, at::Tensor sd, at::Tensor dn,
+    std::optional<at::Tensor> slot_tiles);
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_build_routing(
     at::Tensor topk_ids, int64_t num_groups, int64_t m_cap, bool with_slots,
     std::vector<int64_t> problem_shapes_nk, std::optional<at::Tensor> topk_w);
@@ -156,7 +189,8 @@ at::Tensor moe_combine_sorted(
 TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
 {
     m.def("linear_bf16(Tensor x, Tensor w) -> Tensor");
-    m.def("linear_fp8(Tensor x_fp8, Tensor w_fp8, Tensor sx, Tensor sw) -> Tensor");
+    m.def("linear_fp8(Tensor x_fp8, Tensor w_fp8, Tensor sx, Tensor sw, Tensor? bias=None, Tensor? residual=None, "
+          "int act=0) -> Tensor");
     m.def("linear_fp8_grouped_masked(Tensor a_fp8, Tensor w_fp8, Tensor sa, Tensor sw, "
                                      "Tensor masked_m, int expected_m) -> Tensor");
     m.def("quantize_1x128_grouped_gather_sm90(Tensor x, Tensor slot_of_flat, int topk, "
@@ -184,8 +218,10 @@ TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
     // A pure host-side query (no tensor argument), so it carries its own catch-all kernel, like the route queries
     // below: the compiler of the sm_90 deep_gemm JIT, which it loads on first use.
     m.def("jit_compiler_sm90() -> str", &blockscale_gemm::jit_compiler_sm90);
-    m.def("linear_qx(Tensor x_bf16, Tensor w_fp8, Tensor sw) -> Tensor");
+    m.def("linear_qx(Tensor x_bf16, Tensor w_fp8, Tensor sw, Tensor? bias=None, Tensor? residual=None, "
+          "int act=0) -> Tensor");
     m.def("quantize_1x128(Tensor x, bool use_ue8m0=False) -> (Tensor, Tensor)");
+    m.def("quantize_1x128_contract(Tensor x) -> (Tensor, Tensor)");
     m.def("quantize_1x128_packed(Tensor x, bool use_ue8m0=True) -> (Tensor, Tensor)");
     m.def("quantize_128x128(Tensor w, bool use_ue8m0=False) -> (Tensor, Tensor)");
     m.def("repack_fp8_act_scales(Tensor sx_f32, bool check=True) -> Tensor");
@@ -194,8 +230,10 @@ TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
     m.def("quantize_1x32_packed(Tensor x, bool use_ue8m0=True) -> (Tensor, Tensor)");
     m.def("silu_chunk_mul_quantize_1x32(Tensor gu, bool use_ue8m0=True) -> (Tensor, Tensor)");
     m.def("repack_mxfp8_scales(Tensor scales_f32) -> Tensor");
-    m.def("linear_mxfp8_raw(Tensor x_fp8, Tensor w_fp8, "
-                            "Tensor sx_int32, Tensor sw_int32) -> Tensor");
+    m.def("linear_mxfp8_raw(Tensor x_fp8, Tensor w_fp8, Tensor sx_int32, Tensor sw_int32, Tensor? bias=None, "
+          "Tensor? residual=None, int act=0) -> Tensor");
+    m.def("linear_mxfp8_quantized_raw(Tensor x_fp8, Tensor w_fp8, Tensor sx_int32, Tensor sw_int32, "
+          "Tensor? bias=None, int act=0) -> (Tensor, Tensor)");
     m.def("linear_mxfp8_grouped_masked(Tensor a_fp8, Tensor w_fp8, Tensor sa_int32, "
                                        "Tensor sw_int32, Tensor masked_m, int expected_m, "
                                        "int max_active_groups=0, Tensor? slot_to_expert=None, "
@@ -216,6 +254,13 @@ TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
         &blockscale_gemm::mxfp8_grouped_swiglu_fused_route);
     m.def("mxfp8_grouped_swiglu_available(int n_w, int k) -> bool",
         &blockscale_gemm::mxfp8_grouped_swiglu_available);
+    // Host-side query of the sm_120/sm_121 dense MXFP8 route (tests, benches); catch-all like the ones above.
+    m.def("mxfp8_dense_route_sm120(int M, int N, int K) -> int[]", &blockscale_gemm::mxfp8_dense_route_sm120);
+    m.def("mxfp8_dense_smallm_route_sm120(int M, int N, int K, bool bf16x) -> int[]",
+        &blockscale_gemm::mxfp8_dense_smallm_route_sm120);
+    m.def("sm120_smallm_rules(int M, int N, int K, int sms) -> int[]", &blockscale_gemm::sm120_smallm_rules);
+    m.def("linear_mxfp8_bf16x(Tensor x, Tensor w_fp8, Tensor sw_int32, Tensor? bias=None, Tensor? residual=None, "
+          "int act=0) -> Tensor");
     m.def("mxfp8_grouped_slot_possible(int m_cap, int n_w, int k, int num_groups, "
                                        "int max_active_groups, bool fused_swiglu=False, bool compact=False, "
                                        "int expected_m=0) -> bool",
@@ -251,6 +296,11 @@ TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
     m.def("linear_mxfp8_grouped_compact_combine(Tensor a, Tensor b, Tensor sa, Tensor sb, Tensor masked_m, "
           "Tensor blk0, Tensor row_map, Tensor weight_of_slot, int m_cap, int expected_m, int max_active_groups, "
           "Tensor(a!) out) -> ()");
+    // Internal: the MoE layer's fused FC1 + FC2 on the compact slot route (sm_100/103, issue #13 lever 5); not in
+    // fso.compat. Its fake (python/fish_scales_ops/gemm/mxfp8.py) returns nothing, as the op does.
+    m.def("linear_mxfp8_grouped_compact_fc1_fc2(Tensor a, Tensor w13, Tensor sa, Tensor sw13, Tensor w2, Tensor sw2, "
+          "Tensor masked_m, Tensor blk0, int m_cap, int expected_m, int max_active_groups, Tensor slot_to_expert, "
+          "Tensor(a!) slot_sched, Tensor(b!) dq, Tensor(c!) sd, Tensor(d!) dn, Tensor? slot_tiles=None) -> ()");
     m.def("silu_chunk_mul_quantize_1x32_grouped_out(Tensor gu, Tensor slot_of_flat, bool use_ue8m0, "
           "bool pairwise, Tensor(a!) dq, Tensor(b!) sd) -> ()");
     m.def("moe_topk_from_logits(Tensor logits, int topk, bool renormalize=True, "
@@ -278,6 +328,7 @@ TORCH_LIBRARY_IMPL(fish_scales_ops, CUDA, m)
     m.impl("silu_chunk_mul_quantize_1x128_sorted_sm90", &blockscale_gemm::silu_chunk_mul_quantize_1x128_sorted_sm90);
     m.impl("linear_qx", &blockscale_gemm::linear_qx);
     m.impl("quantize_1x128", &blockscale_gemm::quantize_1x128);
+    m.impl("quantize_1x128_contract", &blockscale_gemm::quantize_1x128_contract);
     m.impl("quantize_1x128_packed", &blockscale_gemm::quantize_1x128_packed);
     m.impl("quantize_128x128", &blockscale_gemm::quantize_128x128);
     m.impl("repack_fp8_act_scales", &blockscale_gemm::repack_fp8_act_scales);
@@ -287,6 +338,8 @@ TORCH_LIBRARY_IMPL(fish_scales_ops, CUDA, m)
     m.impl("silu_chunk_mul_quantize_1x32", &blockscale_gemm::silu_chunk_mul_quantize_1x32);
     m.impl("repack_mxfp8_scales", &blockscale_gemm::repack_mxfp8_scales);
     m.impl("linear_mxfp8_raw", &blockscale_gemm::linear_mxfp8_raw);
+    m.impl("linear_mxfp8_quantized_raw", &blockscale_gemm::linear_mxfp8_quantized_raw);
+    m.impl("linear_mxfp8_bf16x", &blockscale_gemm::linear_mxfp8_bf16x);
     m.impl("linear_mxfp8_grouped_masked", &blockscale_gemm::linear_mxfp8_grouped_masked);
     m.impl("quantize_1x32_grouped_gather", &blockscale_gemm::quantize_1x32_grouped_gather);
     m.impl("silu_chunk_mul_quantize_1x32_grouped", &blockscale_gemm::silu_chunk_mul_quantize_1x32_grouped);
@@ -299,6 +352,7 @@ TORCH_LIBRARY_IMPL(fish_scales_ops, CUDA, m)
     m.impl("linear_mxfp8_grouped_compact", &blockscale_gemm::linear_mxfp8_grouped_compact);
     m.impl("linear_mxfp8_grouped_compact_swiglu", &blockscale_gemm::linear_mxfp8_grouped_compact_swiglu);
     m.impl("linear_mxfp8_grouped_compact_combine", &blockscale_gemm::linear_mxfp8_grouped_compact_combine);
+    m.impl("linear_mxfp8_grouped_compact_fc1_fc2", &blockscale_gemm::linear_mxfp8_grouped_compact_fc1_fc2);
     m.impl("silu_chunk_mul_quantize_1x32_grouped_out", &blockscale_gemm::silu_chunk_mul_quantize_1x32_grouped_out);
     m.impl("moe_topk_from_logits", &blockscale_gemm::moe_topk_from_logits);
     m.impl("moe_build_sorted", &blockscale_gemm::moe_build_sorted);

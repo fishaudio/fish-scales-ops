@@ -134,6 +134,11 @@
 
 #include "blockscale_gemm/arch/sm100/mxfp8/sm100_slot_gemm_kernel.hpp"
 
+// The compact slot route's mainloop with the token load bounded by the tile's live rows (issue #13 lever 3): a
+// class derived from CUTLASS's block-scaled collective. Its kernels are instantiated only in the translation unit
+// that defines FSO_SLOT_ROWS_TU (ops/mxfp8_sm100_slot_rows_kernel.cu); see `RowsBounded` below.
+#include "blockscale_gemm/arch/sm100/mxfp8/slot_rows_mainloop.cuh"
+
 #include "cute/tensor.hpp"
 #include "cutlass/detail/sm100_blockscaled_layout.hpp"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
@@ -225,11 +230,17 @@ struct RebindPlainSlotBounded<cutlass::epilogue::collective::CollectiveEpilogue<
 // `TileList` (compact only; run fso_0.2.1_20261010/S10b-3b) selects the compact twin's tile-list form,
 // `FsoSm100SlotGemmCompactList`, which walks the routing op's packed list of live 64-row token tiles past a row
 // capacity of one token tile. A separate class rather than a runtime mode, so the compact class is unchanged.
-template <int TileM, int TileN, int TileK, bool Compact = false, bool TileList = false>
+// `RowsBounded` (compact only; issue #13 lever 3) selects FsoRowsBoundedMainloop, the mainloop whose token load reads
+// only the tile's live rows. Its kernels live in their own translation unit (FSO_SLOT_ROWS_TU) so that the slot
+// translation unit keeps exactly the kernels it had (run fso_issue13_20261031/I13-L123: compiled into the one compact
+// kernel the bounded load cost 0.5 to 1.3 per cent at M <= 16, where it never fires).
+template <int TileM, int TileN, int TileK, bool Compact = false, bool TileList = false, bool RowsBounded = false>
 struct Sm100MxFP8SlotGemmConfig
 {
     static_assert(Compact || !TileList, "the tile-list form exists for the compact twin only");
+    static_assert(Compact || !RowsBounded, "the row-bounded token load exists for the compact twin only");
     static constexpr bool kTileList = TileList;
+    static constexpr bool kRowsBounded = RowsBounded;
     static_assert(TileM == 128, "1SM only: cluster 1x1x1 / TileM 128 is the only configuration built and measured");
     static_assert(TileN == 64 || TileN == 128 || TileN == 192 || TileN == 256,
         "block-scaled UMMA: TileN must be 64, 128, 192 or 256 (the SF block is padded up on the N axis)");
@@ -277,12 +288,14 @@ struct Sm100MxFP8SlotGemmConfig
     using CollectiveEpilogue = cute::conditional_t<Compact,
         typename RebindPlainSlotBounded<CompactStockEpilogue>::type, MaskedEpilogue>;
 
-    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<cutlass::arch::Sm100,
+    using StockMainloop = typename cutlass::gemm::collective::CollectiveBuilder<cutlass::arch::Sm100,
         cutlass::arch::OpClassBlockScaledTensorOp, ElementAPair, LayoutATag, AlignmentAB, ElementBPair, LayoutBTag,
         AlignmentAB, ElementAccumulator, MmaTileShape, ClusterShape,
         cutlass::gemm::collective::StageCountAutoCarveout<
             static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
         cutlass::gemm::KernelTmaWarpSpecialized1SmMxf8f6f4Sm100>::CollectiveOp;
+    using CollectiveMainloop
+        = cute::conditional_t<RowsBounded, FsoRowsBoundedMainloop<StockMainloop>, StockMainloop>;
 
     // Swapped: (M, N, K, L) = (N_w, m_cap, K, G).
     using ProblemShape = Shape<int, int, int, int>;
@@ -290,7 +303,7 @@ struct Sm100MxFP8SlotGemmConfig
     using GemmKernel = cute::conditional_t<Compact,
         cute::conditional_t<TileList,
             cutlass::gemm::kernel::FsoSm100SlotGemmCompactList<ProblemShape, CollectiveMainloop, CollectiveEpilogue,
-                cutlass::gemm::FsoSlotWorkStealingScheduler>,
+                cutlass::gemm::FsoSlotWorkStealingListScheduler>,
             cutlass::gemm::kernel::FsoSm100SlotGemmCompact<ProblemShape, CollectiveMainloop, CollectiveEpilogue,
                 cutlass::gemm::FsoSlotWorkStealingScheduler>>,
         cutlass::gemm::kernel::FsoSm100SlotGemm<ProblemShape, CollectiveMainloop, CollectiveEpilogue,
@@ -398,11 +411,13 @@ struct RebindFusedSwiGluSlotBounded<cutlass::epilogue::collective::CollectiveEpi
     using type = FusedSwiGluSlotEpilogueWSBounded<ET, EC, SC, ED, SD, FC, CT, AC, AD>;
 };
 
-template <int TileM, int TileN, int TileK, bool Compact = false, bool TileList = false>
+template <int TileM, int TileN, int TileK, bool Compact = false, bool TileList = false, bool RowsBounded = false>
 struct Sm100MxFP8SlotSwiGluGemmConfig
 {
     static_assert(Compact || !TileList, "the tile-list form exists for the compact twin only");
+    static_assert(Compact || !RowsBounded, "the row-bounded token load exists for the compact twin only");
     static constexpr bool kTileList = TileList;
+    static constexpr bool kRowsBounded = RowsBounded;
     static_assert(TileM == 128, "1SM only: cluster 1x1x1 / TileM 128 is the only configuration built and measured");
     static_assert(TileN == 64,
         "the fused slot store is written against a 64-column token tile held whole by one thread (one epilogue "
@@ -449,12 +464,14 @@ struct Sm100MxFP8SlotSwiGluGemmConfig
                 + sizeof(float) * cutlass::epilogue::collective::fso_swiglu_slot::kSlotAmaxFloats + 16,
         "the fused slot epilogue grew beyond its cross-warp amax buffer, which would cost mainloop stages");
 
-    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<cutlass::arch::Sm100,
+    using StockMainloop = typename cutlass::gemm::collective::CollectiveBuilder<cutlass::arch::Sm100,
         cutlass::arch::OpClassBlockScaledTensorOp, ElementAPair, LayoutATag, AlignmentAB, ElementBPair, LayoutBTag,
         AlignmentAB, ElementAccumulator, MmaTileShape, ClusterShape,
         cutlass::gemm::collective::StageCountAutoCarveout<
             static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
         cutlass::gemm::KernelTmaWarpSpecialized1SmMxf8f6f4Sm100>::CollectiveOp;
+    using CollectiveMainloop
+        = cute::conditional_t<RowsBounded, FsoRowsBoundedMainloop<StockMainloop>, StockMainloop>;
 
     // Swapped: (M, N, K, L) = (N_w, m_cap, K, G).
     using ProblemShape = Shape<int, int, int, int>;
@@ -466,7 +483,7 @@ struct Sm100MxFP8SlotSwiGluGemmConfig
     using GemmKernel = cute::conditional_t<Compact,
         cute::conditional_t<TileList,
             cutlass::gemm::kernel::FsoSm100SlotGemmCompactList<ProblemShape, CollectiveMainloop, CollectiveEpilogue,
-                cutlass::gemm::FsoSlotWorkStealingScheduler>,
+                cutlass::gemm::FsoSlotWorkStealingListScheduler>,
             cutlass::gemm::kernel::FsoSm100SlotGemmCompact<ProblemShape, CollectiveMainloop, CollectiveEpilogue,
                 cutlass::gemm::FsoSlotWorkStealingScheduler>>,
         cutlass::gemm::kernel::FsoSm100SlotGemm<ProblemShape, CollectiveMainloop, CollectiveEpilogue,
@@ -600,6 +617,7 @@ inline int device_sm_count() noexcept
 // kernel now waits on its dependent grids before that read (generator edit 4c),
 // withholding the release here costs nothing -- nothing else follows this
 // kernel -- and keeps the ordering true even if that wait is ever moved.
+#if !defined(FSO_SLOT_ROWS_TU)
 __global__ __launch_bounds__(256) void sm100_slot_build_kernel(
     int* __restrict__ slot_to_expert, int32_t const* __restrict__ masked_m, int groups, int num_slots, bool pdl)
 {
@@ -654,6 +672,11 @@ __global__ __launch_bounds__(256) void sm100_slot_build_kernel(
         __syncthreads();
     }
 }
+#else
+// The row-bounded translation unit launches no builder: its launches always receive the routing op's lists.
+__global__ void sm100_slot_build_kernel(
+    int* __restrict__ slot_to_expert, int32_t const* __restrict__ masked_m, int groups, int num_slots, bool pdl);
+#endif
 
 // Device-side slot lists for the slot route.
 //
@@ -713,8 +736,8 @@ struct SlotPool
 // k-th tile of expert e is rows 64k .. 64k + 63 of the expert, i.e. q = 2 * blk0[e]
 // + k and r = min(64, masked_m[e] - 64k). The same packing is written by
 // moe_build_routing_compact(..., with_tiles=True) (ops/moe_glue.cu, which cannot
-// include this header) and decoded by the generated kernel's
-// `fso_slot_live_compact`; a block index needs b < 8192 and an expert e < 1024.
+// include this header) and decoded by the work-stealing scheduler's tile-list mode
+// (slot_work_stealing.cuh); a block index needs b < 8192 and an expert e < 1024.
 constexpr int kTileListMaxBlocks = 1 << 13;
 constexpr int kTileListMaxGroups = 1 << 10;
 
@@ -728,6 +751,7 @@ __host__ __device__ constexpr int pack_token_tile(int q, int e, int r)
 // One CTA, one thread per expert (blockDim = G rounded up to a warp, G <= 1024):
 // a block-wide exclusive scan of each expert's token-tile count gives its first
 // entry. Like `sm100_slot_build_kernel`, it never releases its dependents early.
+#if !defined(FSO_SLOT_ROWS_TU)
 __global__ __launch_bounds__(1024) void sm100_slot_tiles_build_kernel(int* __restrict__ tiles,
     int32_t const* __restrict__ masked_m, int32_t const* __restrict__ blk0, int groups, int cap, bool pdl)
 {
@@ -779,6 +803,10 @@ __global__ __launch_bounds__(1024) void sm100_slot_tiles_build_kernel(int* __res
     if (tid == 0)
         tiles[cap] = total < cap ? total : cap;
 }
+#else
+__global__ void sm100_slot_tiles_build_kernel(int* __restrict__ tiles, int32_t const* __restrict__ masked_m,
+    int32_t const* __restrict__ blk0, int groups, int cap, bool pdl);
+#endif
 
 } // namespace slot_detail
 
@@ -967,6 +995,7 @@ inline bool sm100_mxfp8_slot_instantiated(int shape_n, int shape_k)
     return shape_n % 128 == 0 && shape_k % 128 == 0;
 }
 
+#if !defined(FSO_SLOT_ROWS_TU)
 // Top-level sm_100 / sm_103 slot-bound grouped MXFP8 entry. Legality
 // (m_cap <= kSlotTileN, an instantiation for (N_w, K), a known slot bound) is
 // decided in `grouped_dispatch.cuh` and refused by the op before the call gets
@@ -980,6 +1009,7 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8_slot(__nv_fp8_e4m3* mat_a, __nv_fp8
     return launch_sm100_mxfp8_slot_gemm<slot_detail::Sm100MxFP8SlotGemmConfig<128, kSlotTileN, 128>>(mat_a, mat_b,
         mat_d, scales_a, scales_b, masked_m, groups, num_slots, m_cap, shape_n, shape_k, slot_to_expert, stream);
 }
+#endif // !FSO_SLOT_ROWS_TU
 
 // ---------------------------------------------------------------------------
 // The fused FC1 on the slot route
@@ -1163,6 +1193,7 @@ inline bool sm100_mxfp8_slot_swiglu_instantiated(int shape_n, int shape_k)
     return sm100_mxfp8_slot_instantiated(shape_n, shape_k) && (shape_n % 2 == 0) && ((shape_n / 2) % 128 == 0);
 }
 
+#if !defined(FSO_SLOT_ROWS_TU)
 // Top-level sm_100 / sm_103 slot-bound fused-SwiGLU FC1 entry. Legality
 // (m_cap <= kSlotTileN, an instantiation for (N_w, K), a known slot bound) is
 // decided in `grouped_dispatch.cuh` and refused by the op before the call gets
@@ -1177,6 +1208,7 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8_slot_swiglu(__nv_fp8_e4m3* mat_a, _
         mat_a, mat_b, out_h, out_sfh, scales_a, scales_b, masked_m, groups, num_slots, m_cap, shape_n, shape_k,
         slot_to_expert, stream);
 }
+#endif // !FSO_SLOT_ROWS_TU
 
 // ---------------------------------------------------------------------------
 // The slot route on the compact activation layout (fso 0.2.1)
@@ -1278,44 +1310,56 @@ cudaError_t launch_sm100_mxfp8_slot_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3*
     }
 
     bool const pdl = sd::slot_pdl_enabled();
-    if (list_mode && build_tiles)
+    if constexpr (Config::kRowsBounded)
     {
-        cudaLaunchConfig_t cfg{};
-        cudaLaunchAttribute attrs[1];
-        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = pdl ? 1 : 0;
-        cfg.gridDim = dim3(1);
-        cfg.blockDim = dim3(static_cast<unsigned>((groups + 31) / 32 * 32));
-        cfg.dynamicSmemBytes = 0;
-        cfg.stream = stream;
-        cfg.attrs = attrs;
-        cfg.numAttrs = 1;
-        cudaError_t const prep_err = cudaLaunchKernelEx(&cfg, sd::sm100_slot_tiles_build_kernel, slot_tiles,
-            static_cast<int32_t const*>(masked_m), blk0, groups, tiles_cap, pdl);
-        if (prep_err != cudaSuccess)
-            return prep_err;
+        // The row-bounded kernels' translation unit has no list builder: the caller hands both lists in.
+        if (list_mode ? (build_tiles || slot_tiles == nullptr) : (slot_to_expert == nullptr))
+            return cudaErrorInvalidValue;
+    }
+    if constexpr (!Config::kRowsBounded)
+    {
+        if (list_mode && build_tiles)
+        {
+            cudaLaunchConfig_t cfg{};
+            cudaLaunchAttribute attrs[1];
+            attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attrs[0].val.programmaticStreamSerializationAllowed = pdl ? 1 : 0;
+            cfg.gridDim = dim3(1);
+            cfg.blockDim = dim3(static_cast<unsigned>((groups + 31) / 32 * 32));
+            cfg.dynamicSmemBytes = 0;
+            cfg.stream = stream;
+            cfg.attrs = attrs;
+            cfg.numAttrs = 1;
+            cudaError_t const prep_err = cudaLaunchKernelEx(&cfg, sd::sm100_slot_tiles_build_kernel, slot_tiles,
+                static_cast<int32_t const*>(masked_m), blk0, groups, tiles_cap, pdl);
+            if (prep_err != cudaSuccess)
+                return prep_err;
+        }
     }
     int const* slots = slot_to_expert;
-    if (slots == nullptr && !list_mode)
+    if constexpr (!Config::kRowsBounded)
     {
-        int* const own = sd::SlotPool::instance().acquire(stream);
-        if (own == nullptr)
-            return cudaErrorMemoryAllocation;
-        slots = own;
-        cudaLaunchConfig_t cfg{};
-        cudaLaunchAttribute attrs[1];
-        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = pdl ? 1 : 0;
-        cfg.gridDim = dim3(1);
-        cfg.blockDim = dim3(256);
-        cfg.dynamicSmemBytes = 0;
-        cfg.stream = stream;
-        cfg.attrs = attrs;
-        cfg.numAttrs = 1;
-        cudaError_t const prep_err = cudaLaunchKernelEx(
-            &cfg, sd::sm100_slot_build_kernel, own, static_cast<int32_t const*>(masked_m), groups, num_slots, pdl);
-        if (prep_err != cudaSuccess)
-            return prep_err;
+        if (slots == nullptr && !list_mode)
+        {
+            int* const own = sd::SlotPool::instance().acquire(stream);
+            if (own == nullptr)
+                return cudaErrorMemoryAllocation;
+            slots = own;
+            cudaLaunchConfig_t cfg{};
+            cudaLaunchAttribute attrs[1];
+            attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attrs[0].val.programmaticStreamSerializationAllowed = pdl ? 1 : 0;
+            cfg.gridDim = dim3(1);
+            cfg.blockDim = dim3(256);
+            cfg.dynamicSmemBytes = 0;
+            cfg.stream = stream;
+            cfg.attrs = attrs;
+            cfg.numAttrs = 1;
+            cudaError_t const prep_err = cudaLaunchKernelEx(
+                &cfg, sd::sm100_slot_build_kernel, own, static_cast<int32_t const*>(masked_m), groups, num_slots, pdl);
+            if (prep_err != cudaSuccess)
+                return prep_err;
+        }
     }
 
     int const pm = shape_n; // expert weight rows, on the M axis
@@ -1371,14 +1415,21 @@ cudaError_t launch_sm100_mxfp8_slot_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3*
     args.fso_masked_m = masked_m;
     args.fso_num_slots = num_slots;
     args.fso_num_groups = groups;
-    if constexpr (list_mode)
-        args.fso_tile_list = slot_tiles;
     // The work-stealing scheduler: its counter, the live slot count (blk0[G] in slot mode, the list's count word in
     // tile-list mode, where each list entry is one token tile), and how many waves of the grid it hands out
     // statically before it draws (sd::slot_static_waves).
     args.scheduler.counter = slot_sched;
     args.scheduler.live_slots = list_mode ? slot_tiles + tiles_cap : blk0 + groups;
     args.scheduler.tiles_n = list_mode ? 1 : 0;
+    // What the scheduler resolves each tile from (issue #13 lever 2; slot_work_stealing.cuh, "What a handed-out tile
+    // carries"): slot mode the packed active-expert list and the per-expert row counts, tile-list mode the packed
+    // live token-tile list. The kernel's warp roles read the resolved facts instead of these tensors.
+    args.scheduler.slot_to_expert = list_mode ? nullptr : slots;
+    args.scheduler.masked_m = masked_m;
+    args.scheduler.tile_list = list_mode ? slot_tiles : nullptr;
+    args.scheduler.num_slots = num_slots;
+    args.scheduler.num_groups = groups;
+    args.scheduler.tile_n_rows = sd::kSlotTokenTileRows;
     {
         long long const tiles_n = list_mode ? 1 : (pn + 63) / 64;
         long long const bound_tiles = static_cast<long long>((pm + 127) / 128) * tiles_n * num_slots;
@@ -1458,6 +1509,7 @@ cudaError_t launch_sm100_mxfp8_slot_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3*
     return cudaGetLastError();
 }
 
+#if !defined(FSO_SLOT_ROWS_TU)
 inline cudaError_t gemm_dispatch_sm100_mxfp8_slot_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b,
     __nv_bfloat16* mat_d, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int32_t const* blk0, int groups,
     int num_slots, int m_cap, int b_alloc, int shape_n, int shape_k, int const* slot_to_expert, int* slot_sched,
@@ -1495,6 +1547,62 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8_slot_swiglu_compact(__nv_fp8_e4m3* 
         true>(mat_a, mat_b, out_h, out_sfh, scales_a, scales_b, masked_m, blk0, groups, num_slots, m_cap, b_alloc,
         shape_n, shape_k, slot_to_expert, slot_sched, nullptr, 0, false, stream);
 }
+#endif // !FSO_SLOT_ROWS_TU
+
+// Whether a compact slot launch takes the row-bounded token load (issue #13 lever 3): where the bounded load reads
+// less than the stock one -- tile-list mode (m_cap > 64) and slot mode at m_cap >= 32 -- and the caller passed the
+// routing op's lists (the row-bounded kernels' translation unit has no list builder). Host code, both units.
+inline constexpr int kSlotRowsTileN = kSlotTileN;
+
+inline bool sm100_mxfp8_slot_rows_applies(int m_cap, int const* slot_to_expert, int const* slot_tiles, bool build_tiles)
+{
+    return m_cap > kSlotRowsTileN ? (slot_tiles != nullptr && !build_tiles) : (m_cap >= 32 && slot_to_expert != nullptr);
+}
+
+#if defined(FSO_SLOT_ROWS_TU)
+// The compact entries with the row-bounded token load, instantiated only in ops/mxfp8_sm100_slot_rows_kernel.cu. The
+// slot translation unit's compact entries hand a launch here when `sm100_mxfp8_slot_rows_applies`. Same arguments,
+// same results, bit for bit.
+
+inline cudaError_t gemm_dispatch_sm100_mxfp8_slot_compact_rows(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b,
+    __nv_bfloat16* mat_d, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int32_t const* blk0, int groups,
+    int num_slots, int m_cap, int b_alloc, int shape_n, int shape_k, int const* slot_to_expert, int* slot_sched,
+    int* slot_tiles, int tiles_cap, bool build_tiles, cudaStream_t stream)
+{
+    if (!sm100_mxfp8_slot_rows_applies(m_cap, slot_to_expert, slot_tiles, build_tiles) || num_slots < 1
+        || shape_n % 128 != 0 || shape_k % 128 != 0)
+        return cudaErrorInvalidValue;
+    if (m_cap > kSlotRowsTileN)
+        return launch_sm100_mxfp8_slot_compact<
+            slot_detail::Sm100MxFP8SlotGemmConfig<128, kSlotRowsTileN, 128, true, true, true>, false>(mat_a, mat_b,
+            mat_d, nullptr, scales_a, scales_b, masked_m, blk0, groups, num_slots, m_cap, b_alloc, shape_n, shape_k,
+            slot_to_expert, slot_sched, slot_tiles, tiles_cap, false, stream);
+    return launch_sm100_mxfp8_slot_compact<
+        slot_detail::Sm100MxFP8SlotGemmConfig<128, kSlotRowsTileN, 128, true, false, true>, false>(mat_a, mat_b,
+        mat_d, nullptr, scales_a, scales_b, masked_m, blk0, groups, num_slots, m_cap, b_alloc, shape_n, shape_k,
+        slot_to_expert, slot_sched, nullptr, 0, false, stream);
+}
+
+inline cudaError_t gemm_dispatch_sm100_mxfp8_slot_swiglu_compact_rows(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b,
+    __nv_fp8_e4m3* out_h, int32_t* out_sfh, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m,
+    int32_t const* blk0, int groups, int num_slots, int m_cap, int b_alloc, int shape_n, int shape_k,
+    int const* slot_to_expert, int* slot_sched, int* slot_tiles, int tiles_cap, bool build_tiles,
+    cudaStream_t stream)
+{
+    if (!sm100_mxfp8_slot_rows_applies(m_cap, slot_to_expert, slot_tiles, build_tiles) || num_slots < 1
+        || shape_n % 128 != 0 || shape_k % 128 != 0 || (shape_n % 2) != 0 || ((shape_n / 2) % 128) != 0)
+        return cudaErrorInvalidValue;
+    if (m_cap > kSlotRowsTileN)
+        return launch_sm100_mxfp8_slot_compact<
+            slot_detail::Sm100MxFP8SlotSwiGluGemmConfig<128, kSlotRowsTileN, 128, true, true, true>, true>(mat_a,
+            mat_b, out_h, out_sfh, scales_a, scales_b, masked_m, blk0, groups, num_slots, m_cap, b_alloc, shape_n,
+            shape_k, slot_to_expert, slot_sched, slot_tiles, tiles_cap, false, stream);
+    return launch_sm100_mxfp8_slot_compact<
+        slot_detail::Sm100MxFP8SlotSwiGluGemmConfig<128, kSlotRowsTileN, 128, true, false, true>, true>(mat_a, mat_b,
+        out_h, out_sfh, scales_a, scales_b, masked_m, blk0, groups, num_slots, m_cap, b_alloc, shape_n, shape_k,
+        slot_to_expert, slot_sched, nullptr, 0, false, stream);
+}
+#endif // FSO_SLOT_ROWS_TU
 
 } // namespace sm100_blockscaled_gemm
 

@@ -535,6 +535,237 @@ inline GemmConfig get_dense_gemm_config(
     return std::make_tuple(block_m, block_n, num_stages, num_tma_multicast, smem_size);
 }
 
+// The stage count of a dense tile, by get_best_gemm_config's rule: the deepest of 8..4 (6..4 when block_n does not
+// divide 128) whose shared memory fits; num_stages and smem_size are left as they are when none fits.
+inline void dense_pick_stages(int block_m, int block_n, uint32_t shape_k, bool swap_ab, int& num_stages, int& smem_size)
+{
+    constexpr int sm90_capacity = 232448;
+    std::vector<int> const stage_candidates
+        = (128 % block_n != 0) ? std::vector<int>{6, 5, 4} : std::vector<int>{8, 7, 6, 5, 4};
+    for (int stages : stage_candidates)
+    {
+        int const smem = get_smem_size(stages, static_cast<int>(shape_k), block_m, block_n, 128, swap_ab);
+        if (smem <= sm90_capacity)
+        {
+            num_stages = stages;
+            smem_size = smem;
+            return;
+        }
+    }
+}
+
+// Swap-AB above M = 32 (fso issue 12, 2026-11-02; /data/bench-runs/fso_issue12_20261028/runs/H2). For 32 < M < 64 the
+// main path runs a 64-row tile, so 64 - M rows of every activation box it loads lie beyond M. Those boxes move their
+// full size whatever the fill (ncu, 2048 x 4096 at 64 x 16: the same L2-to-SM bytes at M = 33, 40, 48 and 64) and the
+// out-of-bounds rows are not free: the kernel takes longer the emptier its tile, with the math warp groups waiting
+// longer on every stage. Swap-AB puts the tokens on the narrow side of the tile instead (a token tile of 16 to 40
+// rows), streams the weight once per token tile, and runs at about the rate of a full main-path tile while its launch
+// gives between half and all of the SMs one tile each. It therefore wins on the emptiest 64-row tiles, and how empty
+// depends on the weight tile the swap-AB picker takes (get_dense_gemm_config's rule 2):
+//   - 64-row weight tiles (ceil(N / 128) * 4 <= SMs, N <= 4224 on 132 SMs; the main tile is then 64 x 16 or 64 x 32,
+//     whose traffic is mostly the activation box): a 16-token tile, from 18 empty rows (M <= 46);
+//   - 128-row weight tiles (three warp groups per CTA, 72-96 CTAs on the measured shapes; the main tile is 64 x 40 to
+//     64 x 96, whose traffic is mostly the weight box): from 28 empty rows (M <= 36) and K >= 2048, with the token
+//     tile that covers M in two tiles when two tiles per weight tile fit one wave (5120 x 2048, 6144 x 2560: a
+//     24-token tile), else in one (9216 / 9728 / 12288 x 2048-2560: 40 tokens). A token tile of 16 there re-streams
+//     each weight tile three times and was slower than 24 on every measured cell. At M = 37 / 38, and with K = 1280
+//     (5120 x 1280 at M = 33 / 34), the route measured level or faster alone but slower behind the activation
+//     quantize it is chained to.
+// The launch floor keeps the main path where swap-AB has too few tiles to beat it: N <= 1280 with 64-row weight tiles
+// (20 tiles of 64 rows x 3 token tiles = 60 CTAs) ran at the main path's full-tile rate but not below it, so it lost
+// wherever the main tile happened to be fast (1280 x 7680 at M = 40 / 46). A launch that would need a second wave keeps
+// the main path as well (19456 x 2560, 152 weight tiles of 128 rows). Below the thresholds swap-AB no longer wins both
+// alone and in the chain (M = 48 on the narrow shapes; M = 37 to 44 on the wide ones). M <= 32 is unchanged:
+// swap-AB below 32, and at 32 for N < 16384, at get_dense_gemm_config's swap-AB tile. Both routes compute each output
+// element in one CTA in K order; the outputs of every re-routed cell of the measurement were byte-identical to the
+// main path's.
+//
+// Swap-AB at 64 < M <= 96 (fso issue 12, 2026-11-02; /data/bench-runs/fso_issue12_20261028/runs/H3). There the main
+// path's last M block (two 64-row blocks, or one 128-row block) leaves 128 - M rows empty, from 63 at M = 65 to 32 at
+// M = 96, and its boxes again move their full size whatever the fill (ncu, 2048 x 4096 at 64 x 32: the same L2-to-SM
+// bytes at M = 96 and 112, with fewer load stalls at 112), while the swap-AB token tiles cover M with less padding: at
+// M = 72 the swap-AB 24-token tile moved a third fewer bytes and took 8.9 against 11.4 us (DeepGEMM v2's 64 x 32 tile
+// of rule 5), isolated with the caches flushed. It wins, alone and behind the activation quantize, wherever the main
+// tile leaves at least 32 rows empty, with the weight tile of rule 2 deciding the token tile and the band:
+//   - 64-row weight tiles (N <= 4224 on 132 SMs): the smallest token tile, a multiple of 8 from 16, whose launch fits
+//     one wave: 16 for N = 1024 / 1280 (80-120 CTAs), 24 for N = 2048 (96-128), 24 or 32 for N = 2560 (120), 40 or
+//     48 for N = 4096 (128). Every measured cell from M = 65 to 96 won (0.66-0.97 of the trunk's time alone,
+//     0.67-0.98 in the chain; 10 shapes, two passes); at M = 100 (28 empty rows) 2048 x 512 and 1280 x 5120 lost.
+//   - 128-row weight tiles (K >= 2048; the token tile covers M in two tiles when two per weight tile fit one wave,
+//     else in one): at M <= 72 (56 empty rows; the main path is DeepGEMM v2's tile there, rule 5); and at
+//     80 < M <= 96, where the main path is fp8_gemm_kernel's 128-row tile, when two token tiles per weight tile fit
+//     (5120 x 2048, 6144 x 2560, 7168 x 5120). Between them rule 5's DeepGEMM v2 tiles run nearly as fast as swap-AB
+//     (12288 x 2048 at M = 76 was level in the chain, 6144 x 2560 at M = 80 1 % slower alone); with one token tile
+//     per weight tile the CTAs are fewer than the main path's and each carries a 128 x M tile, which lost from
+//     M = 84, 92 or 96 (9216 x 2048, 9728 x 2560, 12288 x 2048; at M = 96 9728 x 2560's 76 CTAs of 128 x 96 took 13.9
+//     against 12.5 us for the main path's 122 CTAs of 128 x 80, with a third fewer bytes); at M = 100 5120 x 2048
+//     lost in the chain. The re-routed cells measured 0.75-0.98 of the trunk's time alone and 0.79-0.98 in the chain.
+// Rule 5 decides the main path wherever this route does not take the cell; the cells it takes at 64 < M <= 80 leave
+// the v2 kernel for swap-AB.
+//
+// The token tile of the swap-AB route above M = 32 (32 < M < 64, and 64 < M <= 96 below) for a weight tile of
+// `weight_rows` rows, or 0 when no tile fits one wave: on 64-row weight tiles a 16-token tile below M = 64 and, above
+// it, the smallest token tile (a multiple of 8 from 16) whose launch fits one wave; on 128-row weight tiles the token
+// tile that covers M in two tiles when two per weight tile fit one wave, else in one.
+inline int dense_swap_ab_token_tile(uint32_t shape_m, uint32_t shape_n, int weight_rows, int num_sms)
+{
+    int const weight_tiles = div_up(static_cast<int>(shape_n), weight_rows);
+    int const m = static_cast<int>(shape_m);
+    if (weight_rows == 64)
+    {
+        if (shape_m < 64u)
+            return weight_tiles * div_up(m, 16) <= num_sms ? 16 : 0;
+        for (int token_tile = 16; token_tile <= 128; token_tile += 8)
+            if (weight_tiles * div_up(m, token_tile) <= num_sms)
+                return token_tile;
+        return 0;
+    }
+    if (2 * weight_tiles <= num_sms)
+        return div_up(div_up(m, 2), 8) * 8;
+    if (weight_tiles <= num_sms)
+        return div_up(m, 8) * 8;
+    return 0;
+}
+
+// Swap-AB above M = 96 (fso issue 12, 2026-11-03; /data/bench-runs/fso_issue12_20261028/runs/H4, measured on the
+// trunk with the stage-release fence of f041cc8, which makes swap-AB launches of more than one wave correct). From
+// M = 97 to 128 the main path is fp8_gemm_kernel, whose last M block is up to 31 rows short; from M = 129 to 191 it is
+// DeepGEMM v2 at DeepGEMM's configuration (use_dg2_dense_classes), on these shapes a 64-row tile whose third M block
+// holds only M - 128 rows. The CTAs on that block load full boxes for a mostly empty activation tile and are a third of
+// the launch, and the v2 kernel loses more behind the activation quantize than alone. Swap-AB pads M only to its token
+// tile (0-31 rows over all its token tiles here, against 48-63 rows of the v2 tile's third block at M = 129-144), and
+// it won, alone and in the quantize -> GEMM chain in both passes, where:
+//   - 64-row weight tiles (N <= 4224 on 132 SMs) with K >= 4096, at 128 < M <= 144 (at least 48 of the third block's
+//     64 rows empty): every such cell of the measurement (2048 x 4096, 2560 x 4096 / 9728, 1280 x 5120 / 7680,
+//     4096 x 4096; 0.77-0.97 of the trunk's time alone, 0.73-0.87 in the chain). At M = 152 four of the six lost alone
+//     (2048 x 4096, 2560 x 4096, 1280 x 5120, 4096 x 4096). With K = 2048 the 2048-wide weight lost alone at M = 144
+//     and the 2560-wide one at M = 136 / 144 (also with PDL off, although the isolated kernel, ncu with the caches
+//     flushed, was 4 % faster at 2560 x 2048 and M = 136), and 2048 x 512 was level at M = 136, so K < 4096 keeps the
+//     main path, also on the shapes that won there by 1-7 % (1024 x 2048, 1280 x 1280, 2048 x 1280).
+//   - the same tiles at 96 < M <= 100 with N >= 2048 (the main path's last block 28-31 rows short): 2048 x 4096,
+//     2560 x 4096 / 9728, 4096 x 4096 (0.83-0.96 alone, 0.87-0.99 in the chain). At M = 104 2560 x 4096 lost alone; at
+//     N = 1280 swap-AB's 100 CTAs lost alone to the main path's 80 at M = 97 and 100 (1280 x 5120) or won by 1 %
+//     (1280 x 7680).
+//   - 128-row weight tiles at 128 < M <= 144 when the swap-AB launch has fewer CTAs than the main path
+//     (dense_main_path_tiles), and up to M = 160 when it has at most three quarters of them: 6144 x 2560, 9216 x 2048,
+//     9728 x 2560, 12288 x 2048, 7168 x 5120 (0.64-0.95 alone, 0.65-0.97 in the chain). With as many CTAs as the main
+//     path the swap-AB launch lost alone in the replayed graph (5120 x 2048 and 5120 x 1280: 120 CTAs of 128 x 48
+//     against 120 of v2's 64 x 128, 2-5 % slower, also with PDL off) although the isolated kernel was 4 % faster with
+//     9 % fewer L2-to-SM bytes (the rule follows the bench); with more CTAs (19456 x 2560: 304 against 244) it won
+//     by 1-3 % at M = 132 and lost from M = 144; 9216 x 2048 and 9728 x 2560 (216 / 228 against 249 / 261 CTAs) were
+//     level at M = 152 and lost in the chain at M = 160; 6144 x 2560 and 12288 x 2048 (96 / 192 against 129 / 258)
+//     were level or 3 % faster at M = 176 in two measurements of the same tile and lost at M = 182.
+// The token tile is get_best_gemm_config's own criterion with the real weight rows (dense_swap_ab_token_tile_above_96):
+// on the wide weights it takes two waves (216 / 228 tiles of 128 x 48 or 192 of 128 x 72-80 on 132 SMs). M = 101-128
+// and M = 161-255 keep the main path; the cells that still won there (by 1-4 % on most shapes, more on 2560 x 4096 /
+// 9728 at M = 208 / 224 and on 7168 x 5120 up to M = 192) are not a class this rule separates from the losing
+// neighbours (runs/H4 open items). Rule 5 and the v2 tile classes decide the main path wherever this route does not
+// take the cell. Both routes compute each output element in one CTA in K order; the outputs of all 3,988 swap-AB
+// arm-cells of the measurement were byte-identical to the trunk route's.
+//
+// The token tile of the swap-AB route above M = 96 for a weight tile of `weight_rows` rows: get_best_gemm_config's own
+// criterion (the fewest waves on num_sms, then the fullest last wave, then the smaller tile), applied with the weight
+// tile rule 2 picks. On 128-row weight tiles this is the picker's own token tile; on 64-row weight tiles the picker
+// counts 128-row tiles and may pick a tile that needs two waves once the rows are halved, where this criterion takes
+// the smallest token tile that fits one wave.
+inline int dense_swap_ab_token_tile_above_96(uint32_t shape_m, uint32_t shape_n, int weight_rows, int num_sms)
+{
+    int const weight_tiles = div_up(static_cast<int>(shape_n), weight_rows);
+    int best = 0, best_waves = 0, best_last = 0;
+    for (int token_tile = 16; token_tile <= 128; token_tile += 8)
+    {
+        int const tiles = weight_tiles * div_up(static_cast<int>(shape_m), token_tile);
+        int const waves = div_up(tiles, num_sms);
+        int const last = tiles - (waves - 1) * num_sms; // tiles of the last wave
+        if (best == 0 || waves < best_waves || (waves == best_waves && last > best_last))
+        {
+            best = token_tile;
+            best_waves = waves;
+            best_last = last;
+        }
+    }
+    return best;
+}
+
+// The number of CTAs the main path launches for a dense GEMM (defined after use_dg2_dense below).
+inline int dense_main_path_tiles(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_sms);
+
+// Whether gemm_dispatch_sm90 runs a dense GEMM with M > 96 through swap-AB (see above).
+inline bool use_dense_swap_ab_above_96(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_sms)
+{
+    bool const low_band = shape_m <= 100u;                      // 96 < M <= 100
+    bool const dg2_band = shape_m > 128u && shape_m <= 160u;    // the third 64-row block of M holds 1 to 32 rows
+    if (!low_band && !dg2_band)
+        return false;
+    int const weight_rows = std::get<0>(get_dense_gemm_config(shape_n, shape_m, shape_k, num_sms, true));
+    int const token_tile = dense_swap_ab_token_tile_above_96(shape_m, shape_n, weight_rows, num_sms);
+    int const tiles = div_up(static_cast<int>(shape_n), weight_rows) * div_up(static_cast<int>(shape_m), token_tile);
+    if (2 * tiles < num_sms) // fewer than half the SMs would get a tile
+        return false;
+    if (weight_rows == 64)
+        return shape_k >= 4096u && (low_band ? shape_n >= 2048u : shape_m <= 144u);
+    if (!dg2_band)
+        return false;
+    int const main_tiles = dense_main_path_tiles(shape_m, shape_n, shape_k, num_sms);
+    return (shape_m <= 144u && tiles < main_tiles) || 4 * tiles <= 3 * main_tiles;
+}
+
+// Whether gemm_dispatch_sm90 runs the dense GEMM through swap-AB (see above).
+inline bool use_dense_swap_ab(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_sms)
+{
+    if (shape_m < 32u || (shape_m == 32u && shape_n < 16384u))
+        return true;
+    if (shape_m > 96u)
+        return use_dense_swap_ab_above_96(shape_m, shape_n, shape_k, num_sms);
+    if (shape_m <= 32u || shape_m == 64u)
+        return false;
+    int const weight_rows = std::get<0>(get_dense_gemm_config(shape_n, shape_m, shape_k, num_sms, true));
+    int const token_tile = dense_swap_ab_token_tile(shape_m, shape_n, weight_rows, num_sms);
+    if (token_tile == 0)
+        return false;
+    int const weight_tiles = div_up(static_cast<int>(shape_n), weight_rows);
+    int const tiles = weight_tiles * div_up(static_cast<int>(shape_m), token_tile);
+    if (2 * tiles < num_sms) // fewer than half the SMs would get a tile
+        return false;
+    if (shape_m < 64u)
+    {
+        uint32_t const empty = 64u - shape_m; // rows of the main path's 64-row tile beyond M
+        if (weight_rows == 64)
+            return empty >= 18u;
+        return empty >= 28u && shape_k >= 2048u;
+    }
+    // 64 < M <= 96: the main path's last M block (two 64-row blocks or one 128-row block) leaves 128 - M >= 32 rows
+    // empty.
+    uint32_t const empty = 128u - shape_m;
+    if (weight_rows == 64)
+        return true;
+    if (shape_k < 2048u)
+        return false;
+    if (empty >= 56u) // M <= 72
+        return true;
+    return empty < 48u && 2 * weight_tiles <= num_sms; // 80 < M <= 96 with two token tiles per weight tile
+}
+
+// The swap-AB tile of the dense GEMM (shape convention of gemm_dispatch_sm90: M tokens, N weight rows):
+// get_dense_gemm_config's swap-AB pick, with the token tile of dense_swap_ab_token_tile at 32 < M < 64 and 64 < M <= 96
+// (where it gives one) and of dense_swap_ab_token_tile_above_96 at 96 < M <= 160, and the stage count recomputed.
+inline GemmConfig get_dense_swap_ab_config(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_sms)
+{
+    auto [block_m, block_n, num_stages, num_tma_multicast, smem_size]
+        = get_dense_gemm_config(shape_n, shape_m, shape_k, num_sms, true);
+    int token_tile = 0;
+    if (shape_m > 32u && shape_m != 64u && shape_m <= 96u)
+        token_tile = dense_swap_ab_token_tile(shape_m, shape_n, block_m, num_sms);
+    else if (shape_m > 96u && shape_m <= 160u)
+        token_tile = dense_swap_ab_token_tile_above_96(shape_m, shape_n, block_m, num_sms);
+    if (token_tile != 0)
+    {
+        block_n = token_tile;
+        dense_pick_stages(block_m, block_n, shape_k, true, num_stages, smem_size);
+    }
+    return std::make_tuple(block_m, block_n, num_stages, num_tma_multicast, smem_size);
+}
+
 // ------------------------------------------------------------------------------------------------------------------
 // DeepGEMM v2's dense block-FP8 kernel (deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh, vendored from sgl-project/DeepGEMM
 // v0.2.0, MIT): its configuration for one dense GEMM, and the rule that decides when the dense dispatcher runs it
@@ -718,7 +949,9 @@ inline Dg2DenseConfig get_dg2_dense_config_cached(uint32_t shape_m, uint32_t sha
 }
 
 // Whether the dense dispatcher runs DeepGEMM v2's kernel at its configuration (`dg2`) instead of fp8_gemm_kernel at
-// get_dense_gemm_config's pick, on the main (non-swap-AB) path. The v2 kernel is taken for exactly the tile classes
+// get_dense_gemm_config's pick, on the main (non-swap-AB) path, by the tile classes below (use_dg2_dense_classes) or
+// by rule 5 further down (a mostly empty last M block, use_dg2_dense_partial_block). The v2 kernel is taken for the
+// tile classes
 // fp8_gemm_kernel cannot run and that measured faster on the H200 against fso's pick wherever DeepGEMM chose them
 // (H1, /data/bench-runs/sm90_dg2_dense_20261005/phase2/runs/remaining/report.md; P2 of the 0.2.1 round,
 // /data/bench-runs/fso_0.2.1_20261010/P2):
@@ -748,7 +981,7 @@ inline Dg2DenseConfig get_dg2_dense_config_cached(uint32_t shape_m, uint32_t sha
 // Every other v2 pick keeps fso's kernel: 256-row tiles narrower than 128 (256 x 112: 1.04-1.29), 256 x 128 without
 // multicast (one wave: 1.9-2.3), 128 x 144 (mixed), the 64-row mid-band tiles (1.03-1.22 on most cells) and the
 // 16- and 32-row small-M tiles, where fso's swap-AB kernel is faster.
-inline bool use_dg2_dense(Dg2DenseConfig const& dg2, uint32_t shape_m, uint32_t shape_k)
+inline bool use_dg2_dense_classes(Dg2DenseConfig const& dg2, uint32_t shape_m, uint32_t shape_k)
 {
     if (shape_m > 128 && shape_m < 256)
         return dg2.block_n != 80;
@@ -759,5 +992,93 @@ inline bool use_dg2_dense(Dg2DenseConfig const& dg2, uint32_t shape_m, uint32_t 
     if (dg2.block_m == 128)
         return dg2.block_n == 160 || dg2.block_n == 192;
     return false;
+}
+
+// Rule 5 (fso issue 12, 2026-10-28; /data/bench-runs/fso_issue12_20261028/runs/H1): a mostly empty last M block.
+// When fso's tile (get_dense_gemm_config) leaves at least 48 rows of its last M block beyond M, the CTAs on that block
+// load TMA boxes that are mostly out of bounds, and the zero-filled rows are not free: the boxes still move their full
+// size (ncu, 1280 x 7680 at 128 x 40: 169.1 MB from the L2 to the SMs at M = 400 and at M = 512 alike, and 14 % more
+// L2 read sectors at M = 400), and the math warp groups wait longer for every stage. A one-wave GEMM then takes up to
+// 1.5 times as long as with that block full (tower fc2 1280 x 5120 at 128 x 40: 17.1 against 11.3 us at M = 400 and
+// 512). DeepGEMM v2's 128-row tiles pay it as well (1.25-1.45 on that shape), its 64-row tiles stay within 3 %, and
+// DeepGEMM's cost model, which counts the blocks of the padded M, picks those or a fuller wave on such shapes. Below
+// M = 1024 the shape therefore runs the v2 kernel:
+//   - at DeepGEMM's configuration when that is a single-CTA one and fso's tile fills one wave or needs more waves than
+//     it (qkv 5120 x 2048 and o 2048 x 4096 at M = 80, 400-464 and o at 272-336, the tower projections at M = 400-576:
+//     0.55-0.98 of fso's time alone, 0.66-0.99 in the fso_chain arm of bench_issue12_dense.py, the quantize ->
+//     GEMM chain a serving step runs; exceptions below);
+//   - at fso's own tile when DeepGEMM picks a two-CTA cluster, which needs two waves there, and fso's tile fills one
+//     (qkv at M = 272-320: 0.79-0.88 alone, 0.90-0.94 in the chain);
+//   - otherwise it keeps fp8_gemm_kernel (tower fc1 5120 x 1280 at M = 533 / 576: DeepGEMM's pick clustered and fso's
+//     tile two waves; no tile of either kernel fills one wave there).
+// Up to 32 empty rows (M = 96 on every published family shape, M = 112, 352, 480, 496) keep the previous choice: the
+// cost is small there and the v2 kernel loses its gain back in the chain. From M = 1024 the classes above decide alone
+// (at M = 1079 the v2 kernel takes the tower conv_out 0.89 of its time alone but 1.10 in the chain, fc2 1.02 / 1.07).
+// The v2 configuration must also give at least three quarters of the SMs a tile: with fewer, its time depends on the
+// SMs its CTAs land on, and fp8_gemm_kernel's does not (tower fc2 / conv_out at M = 78, 80 tiles of 64 x 32 on the v2
+// kernel: rounds alternate between 8.4 and 10.3 us and between 11.3 and 13.7 us, against a steady 8.65 / 11.5 us;
+// runs/H1/val_i12). Measured exceptions inside the rule: o at M = 336 (0.81 alone, 1.07 in the chain), the 1280 x 1280
+// projection at M = 448 (0.98 / 1.02) and proj2 2048 x 1280 at M = 576 (1.01 / 1.02). Both kernels compute the same
+// bits.
+inline bool use_dg2_dense_partial_block(
+    Dg2DenseConfig& dg2, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_sms)
+{
+    if (shape_m >= 1024)
+        return false;
+    auto [bm, bn, ns, mc, smem] = get_dense_gemm_config(shape_m, shape_n, shape_k, num_sms, false);
+    (void) ns;
+    (void) smem;
+    uint32_t const ubm = static_cast<uint32_t>(bm);
+    uint32_t const empty = (ubm - shape_m % ubm) % ubm; // rows of the last M block beyond M
+    if (empty < 48 || mc != 1)
+        return false;
+    int const fso_tiles = div_up(static_cast<int>(shape_m), bm) * div_up(static_cast<int>(shape_n), bn);
+    int const fso_waves = div_up(fso_tiles, num_sms);
+    // The v2 configuration must give at least three quarters of the SMs a tile (see above).
+    auto fills = [&](int tiles) { return 4 * tiles >= 3 * num_sms; };
+    if (dg2.cluster_size() == 1)
+    {
+        int const dg2_tiles = div_up(static_cast<int>(shape_m), static_cast<int>(dg2.block_m))
+            * div_up(static_cast<int>(shape_n), static_cast<int>(dg2.block_n));
+        return (fso_waves == 1 || dg2.num_waves < fso_waves) && fills(dg2_tiles);
+    }
+    if (fso_waves != 1 || bn % 16 != 0 || !fills(fso_tiles))
+        return false;
+    Dg2DenseConfig c;
+    c.block_m = static_cast<uint32_t>(bm);
+    c.block_n = static_cast<uint32_t>(bn);
+    c.num_stages = static_cast<uint32_t>(dg2_num_stages(c.block_m, c.block_n, shape_k, c.smem_size));
+    if (c.num_stages < 4)
+        return false;
+    c.swizzle_d = dg2_swizzle_mode(c.block_n, 2);
+    c.num_sms = static_cast<uint32_t>(num_sms);
+    c.num_waves = fso_waves;
+    c.shape_n = 0u;
+    dg2 = c;
+    return true;
+}
+
+// `dg2` is DeepGEMM's configuration on entry; rule 5 may replace it with the configuration the v2 kernel runs.
+inline bool use_dg2_dense(Dg2DenseConfig& dg2, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_sms)
+{
+    if (use_dg2_dense_classes(dg2, shape_m, shape_k))
+        return true;
+    return use_dg2_dense_partial_block(dg2, shape_m, shape_n, shape_k, num_sms);
+}
+
+// The number of CTAs the main (non-swap-AB) path launches for a dense GEMM in the default FSO_SM90_DENSE_DG2 mode: the
+// tiles of DeepGEMM v2's configuration where use_dg2_dense takes it (a two-CTA cluster counts both CTAs), else of
+// fp8_gemm_kernel's get_dense_gemm_config tile. use_dense_swap_ab_above_96 compares the swap-AB launch with it.
+inline int dense_main_path_tiles(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_sms)
+{
+    Dg2DenseConfig dg2 = get_dg2_dense_config_cached(shape_m, shape_n, shape_k, num_sms);
+    if (use_dg2_dense(dg2, shape_m, shape_n, shape_k, num_sms))
+        return div_up(static_cast<int>(shape_m), static_cast<int>(dg2.block_m))
+            * div_up(static_cast<int>(shape_n), static_cast<int>(dg2.block_n));
+    auto [bm, bn, ns, mc, smem] = get_dense_gemm_config(shape_m, shape_n, shape_k, num_sms, false);
+    (void) ns;
+    (void) mc;
+    (void) smem;
+    return div_up(static_cast<int>(shape_m), bm) * div_up(static_cast<int>(shape_n), bn);
 }
 } // namespace deep_gemm::jit

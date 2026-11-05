@@ -22,7 +22,11 @@ in the same K order, so their outputs are bitwise identical and the choice betwe
   configuration but the 80-wide tiles at 128 < M < 256 (where the first kernel's 128-row tiles leave a second,
   partly filled M block),
   or a 64-row tile at M = 64 / 128 with K >= 8192 (the same tiles with a stage ring of up to 16, where the first
-  kernel stops at 6 or 8) (`use_dg2_dense`). `FSO_SM90_DENSE_DG2_K=<K>` restricts `all` to one `K`.
+  kernel stops at 6 or 8), and below M = 1024 for a shape whose first-kernel tile leaves at least 48 rows of its last
+  M block empty, at DeepGEMM's configuration when that is a single-CTA one and otherwise at the first kernel's tile
+  when that fills one wave, provided the v2 configuration gives at least three quarters of the SMs a tile (the TMA
+  boxes of a mostly empty last block still move their full size, which slows the first kernel's 128-row tiles and
+  not the v2 kernel's 64-row ones) (`use_dg2_dense`). `FSO_SM90_DENSE_DG2_K=<K>` restricts `all` to one `K`.
   `FSO_SM90_DENSE_DG2=0` turns the route off, `all` takes every DeepGEMM pick on the non-swap path.
   Its programs are compiled with C++20, `--device-int128` and `deep_gemm/nvrtc_shim/` first on the include
   path (NVRTC lacks `<utility>` and `<cstddef>`); its runtimes are named `gemm_dg2_*`. `runGemmDg2` launches
@@ -30,6 +34,24 @@ in the same K order, so their outputs are bitwise identical and the choice betwe
   and the cluster-dimension attribute only for a two-CTA (multicast) cluster. A launch that carries the
   attribute is a cluster launch even at size 1; the CTAs then land on the SMs in another order, which changes
   the L2 partition each tile's operands come from and slows the 64-row tiles markedly.
+
+## Dense epilogue variants (interface v1, issue #12)
+
+`fso.dense.linear(..., bias=, residual=, activation="gelu_erf")` runs on all three dense kernels above. A call with
+any of these fields builds a variant of the kernel the same call without them runs, at the same tile configuration:
+`fp8_gemm_kernel` / `fp8_gemm_kernel_swapAB` with the scheduler input `NormalSchedulerInputEpi<kBias, kAct, kResidual>`
+/ `NormalSchedulerInputSwapABEpi<...>` (which carries the `fso::DenseEpilogue` by value), or
+`sm90_fp8_gemm_1d2d_impl_fso_epilogue` with `epilogue_op_t = Sm90DenseEpilogueOp<...>` (the struct is its last
+argument). Their runtimes are named like the identity's plus `_e` and `b` (bias), `g` (erf-GELU), `r` (residual). The
+epilogue (`deep_gemm/fso_dense_epilogue.cuh`) applies the formula of
+`blockscale_gemm/common/epilogue_device.cuh` (one definition for every architecture; it is the only header the JIT
+includes from outside `deep_gemm/`, so the include path must reach it: a wheel's `_jit_include/` holds it, an
+in-place build bakes `csrc/gemm/include` in, and a source tree's root is added by itself when an
+`FSO_JIT_INCLUDE_DIRS` list names only the `jit/` directory) to the promoted fp32 accumulators before the kernel's
+one bf16 rounding. Each tile stages its bias and residual at its start, after the kernel's `griddepcontrol.wait`:
+into registers where the tile's accumulators leave room, otherwise as prefetches (bias to L1, residual to L2) for
+loads after the main loop. A call without these fields generates exactly the source it generated before, and so
+the same kernel.
 
 ## Compile-time cost
 

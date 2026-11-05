@@ -108,11 +108,27 @@ cudaError_t slot_swiglu_kernel_launch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b
 // handed out by the work-stealing scheduler over `slot_sched` (int32 [2], zero on
 // entry) and stores bounded by each expert's routed rows; past a row capacity of
 // one token tile over the packed live token-tile list `slot_tiles`.
+// The row-bounded token load (issue #13 lever 3) lives in its own translation unit, mxfp8_sm100_slot_rows_kernel.cu,
+// so that this unit's kernels -- the ones every launch below a row capacity of 32 runs -- stay exactly what they were.
+// The compact entries below hand a launch to it when sm100_mxfp8_slot_rows_applies (host code only).
+cudaError_t slot_kernel_launch_compact_rows(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bfloat16* mat_d,
+    int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int32_t const* blk0, int groups, int num_slots,
+    int m_cap, int b_alloc, int shape_n, int shape_k, int const* slot_to_expert, int* slot_sched, int* slot_tiles,
+    int tiles_cap, bool build_tiles, cudaStream_t stream);
+cudaError_t slot_swiglu_kernel_launch_compact_rows(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_fp8_e4m3* out_h,
+    int32_t* out_sfh, int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int32_t const* blk0, int groups,
+    int num_slots, int m_cap, int b_alloc, int shape_n, int shape_k, int const* slot_to_expert, int* slot_sched,
+    int* slot_tiles, int tiles_cap, bool build_tiles, cudaStream_t stream);
+
 cudaError_t slot_kernel_launch_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bfloat16* mat_d,
     int32_t* scales_a, int32_t* scales_b, int32_t* masked_m, int32_t const* blk0, int groups, int num_slots,
     int m_cap, int b_alloc, int shape_n, int shape_k, int const* slot_to_expert, int* slot_sched, int* slot_tiles,
     int tiles_cap, bool build_tiles, cudaStream_t stream)
 {
+    if (sm100_mxfp8_slot_rows_applies(m_cap, slot_to_expert, slot_tiles, build_tiles))
+        return slot_kernel_launch_compact_rows(mat_a, mat_b, mat_d, scales_a, scales_b, masked_m, blk0, groups,
+            num_slots, m_cap, b_alloc, shape_n, shape_k, slot_to_expert, slot_sched, slot_tiles, tiles_cap,
+            build_tiles, stream);
     return gemm_dispatch_sm100_mxfp8_slot_compact(mat_a, mat_b, mat_d, scales_a, scales_b, masked_m, blk0, groups,
         num_slots, m_cap, b_alloc, shape_n, shape_k, slot_to_expert, slot_sched, slot_tiles, tiles_cap, build_tiles,
         stream);
@@ -123,6 +139,10 @@ cudaError_t slot_swiglu_kernel_launch_compact(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m
     int num_slots, int m_cap, int b_alloc, int shape_n, int shape_k, int const* slot_to_expert, int* slot_sched,
     int* slot_tiles, int tiles_cap, bool build_tiles, cudaStream_t stream)
 {
+    if (sm100_mxfp8_slot_rows_applies(m_cap, slot_to_expert, slot_tiles, build_tiles))
+        return slot_swiglu_kernel_launch_compact_rows(mat_a, mat_b, out_h, out_sfh, scales_a, scales_b, masked_m,
+            blk0, groups, num_slots, m_cap, b_alloc, shape_n, shape_k, slot_to_expert, slot_sched, slot_tiles,
+            tiles_cap, build_tiles, stream);
     return gemm_dispatch_sm100_mxfp8_slot_swiglu_compact(mat_a, mat_b, out_h, out_sfh, scales_a, scales_b, masked_m,
         blk0, groups, num_slots, m_cap, b_alloc, shape_n, shape_k, slot_to_expert, slot_sched, slot_tiles, tiles_cap,
         build_tiles, stream);

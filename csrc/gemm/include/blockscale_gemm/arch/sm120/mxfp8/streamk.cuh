@@ -4,10 +4,10 @@
  */
 
 // Stream-K (concurrent K-split) wrapper for the SM120 MXFP8 (1×32) GEMM.
-// Mirrors `sm120_streamk.cuh::launch_sm120_streamk_gemm` but routes
+// Mirrors `common/streamk.cuh::launch_sm120_streamk_gemm` but routes
 // through `launch_sm120_mxfp8_gemm_kernel` and takes int32-packed UE8M0
-// scales. Reuses the same `detail::StreamKPool` (BF16 partial scratch
-// + side streams + fork_event) and the same
+// scales. Reuses the same `detail::StreamKPool` (side streams + fork_event;
+// the bf16 partial scratch is the caller's) and the same
 // `sm120_streamk_choose_k_split` heuristic — the only VS-specific bit is
 // `kSfBlock = 4 * kSFVecSize = 128` (the K-extent of one int32 SF word).
 
@@ -25,10 +25,18 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels::blockscale_gemm
 {
 
+// `scratch` / `scratch_bytes`: the caller's bf16 partial scratch (Sm120DenseRoute::streamk_scratch_bytes of the
+// route, k_split slices of [M, N]), allocated by the op body from the torch caching allocator on `stream`; no
+// process-wide buffer is involved. `epilogue` (common/epilogue.cuh): the slices run the identity epilogue into the
+// partials, and the reduce applies the epilogue once to the fp32 sum (sm120_streamk_reduce_epi_kernel); the identity
+// keeps the plain reduce. With epilogue.out_q (fso.dense.linear_quantized) the reduce writes the quantized form
+// instead (launch_sm120_mxfp8_streamk_reduce_quant: the same sum, the epilogue, one rounding, the contract's
+// quantizer) and mat_d is not written.
 template <int TileM, int TileN, int Stages>
 void launch_sm120_mxfp8_streamk_gemm(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4m3* mat_b, int ld_b,
     __nv_bfloat16* mat_d, int ld_d, int M, int N, int K, int32_t* scales_a, int32_t* scales_b, int k_split,
-    int sm_count, cudaStream_t stream)
+    int sm_count, cudaStream_t stream, void* scratch, std::size_t scratch_bytes,
+    fso::DenseEpilogue const& epilogue = fso::DenseEpilogue{})
 {
     // VS=32: each int32 SF word covers 4 UE8M0 bytes × 32 K-elements = 128 K.
     // VS=128 path uses kSfBlock=512 (4 × 128). The K-chunk arithmetic is
@@ -36,22 +44,37 @@ void launch_sm120_mxfp8_streamk_gemm(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4
     constexpr int kSfBlock = 128;
 
     int const k_chunks_total = detail::sk_ceil_div(K, kSfBlock);
-    if (k_split > k_chunks_total)
-        k_split = k_chunks_total;
+    k_split = sm120_streamk_effective_split(k_split, K, kSfBlock);
     if (k_split <= 1)
     {
-        launch_sm120_mxfp8_gemm_kernel<TileM, TileN, Stages>(mat_a, ld_a, 0, mat_b, ld_b, 0, mat_d, ld_d, 0,
-            scales_a, 0, scales_b, 0, /*num_problems=*/1u, static_cast<uint32_t>(M), static_cast<uint32_t>(N),
-            static_cast<uint32_t>(K), stream, sm_count);
+        if (epilogue.is_identity())
+        {
+            launch_sm120_mxfp8_gemm_kernel<TileM, TileN, Stages>(mat_a, ld_a, 0, mat_b, ld_b, 0, mat_d, ld_d, 0,
+                scales_a, 0, scales_b, 0, /*num_problems=*/1u, static_cast<uint32_t>(M), static_cast<uint32_t>(N),
+                static_cast<uint32_t>(K), stream, sm_count);
+        }
+        else if (epilogue.out_q != nullptr)
+        {
+            bool const launched = launch_sm120_mxfp8_dense_quant_single(TileM, TileN, Stages, mat_a, mat_b, scales_a,
+                scales_b, static_cast<uint32_t>(M), static_cast<uint32_t>(N), static_cast<uint32_t>(K), stream,
+                sm_count, epilogue);
+            TLLM_CHECK_WITH_INFO(
+                launched, "sm120 mxfp8: no quantized-output instance (%d, %d, %d)", TileM, TileN, Stages);
+        }
+        else
+        {
+            bool const launched = launch_sm120_mxfp8_dense_epi_single(TileM, TileN, Stages, mat_a, mat_b, mat_d,
+                scales_a, scales_b, static_cast<uint32_t>(M), static_cast<uint32_t>(N), static_cast<uint32_t>(K),
+                stream, sm_count, epilogue);
+            TLLM_CHECK_WITH_INFO(launched, "sm120 mxfp8: no dense-epilogue instance (%d, %d, %d)", TileM, TileN, Stages);
+        }
         return;
     }
 
     auto& pool = detail::StreamKPool::instance();
     pool.ensure_streams_initialized();
-    if (k_split > detail::StreamKPool::kMaxKSplit)
-        k_split = detail::StreamKPool::kMaxKSplit;
     std::size_t const needed = static_cast<std::size_t>(k_split) * M * N * sizeof(__nv_bfloat16);
-    __nv_bfloat16* d_partial = pool.ensure_partial_capacity(needed);
+    __nv_bfloat16* d_partial = sm120_streamk_scratch(scratch, scratch_bytes, needed);
 
     int const sfa_pad_m = detail::sk_round_up(M, 4);
     int const sfb_pad_n = detail::sk_round_up(N, 4);
@@ -59,11 +82,8 @@ void launch_sm120_mxfp8_streamk_gemm(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4
     int const sm_per_slice = std::max(1, sm_count / k_split);
     std::size_t const partial_stride = static_cast<std::size_t>(M) * N;
 
-    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-    cudaStreamIsCapturing(stream, &capture_status);
-    bool const is_capturing = (capture_status == cudaStreamCaptureStatusActive);
-    if (is_capturing)
-        cudaEventRecord(pool.fork_event, stream);
+    // Fork on every call, eager or capturing (see launch_sm120_streamk_gemm in common/streamk.cuh for why).
+    cudaEventRecord(pool.fork_event, stream);
 
     int actual_splits = 0;
     for (int s = 0; s < k_split; ++s)
@@ -86,7 +106,7 @@ void launch_sm120_mxfp8_streamk_gemm(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4
         __nv_bfloat16* part_d = d_partial + static_cast<std::size_t>(actual_splits) * partial_stride;
 
         cudaStream_t this_stream = (s == 0) ? stream : pool.side_streams[s - 1];
-        if (s != 0 && is_capturing)
+        if (s != 0)
             cudaStreamWaitEvent(this_stream, pool.fork_event, 0);
 
         launch_sm120_mxfp8_gemm_kernel<TileM, TileN, Stages>(a_off, ld_a, 0, b_off, ld_b, 0, part_d, /*ld_d=*/N, 0,
@@ -105,8 +125,20 @@ void launch_sm120_mxfp8_streamk_gemm(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4
     std::size_t const total = static_cast<std::size_t>(M) * static_cast<std::size_t>(N);
     int const reduce_threads = 256;
     int const reduce_blocks = static_cast<int>((total + reduce_threads - 1) / reduce_threads);
-    sm120_streamk_reduce_kernel<<<reduce_blocks, reduce_threads, 0, stream>>>(
-        d_partial, mat_d, M, N, actual_splits, partial_stride);
+    if (epilogue.is_identity())
+    {
+        sm120_streamk_reduce_kernel<<<reduce_blocks, reduce_threads, 0, stream>>>(
+            d_partial, mat_d, M, N, actual_splits, partial_stride);
+    }
+    else if (epilogue.out_q != nullptr)
+    {
+        launch_sm120_mxfp8_streamk_reduce_quant(d_partial, M, N, actual_splits, partial_stride, epilogue, stream);
+    }
+    else
+    {
+        sm120_streamk_reduce_epi_kernel<><<<reduce_blocks, reduce_threads, 0, stream>>>(d_partial, mat_d, M, N,
+            actual_splits, partial_stride, epilogue.bias, epilogue.residual, epilogue.ld_residual, epilogue.act);
+    }
 }
 
 } // namespace kernels::blockscale_gemm

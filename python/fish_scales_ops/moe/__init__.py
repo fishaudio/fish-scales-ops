@@ -362,6 +362,17 @@ def _check_expert_tensors(w13, w2, fmt: str, where: str):
     return e, h, i
 
 
+def _aligned_storage(t: torch.Tensor) -> torch.Tensor:
+    """``t``, or a copy of it in an allocation of its own when its data pointer is not 16-byte aligned. The handle of
+    :func:`prepare_experts` keeps a caller's checkpoint tensor where it can, and the grouped GEMMs read the handle's
+    tensors in place with TMA, which needs 16 bytes; a kept tensor that is a view at another offset is copied once here,
+    at load time, and never per call. Every other tensor of a handle is a fresh allocation, which the caching allocator
+    aligns far beyond that."""
+    if t.numel() == 0 or t.data_ptr() % 16 == 0:
+        return t
+    return t.clone()
+
+
 def _quantize_mxfp8_chunked(num_experts: int, source, per_expert_elems: int, interleave: bool):
     """Quantize ``num_experts`` experts to MXFP8 1x32 a few at a time.
 
@@ -460,9 +471,9 @@ def _prepare_mxfp8_checkpoint(w13, w2, sw13, sw2, arch: int, e: int, h: int, i: 
     interleave = bool(mxfp8_grouped_swiglu_available(2 * i, h))
     perm = _w13_interleave_perm(2 * i, w13.device) if interleave else None
     w13_d = w13.detach()
-    w13_q = w13_d.index_select(1, perm) if interleave else w13_d.contiguous()
+    w13_q = w13_d.index_select(1, perm) if interleave else _aligned_storage(w13_d.contiguous())
     s13_q = _ue8m0_scale_handle(sw13.detach(), row_perm=perm)
-    w2_q = w2.detach().contiguous()
+    w2_q = _aligned_storage(w2.detach().contiguous())
     s2_q = _ue8m0_scale_handle(sw2.detach())
     return MoeExperts("mxfp8", arch, e, h, i, w13_q, s13_q, w2_q, s2_q, interleave)
 
@@ -515,6 +526,11 @@ def prepare_experts(w13, w2, *, format, sw13=None, sw2=None) -> MoeExperts:
     Constraints: ``H % 128 == 0``, ``I_local % 128 == 0``, ``1 <= E_local <= 1024``,
     and the router draws its top-k without replacement.
 
+    Alignment: every tensor of the returned handle starts on a 16-byte boundary,
+    which the grouped GEMMs need. A kept tensor that is a view at another offset
+    is copied into a tensor of its own here, once; :func:`layer` never copies the
+    experts.
+
     Returns:
         :class:`MoeExperts`.
     """
@@ -559,7 +575,8 @@ def prepare_experts(w13, w2, *, format, sw13=None, sw2=None) -> MoeExperts:
         s13_c = sw13.detach().contiguous()
         s2_c = sw2.detach().contiguous()
         if arch // 10 == 9:
-            return MoeExperts("bsfp8", arch, e, h, i, w13_c, s13_c, w2_c, s2_c, False)
+            return MoeExperts("bsfp8", arch, e, h, i, *(_aligned_storage(t) for t in (w13_c, s13_c, w2_c, s2_c)),
+                              False)
 
         def src13(e0, e1):
             return _dequantize_block_fp8(w13_c, s13_c, e0, e1)
@@ -601,6 +618,36 @@ def _fused_combine_allowed() -> bool:
     return _fused_combine_env and sm_major() == 12
 
 
+def _bf16_storage(t):
+    """A bf16 operand of the layer (``hidden``, and on the MXFP8 layer ``bias``) in storage its kernels can read.
+    The gather-quantize kernels read ``hidden`` and the combine reads ``bias`` in vectors straight from the data
+    pointer (8 and 16 bytes), and the raw ops refuse what their kernel cannot read (``ValueError``,
+    ``csrc/gemm/ops/input_alignment.h``). A ``t`` that is not contiguous, or whose data pointer is not 16-byte aligned
+    (a view that starts at an element offset that is not a multiple of 8), is copied into a tensor of its own (one copy
+    kernel; the caching allocator returns blocks aligned far beyond 16 bytes), the rule ``fso.dense`` applies to its
+    bf16 ``x``. Called in the op body, which runs on real tensors: under torch.compile the fake implementation stands
+    in for it, and inside a CUDA-graph capture the copy is captured with the call."""
+    if t.numel() > 0 and (not t.is_contiguous() or t.data_ptr() % 16 != 0):
+        return t.contiguous() if not t.is_contiguous() else t.clone()
+    return t
+
+
+def _require_experts_aligned(kind, w13, sw13, w2, sw2, where: str) -> None:
+    """The expert weights, and on kind ``"mxfp8"`` their int32 scale handles, must start on a 16-byte boundary: the
+    grouped GEMMs read them in place with TMA, and the layer never copies the experts per call. Every tensor
+    :func:`prepare_experts` returns does. The fp32 block scales of kind ``"bsfp8"`` are read with plain loads, at any
+    address. Asked in the op body before the routing and the gather are launched, so a refused call launches nothing
+    (the raw grouped GEMMs underneath refuse the same operands)."""
+    named = (("w13", w13), ("sw13", sw13), ("w2", w2), ("sw2", sw2)) if kind == "mxfp8" else (("w13", w13), ("w2", w2))
+    for name, t in named:
+        if t.numel() > 0 and t.data_ptr() % 16 != 0:
+            raise ValueError(f"fish_scales_ops::moe_layer ({where}, kind {kind!r}): {name}'s data pointer is "
+                             f"{t.data_ptr() % 16} bytes past a 16-byte boundary; the grouped GEMMs read it in place "
+                             f"with TMA, which needs a 16-byte aligned address. fso.moe.prepare_experts returns "
+                             f"aligned tensors; a handle built from views at other offsets is refused, and the experts "
+                             f"are never copied per call")
+
+
 @torch.library.custom_op(
     "fish_scales_ops::moe_layer",
     mutates_args=(),
@@ -612,12 +659,19 @@ def _moe_layer_op(hidden, w13, sw13, w2, sw2, topk_ids, topk_w, bias, bias_scale
     kind and on this device's architecture, then run that architecture's chain."""
     major = sm_major()
     arch = _device_arch()
+    # The experts are read in place; a misaligned one is refused before anything below converts, copies or launches.
+    # An empty bucket reads no expert, and a kind this architecture does not serve is refused further down.
+    if int(hidden.shape[0]) > 0 and ((kind == "bsfp8" and major == 9) or (kind == "mxfp8" and major in (10, 12))):
+        _require_experts_aligned(kind, w13, sw13, w2, sw2, _arch_label(arch))
     # layer() already hands over int32 ids, fp32 weights and a [M] bias_scale; a caller
     # of the registered op may not, and each of these is a no-op when it does.
     if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
         topk_ids = topk_ids.to(torch.int32).contiguous()
     if topk_w.dtype != torch.float32 or not topk_w.is_contiguous():
         topk_w = topk_w.to(torch.float32).contiguous()
+    # Both kinds read hidden with the gather-quantize kernels' vector loads: a hidden that is not contiguous or not
+    # 16-byte aligned is copied first (_bf16_storage), so no layer call reaches a kernel that cannot read it.
+    hidden = _bf16_storage(hidden)
     if bias is not None:
         bias = bias.contiguous()
     if bias_scale is not None:
@@ -641,7 +695,8 @@ def _moe_layer_op(hidden, w13, sw13, w2, sw2, topk_ids, topk_w, bias, bias_scale
         # The sm_90 combine kernel has no bias input yet, so the bias is folded with one
         # fused elementwise pass over the result: out + bias, or out + bias_scale * bias
         # evaluated as one fp32 multiply-add (the product is not rounded on its own) and
-        # rounded once to bf16.
+        # rounded once to bf16. That torch pass reads a bias at any alignment, so it is
+        # not copied here.
         if bias is not None:
             if bias_scale is None:
                 y.add_(bias)
@@ -654,9 +709,11 @@ def _moe_layer_op(hidden, w13, sw13, w2, sw2, topk_ids, topk_w, bias, bias_scale
                 f"fish_scales_ops::moe_layer: kind 'mxfp8' needs MXFP8 hardware (sm_100/sm_103 or "
                 f"sm_120/sm_121) and this device is {_arch_label(arch)}; on sm_90 prepare "
                 f"block-FP8 experts with format='bsfp8'")
-        x = hidden if hidden.is_contiguous() else hidden.contiguous()
+        # The combine kernel reads the bias rows in 16-byte vectors.
+        if bias is not None:
+            bias = _bf16_storage(bias)
         return _moe_layer_mxfp8(
-            x, w13, sw13, w2, sw2, topk_ids, topk_w, bias=bias, bias_scale=bias_scale,
+            hidden, w13, sw13, w2, sw2, topk_ids, topk_w, bias=bias, bias_scale=bias_scale,
             w13_interleaved=w13_interleaved, fused_combine=_fused_combine_allowed())
     raise ValueError(f"fish_scales_ops::moe_layer: unknown kind {kind!r} on {_arch_label(arch)}; "
                      f"the kinds are 'bsfp8' and 'mxfp8', produced by fso.moe.prepare_experts")

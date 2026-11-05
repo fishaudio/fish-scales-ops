@@ -26,6 +26,8 @@
  * store of the compact GEMMs is bounded by masked_m[g]); they hold whatever the caller's buffer held.
  */
 
+#include "input_alignment.h"
+
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/util/Exception.h>
@@ -61,6 +63,15 @@ void fp8bs_quantize_1x32_packed_grouped_gather(__nv_fp8_e4m3* x_q, int32_t* pack
 void fp8bs_silu_chunk_mul_quantize_1x32_packed_grouped(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
     __nv_bfloat16 const* gu, int32_t const* slot_of_flat, int n_pairs, int m_cap, int K, cudaStream_t stream,
     bool use_ue8m0, bool sm1xx_sf_layout, bool pairwise);
+// The width of the vector loads with which their kernels read the bf16 input (8 bytes; 16 for the pairwise SwiGLU
+// form); the two glue ops below refuse an input whose rows those kernels cannot read (input_alignment.h).
+int fp8bs_quantize_1x32_packed_grouped_gather_x_vector_bytes();
+int fp8bs_silu_chunk_mul_quantize_1x32_packed_grouped_x_vector_bytes(bool pairwise);
+// The width of the stores with which those kernels write the fp8 output (4 bytes); the two glue ops below refuse a
+// caller-owned x_q / dq whose rows those kernels cannot write (input_alignment.h). The scale words are written one
+// int32 at a time.
+int fp8bs_quantize_1x32_packed_grouped_gather_x_q_vector_bytes();
+int fp8bs_silu_chunk_mul_quantize_1x32_packed_grouped_x_q_vector_bytes();
 } // namespace detail
 
 namespace
@@ -156,6 +167,11 @@ CompactDims check_compact_gemm(char const* op, at::Tensor const& a, at::Tensor c
     TORCH_CHECK(b.device() == dev && sa.device() == dev && sb.device() == dev && masked_m.device() == dev
             && blk0.device() == dev,
         op, ": every tensor must be on ", dev);
+    // TMA reads all four (input_alignment.h); a misaligned one would abort the process at CuTe's host assertion.
+    detail::require_tma_aligned(a, op, "a");
+    detail::require_tma_aligned(sa, op, "sa");
+    detail::require_tma_aligned(b, op, "b");
+    detail::require_tma_aligned(sb, op, "sb");
     return {R, K, N, G};
 }
 
@@ -218,10 +234,15 @@ void quantize_1x32_grouped_gather_out(at::Tensor x, at::Tensor slot_of_flat, int
     auto const dev = x.device();
     TORCH_CHECK(slot_of_flat.device() == dev && x_q.device() == dev && packed.device() == dev,
         "every tensor must be on ", dev);
+    detail::require_bf16_vector_aligned(x, M, K, detail::fp8bs_quantize_1x32_packed_grouped_gather_x_vector_bytes(),
+        "fish_scales_ops::quantize_1x32_grouped_gather_out", "x");
     if (M * topk == 0)
     {
         return; // no routed pair: nothing to write
     }
+    detail::require_out_aligned(x_q, num_groups * m_cap, K,
+        detail::fp8bs_quantize_1x32_packed_grouped_gather_x_q_vector_bytes(),
+        "fish_scales_ops::quantize_1x32_grouped_gather_out", "x_q");
     auto stream = at::cuda::getCurrentCUDAStream();
     detail::fp8bs_quantize_1x32_packed_grouped_gather(reinterpret_cast<__nv_fp8_e4m3*>(x_q.data_ptr()),
         reinterpret_cast<int32_t*>(packed.data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(x.data_ptr()),
@@ -277,6 +298,12 @@ void silu_chunk_mul_quantize_1x32_grouped_out(
     {
         return; // no routed pair: nothing to write
     }
+    detail::require_bf16_vector_aligned(gu, G * m_cap, TWO_INTER,
+        detail::fp8bs_silu_chunk_mul_quantize_1x32_packed_grouped_x_vector_bytes(pairwise),
+        "fish_scales_ops::silu_chunk_mul_quantize_1x32_grouped_out", "gu");
+    detail::require_out_aligned(dq, G * m_cap, INTER,
+        detail::fp8bs_silu_chunk_mul_quantize_1x32_packed_grouped_x_q_vector_bytes(),
+        "fish_scales_ops::silu_chunk_mul_quantize_1x32_grouped_out", "dq");
     auto stream = at::cuda::getCurrentCUDAStream();
     detail::fp8bs_silu_chunk_mul_quantize_1x32_packed_grouped(reinterpret_cast<__nv_fp8_e4m3*>(dq.data_ptr()),
         reinterpret_cast<int32_t*>(sd.data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(gu.data_ptr()),
@@ -326,6 +353,8 @@ void linear_mxfp8_grouped_compact(at::Tensor a, at::Tensor b, at::Tensor sa, at:
     TORCH_CHECK(d.numel() == s.R * s.N && d.size(-1) == s.N, op, ": d must be [R, N] = [", s.R, ", ", s.N,
         "] (or its one-group view [1, R, N]), got ", d.sizes());
     TORCH_CHECK(d.device() == a.device(), op, ": d must be on ", a.device());
+    // The GEMM stores d through a TMA descriptor built on it (input_alignment.h).
+    detail::require_tma_store_aligned(d, op, "d");
     auto stream = at::cuda::getCurrentCUDAStream();
     cudaError_t const err = detail::launch_sm120_mxfp8_grouped_compact_dispatch(
         reinterpret_cast<__nv_fp8_e4m3*>(a.data_ptr()), reinterpret_cast<__nv_fp8_e4m3*>(b.data_ptr()),
@@ -371,6 +400,9 @@ void linear_mxfp8_grouped_compact_swiglu(at::Tensor a, at::Tensor b, at::Tensor 
         op, ": sd must be the one-group K-major scale words [1, I/128, R] (", s.R * (INTER / 128),
         " contiguous CUDA int32), got ", sd.dtype(), " ", sd.sizes());
     TORCH_CHECK(dq.device() == a.device() && sd.device() == a.device(), op, ": dq and sd must be on ", a.device());
+    // The fused epilogue writes dq in 2-byte words and sd one byte at a time, but the GEMM's TMA store descriptor is
+    // built on dq (input_alignment.h), so dq must be 16-byte aligned; sd is not checked.
+    detail::require_tma_store_aligned(dq, op, "dq");
     auto stream = at::cuda::getCurrentCUDAStream();
     cudaError_t const err = detail::launch_sm120_mxfp8_grouped_compact_swiglu_dispatch(
         reinterpret_cast<__nv_fp8_e4m3*>(a.data_ptr()), reinterpret_cast<__nv_fp8_e4m3*>(b.data_ptr()),
@@ -413,6 +445,9 @@ void linear_mxfp8_grouped_compact_combine(at::Tensor a, at::Tensor b, at::Tensor
     auto const dev = a.device();
     TORCH_CHECK(row_map.device() == dev && weight_of_slot.device() == dev && out.device() == dev, op,
         ": every tensor must be on ", dev);
+    // The epilogue adds into out with 8-byte reductions, and the GEMM's TMA store descriptor is built on out
+    // (input_alignment.h), so out must be 16-byte aligned.
+    detail::require_tma_store_aligned(out, op, "out");
     auto stream = at::cuda::getCurrentCUDAStream();
     cudaError_t const err = detail::launch_sm120_mxfp8_grouped_compact_combine_dispatch(
         reinterpret_cast<__nv_fp8_e4m3*>(a.data_ptr()), reinterpret_cast<__nv_fp8_e4m3*>(b.data_ptr()),

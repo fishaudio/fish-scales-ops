@@ -1,6 +1,16 @@
 // Vendored from sgl-project/DeepGEMM v0.2.0 (MIT License, Copyright (c) 2025 DeepSeek; see ../LICENSE.DeepGEMM).
 // Modified by fish-scales-ops for NVRTC: cudaGridDependencySynchronize(), which NVRTC does not declare, is written
 // as the instruction it lowers to (griddepcontrol.wait).
+// Modified by fish-scales-ops for the dense epilogue of interface v1 (issue #12, ../fso_dense_epilogue.cuh): the
+// kernel body is the device function sm90_fp8_gemm_1d2d_body, called by two entry points with the same template
+// arguments: sm90_fp8_gemm_1d2d_impl, DeepGEMM's kernel with its parameter list unchanged (identity epilogue), and
+// sm90_fp8_gemm_1d2d_impl_fso_epilogue, which takes one more argument, the fso::DenseEpilogue, and is instantiated
+// with epilogue_op_t = Sm90DenseEpilogueOp<kBias, kAct, kResidual>. The body applies bias, erf-GELU and residual to
+// the promoted accumulators before its bf16 store when DenseEpilogueOf<epilogue_op_t>::kEnabled, after its
+// griddepcontrol.wait like every other global read.
+// Modified by fish-scales-ops (issue #12, SW1): the math warps execute fence.proxy.async + __syncwarp between the
+// last WGMMA batch of a stage and the stage's release, so that their ld.shared of the TMA-written A scales are
+// performed before the producer can refill the stage (see fso_fence_stage_reads in ../fp8_gemm_impl.cuh).
 #pragma once
 
 #pragma clang diagnostic push
@@ -24,6 +34,7 @@
 #include <deep_gemm/ptx/utils.cuh>
 #include <deep_gemm/ptx/wgmma.cuh>
 #include <deep_gemm/scheduler/gemm.cuh>
+#include <deep_gemm/fso_dense_epilogue.cuh>
 
 namespace deep_gemm {
 
@@ -49,13 +60,14 @@ template <cute::UMMA::Major kMajorSFB,
           uint32_t kNumSMs, GemmType kGemmType,
           typename cd_dtype_t,
           typename epilogue_op_t>
-CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
-sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
+CUTLASS_DEVICE void
+sm90_fp8_gemm_1d2d_body(float* sfb, int* grouped_layout,
                         uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
-                        const __grid_constant__ cute::TmaDescriptor tensor_map_a,
-                        const __grid_constant__ cute::TmaDescriptor tensor_map_b,
-                        const __grid_constant__ cute::TmaDescriptor tensor_map_d,
-                        const __grid_constant__ cute::TmaDescriptor tensor_map_sfa) {
+                        const cute::TmaDescriptor& tensor_map_a,
+                        const cute::TmaDescriptor& tensor_map_b,
+                        const cute::TmaDescriptor& tensor_map_d,
+                        const cute::TmaDescriptor& tensor_map_sfa,
+                        const fso::DenseEpilogue& fso_epilogue) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
     // Scaling checks
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
@@ -230,6 +242,24 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
 
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+            // fish-scales-ops: stage this tile's bias and residual for the dense epilogue now, in registers where the
+            // tile leaves room for them and as prefetches (bias to L1, residual to L2) where it does not, so that the
+            // main loop hides the loads (../fso_dense_epilogue.cuh). Unless epilogue_op_t is Sm90DenseEpilogueOp the
+            // registers are empty structs and the staging is discarded.
+            constexpr uint32_t kFsoWaveRows = BLOCK_M <= WGMMA::M ? BLOCK_M : WGMMA::M * 2;
+            constexpr uint32_t kFsoWaves = BLOCK_M / kFsoWaveRows;
+            using FsoPolicy = DenseOperandPolicy<DenseEpilogueOf<epilogue_op_t>::kBias,
+                DenseEpilogueOf<epilogue_op_t>::kResidual, WGMMA::kNumAccum * (1 + kFsoWaves), WGMMA::kNumAccum / 4,
+                2 * kFsoWaves>;
+            DenseOperandRegs<FsoPolicy::kBiasInRegs, FsoPolicy::kResInRegs, WGMMA::kNumAccum / 4, kFsoWaves> fso_regs;
+            if constexpr (DenseEpilogueOf<epilogue_op_t>::kEnabled) {
+                const uint32_t fso_m0 = scheduler.template get_global_idx<false>(shape_m, BLOCK_M, m_block_idx);
+                dense_stage_tile<DenseEpilogueOf<epilogue_op_t>, FsoPolicy, BLOCK_M, BLOCK_N, kNumMathThreads,
+                                 WGMMA::kNumAccum / 4, kFsoWaves, kFsoWaveRows>(fso_regs, fso_epilogue, fso_m0,
+                    fso_m0 + r_0, shape_m, n_block_idx * BLOCK_N, n_block_idx * BLOCK_N + (lane_idx % 4) * 2, shape_n,
+                    threadIdx.x);
+            }
+
             // Decide the number of scales B to load
             DG_TRAP_ONLY_DEVICE_ASSERT(shape_n % 8 == 0);
             uint32_t num_former_iters = BLOCK_N / 8, num_full_iters = num_former_iters;
@@ -318,6 +348,11 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                                 WGMMA::wgmma(a_desc, b_desc, accum, k);
                             }
                             ptx::warpgroup_commit_batch();
+                            // The stage's A-scale loads before its release (fso_fence_stage_reads in ../fp8_gemm_impl.cuh)
+                            if (local_idx == BLOCK_M / WAVE_BLOCK_M - 1) {
+                                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                                __syncwarp();
+                            }
                             #pragma unroll
                             for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
                                 ptx::warpgroup_fence_operand(accum[i]);
@@ -371,6 +406,22 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
             // Skip WGMMA store for the unfilled parts
             if (not do_wgmma_store)
                 continue;
+
+            // fish-scales-ops: the dense epilogue (issue #12; ../fso_dense_epilogue.cuh) on the promoted accumulators,
+            // which the STSM below rounds to bf16 once. Discarded unless epilogue_op_t is Sm90DenseEpilogueOp.
+            if constexpr (DenseEpilogueOf<epilogue_op_t>::kEnabled) {
+                using Epi = DenseEpilogueOf<epilogue_op_t>;
+                DG_STATIC_ASSERT(kGemmType == GemmType::Normal, "the dense epilogue is GemmType::Normal only");
+                const uint32_t m_base = scheduler.template get_global_idx<false>(shape_m, BLOCK_M, m_block_idx);
+                #pragma unroll
+                for (uint32_t local_idx = 0; local_idx < BLOCK_M / WAVE_BLOCK_M; ++ local_idx)
+                    dense_epilogue_fragment<Epi::kBias, Epi::kAct, Epi::kResidual, WGMMA::kNumAccum / 4,
+                                            FsoPolicy::kBiasInRegs, FsoPolicy::kResInRegs>(
+                        final_accum + WGMMA::kNumAccum * local_idx, fso_epilogue, fso_regs.bias.ptr(),
+                        FsoPolicy::kResInRegs ? fso_regs.res.ptr() + 2 * (WGMMA::kNumAccum / 4) * local_idx : nullptr,
+                        m_base + local_idx * WAVE_BLOCK_M + r_0, shape_m,
+                        n_block_idx * BLOCK_N + (lane_idx % 4) * 2, shape_n);
+            }
 
             // Wait last TMA store to be finished
             if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N)
@@ -450,6 +501,64 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     if (blockIdx.x == 0 and threadIdx.x == 0)
         DG_DEVICE_ASSERT(false and "This kernel only support sm_90a");
 #endif
+}
+
+// DeepGEMM's kernel: the identity epilogue (and DeepGEMM's own epilogue_op_t), with DeepGEMM's parameter list.
+template <cute::UMMA::Major kMajorSFB,
+          uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
+          uint32_t kNumGroups,
+          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
+          uint32_t kSwizzleAMode, uint32_t kSwizzleBMode, uint32_t kSwizzleDMode,
+          uint32_t kNumStages,
+          uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
+          uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
+          uint32_t kNumSMs, GemmType kGemmType,
+          typename cd_dtype_t,
+          typename epilogue_op_t>
+CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
+sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
+                        uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+                        const __grid_constant__ cute::TmaDescriptor tensor_map_a,
+                        const __grid_constant__ cute::TmaDescriptor tensor_map_b,
+                        const __grid_constant__ cute::TmaDescriptor tensor_map_d,
+                        const __grid_constant__ cute::TmaDescriptor tensor_map_sfa) {
+    DG_STATIC_ASSERT(not DenseEpilogueOf<epilogue_op_t>::kEnabled,
+                     "a dense epilogue runs as sm90_fp8_gemm_1d2d_impl_fso_epilogue");
+    sm90_fp8_gemm_1d2d_body<kMajorSFB, SHAPE_M, SHAPE_N, SHAPE_K, kNumGroups, BLOCK_M, BLOCK_N, BLOCK_K,
+                            kSwizzleAMode, kSwizzleBMode, kSwizzleDMode, kNumStages, kNumTMAThreads, kNumMathThreads,
+                            kNumTMAMulticast, kIsTMAMulticastOnA, kNumSMs, kGemmType, cd_dtype_t, epilogue_op_t>(
+        sfb, grouped_layout, shape_m, shape_n, shape_k, tensor_map_a, tensor_map_b, tensor_map_d, tensor_map_sfa,
+        fso::DenseEpilogue{});
+}
+
+// fish-scales-ops: the same kernel with the dense epilogue of interface v1, epilogue_op_t = Sm90DenseEpilogueOp<...>;
+// `fso_epilogue` holds the bias / residual pointers and the residual's row stride (bound by address in a graph).
+template <cute::UMMA::Major kMajorSFB,
+          uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
+          uint32_t kNumGroups,
+          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
+          uint32_t kSwizzleAMode, uint32_t kSwizzleBMode, uint32_t kSwizzleDMode,
+          uint32_t kNumStages,
+          uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
+          uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
+          uint32_t kNumSMs, GemmType kGemmType,
+          typename cd_dtype_t,
+          typename epilogue_op_t>
+CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
+sm90_fp8_gemm_1d2d_impl_fso_epilogue(float* sfb, int* grouped_layout,
+                                     uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+                                     const __grid_constant__ cute::TmaDescriptor tensor_map_a,
+                                     const __grid_constant__ cute::TmaDescriptor tensor_map_b,
+                                     const __grid_constant__ cute::TmaDescriptor tensor_map_d,
+                                     const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
+                                     const fso::DenseEpilogue fso_epilogue) {
+    DG_STATIC_ASSERT(DenseEpilogueOf<epilogue_op_t>::kEnabled,
+                     "sm90_fp8_gemm_1d2d_impl_fso_epilogue needs epilogue_op_t = Sm90DenseEpilogueOp<...>");
+    sm90_fp8_gemm_1d2d_body<kMajorSFB, SHAPE_M, SHAPE_N, SHAPE_K, kNumGroups, BLOCK_M, BLOCK_N, BLOCK_K,
+                            kSwizzleAMode, kSwizzleBMode, kSwizzleDMode, kNumStages, kNumTMAThreads, kNumMathThreads,
+                            kNumTMAMulticast, kIsTMAMulticastOnA, kNumSMs, kGemmType, cd_dtype_t, epilogue_op_t>(
+        sfb, grouped_layout, shape_m, shape_n, shape_k, tensor_map_a, tensor_map_b, tensor_map_d, tensor_map_sfa,
+        fso_epilogue);
 }
 
 };  // namespace deep_gemm

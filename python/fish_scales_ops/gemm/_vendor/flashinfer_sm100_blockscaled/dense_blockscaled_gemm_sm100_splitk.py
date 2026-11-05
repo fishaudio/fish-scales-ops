@@ -185,18 +185,41 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
 
     The supported tactics use an MMA-M tile of 128, MMA-N tiles of 8/16/32,
     and two or four K slices.
+
+    fso-p5 (fish-scales-ops issue #12): MMA-N tiles of 64 and 128 as well,
+    which may repeat along the token dimension; a mailbox sized to the
+    subtiles a CTA owns; a chunk-interleaved mailbox layout; and a push-first
+    epilogue walk (every edit site carries an ``fso-p5`` comment). The
+    reduction order and therefore the output bytes of a given tactic are
+    unchanged.
     """
 
     MAX_M = 32
     MMA_INST_BITS_K = 256
     MMA_INST_TILE_K = 4
-    SUPPORTED_MMA_TILER_MN = ((128, 8), (128, 16), (128, 32))
+    # fso-p5: the 64- and 128-wide token tiles, which may repeat along the
+    # token dimension (several token tiles per problem on grid Y). A narrow
+    # tile (8/16/32) serves only a problem it covers in one tile: the
+    # scale-factor slice of a second narrow tile does not exist (the SFB atom
+    # is 128 rows; only 64 has the TMEM shift that places the odd half), and
+    # such a launch computes wrong output.
+    SUPPORTED_MMA_TILER_MN = ((128, 8), (128, 16), (128, 32), (128, 64), (128, 128))
+    MULTI_TILE_TOKEN_TILES = (64, 128)  # fso-p5
     SUPPORTED_SPLIT_K_SLICES = (2, 4)
 
     @classmethod
     def supports_m(cls, m: int) -> bool:
         """Return whether the specialized low-M policy supports M."""
         return m <= cls.MAX_M
+
+    @classmethod
+    def supports_tile(cls, m: int, tile_n: int) -> bool:
+        """fso-p5: whether the token tile ``tile_n`` serves a problem of M
+        tokens: a narrow tile (8/16/32) only as the problem's one token tile
+        (``m <= tile_n``), a 64- or 128-wide tile at any M."""
+        if (128, tile_n) not in cls.SUPPORTED_MMA_TILER_MN:
+            return False
+        return tile_n in cls.MULTI_TILE_TOKEN_TILES or m <= tile_n
 
     @classmethod
     def mma_tiler_mn_for_m(cls, m: int) -> Tuple[int, int]:
@@ -213,13 +236,20 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
         k: int,
         ab_dtype,
         split_k_slices: int,
+        tile_n: Optional[int] = None,  # fso-p5
     ) -> bool:
-        """Return whether the MXFP8 shape satisfies this kernel's K tiling."""
+        """Return whether the MXFP8 shape satisfies this kernel's K tiling.
+
+        fso-p5: ``tile_n`` None asks about the narrow tile of
+        ``mma_tiler_mn_for_m`` (M <= MAX_M), as before; a token tile width asks
+        ``supports_tile`` instead.
+        """
         if ab_dtype.width != 8:
             return False
         tile_k = (cls.MMA_INST_BITS_K * cls.MMA_INST_TILE_K) // ab_dtype.width
+        tile_ok = cls.supports_m(m) if tile_n is None else cls.supports_tile(m, tile_n)
         return (
-            cls.supports_m(m)
+            tile_ok
             and split_k_slices in cls.SUPPORTED_SPLIT_K_SLICES
             and k % (tile_k * split_k_slices) == 0
         )
@@ -230,18 +260,22 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
         mma_tiler_mn: Tuple[int, int],
         split_k_slices: int,
         enable_pdl: bool = True,
+        fso_epilogue: Optional[Tuple[bool, int, bool]] = None,
     ):
         """Configure one low-M split-K tactic.
 
         Args:
             sf_vec_size: MXFP8 scale-factor vector size; must be 32.
             mma_tiler_mn: MMA tile shape; supported values are (128, 8),
-                (128, 16), and (128, 32).
+                (128, 16), (128, 32), and (fso-p5) (128, 64) and (128, 128).
             split_k_slices: Physical cluster-K size; must be 2 or 4.
             enable_pdl: Whether to enable programmatic dependent launch.
+            fso_epilogue: fso-epilogue, None (today's kernel) or
+                (has_bias, act, has_residual); see _Sm100BlockScaledGemmCommon.
         """
 
         self.acc_dtype = cutlass.Float32
+        self._fso_set_epilogue(fso_epilogue)  # fso-epilogue
         if sf_vec_size != 32:
             raise ValueError(
                 f"MXFP8 split-K requires sf_vec_size=32, got {sf_vec_size}"
@@ -249,7 +283,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
         self.sf_vec_size = sf_vec_size
         if mma_tiler_mn not in self.SUPPORTED_MMA_TILER_MN:
             raise ValueError(
-                "MXFP8 split-K requires mma_tiler_mn=(128, 8/16/32), "
+                "MXFP8 split-K requires mma_tiler_mn=(128, 8/16/32/64/128), "  # fso-p5: 64, 128
                 f"got {mma_tiler_mn}"
             )
         if split_k_slices not in self.SUPPORTED_SPLIT_K_SLICES:
@@ -393,10 +427,17 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
         self.reduce_values_per_thread = (
             cute.size(self.epi_tile[0]) * cute.size(self.epi_tile[1])
         ) // (self.num_epilogue_threads)
+        # fso-p5: the compact mailbox. Subtile i is owned by CTA i % split_k_slices, so a CTA only ever receives the
+        # subtiles it owns: ceil(subtiles / split_k_slices) slots of (split_k_slices - 1) peer fragments, indexed by
+        # the owned subtile's ordinal (i // split_k_slices), instead of a reserve for the whole tile. On the
+        # one-subtile tiles (token tile <= 32) this is the stock size; on a 128-token four-way split the stock
+        # reserve left no shared memory for a single mainloop stage.
+        epi_tile_elements = cute.size(self.epi_tile[0]) * cute.size(self.epi_tile[1])
+        self.num_mailbox_slots = (
+            self.num_epilogue_subtiles + self.split_k_slices - 1
+        ) // self.split_k_slices
         self.reduce_mailbox_elements = (
-            (self.split_k_slices - 1)
-            * self.cta_tile_shape_mnk[0]
-            * self.cta_tile_shape_mnk[1]
+            (self.split_k_slices - 1) * self.num_mailbox_slots * epi_tile_elements
         )
         self.reduce_smem_bytes = (
             self.reduce_mailbox_elements * cutlass.Float32.width // 8
@@ -454,6 +495,10 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
         )
 
         self.overlapping_accum = self.num_acc_stage == 1
+        if self.overlapping_accum:
+            # fso-p5: the push-first epilogue walk (see the epilogue warps) does not implement the overlapping
+            # accumulator's early release; no supported token tile (<= 128) reaches it.
+            raise ValueError("MXFP8 split-K: the epilogue walk needs a non-overlapping accumulator")
         sf_atom_mn = 32
         self.num_sfa_tmem_cols = (
             self.cta_tile_shape_mnk[0] // sf_atom_mn
@@ -485,6 +530,8 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        fso_bias: Optional[cute.Tensor] = None,  # fso-epilogue: bias as (m, n, l), stride 0 along n
+        fso_res: Optional[cute.Tensor] = None,  # fso-epilogue: residual with C's layout
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -610,6 +657,8 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
             self.epi_tile,
             epilogue_op,
             alpha,
+            fso_bias,  # fso-epilogue
+            fso_res,  # fso-epilogue
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -647,6 +696,8 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
         epi_tile: cute.Tile,
         epilogue_op: cutlass.Constexpr,
         alpha: cute.Tensor,
+        fso_bias: Optional[cute.Tensor],  # fso-epilogue
+        fso_res: Optional[cute.Tensor],  # fso-epilogue
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -825,6 +876,10 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
         tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
         # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
         tCgC = thr_mma.partition_C(gC_mnl)
+        # fso-epilogue: the coordinate tensor of C, partitioned like C (layouts only).
+        fso_tCcC = None
+        if cutlass.const_expr(self.fso_epi):
+            fso_tCcC = self._fso_epi_partition_mma(thr_mma, mC_mnl)
 
         #
         # Partition global/shared tensor for TMA load A/B
@@ -1336,6 +1391,13 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                     epi_tidx, tma_atom_c, tCgC, epi_tile, sC
                 )
             )
+            # fso-epilogue: this thread's coordinate fragment and fp32 scratch. The bias / residual loads happen
+            # per subtile below, in the epilogue warps, after the griddepcontrol_wait above.
+            fso_epi = None
+            if cutlass.const_expr(self.fso_epi):
+                fso_epi = self._fso_epi_setup(
+                    tiled_copy_t2r, tiled_copy_r2s, epi_tidx, epi_tile, tTR_rAcc, mC_mnl, fso_tCcC
+                )
 
             #
             # Persistent tile scheduling loop
@@ -1382,6 +1444,12 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                         0,
                     )
                 ]
+                # fso-epilogue: the same tile of the coordinate fragment.
+                fso_tile = None
+                if cutlass.const_expr(self.fso_epi):
+                    fso_tile = self._fso_epi_tile(
+                        fso_epi, (mma_tile_coord_mnl[0], mma_tile_coord_mnl[1], 0)
+                    )
 
                 if cutlass.const_expr(self.overlapping_accum):
                     acc_stage_index = acc_consumer_state.phase
@@ -1411,124 +1479,135 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                 # Store accumulator to global memory in sub-tiles
                 #
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+                peer_count = self.split_k_slices - 1
+                values_per_thread = self.reduce_values_per_thread
+                values_per_peer = self.num_epilogue_threads * values_per_thread
+                epilog_threads = 32 * len(self.epilog_warp_id)
 
-                for subtile_idx in cutlass.range(subtile_cnt):
-                    real_subtile_idx = subtile_idx
-                    if cutlass.const_expr(self.overlapping_accum):
-                        if reverse_subtile:
-                            real_subtile_idx = (
-                                self.cta_tile_shape_mnk[1] // self.epi_tile_n
-                                - 1
-                                - subtile_idx
-                            )
-                    #
-                    # Load accumulator from tensor memory buffer to register
-                    #
-                    tTR_tAcc_mn = tTR_tAcc[(None, None, None, real_subtile_idx)]
-                    cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+                # fso-p5: the push-first walk. Phase 0 loads every subtile this CTA does NOT own from TMEM and pushes
+                # it into its owner's mailbox; phase 1 then waits for, sums, finishes and stores the subtiles it
+                # owns. In the stock single pass an owner's wait for subtile i sat behind its own add + store of
+                # subtile i - S, and its peers' pushes of later subtiles behind theirs; with several subtiles per
+                # tile (token tile 64 / 128) that serialised the cluster. The sum is the same in both walks: the
+                # owner's own slice, then the peers in rank order, in fp32, before the one conversion.
+                for epi_phase in cutlass.range_constexpr(2):
+                    for subtile_idx in cutlass.range(subtile_cnt):
+                        real_subtile_idx = subtile_idx
+                        owner_rank = cutlass.Int32(real_subtile_idx % self.split_k_slices)
+                        # fso-p5: the compact mailbox slot (the owned subtile's ordinal) and its barrier.
+                        owned_ordinal = cutlass.Int32(real_subtile_idx // self.split_k_slices)
+                        subtile_mailbox_base = owned_ordinal * peer_count * values_per_peer
+                        reduce_mbar_ptr = reduce_full_mbar_ptr + real_subtile_idx
+                        is_owner = cta_rank_in_cluster == owner_rank
+                        take_subtile = is_owner
+                        if cutlass.const_expr(epi_phase == 0):
+                            take_subtile = cta_rank_in_cluster != owner_rank
+                        if take_subtile:
+                            #
+                            # Load accumulator from tensor memory buffer to register
+                            #
+                            tTR_tAcc_mn = tTR_tAcc[(None, None, None, real_subtile_idx)]
+                            cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+                            # Retile the FP32 accumulator fragment into the same register
+                            # order used by the existing shared-memory epilogue.
+                            tRS_rAcc = tiled_copy_r2s.retile(tTR_rAcc)
 
-                    #
-                    # Async arrive accumulator buffer empty earlier when overlapping_accum is enabled
-                    #
-                    if cutlass.const_expr(self.overlapping_accum):
-                        if subtile_idx == self.iter_acc_early_release_in_epilogue:
-                            # Fence for TMEM load
-                            cute.arch.fence_view_async_tmem_load()
-                            with cute.arch.elect_one():
-                                acc_pipeline.consumer_release(acc_consumer_state)
-                            acc_consumer_state.advance()
-                    # Retile the FP32 accumulator fragment into the same register
-                    # order used by the existing shared-memory epilogue.
-                    tRS_rAcc = tiled_copy_r2s.retile(tTR_rAcc)
-                    owner_rank = cutlass.Int32(real_subtile_idx % self.split_k_slices)
-                    peer_count = self.split_k_slices - 1
-                    values_per_thread = self.reduce_values_per_thread
-                    values_per_peer = self.num_epilogue_threads * values_per_thread
-                    subtile_mailbox_base = (
-                        real_subtile_idx * peer_count * values_per_peer
-                    )
-                    reduce_mbar_ptr = reduce_full_mbar_ptr + real_subtile_idx
+                            if cutlass.const_expr(epi_phase == 0):
+                                # A peer: push the fp32 fragment into the owner's mailbox.
+                                peer_slot = cta_rank_in_cluster
+                                if cta_rank_in_cluster > owner_rank:
+                                    peer_slot = cta_rank_in_cluster - cutlass.Int32(1)
+                                remote_peer_base = subtile_mailbox_base + peer_slot * values_per_peer
+                                for value_idx in cutlass.range_constexpr(
+                                    0, values_per_thread, 4
+                                ):
+                                    # fso-p5: the chunk-interleaved mailbox. 16-byte chunk c of thread t sits at
+                                    # c * (threads * 4) + t * 4 floats, so a warp's 32 chunks c are 512 contiguous
+                                    # bytes. The stock layout (thread t's values contiguous, t * values_per_thread)
+                                    # put a warp's 32 lanes 128 B apart, i.e. in one bank group: every remote
+                                    # st.async and every owner LDS.128 was a 16-32-way bank conflict.
+                                    remote_off = (
+                                        remote_peer_base
+                                        + (value_idx // 4) * (self.num_epilogue_threads * 4)
+                                        + epi_tidx * 4
+                                    )
+                                    _store_shared_remote_v4(
+                                        tRS_rAcc[value_idx],
+                                        tRS_rAcc[value_idx + 1],
+                                        tRS_rAcc[value_idx + 2],
+                                        tRS_rAcc[value_idx + 3],
+                                        reduce_mailbox.iterator + remote_off,
+                                        reduce_mbar_ptr,
+                                        owner_rank,
+                                    )
+                            else:
+                                # The owner: wait for the peers' fragments, add them in rank order.
+                                if warp_idx == self.epilog_warp_id[0]:
+                                    with cute.arch.elect_one():
+                                        cute.arch.mbarrier_arrive_and_expect_tx(
+                                            reduce_mbar_ptr,
+                                            peer_count
+                                            * (cute.size(epi_tile[0]) * cute.size(epi_tile[1]))
+                                            * 4,
+                                        )
+                                cute.arch.mbarrier_wait(reduce_mbar_ptr, phase=0)
 
-                    if cta_rank_in_cluster != owner_rank:
-                        peer_slot = cta_rank_in_cluster
-                        if cta_rank_in_cluster > owner_rank:
-                            peer_slot = cta_rank_in_cluster - cutlass.Int32(1)
-                        remote_thread_base = (
-                            subtile_mailbox_base
-                            + peer_slot * values_per_peer
-                            + epi_tidx * values_per_thread
-                        )
-                        for value_idx in cutlass.range_constexpr(
-                            0, values_per_thread, 4
-                        ):
-                            _store_shared_remote_v4(
-                                tRS_rAcc[value_idx],
-                                tRS_rAcc[value_idx + 1],
-                                tRS_rAcc[value_idx + 2],
-                                tRS_rAcc[value_idx + 3],
-                                reduce_mailbox.iterator
-                                + remote_thread_base
-                                + value_idx,
-                                reduce_mbar_ptr,
-                                owner_rank,
-                            )
-                    else:
-                        if warp_idx == self.epilog_warp_id[0]:
-                            with cute.arch.elect_one():
-                                cute.arch.mbarrier_arrive_and_expect_tx(
-                                    reduce_mbar_ptr,
-                                    peer_count
-                                    * (cute.size(epi_tile[0]) * cute.size(epi_tile[1]))
-                                    * 4,
+                                for peer_slot in cutlass.range_constexpr(peer_count):
+                                    peer_base = subtile_mailbox_base + peer_slot * values_per_peer
+                                    for value_idx in cutlass.range_constexpr(values_per_thread):
+                                        mailbox_idx = (  # fso-p5: the chunk-interleaved layout, as pushed
+                                            peer_base
+                                            + (value_idx // 4) * (self.num_epilogue_threads * 4)
+                                            + epi_tidx * 4
+                                            + (value_idx % 4)
+                                        )
+                                        tRS_rAcc[value_idx] = (
+                                            tRS_rAcc[value_idx] + reduce_mailbox[mailbox_idx]
+                                        )
+
+                                if cutlass.const_expr(self.fso_epi):
+                                    # fso-epilogue: bias / GELU / residual in fp32 on the summed accumulator, one
+                                    # bf16 rounding; only the owner applies it, so a term is never added per K slice.
+                                    acc_vec = self._fso_epi_apply(
+                                        fso_epi, fso_tile, real_subtile_idx, tTR_rAcc, alpha_value, epilogue_op,
+                                        fso_bias, fso_res,
+                                    )
+                                else:
+                                    # Apply alpha and cast only after the FP32 cluster sum.
+                                    acc_vec = tRS_rAcc.load()
+                                    acc_vec = epilogue_op((alpha_value * acc_vec).to(self.c_dtype))
+                                tRS_rC.store(acc_vec)
+
+                                # fso-p5: the staging buffer follows the owned ordinal, so an owner's consecutive
+                                # stores alternate buffers whatever the split (subtile_idx % stages would hand an
+                                # owner of subtiles 0, 2 of a 2-stage ring the same buffer twice in a row).
+                                c_buffer = owned_ordinal % self.num_c_stage
+                                cute.copy(
+                                    tiled_copy_r2s,
+                                    tRS_rC,
+                                    tRS_sC[(None, None, None, c_buffer)],
                                 )
-                        cute.arch.mbarrier_wait(reduce_mbar_ptr, phase=0)
-
-                        local_thread_base = (
-                            subtile_mailbox_base + epi_tidx * values_per_thread
-                        )
-                        for peer_slot in cutlass.range_constexpr(peer_count):
-                            peer_thread_base = (
-                                local_thread_base + peer_slot * values_per_peer
-                            )
-                            for value_idx in cutlass.range_constexpr(values_per_thread):
-                                tRS_rAcc[value_idx] = (
-                                    tRS_rAcc[value_idx]
-                                    + reduce_mailbox[peer_thread_base + value_idx]
+                                cute.arch.fence_proxy(
+                                    "async.shared",
+                                    space="cta",
+                                )
+                                cute.arch.barrier(
+                                    barrier_id=self.epilog_sync_bar_id,
+                                    number_of_threads=epilog_threads,
                                 )
 
-                        # Apply alpha and cast only after the FP32 cluster sum.
-                        acc_vec = tRS_rAcc.load()
-                        acc_vec = epilogue_op((alpha_value * acc_vec).to(self.c_dtype))
-                        tRS_rC.store(acc_vec)
-
-                        c_buffer = subtile_idx % self.num_c_stage
-                        cute.copy(
-                            tiled_copy_r2s,
-                            tRS_rC,
-                            tRS_sC[(None, None, None, c_buffer)],
-                        )
-                        cute.arch.fence_proxy(
-                            "async.shared",
-                            space="cta",
-                        )
-                        epilog_threads = 32 * len(self.epilog_warp_id)
-                        cute.arch.barrier(
-                            barrier_id=self.epilog_sync_bar_id,
-                            number_of_threads=epilog_threads,
-                        )
-
-                        if warp_idx == self.epilog_warp_id[0]:
-                            cute.copy(
-                                tma_atom_c,
-                                bSG_sC[(None, c_buffer)],
-                                bSG_gC[(None, real_subtile_idx)],
-                            )
-                            c_pipeline.producer_commit()
-                            c_pipeline.producer_acquire()
-                        cute.arch.barrier(
-                            barrier_id=self.epilog_sync_bar_id,
-                            number_of_threads=epilog_threads,
-                        )
+                                if warp_idx == self.epilog_warp_id[0]:
+                                    cute.copy(
+                                        tma_atom_c,
+                                        bSG_sC[(None, c_buffer)],
+                                        bSG_gC[(None, real_subtile_idx)],
+                                    )
+                                    c_pipeline.producer_commit()
+                                    c_pipeline.producer_acquire()
+                                cute.arch.barrier(
+                                    barrier_id=self.epilog_sync_bar_id,
+                                    number_of_threads=epilog_threads,
+                                )
 
                 #
                 # Async arrive accumulator buffer empty

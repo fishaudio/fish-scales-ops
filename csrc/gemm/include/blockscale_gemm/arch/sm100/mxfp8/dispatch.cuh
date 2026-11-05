@@ -14,11 +14,15 @@
 //     Gemm::initialize(), i.e. only on cache miss. CUDA-graph capture is
 //     therefore safe as long as callers warm up eagerly first — the same
 //     contract test_cuda_graph.py enforces for sm_120.
-//   * Workspace: the dense BlockScaled kernel with the default tile
-//     scheduler needs no global workspace on the shapes we serve; if
-//     CUTLASS ever asks for one we grow a thread-local pool OUTSIDE
-//     capture (same contract as Sm120BfPackPool) and abort with a clear
-//     message if a capture-mode call needs more.
+//   * Workspace (issue #12, charter 7.5): the caller provides it. The op
+//     bodies ask gemm_workspace_sm100_mxfp8 for the bytes the cascade's
+//     choice needs (the FP32 partials of the two-kernel split-K; zero for
+//     the plain tiles with the default scheduler), allocate them with the
+//     torch caching allocator on the stream they launch on, and pass them
+//     down (Sm100DenseWorkspace, dense_common.cuh), so no two streams ever
+//     share scratch and a capture takes graph-private memory. Only the
+//     sweep-only Stream-K force codes (ST 7, 8) still use the per-thread
+//     Sm100WorkspacePool below.
 //
 // Cascade status: bring-up heuristic only (C1). The (M, tiles_n) rules
 // below are placeholders pending the b300 tile sweep (FSO_FORCE_TILE grid
@@ -52,8 +56,32 @@
 //   ST=25 → 2SM cluster(2,1) K128, TMA epilogue
 // Instantiated TileN per code (the set the 2026-09-17 sweep needed; adding
 // one costs a full CUTLASS kernel's compile time, so the list is explicit):
-//   ST=20/21: TileN 64, 128, 192      ST=22/23: TileN 64
-//   ST=24/25: TileN 64, 192
+//   ST=20/21: TileN 64, 128, 192, 256     ST=22/23: TileN 64
+//   ST=24: TileN 64, 192, 256             ST=25: TileN 64, 128, 192, 256
+// (TileN 256 on 20 / 21 / 24 and 128 / 256 on 25 were added 2026-10-28,
+// issue #12: they reach tiles the cascade already ships — (128,256) direct-
+// store and TMA, (256,256) direct-store and TMA, (256,128) TMA — so that every
+// configuration the cascade's rules pick can be forced under its own name.)
+//
+// Dense epilogue (bias, erf-GELU, residual; issue #12, common/epilogue.cuh):
+// served on every configuration the cascade's default rules pick (the list in
+// dense_common.cuh) and on the two-kernel split-K (applied once, in the
+// reduce), whether the cascade or FSO_FORCE_TILE chose it. A forced row whose
+// configuration has no dense-epilogue instantiation refuses a non-identity
+// epilogue with fso::DenseEpilogueNotImplemented naming the code, before
+// anything is launched: the Stream-K rows 7 and 8 (in-kernel partial-tile
+// reduction) and the sweep-only tiles of rows 3, 4 (TileN 256), 5, 6, 10, 11,
+// 20 / 24 (TileN 64, 192), 22 and 23. Identity calls are unchanged on every row.
+//
+// Quantized output (fso.dense.linear_quantized, issue #12 S3b; epilogue.out_q /
+// out_scale): the same configurations, through their quantized-output
+// instantiation (launch_sm100_mxfp8_gemm_epi_q: bias and the activation, then
+// RN_bf16, then the activation quantizer of fso/activation_contract.h, the
+// codes as D and the UE8M0 words in the sm_100 contract layout), and the
+// two-kernel split-K through its quantized reduce. It takes no residual; the
+// dispatch refuses out_q with a residual, with a scale layout other than
+// kDenseOutScaleMxSm100, with N % 128 != 0, and on the rows that refuse the
+// bf16 epilogue, before anything is launched.
 //
 // FSO_PRINT_TILE_INFO=1 makes every instantiation print, once, the mainloop
 // stage count StageCountAutoCarveout derived for it and its shared-memory
@@ -72,13 +100,16 @@
 
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 
+#include "blockscale_gemm/common/epilogue.cuh"
 #include "blockscale_gemm/arch/sm100/mxfp8/gemm_types.cuh"
+#include "blockscale_gemm/arch/sm100/mxfp8/dense_common.cuh" // host knobs, workspace, dense-epilogue launchers
 #include "blockscale_gemm/arch/sm120/common/env_overrides.cuh" // FSO_FORCE_TILE parsing (arch-agnostic)
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <unordered_map>
 #include <vector>
 #include <cuda_bf16.h>
@@ -91,51 +122,8 @@ namespace sm100_blockscaled_gemm
 namespace detail
 {
 
-// FSO_FORCE_SWIZZLE: raster swizzle group size for the default (CLC)
-// scheduler — sweep knob for L2 locality on large shapes. 0 = CUTLASS
-// heuristic default. Read once (function-static), same contract as the
-// other FSO_* overrides.
-inline int read_force_swizzle() noexcept
-{
-    static int s_cache = -2;
-    if (s_cache == -2)
-    {
-        char const* env = std::getenv("FSO_FORCE_SWIZZLE");
-        s_cache = (env && *env) ? std::atoi(env) : 0;
-    }
-    return s_cache;
-}
-
-// FSO_PRINT_TILE_INFO: print, once per kernel instantiation, the mainloop
-// stage count the CollectiveBuilder's StageCountAutoCarveout derived and the
-// shared memory the kernel ends up asking for. Host-side, read once, and off
-// unless the variable is set, so it costs one int compare on the hot path.
-inline bool read_print_tile_info() noexcept
-{
-    static int s_cache = -1;
-    if (s_cache < 0)
-    {
-        char const* env = std::getenv("FSO_PRINT_TILE_INFO");
-        s_cache = (env && *env && env[0] != '0') ? 1 : 0;
-    }
-    return s_cache != 0;
-}
-
-// Programmatic dependent launch of the dense CUTLASS GEMMs (2026-10-11). True when the translation unit that
-// includes this header compiled CUTLASS with grid dependency control (FSO_SM100_DENSE_GDC, see
-// mxfp8_sm100_kernel.cu) and PDL is not switched off (FSO_DISABLE_PDL=1, the one global switch). The Stream-K
-// variants (force codes only) keep their plain launch: their workspace initialisation is a separate
-// stream-ordered operation in front of the GEMM.
-#if defined(FSO_SM100_DENSE_GDC)
-inline constexpr bool kDenseGdcCompiled = true;
-#else
-inline constexpr bool kDenseGdcCompiled = false;
-#endif
-
-inline bool dense_gemm_pdl() noexcept
-{
-    return kDenseGdcCompiled && tensorrt_llm::kernels::blockscale_gemm::fso_pdl_enabled();
-}
+// read_force_swizzle, read_force_raster, read_print_tile_info, kDenseGdcCompiled, dense_gemm_pdl and
+// apply_default_scheduler_knobs live in dense_common.cuh (shared with the dense-epilogue translation units).
 
 // Multiprocessor count of the current device, read once. The rule below is
 // written against the count the driver reports rather than the 148 of a whole
@@ -228,7 +216,48 @@ inline int grid_ctas(int M, int N, int cluster_rows, int ctas_per_cluster, int t
 // (per-launch median): the 1-SM 192-wide tile costs 21.38 us on its own but
 // 25.44 us in the block, while the 2-SM 192-wide tile costs 20.90 us on its
 // own and 21.10 us in the block (run b300_head_vs_wt_20260921/R2).
-inline int pick_wave_tile(int M, int N) noexcept
+//
+// Empty-pair guard (issue #12, T1b). Below M = 129 the 2-SM 64-wide pick
+// leaves the second CTA of every pair with A rows 128-255, all of them out
+// of bounds. That CTA still loads its A box, and ncu counts the box among
+// the bytes the crossbar delivers to the SMs (fused q/k/v 3840 x 1280 at
+// M = 78: 25.8 MB of TMA loads on the 2-SM tile against 15.4 MB on the 1-SM
+// tile). When the activation is also smaller than 128 KiB (M * K < 131072
+// bytes of fp8), the 2-SM form runs in a slow mode. On 3840 x 1280 at
+// M = 65-102 it takes 5.05-5.98 us for the identity call and 5.27-6.25 us
+// for the bias call, while the 1-SM 128 x 64 tile takes 4.13-4.33 and
+// 4.06-4.35 us. From M = 103, where the activation reaches 128 KiB, the 2-SM
+// tile takes 3.93-3.96 and 4.14-4.16 us. The edge follows M * K and nothing
+// else: at K = 1536 the slow mode ends at M = 86, at K = 1024 at M = 128,
+// and K = 2048 or 2560 never shows it at M >= 65. Placing the activation at
+// 18 base offsets (M = 78 and 117) did not move the edge on this shape, the
+// values of x did not matter, and the slow mode stays with PDL off and in an
+// isolated ncu launch (8.35-8.45 us at M = 78 against 7.36-7.62 us at
+// M = 103). With fewer clusters the slow mode appears only at some
+// activation addresses: on 2048 x 1280 (64 CTAs) the identity call was slow
+// at 9 and 7 of the 38 M values below 103 in the two passes, six of them in
+// both, and the same M turned fast or slow when only the activation's base
+// offset changed. When both CTAs of the pair hold real rows (128 < M <= 256)
+// a small activation does not slow the 2-SM form (K = 512 and 768: it stays
+// 2.5-4.5 % faster than the 1-SM tile on the identity call). Why 128 KiB
+// is the edge was not established. So below M = 129, with an activation
+// under 128 KiB and K >= 1024, the rule hands the cell the 1-SM 128 x 64
+// tile of the same width: it still owns the cell, with half the CTAs. On the
+// wave-owned short-K shapes N = 2432-4736 at K = 1024-1536 and every M
+// measured below the edge, the 1-SM tile was faster in both passes for the
+// identity, bias, bias + residual and bf16-x bias calls (0.64-0.99 of the
+// 2-SM time, the same output bytes). Above the edge the 2-SM tile keeps the
+// identity call 2-6 % faster, so the guard stops there. Below K = 1024 the
+// guard is not applied: at K = 512 on N = 2432 and 2560 (76 and 80 CTAs) and
+// at K = 768 on N = 2432 at M = 64 / 65 the identity call was up to 3 %
+// slower on the 1-SM tile in at least one pass, although the bias,
+// bias + residual and bf16-x bias calls of the same cells were 1-27 % faster
+// on it. Measured on the B300 with cold weights (run
+// fso_issue12_20261028/runs/T1b, sweep/, ab/ and ncu/).
+inline constexpr long long kWaveEmptyPairMinActBytes = 128 * 1024;
+inline constexpr int kWaveEmptyPairMinK = 1024;
+
+inline int pick_wave_tile(int M, int N, int K) noexcept
 {
     if (M < 64 || M > 1024)
         return 0;
@@ -265,14 +294,95 @@ inline int pick_wave_tile(int M, int N) noexcept
     // the 1-SM 128x64 tile that lost at M = 256.
     if (best_m == 128 && grid_ctas(M, N, 256, 2, best_n) == best_ctas)
         best_m = 256;
+    // Empty-pair guard (see the comment above): below M = 129 with an activation under 128 KiB and K >= 1024 the
+    // 2-SM 64-wide pick becomes the 1-SM 128 x 64 tile. It changes only the tile of a cell the rule already owns.
+    if (best_m == 256 && best_n == 64 && M <= 128 && K >= kWaveEmptyPairMinK
+        && static_cast<long long>(M) * K < kWaveEmptyPairMinActBytes)
+        best_m = 128;
     return best_m * 1000 + best_n;
 }
 
-// Thread-local device workspace of the dense cascade. Its main tenant is the
-// two-kernel parallel split-K of the decode band (launch_sm100_mxfp8_gemm_splitk
-// below), which keeps its FP32 partial sums here; the forced Stream-K variants
-// keep their reduction barriers here, and the plain tiles with the default
-// scheduler ask for nothing.
+// Short-K tile rule (issue #12, T1): the K bound and the M range of pick_short_k_tile. Which of its cells tier 1
+// (cuBLAS scaled_mm) declines, so that their bias calls reach this rule too, is decided in Python
+// (`_sm100_smm.short_k_owns`: N <= 2048, 1024 <= K <= kShortKMaxK, 64 < M <= 256), whose K bound must stay equal.
+inline constexpr int kShortKMaxK = 2560;
+inline constexpr int kShortKMinM = 65;
+inline constexpr int kShortKMaxM = 2048;
+
+// N-tile and SM count of a short-K GEMM (K <= kShortKMaxK, 65 <= M <= kShortKMaxM), chosen by wave arithmetic over
+// the TileK 128 tiles with a TMA epilogue. Returns TileM * 1000 + TileN, or 0 when no tile of the rule fits one wave
+// (the cell then falls through to pick_wave_tile and the band rules below, unchanged). `fused` is true when the call
+// carries an activation or writes the quantized output (linear_quantized).
+//
+// Why short K needs its own rule. At K = 1280 a CTA's mainloop is 10 TileK-128 blocks, and the 128 x 64 and 2-SM
+// 256 x 64 tiles stage 8 and 9 of them (FSO_PRINT_TILE_INFO), so the whole K is in flight after the prologue: a CTA's
+// time is one pipeline fill, ten MMA blocks and one epilogue, and since each CTA owns one tile its epilogue is fully
+// exposed. Two things therefore set the kernel time: how many SMs share the output, and how many outputs each CTA's
+// epilogue processes (the erf-GELU epilogue costs about 0.8 us over the bias epilogue on 64-wide tiles, 1.6 us on
+// 128-wide and 3.3 us on 256-wide, at any M while the grid is one wave). The band rules below were measured on long-K
+// shapes and send these cells to the 2-SM 256 x 128 tile with TileK 256, whose 4 stages of 5 blocks start the first
+// MMA only after a 256-deep stage lands, and which puts at most 32 CTAs on 148 SMs at N <= 2048 and M <= 256 (half of
+// them on out-of-bounds rows at M <= 128). Measured on the B300
+// with cold weights (run fso_issue12_20261028/runs/T1: every tile of the dense-epilogue lists forced, both entry
+// paths, two passes, and fine-M probes):
+//   * 64-wide while the 1-SM 128 x 64 grid fits one wave. 1280 x 1280 at M = 65-768 and 2048 x 1280 at M = 65-364:
+//     bias + erf-GELU 4.6-4.8 us, bias + residual 4.1-4.35 us and linear_quantized(bias + erf-GELU) 4.9-5.1 us on the
+//     1-SM 128 x 64 tile, against 6.7-6.8, 5.9-6.0 and 7.4-7.55 us on the 256 x 128 TileK 256 tile. A call with an
+//     activation or the quantized output takes the 1-SM tile always (the 2-SM 256 x 64 form was 1-23 % slower at
+//     every M measured). Any other call keeps pick_wave_tile's 64-wide pick where that rule owns the cell, and
+//     elsewhere takes the 2-SM 256 x 64 form only while both CTAs of its one cluster row hold real rows
+//     (128 < M <= 256): there it halves each CTA's share of the weight (identity 3.75-3.82 against 3.94-4.05 us on the
+//     1-SM tile, bias 1-2 % faster; 1280 x 1280, 2048 x 1280 and 2048 x 2048 at ten M from 129 to 250). At M <= 128
+//     the second CTA of each pair holds only out-of-bounds rows and the 2-SM form is erratic on narrow N (2048 x 1280:
+//     4.6 us at M = 65 / 66 and 4.5 at M = 80 against 3.8 at M = 72 / 78 / 96; the 1-SM tile 3.9-4.0 us at all of
+//     them), so the rule does not use it there (pick_wave_tile's empty-pair guard explains the erratic cells: an
+//     activation under 128 KiB, and the same guard covers the cells the wave rule owns); above M = 256 its grid adds
+//     an empty CTA row whenever ceil(M / 128) is odd.
+//   * otherwise 128-wide while a TileK 128 tile fits one wave: the 2-SM 256 x 128 form when its grid fits (it streams
+//     the weight once per 256 rows), else the 1-SM 128 x 128. 5120 x 1280 at M = 144-256 with bias + erf-GELU: 2-SM
+//     256 x 128 TileK 128 (80 CTAs) 6.6 against 7.2 us on the TileK 256 form of the same tile; at M = 364 the 1-SM
+//     128 x 128 (120 CTAs, one wave) 7.0 against 10.4 us on the TileK 256 tile, whose 160 CTAs run two waves;
+//     1280 x 1280 at M = 1079-1792 and 2048 x 1280 at M = 533-768: 2-SM 256 x 128 TileK 128 6.4-6.65 against
+//     6.85-7.1 us; 2048 x 1280 at M = 1079: 1-SM 128 x 128 (144 CTAs) 6.9 against 10.15 us; 1024 x 2048 (Family C
+//     shared.gate_up) at M = 1280-2048: 2-SM 256 x 128 TileK 128 7.4 against 7.85-7.9 us, and bias + residual 6.3-6.5
+//     against 7.3-7.4 us. kShortKMaxM caps the rule at that last measured row (on 1024 x 2048 the 2-SM tile would
+//     still fit one wave up to M = 2304, unmeasured; 1280 x 1280 already falls through at M = 1920).
+//   * otherwise 0. Where only a 192-wide tile fits one wave (5120 x 1280 at M = 533, the Family A / B / C wide-N
+//     projections at M = 256-1024) pick_wave_tile's pick was the fastest measured. Where nothing fits one wave the
+//     TileK 128 alternatives on 5120 x 1280 (M = 768-2048) ranged from 6 % faster to 2 % slower than the band rules'
+//     TileK 256 tile, cell by cell and epilogue by epilogue, and on 2048 x 1280 the 64-wide tiles in two waves were
+//     10 % faster at M = 1280 / 1536 but 7 % slower at M = 2048: that multi-wave regime keeps the band rules.
+inline int pick_short_k_tile(int M, int N, int K, bool fused) noexcept
+{
+    if (K > kShortKMaxK || M < kShortKMinM || M > kShortKMaxM)
+        return 0;
+    int const sms = sm_count();
+    if (grid_ctas(M, N, 128, 1, 64) <= sms)
+    {
+        if (!fused)
+        {
+            int const wave = pick_wave_tile(M, N, K); // a 64-wide pick wherever it owns the cell (see the comment above)
+            if (wave != 0)
+                return wave;
+            if (M > 128 && M <= 256 && grid_ctas(M, N, 256, 2, 64) <= sms)
+                return 256 * 1000 + 64;
+        }
+        return 128 * 1000 + 64;
+    }
+    if (grid_ctas(M, N, 256, 2, 128) <= sms)
+        return 256 * 1000 + 128;
+    if (grid_ctas(M, N, 128, 1, 128) <= sms)
+        return 128 * 1000 + 128;
+    return 0;
+}
+
+// Thread-local device workspace of the forced Stream-K variants (FSO_FORCE_TILE
+// codes 7 and 8, sweep-only), which keep their reduction barriers here. Until
+// 2026-10-28 it also held the FP32 partial sums of the two-kernel parallel
+// split-K; those now come from the caller (Sm100DenseWorkspace, the torch
+// caching allocator on the caller's stream: issue #12, charter 7.5), because a
+// per-thread buffer is shared by every stream and every graph that thread
+// launches. The plain tiles with the default scheduler ask for nothing.
 //
 // A captured CUDA graph keeps the buffer address it saw at capture time, so the
 // pool never frees a buffer. When an eager call needs more than the pool holds,
@@ -354,10 +464,17 @@ struct Sm100WorkspacePool
 //     capture is safe: to_underlying_arguments is host-only work, and
 //     GemmUniversalAdapter's *static* run(params, stream) issues nothing
 //     but the (cluster-)launch itself.
+//
+// Workspace: whatever CUTLASS asks for comes from `workspace` (caller-provided,
+// see Sm100DenseWorkspace; zero bytes with the default scheduler), except for
+// the Stream-K variants, which keep the per-thread Sm100WorkspacePool. With
+// `workspace_query` non-null nothing is launched and *workspace_query receives
+// the bytes of `workspace` the call needs.
 template <int TileM, int TileN, int ClusterM, int ClusterN, int TileK = 128, bool UseStreamK = false,
     bool NoSmemEpi = false>
 cudaError_t launch_sm100_mxfp8_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bfloat16* mat_d,
-    int32_t* scales_a, int32_t* scales_b, int M, int N, int K, cudaStream_t stream, int swizzle = 0)
+    int32_t* scales_a, int32_t* scales_b, int M, int N, int K, cudaStream_t stream, int swizzle,
+    Sm100DenseWorkspace const& workspace, std::size_t* workspace_query)
 {
     using Config = Sm100MxFP8GemmConfig<TileM, TileN, ClusterM, ClusterN, TileK, UseStreamK, NoSmemEpi>;
     using Gemm = typename Config::Gemm;
@@ -365,7 +482,7 @@ cudaError_t launch_sm100_mxfp8_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, 
     using Args = typename Gemm::Arguments;
     using Params = typename Gemm::Params;
 
-    if (detail::read_print_tile_info())
+    if (workspace_query == nullptr && detail::read_print_tile_info())
     {
         static bool s_info_printed = false;
         if (!s_info_printed)
@@ -435,32 +552,34 @@ cudaError_t launch_sm100_mxfp8_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, 
     }
     else
     {
-        // Cascade-provided value; FSO_FORCE_SWIZZLE overrides for sweeps.
-        int const sw = detail::read_force_swizzle();
-        int const eff = sw > 0 ? sw : swizzle;
-        if (eff > 0)
-            args.scheduler.max_swizzle_size = eff;
-        // FSO_FORCE_RASTER: 1 = AlongM, 2 = AlongN (default Heuristic).
-        // Probe knob (2026-07-06): nvjet picks h_bz (horizontal raster) for
-        // the narrow-N down-class at mid/large M where we lose ~17%.
-        // PROBED NEUTRAL (raster_probe.txt): ±2% noise on every mid/large-M
-        // cell; gate_up AlongN −5%. The CLC Heuristic already picks right —
-        // do not wire into the cascade.
-        static int const s_raster = []() {
-            char const* e = std::getenv("FSO_FORCE_RASTER");
-            return (e && *e) ? std::atoi(e) : 0;
-        }();
-        using cutlass::gemm::kernel::detail::RasterOrderOptions;
-        if (s_raster == 1)
-            args.scheduler.raster_order = RasterOrderOptions::AlongM;
-        else if (s_raster == 2)
-            args.scheduler.raster_order = RasterOrderOptions::AlongN;
+        // Cascade-provided swizzle; FSO_FORCE_SWIZZLE overrides it and
+        // FSO_FORCE_RASTER sets the raster order (probe knobs, dense_common.cuh).
+        detail::apply_default_scheduler_knobs(args.scheduler, swizzle);
+    }
+
+    // Workspace of the non-Stream-K variants: sized here, provided by the caller. The Stream-K variants use the
+    // per-thread pool instead and ask the caller for nothing.
+    std::size_t caller_ws_bytes = 0;
+    void* caller_ws = nullptr;
+    if constexpr (!UseStreamK)
+        caller_ws_bytes = Gemm::get_workspace_size(args);
+    if (workspace_query != nullptr)
+    {
+        *workspace_query = caller_ws_bytes;
+        return cudaSuccess;
+    }
+    if constexpr (!UseStreamK)
+    {
+        if (caller_ws_bytes > workspace.bytes)
+            return cudaErrorInvalidValue; // the op body sized `workspace` with the query above
+        if (caller_ws_bytes > 0)
+            caller_ws = workspace.ptr;
     }
 
     // E9-style cache: key on everything the initialized Params bake in.
     struct CacheKey
     {
-        void const* p[5];
+        void const* p[6];
         int dims[4];  // M, N, K, swizzle
         bool operator==(CacheKey const& o) const { return std::memcmp(this, &o, sizeof(o)) == 0; }
     };
@@ -478,6 +597,7 @@ cudaError_t launch_sm100_mxfp8_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, 
     CacheKey key;
     std::memset(&key, 0, sizeof(key));
     key.p[0] = ptr_A; key.p[1] = ptr_B; key.p[2] = ptr_SFA; key.p[3] = ptr_SFB; key.p[4] = ptr_D;
+    key.p[5] = caller_ws; // baked into the Params when CUTLASS asks for a workspace (never with the default scheduler)
     key.dims[0] = M; key.dims[1] = N; key.dims[2] = K; key.dims[3] = swizzle;
 
     Params kernel_params;
@@ -505,11 +625,15 @@ cudaError_t launch_sm100_mxfp8_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, 
     {
         if (Gemm::can_implement(args) != cutlass::Status::kSuccess)
             return cudaErrorInvalidValue;
-        std::size_t const ws_bytes = Gemm::get_workspace_size(args);
-        void* ws = nullptr;
-        cudaError_t const ws_err = detail::Sm100WorkspacePool::instance().ensure(ws_bytes, stream, &ws);
-        if (ws_err != cudaSuccess)
-            return ws_err;
+        std::size_t ws_bytes = caller_ws_bytes;
+        void* ws = caller_ws;
+        if constexpr (UseStreamK)
+        {
+            ws_bytes = Gemm::get_workspace_size(args);
+            cudaError_t const ws_err = detail::Sm100WorkspacePool::instance().ensure(ws_bytes, stream, &ws);
+            if (ws_err != cudaSuccess)
+                return ws_err;
+        }
         if (ws_bytes > 0)
         {
             // Stream-ordered workspace init (capture-legal; a captured init
@@ -602,18 +726,7 @@ cudaError_t launch_sm100_mxfp8_gemm(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, 
 //
 // FSO_DISABLE_PDL=1 restores the plain serialised launch (the same variable
 // the sm_120 MoE chain reads, so one knob disables PDL everywhere).
-__device__ __forceinline__ void sm100_pdl_wait(bool pdl)
-{
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-    if (pdl)
-        cudaGridDependencySynchronize();
-#else
-    // griddepcontrol needs sm_90 or newer. This header only compiles under
-    // CUTLASS_ARCH_MMA_SM100_SUPPORTED so the branch is unreachable today; it
-    // keeps the file compilable if that guard is ever widened to an older arch.
-    (void) pdl;
-#endif
-}
+// sm100_pdl_wait (the grid-dependency wait both reduce kernels start with) is defined in dense_common.cuh.
 
 static __global__ void sm100_mxfp8_splitk_reduce_kernel(
     float4 const* __restrict__ partials, ushort4* __restrict__ out, int splits, long mn4, bool pdl)
@@ -644,6 +757,11 @@ static __global__ void sm100_mxfp8_splitk_reduce_kernel(
     }
 }
 
+// The reduce that applies the dense epilogue (sm100_mxfp8_splitk_reduce_epi_kernel) is defined in its own translation
+// unit, ops/mxfp8_sm100_splitk_epi_kernel.cu, and reached through launch_sm100_mxfp8_splitk_reduce_epi
+// (dense_common.cuh). It is deliberately not in this header: this header's device code is the identity kernels'
+// cubin, and the driver's load-time finalisation of a kernel depends on that cubin's layout (issue #12, R1).
+
 namespace detail
 {
 
@@ -673,9 +791,18 @@ inline int pick_splits(int tiles, int kblks) noexcept
 
 // Batched-slice GEMM into FP32 partials + reduce. Caller guarantees
 // K % 128 == 0 and (K/128) % splits == 0 (pick_splits does).
+//
+// `epilogue` (issue #12): applied once, by the reduce, to the sum of the
+// partials; the batched GEMM is the identity-epilogue FP32-partials kernel in
+// every case. `workspace` holds the partials (and whatever CUTLASS asks for,
+// zero with the default scheduler): it is the caller's, allocated per call with
+// the torch caching allocator on `stream` (charter 7.5), so two streams or two
+// graphs never share it. With `workspace_query` non-null nothing is launched
+// and *workspace_query receives the bytes the call needs.
 template <int TileM, int TileN>
 cudaError_t launch_sm100_mxfp8_gemm_splitk(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bfloat16* mat_d,
-    int32_t* scales_a, int32_t* scales_b, int M, int N, int K, int splits, cudaStream_t stream)
+    int32_t* scales_a, int32_t* scales_b, int M, int N, int K, int splits, cudaStream_t stream,
+    fso::DenseEpilogue const& epilogue, Sm100DenseWorkspace const& workspace, std::size_t* workspace_query)
 {
     // NoSmemEpi: decode band, partial stores are a sliver (see the M ≤ 32
     // NOSMEM rationale in the cascade). ElementD float → FP32 partials.
@@ -685,7 +812,7 @@ cudaError_t launch_sm100_mxfp8_gemm_splitk(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* 
     using Args = typename Gemm::Arguments;
     using Params = typename Gemm::Params;
 
-    if (detail::read_print_tile_info())
+    if (workspace_query == nullptr && detail::read_print_tile_info())
     {
         static bool s_info_printed = false;
         if (!s_info_printed)
@@ -738,7 +865,12 @@ cudaError_t launch_sm100_mxfp8_gemm_splitk(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* 
     typename Config::LayoutSFB layout_SFB
         = fix_sf(Config::Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(problem));
 
-    // Params cache (E9 discipline; ws ptr participates via ptr_D).
+    // Params cache (E9 discipline). The partials pointer is NOT part of the key:
+    // the batched GEMM's direct-store epilogue holds ptr_D as a plain pointer in
+    // its Params (no TMA descriptor), so a cached entry is reused with ptr_D
+    // patched to this call's workspace. The caller's caching allocator may hand
+    // out a different block on every call, which would otherwise rebuild the
+    // Params (TMA descriptors of A, B, SFA, SFB) each time.
     struct CacheKey
     {
         void const* p[5];
@@ -757,33 +889,46 @@ cudaError_t launch_sm100_mxfp8_gemm_splitk(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* 
     };
     static thread_local std::unordered_map<CacheKey, Params, CacheHash> s_params_cache;
 
-    // The pool ptr changes only when the pool grows, which ensure() refuses
-    // inside a capture; the ptr is part of the key, so a grown pool gets fresh
-    // Params, and the retired buffer stays allocated for any graph captured
-    // against it.
     Args args{cutlass::gemm::GemmUniversalMode::kGemm, problem,
         {ptr_A, stride_A, ptr_B, stride_B, ptr_SFA, layout_SFA, ptr_SFB, layout_SFB},
         {{1.0f, 0.0f}, nullptr, stride_D, nullptr /* ptr_D patched below */, stride_D}};
 
     std::size_t const ws_bytes = Gemm::get_workspace_size(args);
-    void* base = nullptr;
-    cudaError_t const ws_err
-        = detail::Sm100WorkspacePool::instance().ensure(partial_bytes + ws_bytes, stream, &base);
-    if (ws_err != cudaSuccess)
-        return ws_err;
-    float* partials = static_cast<float*>(base);
-    void* cutlass_ws = static_cast<char*>(base) + partial_bytes;
+    if (workspace_query != nullptr)
+    {
+        *workspace_query = partial_bytes + ws_bytes;
+        return cudaSuccess;
+    }
+    if (workspace.ptr == nullptr || workspace.bytes < partial_bytes + ws_bytes)
+        return cudaErrorInvalidValue; // the op body sized `workspace` with the query above
+    float* partials = static_cast<float*>(workspace.ptr);
+    void* cutlass_ws = static_cast<char*>(workspace.ptr) + partial_bytes;
     args.epilogue.ptr_D = partials;
+
+    if (detail::read_print_tile_info())
+    {
+        // The workspace a capture bakes in, so that a test can tell two captured calls' workspaces apart.
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &cap) != cudaSuccess)
+            (void) cudaGetLastError(); // the query's own error only
+        else if (cap != cudaStreamCaptureStatusNone)
+            std::fprintf(stderr, "[fso sm100 splitk] captured on stream %p: workspace %p (%zu bytes)\n",
+                static_cast<void*>(stream), workspace.ptr, partial_bytes + ws_bytes);
+    }
 
     CacheKey key;
     std::memset(&key, 0, sizeof(key));
-    key.p[0] = ptr_A; key.p[1] = ptr_B; key.p[2] = ptr_SFA; key.p[3] = ptr_SFB; key.p[4] = partials;
+    key.p[0] = ptr_A; key.p[1] = ptr_B; key.p[2] = ptr_SFA; key.p[3] = ptr_SFB;
+    key.p[4] = ws_bytes > 0 ? cutlass_ws : nullptr; // a CUTLASS workspace would be baked into the Params
     key.dims[0] = M; key.dims[1] = N; key.dims[2] = K; key.dims[3] = splits;
 
     Params kernel_params;
     auto it = s_params_cache.find(key);
     if (it != s_params_cache.end())
+    {
         kernel_params = it->second;
+        kernel_params.epilogue.ptr_D = partials;
+    }
     else
     {
         // NOTE: Gemm::can_implement is intentionally SKIPPED. The mainloop's
@@ -827,59 +972,202 @@ cudaError_t launch_sm100_mxfp8_gemm_splitk(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* 
     int const blocks = static_cast<int>((mn4 + threads - 1) / threads) < 1024
         ? static_cast<int>((mn4 + threads - 1) / threads)
         : 1024;
-    // PDL on the reduce only (see the comment above the reduce kernel): the
-    // GEMM keeps its ordinary launch, the reduce becomes its programmatic
-    // dependent and waits on the implicit end-of-kernel trigger.
+    // PDL on the reduce (see the comment above the reduce kernel): it becomes
+    // the GEMM's programmatic dependent and waits for the GEMM's completion
+    // before it reads a partial, a bias or a residual.
     bool const pdl = tensorrt_llm::kernels::blockscale_gemm::fso_pdl_enabled();
-    if (pdl)
+    cudaLaunchConfig_t cfg{};
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.gridDim = dim3(blocks);
+    cfg.blockDim = dim3(threads);
+    cfg.dynamicSmemBytes = 0;
+    cfg.stream = stream;
+    cfg.attrs = attrs;
+    cfg.numAttrs = 1;
+    if (epilogue.is_identity())
     {
-        cudaLaunchConfig_t cfg{};
-        cudaLaunchAttribute attrs[1];
-        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = 1;
-        cfg.gridDim = dim3(blocks);
-        cfg.blockDim = dim3(threads);
-        cfg.dynamicSmemBytes = 0;
-        cfg.stream = stream;
-        cfg.attrs = attrs;
-        cfg.numAttrs = 1;
-        cudaLaunchKernelEx(&cfg, sm100_mxfp8_splitk_reduce_kernel,
-            reinterpret_cast<float4 const*>(partials), reinterpret_cast<ushort4*>(mat_d), splits, mn4, true);
+        if (pdl)
+        {
+            cudaLaunchKernelEx(&cfg, sm100_mxfp8_splitk_reduce_kernel,
+                reinterpret_cast<float4 const*>(partials), reinterpret_cast<ushort4*>(mat_d), splits, mn4, true);
+        }
+        else
+        {
+            sm100_mxfp8_splitk_reduce_kernel<<<blocks, threads, 0, stream>>>(
+                reinterpret_cast<float4 const*>(partials), reinterpret_cast<ushort4*>(mat_d), splits, mn4, false);
+        }
+        return cudaGetLastError();
     }
-    else
-    {
-        sm100_mxfp8_splitk_reduce_kernel<<<blocks, threads, 0, stream>>>(
-            reinterpret_cast<float4 const*>(partials), reinterpret_cast<ushort4*>(mat_d), splits, mn4, false);
-    }
-    return cudaGetLastError();
+    // The quantized output (linear_quantized): the third reduce, defined in ops/mxfp8_sm100_epi_quant_kernel_nosmem.cu
+    // (declared in dense_common.cuh), with the same PDL discipline as the other two.
+    if (epilogue.out_q != nullptr)
+        return launch_sm100_mxfp8_splitk_reduce_q(partials, splits, M, N, stream, epilogue, pdl);
+    // The dense-epilogue reduce lives in its own translation unit (see the note above pick_splits).
+    return launch_sm100_mxfp8_splitk_reduce_epi(partials, mat_d, splits, mn4, N / 4, epilogue.bias, epilogue.act,
+        epilogue.residual, static_cast<long>(epilogue.ld_residual), pdl, blocks, threads, stream);
 }
 
-// Top-level sm_100/sm_103 MXFP8 dispatcher.
-//
-// Bring-up cascade (C1, placeholder — retune on b300 hardware):
+namespace detail
+{
+
+// One call of the dense cascade: its operands, its epilogue, its workspace, and whether it only asks for the
+// workspace size (query != nullptr: every launcher writes the bytes it needs there and launches nothing). The
+// cascade below makes its choice once, through run / pick / splitk, so the size the op body allocates is the size
+// the launch then uses.
+struct Sm100DenseCall
+{
+    __nv_fp8_e4m3* a;
+    __nv_fp8_e4m3* b;
+    __nv_bfloat16* d;
+    int32_t* sfa;
+    int32_t* sfb;
+    int M, N, K;
+    cudaStream_t stream;
+    fso::DenseEpilogue const& epilogue;
+    Sm100DenseWorkspace workspace;
+    std::size_t* query;
+    // The FSO_FORCE_TILE row being served (st = 0 on the cascade's own picks), for refusal messages.
+    int forced_tm = 0, forced_tn = 0, forced_st = 0;
+
+    // A forced row or a cascade pick: the identity kernel for an identity epilogue, the quantized-output kernel of
+    // the same configuration when the epilogue writes the quantized form (linear_quantized; `d` is unused then),
+    // the dense-epilogue kernel otherwise, and a refusal (before anything is launched) for a configuration that
+    // has none.
+    template <int TM, int TN, int CM, int CN, int TK, bool SK, bool NS>
+    cudaError_t run(int swizzle)
+    {
+        if (epilogue.is_identity())
+            return launch_sm100_mxfp8_gemm<TM, TN, CM, CN, TK, SK, NS>(
+                a, b, d, sfa, sfb, M, N, K, stream, swizzle, workspace, query);
+        if constexpr (!SK && Sm100DenseEpiInstantiated<TM, TN, CM, CN, TK, NS>::value)
+        {
+            if (epilogue.out_q != nullptr)
+                return launch_sm100_mxfp8_gemm_epi_q<TM, TN, CM, CN, TK, NS>(
+                    a, b, sfa, sfb, M, N, K, stream, epilogue, workspace, swizzle, query);
+            if (epilogue.residual != nullptr)
+                return launch_sm100_mxfp8_gemm_epi<TM, TN, CM, CN, TK, NS, true>(
+                    a, b, d, sfa, sfb, M, N, K, stream, epilogue, workspace, swizzle, query);
+            return launch_sm100_mxfp8_gemm_epi<TM, TN, CM, CN, TK, NS, false>(
+                a, b, d, sfa, sfb, M, N, K, stream, epilogue, workspace, swizzle, query);
+        }
+        else
+        {
+            refuse(TM, TN, CM, CN, TK, SK, NS);
+            return cudaErrorNotSupported;
+        }
+    }
+
+    // A pick of the cascade's own rules: it must have a dense-epilogue instantiation (checked at compile time, so
+    // a rule added without one fails the build instead of refusing at run time).
+    template <int TM, int TN, int CM, int CN, int TK, bool SK, bool NS>
+    cudaError_t pick(int swizzle)
+    {
+        static_assert(!SK && Sm100DenseEpiInstantiated<TM, TN, CM, CN, TK, NS>::value,
+            "every configuration the sm_100 dense cascade's rules pick needs a dense-epilogue instantiation "
+            "(FSO_SM100_DENSE_EPI_CONFIGS_* in dense_common.cuh)");
+        return run<TM, TN, CM, CN, TK, SK, NS>(swizzle);
+    }
+
+    template <int TM, int TN>
+    cudaError_t splitk(int splits)
+    {
+        return launch_sm100_mxfp8_gemm_splitk<TM, TN>(
+            a, b, d, sfa, sfb, M, N, K, splits, stream, epilogue, workspace, query);
+    }
+
+    [[noreturn]] void refuse(int tm, int tn, int cm, int cn, int tk, bool sk, bool ns) const
+    {
+        char cfg[160];
+        std::snprintf(cfg, sizeof(cfg), "(%d x %d x %d, cluster (%d, %d), %s)", tm, tn, tk, cm, cn,
+            sk ? "Stream-K scheduler" : (ns ? "direct-store epilogue" : "TMA epilogue"));
+        char forced[96];
+        std::snprintf(forced, sizeof(forced), "FSO_FORCE_TILE=%d,%d,%d", forced_tm, forced_tn, forced_st);
+        std::string msg = "sm_100/sm_103 dense MXFP8 GEMM (gemm_dispatch_sm100_mxfp8, the C++ CUTLASS cascade, "
+                          "tier 3): ";
+        msg += forced_st != 0 ? std::string(forced) + " selects the configuration " + cfg
+                              : std::string("the configuration ") + cfg;
+        if (sk)
+            msg += ", whose Stream-K scheduler reduces partial tiles inside the kernel and has no dense-epilogue "
+                   "instantiation (force codes 7 and 8 are sweep-only)";
+        else
+            msg += ", which has no dense-epilogue instantiation";
+        msg += "; the dense epilogue (" + fso::dense_epilogue_field_names(epilogue.fields())
+            + ") runs on the configurations the cascade's own rules pick (forced: codes 20 / 21 / 24 / 25, the "
+              "1, 2 and 4 rows of those tiles, and 9 for the split-K). Unset FSO_FORCE_TILE or pick one of those";
+        throw fso::DenseEpilogueNotImplemented(msg);
+    }
+};
+
+// A residual the dense-epilogue kernels can read: 16-byte aligned rows (the TMA epilogue's C descriptor, the
+// direct-store epilogue's 16-byte loads, the split-K reduce's 8-byte loads), at least N wide.
+inline void require_sm100_residual_layout(fso::DenseEpilogue const& epilogue, int N, char const* where)
+{
+    if (epilogue.residual == nullptr)
+        return;
+    bool const aligned = (reinterpret_cast<std::uintptr_t>(epilogue.residual) % 16u) == 0u;
+    bool const pitch_ok = epilogue.ld_residual >= N && (epilogue.ld_residual % 8) == 0;
+    if (aligned && pitch_ok)
+        return;
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+        ": the residual must start on a 16-byte boundary and have a row pitch that is a multiple of 8 elements and "
+        "at least N = %d (got address %% 16 = %u, row pitch %lld)",
+        N, static_cast<unsigned>(reinterpret_cast<std::uintptr_t>(epilogue.residual) % 16u),
+        static_cast<long long>(epilogue.ld_residual));
+    throw fso::DenseEpilogueNotImplemented(std::string(where) + buf);
+}
+
+// A quantized output (linear_quantized) this route can write: no residual (the op has no such argument; the
+// quantized-output kernels have no C source), the scale buffer in the sm_100 contract layout (kDenseOutScaleMxSm100,
+// fso/activation_contract.h), N a multiple of 128 (the codes are the next GEMM's activation; the TMA store of the
+// codes needs 16-byte rows), out_q on a 16-byte boundary and out_scale on a 4-byte one.
+inline void require_sm100_quant_out(fso::DenseEpilogue const& epilogue, int N, char const* where)
+{
+    if (epilogue.out_q == nullptr)
+        return;
+    char const* why = nullptr;
+    if (epilogue.residual != nullptr)
+        why = ": the quantized output (linear_quantized) takes no residual";
+    else if (epilogue.out_scale == nullptr || epilogue.out_scale_layout != fso::kDenseOutScaleMxSm100)
+        why = ": the quantized output's scale must be the sm_100/sm_103 layout of activation contract v1 "
+              "(kDenseOutScaleMxSm100: int32 words in the Sm1xx atom layout over align(M, 128) rows)";
+    else if (N % 128 != 0)
+        why = ": the quantized output needs N % 128 == 0 (it is the next GEMM's activation)";
+    else if ((reinterpret_cast<std::uintptr_t>(epilogue.out_q) % 16u) != 0u
+        || (reinterpret_cast<std::uintptr_t>(epilogue.out_scale) % 4u) != 0u)
+        why = ": the quantized output must start on a 16-byte boundary and its scale on a 4-byte one";
+    if (why != nullptr)
+        throw fso::DenseEpilogueNotImplemented(std::string(where) + why);
+}
+
+// The cascade: FSO_FORCE_TILE rows first, then the rules. Bring-up history (C1):
 //   * decode / small M          → (64, 128) 1SM
 //   * mid M                     → (128, 128) 1SM;  wide N → (128, 256) 1SM
 //   * large M (> 256)           → (256, 128) 2SM;  wide N → (256, 256) 2SM
 // No Stream-K: the CLC-based persistent scheduler already load-balances
 // tail waves; revisit only if the b300 sweep shows narrow-N long-K decode
 // shapes losing to a K-split (compare against sm_120's K≥9728 gate).
-inline cudaError_t gemm_dispatch_sm100_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bfloat16* mat_d,
-    int32_t* scales_a, int32_t* scales_b, int M, int N, int K, cudaStream_t stream)
+inline cudaError_t sm100_dense_cascade(Sm100DenseCall& call)
 {
+    int const M = call.M, N = call.N, K = call.K;
     // Epilogue binding (ncu A/B 2026-07-06, see gemm_types.cuh): NOSMEM
     // (direct-store) on the latency-bound decode tiles and the L2-headroom
     // peak tile; TMA epilogue everywhere L2 is near-bound (mid-band
     // (256,128)K256) or unmeasured (StreamK, forced-only variants, and the
     // (256,256)K128 *mid-band* narrow-N route — same tile as peak but bound
     // TMA until probed, hence the separate NOSMEM/TMA call sites below).
-#define DISPATCH_SM100_MX(TM_, TN_, CM_, CN_, TK_, SK_) \
-    launch_sm100_mxfp8_gemm<TM_, TN_, CM_, CN_, TK_, SK_>(mat_a, mat_b, mat_d, scales_a, scales_b, M, N, K, stream)
-#define DISPATCH_SM100_MX_SW(TM_, TN_, CM_, CN_, TK_, SK_, SW_) \
-    launch_sm100_mxfp8_gemm<TM_, TN_, CM_, CN_, TK_, SK_>(mat_a, mat_b, mat_d, scales_a, scales_b, M, N, K, stream, SW_)
-#define DISPATCH_SM100_MX_NOSMEM(TM_, TN_, CM_, CN_, TK_, SK_) \
-    launch_sm100_mxfp8_gemm<TM_, TN_, CM_, CN_, TK_, SK_, true>(mat_a, mat_b, mat_d, scales_a, scales_b, M, N, K, stream)
+    // FORCED_* serve a FSO_FORCE_TILE row (any instantiated configuration);
+    // DISPATCH_* are the rules' own picks (dense-epilogue instantiation
+    // required at compile time).
+#define FORCED_SM100_MX(TM_, TN_, CM_, CN_, TK_, SK_) call.run<TM_, TN_, CM_, CN_, TK_, SK_, false>(0)
+#define FORCED_SM100_MX_NOSMEM(TM_, TN_, CM_, CN_, TK_, SK_) call.run<TM_, TN_, CM_, CN_, TK_, SK_, true>(0)
+#define DISPATCH_SM100_MX(TM_, TN_, CM_, CN_, TK_, SK_) call.pick<TM_, TN_, CM_, CN_, TK_, SK_, false>(0)
+#define DISPATCH_SM100_MX_SW(TM_, TN_, CM_, CN_, TK_, SK_, SW_) call.pick<TM_, TN_, CM_, CN_, TK_, SK_, false>(SW_)
+#define DISPATCH_SM100_MX_NOSMEM(TM_, TN_, CM_, CN_, TK_, SK_) call.pick<TM_, TN_, CM_, CN_, TK_, SK_, true>(0)
 #define DISPATCH_SM100_MX_NOSMEM_SW(TM_, TN_, CM_, CN_, TK_, SK_, SW_) \
-    launch_sm100_mxfp8_gemm<TM_, TN_, CM_, CN_, TK_, SK_, true>(mat_a, mat_b, mat_d, scales_a, scales_b, M, N, K, stream, SW_)
+    call.pick<TM_, TN_, CM_, CN_, TK_, SK_, true>(SW_)
 
     // FSO_FORCE_TILE=TM,TN,ST — ST picks the variant (see header comment).
     // Valid tiles: TileM ∈ {128, 256} (SF Blk_MN=128 granularity on the M
@@ -892,49 +1180,56 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3
             forced, static_cast<uint32_t>(K)))
     {
         int const tm = forced.tm, tn = forced.tn, st = forced.st;
+        call.forced_tm = tm;
+        call.forced_tn = tn;
+        call.forced_st = st;
         // Codes 20..25: explicit (SM count, TileK, cluster, epilogue) with a
         // free TileN — the sweep surface for the 64- and 192-wide tiles.
         if (st == 20 && tm == 128)
         {
-            if (tn == 64) return DISPATCH_SM100_MX_NOSMEM(128, 64, 1, 1, 128, false);
-            if (tn == 128) return DISPATCH_SM100_MX_NOSMEM(128, 128, 1, 1, 128, false);
-            if (tn == 192) return DISPATCH_SM100_MX_NOSMEM(128, 192, 1, 1, 128, false);
+            if (tn == 64) return FORCED_SM100_MX_NOSMEM(128, 64, 1, 1, 128, false);
+            if (tn == 128) return FORCED_SM100_MX_NOSMEM(128, 128, 1, 1, 128, false);
+            if (tn == 192) return FORCED_SM100_MX_NOSMEM(128, 192, 1, 1, 128, false);
+            if (tn == 256) return FORCED_SM100_MX_NOSMEM(128, 256, 1, 1, 128, false);
         }
         if (st == 21 && tm == 128)
         {
-            if (tn == 64) return DISPATCH_SM100_MX(128, 64, 1, 1, 128, false);
-            if (tn == 128) return DISPATCH_SM100_MX(128, 128, 1, 1, 128, false);
-            if (tn == 192) return DISPATCH_SM100_MX(128, 192, 1, 1, 128, false);
+            if (tn == 64) return FORCED_SM100_MX(128, 64, 1, 1, 128, false);
+            if (tn == 128) return FORCED_SM100_MX(128, 128, 1, 1, 128, false);
+            if (tn == 192) return FORCED_SM100_MX(128, 192, 1, 1, 128, false);
+            if (tn == 256) return FORCED_SM100_MX(128, 256, 1, 1, 128, false);
         }
-        if (st == 22 && tm == 128 && tn == 64) return DISPATCH_SM100_MX_NOSMEM(128, 64, 1, 1, 256, false);
-        if (st == 23 && tm == 128 && tn == 64) return DISPATCH_SM100_MX(128, 64, 1, 1, 256, false);
+        if (st == 22 && tm == 128 && tn == 64) return FORCED_SM100_MX_NOSMEM(128, 64, 1, 1, 256, false);
+        if (st == 23 && tm == 128 && tn == 64) return FORCED_SM100_MX(128, 64, 1, 1, 256, false);
         if (st == 24 && tm == 256)
         {
-            if (tn == 64) return DISPATCH_SM100_MX_NOSMEM(256, 64, 2, 1, 128, false);
-            if (tn == 192) return DISPATCH_SM100_MX_NOSMEM(256, 192, 2, 1, 128, false);
+            if (tn == 64) return FORCED_SM100_MX_NOSMEM(256, 64, 2, 1, 128, false);
+            if (tn == 192) return FORCED_SM100_MX_NOSMEM(256, 192, 2, 1, 128, false);
+            if (tn == 256) return FORCED_SM100_MX_NOSMEM(256, 256, 2, 1, 128, false);
         }
         if (st == 25 && tm == 256)
         {
-            if (tn == 64) return DISPATCH_SM100_MX(256, 64, 2, 1, 128, false);
-            if (tn == 192) return DISPATCH_SM100_MX(256, 192, 2, 1, 128, false);
+            if (tn == 64) return FORCED_SM100_MX(256, 64, 2, 1, 128, false);
+            if (tn == 128) return FORCED_SM100_MX(256, 128, 2, 1, 128, false);
+            if (tn == 192) return FORCED_SM100_MX(256, 192, 2, 1, 128, false);
+            if (tn == 256) return FORCED_SM100_MX(256, 256, 2, 1, 128, false);
         }
         // 1SM rows (TileM=128) — K128 rows carry the cascade's NOSMEM binding
         // so FSO_FORCE_TILE sweeps exercise the production instantiation.
-        if (tm == 128 && tn == 128 && st == 1) return DISPATCH_SM100_MX_NOSMEM(128, 128, 1, 1, 128, false);
-        if (tm == 128 && tn == 256 && st == 1) return DISPATCH_SM100_MX_NOSMEM(128, 256, 1, 1, 128, false);
-        if (tm == 128 && tn == 128 && st == 3) return DISPATCH_SM100_MX(128, 128, 1, 1, 256, false);
-        if (tm == 128 && tn == 256 && st == 3) return DISPATCH_SM100_MX(128, 256, 1, 1, 256, false);
-        if (tm == 128 && tn == 128 && st == 7) return DISPATCH_SM100_MX(128, 128, 1, 1, 128, true);
-        if (tm == 128 && tn == 128 && st == 8) return DISPATCH_SM100_MX(128, 128, 1, 1, 256, true);
+        if (tm == 128 && tn == 128 && st == 1) return FORCED_SM100_MX_NOSMEM(128, 128, 1, 1, 128, false);
+        if (tm == 128 && tn == 256 && st == 1) return FORCED_SM100_MX_NOSMEM(128, 256, 1, 1, 128, false);
+        if (tm == 128 && tn == 128 && st == 3) return FORCED_SM100_MX(128, 128, 1, 1, 256, false);
+        if (tm == 128 && tn == 256 && st == 3) return FORCED_SM100_MX(128, 256, 1, 1, 256, false);
+        if (tm == 128 && tn == 128 && st == 7) return FORCED_SM100_MX(128, 128, 1, 1, 128, true);
+        if (tm == 128 && tn == 128 && st == 8) return FORCED_SM100_MX(128, 128, 1, 1, 256, true);
         if (tm == 128 && tn == 128 && st == 9 && (K % 128) == 0)
         {
             int const tiles = ((M + 127) / 128) * ((N + 127) / 128);
             int const ks = forced.ks > 1 ? forced.ks : detail::pick_splits(tiles, K / 128);
             if (ks > 1 && (K / 128) % ks == 0)
-                return launch_sm100_mxfp8_gemm_splitk<128, 128>(
-                    mat_a, mat_b, mat_d, scales_a, scales_b, M, N, K, ks, stream);
+                return call.splitk<128, 128>(ks);
             // No valid split → plain decode tile.
-            return DISPATCH_SM100_MX_NOSMEM(128, 128, 1, 1, 128, false);
+            return FORCED_SM100_MX_NOSMEM(128, 128, 1, 1, 128, false);
         }
         // 1SM cluster(2,2) probes (ncu F3: nvjet's gate M=2048 config is
         // 128×256/CTA with a 4-CTA cluster → half our L2 traffic).
@@ -946,17 +1241,18 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3
         // is scheduler/pipeline-level, not reachable by cluster shape alone.
         // Kept as force codes for future sweeps; do NOT wire into the
         // cascade.
-        if (tm == 128 && tn == 128 && st == 10) return DISPATCH_SM100_MX(128, 128, 2, 2, 128, false);
-        if (tm == 128 && tn == 256 && st == 10) return DISPATCH_SM100_MX(128, 256, 2, 2, 128, false);
-        if (tm == 256 && tn == 128 && st == 11) return DISPATCH_SM100_MX(256, 128, 2, 2, 256, false);
+        if (tm == 128 && tn == 128 && st == 10) return FORCED_SM100_MX(128, 128, 2, 2, 128, false);
+        if (tm == 128 && tn == 256 && st == 10) return FORCED_SM100_MX(128, 256, 2, 2, 128, false);
+        if (tm == 256 && tn == 128 && st == 11) return FORCED_SM100_MX(256, 128, 2, 2, 256, false);
         // 2SM rows (TileM=256)
-        if (tm == 256 && tn == 128 && st == 2) return DISPATCH_SM100_MX(256, 128, 2, 1, 128, false);
-        if (tm == 256 && tn == 256 && st == 2) return DISPATCH_SM100_MX_NOSMEM(256, 256, 2, 1, 128, false);
-        if (tm == 256 && tn == 128 && st == 4) return DISPATCH_SM100_MX(256, 128, 2, 1, 256, false);
-        if (tm == 256 && tn == 256 && st == 4) return DISPATCH_SM100_MX(256, 256, 2, 1, 256, false);
-        if (tm == 256 && tn == 256 && st == 5) return DISPATCH_SM100_MX(256, 256, 2, 2, 128, false);
-        if (tm == 256 && tn == 256 && st == 6) return DISPATCH_SM100_MX(256, 256, 2, 2, 256, false);
+        if (tm == 256 && tn == 128 && st == 2) return FORCED_SM100_MX(256, 128, 2, 1, 128, false);
+        if (tm == 256 && tn == 256 && st == 2) return FORCED_SM100_MX_NOSMEM(256, 256, 2, 1, 128, false);
+        if (tm == 256 && tn == 128 && st == 4) return FORCED_SM100_MX(256, 128, 2, 1, 256, false);
+        if (tm == 256 && tn == 256 && st == 4) return FORCED_SM100_MX(256, 256, 2, 1, 256, false);
+        if (tm == 256 && tn == 256 && st == 5) return FORCED_SM100_MX(256, 256, 2, 2, 128, false);
+        if (tm == 256 && tn == 256 && st == 6) return FORCED_SM100_MX(256, 256, 2, 2, 256, false);
         // Unknown forced combo → fall through to the cascade (sm_120 contract).
+        call.forced_tm = call.forced_tn = call.forced_st = 0;
     }
 
     // Cascade v2 — rules distilled from the 2026-07-05 b300 round-2 tile
@@ -1001,8 +1297,25 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3
         int const tiles = ((M + 127) / 128) * tiles_n;
         int const ks = detail::pick_splits(tiles, K / 128);
         if (ks > 1)
-            return launch_sm100_mxfp8_gemm_splitk<128, 128>(
-                mat_a, mat_b, mat_d, scales_a, scales_b, M, N, K, ks, stream);
+            return call.splitk<128, 128>(ks);
+    }
+
+    // --- Short-K tiles (issue #12, T1) ----------------------------------
+    // detail::pick_short_k_tile carries the rule and its measurements. It only
+    // answers K <= 2560 (never a split-K cell above) and returns 0 where none
+    // of its tiles fits one wave, so those cells reach the wave rule and the
+    // band rules below exactly as before.
+    {
+        bool const fused = call.epilogue.act != fso::kDenseActNone || call.epilogue.out_q != nullptr;
+        int const short_k_tile = detail::pick_short_k_tile(M, N, K, fused);
+        switch (short_k_tile)
+        {
+        case 128 * 1000 + 64:  return DISPATCH_SM100_MX(128, 64, 1, 1, 128, false);
+        case 256 * 1000 + 64:  return DISPATCH_SM100_MX(256, 64, 2, 1, 128, false);
+        case 128 * 1000 + 128: return DISPATCH_SM100_MX(128, 128, 1, 1, 128, false);
+        case 256 * 1000 + 128: return DISPATCH_SM100_MX(256, 128, 2, 1, 128, false);
+        default: break;
+        }
     }
 
     // --- N-tile chosen by wave arithmetic (2026-09-17) -----------------
@@ -1012,7 +1325,7 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3
     // The parallel split-K branch above keeps precedence, so the narrow-N
     // long-K decode cells it owns are untouched.
     {
-        int const wave_tile = detail::pick_wave_tile(M, N);
+        int const wave_tile = detail::pick_wave_tile(M, N, K);
         switch (wave_tile)
         {
         case 128 * 1000 + 64:  return DISPATCH_SM100_MX(128, 64, 1, 1, 128, false);
@@ -1092,8 +1405,51 @@ inline cudaError_t gemm_dispatch_sm100_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3
     }
     return DISPATCH_SM100_MX_SW(256, 128, 2, 1, 128, false, peak_swizzle);
 
+#undef FORCED_SM100_MX
+#undef FORCED_SM100_MX_NOSMEM
 #undef DISPATCH_SM100_MX
 #undef DISPATCH_SM100_MX_SW
+#undef DISPATCH_SM100_MX_NOSMEM
+#undef DISPATCH_SM100_MX_NOSMEM_SW
+}
+
+} // namespace detail
+
+// Top-level sm_100/sm_103 MXFP8 dispatcher.
+//
+// `epilogue`: the dense epilogue of interface v1 (common/epilogue.cuh). This route applies bias, erf-GELU and the
+// residual (kDenseEpiServedSm100Cascade) on every configuration its rules pick and on its two-kernel split-K, and
+// writes the quantized output of linear_quantized (epilogue.out_q / out_scale; bias and the activation, no
+// residual) on the same configurations and on the split-K. It refuses, before it builds or launches anything, a
+// residual it cannot read (alignment, require_sm100_residual_layout), a quantized output it cannot write
+// (require_sm100_quant_out) and a FSO_FORCE_TILE row without a dense-epilogue instantiation. With out_q set,
+// `mat_d` is not written (pass nullptr).
+// `workspace`: the caller's device scratch for this call, at least gemm_workspace_sm100_mxfp8(...) bytes.
+// `workspace_query`: when non-null, nothing is launched and *workspace_query receives the bytes this call needs
+// (the refusals above are thrown in this mode too).
+inline cudaError_t gemm_dispatch_sm100_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bfloat16* mat_d,
+    int32_t* scales_a, int32_t* scales_b, int M, int N, int K, cudaStream_t stream,
+    fso::DenseEpilogue const& epilogue = fso::DenseEpilogue{}, Sm100DenseWorkspace const& workspace = {},
+    std::size_t* workspace_query = nullptr)
+{
+    char const* const where
+        = "sm_100/sm_103 dense MXFP8 GEMM (gemm_dispatch_sm100_mxfp8, the C++ CUTLASS cascade, tier 3)";
+    fso::require_dense_epilogue(epilogue, fso::kDenseEpiServedSm100Cascade, where);
+    detail::require_sm100_residual_layout(epilogue, N, where);
+    detail::require_sm100_quant_out(epilogue, N, where);
+    detail::Sm100DenseCall call{mat_a, mat_b, mat_d, scales_a, scales_b, M, N, K, stream, epilogue, workspace,
+        workspace_query};
+    return detail::sm100_dense_cascade(call);
+}
+
+// The bytes of caller workspace gemm_dispatch_sm100_mxfp8 needs for this call (host-only: the cascade's choice is
+// made, nothing is launched). Throws fso::DenseEpilogueNotImplemented exactly when the dispatch would.
+inline std::size_t gemm_workspace_sm100_mxfp8(int M, int N, int K, fso::DenseEpilogue const& epilogue)
+{
+    std::size_t bytes = 0;
+    cudaError_t const err = gemm_dispatch_sm100_mxfp8(
+        nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, nullptr, epilogue, Sm100DenseWorkspace{}, &bytes);
+    return err == cudaSuccess ? bytes : 0; // a launch error is reported by the launch itself
 }
 
 } // namespace sm100_blockscaled_gemm
