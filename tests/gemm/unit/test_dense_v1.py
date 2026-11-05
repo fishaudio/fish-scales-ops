@@ -202,12 +202,17 @@ The cases, each run where the hardware exists and skipped with a message elsewhe
       the bf16 call and no quantize kernel; capture on a non-default stream (replay into a clobbered output ==
       eager); FSO_DISABLE_PDL=1 gives the same digests; two different split-K quantized calls captured on two
       streams and replayed concurrently 200 times; torch.compile(fullgraph=True) keeps one dense_linear_quantized
-      node; the real op's output metadata equals its fake's. natural: on the card's own routing, on cells whose
-      bf16 call takes the decode row (its narrow-N long-K band above M = 64 and that band's fall-through from
-      tier 1 included, P5), tier 1 or tier 2, the quantized call is planned on and runs on the cascade
-      (no other tier's kernel) and equals quantize_activation of the bf16 cascade call (linear_mxfp8_raw) from both
-      entries; the codes that differ from quantize_activation(linear(...)) on the bf16 call's own route are
-      counted and printed. sm_120/sm_121 (the small-M route of case w does not write the quantized output, so
+      node; the real op's output metadata equals its fake's. On every forced TMA tile narrower than 256 the
+      erf-GELU calls run the epilogue in two warpgroups and the identity / bias calls in one; the 256-wide and
+      direct-store tiles run one for every call (FB3). mwg (FB3): the two-warpgroup kernels of the cascade's own
+      picks at fc1 M = 533 / 1079 and proj1 M = 533, each erf-GELU call captured and replayed 200 times
+      bit-identically, two of them replayed concurrently on two streams 200 times.
+      natural: on the card's own routing, on cells whose bf16 call takes the decode row (its narrow-N long-K band above
+      M = 64 and that band's fall-through from tier 1 included, P5), tier 1 or tier 2, the quantized call is planned on
+      and runs on the cascade (no other tier's kernel) and equals quantize_activation of the bf16 cascade call
+      (linear_mxfp8_raw) from both entries; the codes that differ from quantize_activation(linear(...)) on the bf16
+      call's own route are counted and printed.
+      sm_120/sm_121 (the small-M route of case w does not write the quantized output, so
       linear_quantized runs on the cascade while the bf16 call of a routed decode-band cell runs on the small-M
       route): two subprocesses on the same cells and data, FSO_SMALLM_ROUTE=0 and the rules, on the issue's TP2 qkv /
       o shards across the decode band, the tower shapes at decode M and K = 9728 at M <= 8 (a Stream-K cascade): the
@@ -4911,6 +4916,65 @@ def _s_two_streams(local: list) -> None:
         local.append(f"two-stream concurrent replay: {nbad} mismatching elements over 200 iterations")
 
 
+# The quantized output's two-warpgroup kernels (issue #12 FB3) on the cascade's own picks, N x K x M: the tower's fc1 at
+# M = 533 (the wave rule's 1-SM 128 x 192 tile) and 1079 (the band rule's 2-SM 256 x 128 TileK 256 tile) and proj1 at
+# M = 533 (the short-K rule's 1-SM 128 x 64 tile), all with the TMA epilogue and two accumulator stages.
+S_MWG_CELLS = ((5120, 1280, 533), (5120, 1280, 1079), (1280, 1280, 533))
+
+
+def _s_multiwg(local: list, stats: dict) -> None:
+    """Determinism of the two-warpgroup kernels (dense_epilogue_gemm.cuh, kDenseQuantEpiWarpgroups): every call of
+    S_MWG_CELLS (bias + erf-GELU, the 2b entry) is captured on a stream of its own and replayed 200 times, each replay
+    bit-identical to the eager call (codes and scale words); then the first two are replayed concurrently on their two
+    streams 200 times, each against its serial result."""
+    calls = []
+    for (N, K, M) in S_MWG_CELLS:
+        dw = prepared(10, N, K, seed=M + N)
+        x = make_x(M, K, seed=M + N + 1)
+        xq, sx = D.quantize_activation(x)
+        b = (torch.randn(N, device="cuda") * 0.5).bfloat16()
+        calls.append((f"M={M} N={N} K={K}", lambda xq=xq, dw=dw, sx=sx, b=b: D.linear_quantized(
+            xq, dw, x_scale=sx, bias=b, activation="gelu_erf")))
+    refs = [tuple(t.clone() for t in c()) for _, c in calls]
+    torch.cuda.synchronize()
+    streams, graphs, outs = [], [], []
+    for _, c in calls:
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            outs.append(c())
+        streams.append(s)
+        graphs.append(g)
+    torch.cuda.synchronize()
+
+    def mismatches(i):
+        return (outs[i][0].view(torch.uint8) != refs[i][0].view(torch.uint8)).sum() + (outs[i][1] != refs[i][1]).sum()
+
+    for i, (label, _) in enumerate(calls):
+        bad = torch.zeros((), dtype=torch.int64, device="cuda")
+        torch.cuda.synchronize()  # the counter's fill (default stream) before the replay stream adds to it
+        with torch.cuda.stream(streams[i]):
+            for _ in range(200):
+                graphs[i].replay()
+                bad += mismatches(i)
+        torch.cuda.synchronize()
+        if int(bad):
+            local.append(f"two warpgroups {label}: {int(bad)} mismatching elements over 200 replays")
+        stats["mwg_replayed"] = stats.get("mwg_replayed", 0) + 1
+    bad = [torch.zeros((), dtype=torch.int64, device="cuda") for _ in range(2)]
+    torch.cuda.synchronize()
+    for _ in range(200):
+        for i in range(2):
+            with torch.cuda.stream(streams[i]):
+                graphs[i].replay()
+                bad[i] += mismatches(i)
+    torch.cuda.synchronize()
+    nbad = [int(t) for t in bad]
+    if any(nbad):
+        local.append(f"two warpgroups, two-stream concurrent replay: {nbad} mismatching elements over 200 iterations")
+
+
 def _s_refuse(force: str, word: str, local: list) -> None:
     N, K, M = 1280, 1280, 7
     dw = prepared(10, N, K, seed=91)
@@ -5016,6 +5080,8 @@ def s_worker(label: str) -> int:
         _s_refuse(*P_REFUSE[label], local)
     elif label == "streams":
         _s_two_streams(local)
+    elif label == "mwg":
+        _s_multiwg(local, stats)
     else:
         if label in P_SPLIT:
             cells = [(M, N, K) for (N, K) in S_SHAPES for M in S_SPLIT_MS]
@@ -5072,10 +5138,11 @@ def case_s(major: int) -> None:
     runs.update(P_SPLIT)
     runs.update({k: {"FSO_FORCE_TILE": v[0]} for k, v in P_REFUSE.items()})
     runs["streams"] = {"FSO_FORCE_TILE": "128,128,9"}
+    runs["mwg"] = {}
     runs["natural"] = {}
     nopdl = {"rules": "rules/nopdl", "9": "9/nopdl"}
     digests = {}
-    s_re = re.compile(r"^\[fso sm100 tile\] quantized (\d+x\d+x\d+) cluster=\(\d+,\d+\) nosmem=(\d)")
+    s_re = re.compile(r"^\[fso sm100 tile\] quantized (\d+x\d+x\d+) cluster=\(\d+,\d+\) nosmem=(\d) .* warpgroups=(\d)")
     for label, env in list(runs.items()) + [(v, {**runs[k], "FSO_DISABLE_PDL": "1"}) for k, v in nopdl.items()]:
         worker = label.split("/nopdl")[0]
         r, summary = _s_spawn(worker, env)
@@ -5086,21 +5153,33 @@ def case_s(major: int) -> None:
         note = ""
         if worker in P_FORCED:
             _, tile, ns = P_FORCED[worker]
-            cov = set(ran) == {(tile, str(ns))}
+            # the quantized output's epilogue warpgroups (dense_epilogue_gemm.cuh, kDenseQuantGeluEpiWarpgroups): on
+            # the TMA epilogue of the tiles narrower than 256 the erf-GELU calls run two and the identity / bias calls
+            # one (CUTLASS's own class); every other tile runs one for every call
+            two = ns == 0 and tile.split("x")[1] != "256"
+            want = {(tile, str(ns), "1"), (tile, str(ns), "2")} if two else {(tile, str(ns), "1")}
+            cov = set(ran) == want
             ok = ok and cov
-            note = f"; ran {['%s nosmem=%s' % e for e in ran]}{'' if cov else ' (expected ' + tile + ')'}"
+            note = (f"; ran {['%s nosmem=%s warpgroups=%s' % e for e in ran]}"
+                    f"{'' if cov else ' (expected ' + str(sorted(want)) + ')'}")
         elif worker in P_SPLIT:
             ok = ok and split_ran
             note = f"; split-K ran {split_ran}"
         elif worker == "rules":
             ok = ok and split_ran and len(ran) > 0
-            note = f"; rules ran {len(ran)} quantized kernels {['%s ns=%s' % e for e in ran]}, split-K {split_ran}"
+            note = f"; rules ran {len(ran)} quantized kernels {['%s ns=%s wg=%s' % e for e in ran]}, split-K {split_ran}"
         elif worker == "streams":
             caps = re.findall(r"\[fso sm100 splitk\] captured on stream (0x[0-9a-f]+): workspace (0x[0-9a-f]+)",
                               r.stderr)
             two = len(caps) == 2 and caps[0][0] != caps[1][0] and caps[0][1] != caps[1][1]
             ok = ok and two
             note = f"; captures {caps} (two streams, two workspaces: {two})"
+        elif worker == "mwg":
+            two = len(ran) > 0 and all(e[2] == "2" for e in ran)
+            ok = ok and two
+            n_rep = summary.get("mwg_replayed") if summary else None
+            note = (f"; the cascade's picks ran {['%s ns=%s wg=%s' % e for e in ran]} (two warpgroups on each: {two}), "
+                    f"{n_rep} captured calls replayed 200 x bit-identically, two of them concurrently on two streams")
         elif worker == "natural" and summary is not None:
             tiers = summary.get("bf16_tiers", {})
             want = {"sm100.smm"} | ({"sm100.decode"} if summary.get("decode_enabled") else set()) \
@@ -5109,7 +5188,7 @@ def case_s(major: int) -> None:
             ran_q = len(ran) > 0
             ok = ok and seen and ran_q
             note = (f"; bf16 calls planned on {tiers} (needs {sorted(want)}: {seen}), every quantized call planned "
-                    f"on and ran on the cascade ({len(ran)} quantized kernels {['%s ns=%s' % e for e in ran]})")
+                    f"on and ran on the cascade ({len(ran)} quantized kernels {['%s ns=%s wg=%s' % e for e in ran]})")
             for row in summary.get("natural", []):
                 M, N, K, var, tier, n_bf16, n_codes, n_words, n_el = row
                 print(f"  s  natural M={M} N={N} K={K} {var:15s} bf16 route {tier:13s}: vs quantize_activation("
