@@ -2,8 +2,10 @@
 """The sm_90 dense block-FP8 GEMM's second kernel: DeepGEMM v2's sm90_fp8_gemm_1d2d (vendored with the JIT headers,
 arch/sm90/fp8/jit/deep_gemm/impls/), which gemm_dispatch_sm90 runs at DeepGEMM's own configuration for the tile
 classes deep_gemm::jit::use_dg2_dense accepts (256 x 128 with multicast on A and 128 x 160 / 192 from M = 512 on, every
-DeepGEMM pick but its 80-wide tiles at 128 < M < 256, 64-row tiles at M = 64 / 128 with K >= 8192), and
-fp8_gemm_kernel otherwise. FSO_SM90_DENSE_DG2 (read once per process)
+DeepGEMM pick but its 80-wide tiles at 128 < M < 256, 64-row tiles at M = 64 / 128 with K >= 8192), at the tiles of
+deep_gemm::jit::use_dense_v2_override (FH1 of the issue-12 round: one wave at M <= 256 where the route needs two or
+more, the 128 x 160 / 192 pair over N in a quarter fewer waves for wide outputs at 256 < M <= 672, the 64 x 128 pair
+over M for narrow outputs at 256 < M <= 384), and fp8_gemm_kernel otherwise. FSO_SM90_DENSE_DG2 (read once per process)
 selects the route: 1 (default) the rule, 0 fp8_gemm_kernel only, all every DeepGEMM configuration.
 
 Each mode runs in its own child process over the same cells, and the test checks:
@@ -11,9 +13,12 @@ Each mode runs in its own child process over the same cells, and the test checks
   1. bitwise equality: linear_fp8 and linear_qx give torch.equal outputs in all three modes on every cell (both kernels
      accumulate each 128-wide K block in FP32 in one CTA and promote it with the same scale product in the same order);
   2. the route: with the default, every cell of the rule's classes launches sm90_fp8_gemm_1d2d_impl with the expected
-     tile, and every control cell (swap-AB small M, M = 128 / 256 gate_up, 256 x 112 and one-wave 256 x 128 picks)
-     launches fp8_gemm_kernel; FSO_SM90_DENSE_DG2=0 never launches the v2 kernel;
-  3. graph capture: in the default mode a CUDA graph of the quantize + GEMM chain on two v2 cells, with the output
+     tile (and, where the expectation names one, the cluster: c2x1 pairs two M blocks, c1x2 two N blocks), the cells of
+     FH1's two swap-AB bands and of its 64-row weight tiles at 8 <= M <= 32 launch fp8_gemm_kernel_swapAB with the
+     expected tile, and every control cell (swap-AB
+     small M, M = 256 gate_up, one-wave 256 x 128 picks, the neighbours of FH1's rules) launches fso's kernels;
+     FSO_SM90_DENSE_DG2=0 never launches the v2 kernel;
+  3. graph capture: in the default mode a CUDA graph of the quantize + GEMM chain on seven v2 cells, with the output
      clobbered between capture and replay, replays to the eager result.
   4. a value other than 0, 1 or all prints one warning and keeps the default.
 
@@ -52,9 +57,7 @@ CELLS = [
     (224, 2560, 4096, "fso"),             # 128 < M < 256 but DeepGEMM picks 64 x 80: fso's kernel
     (224, 19456, 2560, "dg2 128x160"),
     (16, 2560, 9728, "fso"),              # swap-AB small M
-    (128, 19456, 2560, "fso"),            # 128 x 160 at M = 128 / 256: fso's kernel
-    (256, 19456, 2560, "fso"),
-    (512, 19456, 2560, "fso"),            # DeepGEMM picks 256 x 112
+    (256, 19456, 2560, "fso"),            # 128 x 160 at M = 256 (DeepGEMM's pick, two waves): fso's kernel
     (2048, 2048, 4096, "fso"),            # DeepGEMM picks one wave of 256 x 128 without multicast
     (64, 2560, 4096, "fso"),              # 64-row tile but K < 8192
     # rule 5: fso's tile leaves at least 48 rows of its last M block empty (below M = 1024)
@@ -73,19 +76,75 @@ CELLS = [
     (576, 5120, 2048, "fso"),
     (112, 5120, 2048, "fso"),             # 16 rows empty: below the threshold
     (1079, 1280, 5120, "fso"),            # from M = 1024 the v2 classes alone decide
+    # FH1 of the issue-12 round (deep_gemm::jit::use_dense_v2_override and the two swap-AB bands of
+    # use_dense_swap_ab_above_96; /data/bench-runs/fso_issue12_20261028/runs/FH1). One wave of the v2 kernel at
+    # M <= 256 where the route needs two or more: the fewest rows, then the narrowest tile, single-CTA, paired over
+    # M (c2x1) for 128-row tiles at 128 < M <= 192; up to M = 128 only widths with one main loop (not 96 / 160 / 192).
+    (8, 18432, 2560, "dg2 16x144"),       # was fp8_gemm_kernel_swapAB 128 x 16 (two waves of 144 tiles)
+    (64, 18432, 2560, "dg2 64x144"),      # was fp8_gemm_kernel 64 x 72
+    (128, 18432, 2560, "dg2 128x144"),    # was fp8_gemm_kernel 128 x 72
+    (8, 19456, 2560, "fso"),              # one wave needs a 160- or 192-wide tile: kept (swap-AB)
+    (128, 19456, 2560, "fso"),            # the same: kept (fp8_gemm_kernel 128 x 80)
+    (160, 9728, 2560, "dg2 128x160 c2x1"),  # was DeepGEMM's 64 x 112 pair
+    (192, 12288, 2048, "dg2 128x192 c2x1"),
+    (256, 10240, 2560, "dg2 128x160"),    # was fp8_gemm_kernel 128 x 80 (three waves)
+    # swap-AB, three token tiles: narrow outputs at 144 < M <= 216 (64-row weight tiles, K >= 8192, or against
+    # fp8_gemm_kernel's tile), wide outputs at 256 < M <= 288 (128-row weight tiles, at most 96 tokens)
+    (152, 2560, 9216, "swapAB 64x56"),    # was the v2 kernel's 64 x 64
+    (216, 2560, 4096, "swapAB 64x72"),    # was fp8_gemm_kernel 128 x 40
+    (200, 2560, 4096, "dg2 64x80"),       # K < 8192 against the v2 main path: kept
+    (272, 10240, 2560, "swapAB 128x96"),  # was fp8_gemm_kernel 128 x 128 (three waves, 96 of 384 rows empty)
+    (296, 10240, 2560, "fso"),            # above the band: kept
+    # wide outputs at 256 < M <= 672: the v2 kernel's 128 x 160 / 192 pair over N (c1x2) in fewer waves
+    (288, 18432, 2560, "dg2 128x160 c1x2"),
+    (400, 18432, 2560, "dg2 128x192 c1x2"),
+    (512, 19456, 2560, "fso"),            # one wave fewer out of five (DeepGEMM picks 256 x 112): kept
+    (680, 18432, 2560, "fso"),            # above M = 672: kept
+    (472, 5120, 2048, "fso"),             # the pair would need one wave only: kept
+    # narrow outputs at 256 < M <= 384, K >= 4096: the v2 kernel's 64 x 128 pair over M (c2x1)
+    (288, 2560, 4096, "dg2 64x128 c2x1"),  # was the v2 kernel's 64 x 112 (five M blocks, weights read five times)
+    (344, 2560, 9216, "dg2 64x128 c2x1"),  # was fp8_gemm_kernel 128 x 64
+    (328, 2560, 4096, "dg2 64x128"),      # the route is DeepGEMM's own 64 x 128 already: kept
+    (288, 2560, 2048, "dg2 64x112"),      # K < 4096: kept
+    # swap-AB at 8 <= M <= 32: 64-row weight tiles with one token tile covering M where they fit one wave (N <= 8448)
+    (16, 5120, 2048, "swapAB 64x16"),     # was 128 x 16
+    (32, 6144, 2560, "swapAB 64x32"),     # was 128 x 16 in two token tiles
+    (4, 6144, 2560, "swapAB 128x16"),     # M < 8: kept
+    (16, 9216, 2048, "swapAB 128x16"),    # 144 tiles of 64 rows would need two waves: kept
 ]
-GRAPH_CELLS = [(1024, 19456, 2560), (128, 2560, 9728), (80, 5120, 2048), (288, 5120, 2048)]
+GRAPH_CELLS = [(1024, 19456, 2560), (128, 2560, 9728), (80, 5120, 2048), (288, 5120, 2048), (160, 9728, 2560),
+               (288, 18432, 2560), (288, 2560, 4096)]
 
 
 def kernel_of(names):
+    """"dg2 <block_m>x<block_n>" (with " c2x1" for a two-CTA cluster that shares the weight, multicast on B, and
+    " c1x2" for one that shares the activation, multicast on A), "swapAB <weight rows>x<token tile>" for
+    fp8_gemm_kernel_swapAB, "fso" for fp8_gemm_kernel. The v2 kernel's template arguments run <major, 0, N, 0, 1,
+    BLOCK_M, BLOCK_N, 128, 128, 128, swizzle, stages, 128, threads, cluster size, multicast on A, ...>."""
     for n in names:
-        m = re.search(r"sm90_fp8_gemm_1d2d_impl<[^,]*, 0u?, \d+u?, 0u?, 1u?, (\d+)u?, (\d+)u?,", n)
+        m = re.search(r"sm90_fp8_gemm_1d2d_impl<[^,]*, 0u?, \d+u?, 0u?, 1u?, (\d+)u?, (\d+)u?, 128u?, 128u?, 128u?, "
+                      r"\d+u?, \d+u?, 128u?, \d+u?, (\d+)u?, (true|false)", n)
         if m:
-            return f"dg2 {m.group(1)}x{m.group(2)}"
+            cluster = "" if m.group(3) == "1" else (" c1x2" if m.group(4) == "true" else " c2x1")
+            return f"dg2 {m.group(1)}x{m.group(2)}{cluster}"
+    for n in names:
+        m = re.search(r"fp8_gemm_kernel_swapAB<\d+u?, \d+u?, (\d+)u?, (\d+)u?,", n)
+        if m:
+            return f"swapAB {m.group(1)}x{m.group(2)}"
     for n in names:
         if "fp8_gemm_kernel" in n:
             return "fso"
     return "none: " + " | ".join(names)
+
+
+def matches(got: str, want: str) -> bool:
+    """An expectation without a cluster suffix accepts every cluster form of its tile, and "fso" accepts both of
+    fso's kernels (fp8_gemm_kernel and fp8_gemm_kernel_swapAB); a suffix or a swap-AB tile must match exactly."""
+    if got == want:
+        return True
+    if want == "fso":
+        return got.startswith("swapAB")
+    return want.startswith("dg2") and want.count(" ") == 1 and got.rsplit(" ", 1)[0] == want
 
 
 def worker(out_path):
@@ -174,10 +233,10 @@ def main():
         for M, N, K, want in CELLS:
             key = f"{M},{N},{K}"
             got = results[None]["kernels"][key]
-            if want is not None and got != want:
+            if want is not None and not matches(got, want):
                 failures.append(f"{key}: default mode launched {got}, expected {want}")
             n_dg2 += got.startswith("dg2")
-            if results["0"]["kernels"][key] != "fso":
+            if not matches(results["0"]["kernels"][key], "fso"):
                 failures.append(f"{key}: FSO_SM90_DENSE_DG2=0 launched {results['0']['kernels'][key]}")
         print(f"[2] default route: {n_dg2} of {len(CELLS)} cells on sm90_fp8_gemm_1d2d_impl, as expected; "
               "FSO_SM90_DENSE_DG2=0 runs fp8_gemm_kernel on every cell")

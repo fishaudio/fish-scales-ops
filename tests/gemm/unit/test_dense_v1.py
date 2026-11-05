@@ -42,9 +42,13 @@ The cases, each run where the hardware exists and skipped with a message elsewhe
 
   The sm_90 dense epilogue (charter section 10), each case sm_90 only:
   g.  order-free exact accumulator on every route of gemm_dispatch_sm90 (swap-AB at M = 1, 7, 32 and, above M = 32,
-      on four cells of 32 < M < 64, eight of 64 < M <= 96 and seven of 96 < M <= 100 / 128 < M <= 160 (one- and
+      on four cells of 32 < M < 64, eight of 64 < M <= 96 and five of 96 < M <= 100 / 128 < M <= 160 (one- and
       two-wave launches) where the dispatcher takes it (the kernel name must show the rule's tile) and four plus six
-      plus eight neighbours it keeps on the main path; DeepGEMM v2's
+      plus eight neighbours it keeps on the main path; in the default mode, FH1's routes and neighbours: DeepGEMM v2's
+      tiles of use_dense_v2_override, single and paired over M or N, the two swap-AB bands with three token tiles and
+      swap-AB's 64-row weight tiles at 8 <= M <= 32, the kernel name showing the tile and the cluster, among them two
+      former swap-AB cells of 128 < M <= 160 (9728 x
+      2560 at M = 144, 12288 x 2048 at M = 152), which now take the v2 kernel's pair over M; DeepGEMM v2's
       kernel and fp8_gemm_kernel at M = 78, 129, 1079, forced in child processes with FSO_SM90_DENSE_DG2=all and =0;
       the default mode in this process; at M = 78 the three N = 1280 shapes take swap-AB in every mode, and at
       M = 129 1280x5120 and 1280x7680 do),
@@ -973,7 +977,9 @@ def case_f(major: int) -> None:
 # The routes of gemm_dispatch_sm90 and how a call reaches each: M < 32 (or M = 32 with N < 16384) runs the swap-AB
 # fp8_gemm_kernel_swapAB, and so do 32 < M < 64 and 64 < M <= 96 where the main path's tile is empty enough and the
 # swap-AB launch fits one wave, and 96 < M <= 100 and 128 < M <= 160 on the shapes of the H4 rule (one or two waves;
-# deep_gemm::jit::use_dense_swap_ab, mirrored by _sm90_swap_ab below); otherwise
+# deep_gemm::jit::use_dense_swap_ab, mirrored by _sm90_swap_ab below), and in FH1's two bands, 144 < M <= 216 and
+# 256 < M <= 288 (not mirrored: their cells are listed in _SM90_EPI_FH1); in the default mode the tiles of
+# deep_gemm::jit::use_dense_v2_override come next (_SM90_EPI_FH1); otherwise
 # FSO_SM90_DENSE_DG2 decides between DeepGEMM v2's sm90_fp8_gemm_1d2d_impl ("all": every call; default: its tile
 # classes) and fp8_gemm_kernel ("0": every call). The variable is read once per process, so the "0" and "all" passes
 # run in child processes of this script (--sm90-epilogue-mode).
@@ -1058,7 +1064,8 @@ def _sm90_swap_ab_tile(M: int, N: int, sms: int):
 
 
 def _sm90_swap_ab(M: int, N: int, K: int, sms: int) -> bool:
-    """Whether gemm_dispatch_sm90 takes the swap-AB route (mirror of deep_gemm::jit::use_dense_swap_ab)."""
+    """Whether gemm_dispatch_sm90 takes the swap-AB route (mirror of deep_gemm::jit::use_dense_swap_ab, without FH1's
+    bands at 144 < M <= 216 and 256 < M <= 288, whose cells _SM90_EPI_FH1 lists with their route)."""
     if M < 32 or (M == 32 and N < 16384):
         return True
     if M > 96:  # mirror of use_dense_swap_ab_above_96
@@ -1116,6 +1123,44 @@ _SM90_EPI_RULE5 = (
     (5120, 2048, 416, 128, 160, 5), (5120, 2048, 448, 128, 160, 5),
     (2048, 4096, 288, 64, 80, 11), (2048, 4096, 320, 64, 80, 11),
     (2048, 4096, 416, 128, 64, 8), (2048, 4096, 448, 128, 64, 8), (2048, 4096, 576, 128, 80, 7))
+
+
+# FH1 of the issue-12 round (/data/bench-runs/fso_issue12_20261028/runs/FH1), default mode, (N, K, M) -> (route,
+# block_m, block_n, cluster), as the dispatcher computes them (runs/FH1/tmp/finalinc): DeepGEMM v2's kernel in one wave
+# where the route needs two or more at M <= 256 (deep_gemm::jit::use_dense_v2_override: the fewest rows, then the
+# narrowest tile, up to M = 128 a width with one main loop; 128-row tiles at 128 < M <= 192 paired over M, "c2x1"), its
+# 128 x 160 / 192 pair over N ("c1x2") in a quarter fewer waves for the wide outputs at 256 < M <= 672 (19456 x 2560 at
+# M = 64 keeps fp8_gemm_kernel: its one-wave tiles are 160 or 192 wide), its 64 x 128 pair over M for the narrow
+# outputs at 256 < M <= 384 with K >= 4096; fp8_gemm_kernel_swapAB with three token tiles for the narrow outputs at
+# 144 < M <= 216 (64-row weight tiles, K >= 8192 or against fp8_gemm_kernel's tile) and the wide outputs at
+# 256 < M <= 288 (128-row weight tiles), and at 8 <= M <= 32 with 64-row weight tiles and one token tile where they fit
+# one wave; and neighbours each rule keeps (cluster None: the kernel class only). Two cells of _SM90_EPI_REROUTE_CELLS
+# move here from swap-AB (9728 x 2560 at M = 144, 12288 x 2048 at M = 152: one wave of the v2 pair instead of two of
+# swap-AB); _sm90_swap_ab does not mirror FH1's bands, so every cell in them is listed here.
+_SM90_EPI_FH1 = {
+    (18432, 2560, 8): ("dg2", 16, 144, "c1x1"), (18432, 2560, 128): ("dg2", 128, 144, "c1x1"),
+    (19456, 2560, 64): ("v1", None, None, None),
+    (9728, 2560, 144): ("dg2", 128, 160, "c2x1"), (12288, 2048, 152): ("dg2", 128, 192, "c2x1"),
+    (9728, 2560, 160): ("dg2", 128, 160, "c2x1"), (10240, 2560, 256): ("dg2", 128, 160, "c1x1"),
+    (2560, 9216, 152): ("swapab", 64, 56, None), (2560, 4096, 216): ("swapab", 64, 72, None),
+    (10240, 2560, 272): ("swapab", 128, 96, None),
+    (18432, 2560, 288): ("dg2", 128, 160, "c1x2"), (18432, 2560, 400): ("dg2", 128, 192, "c1x2"),
+    (2560, 4096, 288): ("dg2", 64, 128, "c2x1"), (2560, 9216, 344): ("dg2", 64, 128, "c2x1"),
+    (2560, 4096, 200): ("dg2", 64, 80, "c1x1"), (10240, 2560, 296): ("v1", None, None, None),
+    (2560, 4096, 328): ("dg2", 64, 128, "c1x1"),
+    # swap-AB at 8 <= M <= 32 with 64-row weight tiles and one token tile up to N = 8448 (get_dense_swap_ab_config);
+    # M < 8 keeps rule 2's 128-row tile
+    (5120, 2048, 16): ("swapab", 64, 16, None), (6144, 2560, 32): ("swapab", 64, 32, None),
+    (6144, 2560, 4): ("swapab", 128, 16, None),
+}
+
+
+def _dg2_cluster_re(bm: int, bn: int, cluster: str) -> str:
+    """A regular expression on the v2 kernel's name for the tile and its cluster: after the stage count come
+    <128, threads, cluster size, multicast on A, ...>; "c2x1" pairs two M blocks (multicast on B), "c1x2" two N
+    blocks (multicast on A), "c1x1" is a single CTA."""
+    size, on_a = {"c1x1": (1, "false"), "c2x1": (2, "false"), "c1x2": (2, "true")}[cluster]
+    return rf"0u, 1u, {bm}u, {bn}u, 128u, 128u, 128u, \d+u, \d+u, 128u, \d+u, {size}u, {on_a}, "
 
 
 def _dg2_tile_re(bm: int, bn: int, stages=None) -> str:
@@ -1375,12 +1420,21 @@ def case_g(major: int, mode: str) -> None:
     ms = (_SM90_EPI_SWAP_MS if mode == "default" else ()) + _SM90_EPI_MAIN_MS
     cells = [(N, K, M, None, "") for N, K in _SM90_EPI_SHAPES for M in ms]
     for N, K, M in (_SM90_EPI_REROUTE_CELLS if mode == "default" else ()):
+        if (N, K, M) in _SM90_EPI_FH1:  # moved by FH1's rules: listed below with its new route
+            continue
         tile = _sm90_swap_ab_tile(M, N, sms) if _sm90_swap_ab(M, N, K, sms) else None
         cells.append((N, K, M, None, "") if tile is None else
                      (N, K, M, _swap_tile_re(N, K, *tile), f"swap {tile[0]}x{tile[1]}"))
     cells += [(N, K, M, _dg2_tile_re(256, 128), "256x128") for N, K, M, m in _SM90_EPI_TWO_WAVE if m == mode]
     if mode == "default":  # the cells rule 5 re-routes: the v2 kernel at the rule's configuration
         cells += [(N, K, M, _dg2_tile_re(bm, bn, ns), f"{bm}x{bn} s{ns}") for N, K, M, bm, bn, ns in _SM90_EPI_RULE5]
+        for (N, K, M), (route, bm, bn, cluster) in _SM90_EPI_FH1.items():  # FH1's routes and their neighbours
+            if route == "dg2":
+                cells.append((N, K, M, _dg2_cluster_re(bm, bn, cluster), f"{bm}x{bn} {cluster}"))
+            elif route == "swapab":
+                cells.append((N, K, M, _swap_tile_re(N, K, bm, bn), f"swap {bm}x{bn}"))
+            else:
+                cells.append((N, K, M, None, ""))
     routes_seen = set()
     for N, K, M, want_tile, tile_label in cells:
         x, wq, acc, b, r, r0, n0 = _exact_inputs(M, N, K, seed=M * 131 + N * 7 + K)
@@ -1390,7 +1444,10 @@ def case_g(major: int, mode: str) -> None:
         dws = {s: D.prepare_weight(wq, format="bsfp8",
                                    scale=torch.full((nb, K // 128), 2.0 ** -s, device="cuda")) for s in (0, 8)}
         xq, sx = D.quantize_activation(x)
-        want_route = "swapab" if _sm90_swap_ab(M, N, K, sms) else want_main
+        if mode == "default" and (N, K, M) in _SM90_EPI_FH1:
+            want_route = _SM90_EPI_FH1[(N, K, M)][0]  # FH1's route (bands _sm90_swap_ab does not mirror)
+        else:
+            want_route = "swapab" if _sm90_swap_ab(M, N, K, sms) else want_main
         if want_route is None and 32 < M < 64:  # a main-path neighbour of the swap-AB band (no DG2 class there)
             want_route = "v1"
         if want_route is None and mode == "default" and (N, K, M) in _SM90_EPI_H3_MAIN:
@@ -1688,9 +1745,9 @@ def case_n(major: int, mode: str) -> None:
         return
     ms = ((7, 32) if mode == "default" else ()) + (78, 1079)
     cells = [(N, K, ms) for N, K in ((1280, 1280), (5120, 1280))]
-    if mode == "default":  # swap-AB above M = 32, 64 and 128 (case g): 64- and 128-row weight tiles
+    if mode == "default":  # swap-AB above M = 32, 64 and 128 (case g): 64- and 128-row weight tiles; FH1's routes
         cells += [(2048, 1280, (40,)), (5120, 2048, (36, 96)), (2048, 4096, (80,)), (2560, 4096, (136,)),
-                  (9728, 2560, (144,))]
+                  (6144, 2560, (160,)), (2560, 4096, (216, 288)), (18432, 2560, (8, 288))]
     for N, K, cell_ms in cells:
         dw = prepared(major, N, K, seed=111 + N)
         for M in cell_ms:

@@ -138,10 +138,11 @@ inline void gemm_dispatch_sm90(void* mat_a, int ld_a, void* mat_b, int ld_b, voi
     // Small-M routing. The main path's block_m floor is 64 (Hopper WGMMA 2-warpgroup layout), so below M = 64 its
     // activation tile is partly empty, and so is its last M block up to M = 128. Swap-AB turns the small dimension
     // into the tile's narrow side: every call below M = 32, at M = 32 for N < 16384 (the 2026-06 rule), at
-    // 32 < M < 64 and 64 < M <= 96 where the main path's tile is empty enough and the swap-AB launch fits one wave, and
-    // at 96 < M <= 100 and 128 < M <= 160 on the weight shapes where it measured faster (one or two waves)
-    // (deep_gemm::jit::use_dense_swap_ab, jit_utils.cuh, with the token tile of get_dense_swap_ab_config).
-    // FSO_SM90_SWAP_MAX_M overrides the route for A/B runs.
+    // 32 < M < 64 and 64 < M <= 96 where the main path's tile is empty enough and the swap-AB launch fits one wave, at
+    // 96 < M <= 100 and 128 < M <= 160 on the weight shapes where it measured faster (one or two waves), and in two
+    // bands where three token tiles cover M with little padding: narrow outputs at 144 < M <= 216, wide outputs at
+    // 256 < M <= 288 (deep_gemm::jit::use_dense_swap_ab, jit_utils.cuh, with the token tile of
+    // get_dense_swap_ab_config). FSO_SM90_SWAP_MAX_M overrides the route for A/B runs.
     bool use_swap_ab = deep_gemm::jit::use_dense_swap_ab(shape_m, shape_n, shape_k, num_device_sms);
     if (uint32_t const max_m = sm90_swap_max_m_override())
         use_swap_ab = shape_m <= max_m;
@@ -150,6 +151,24 @@ inline void gemm_dispatch_sm90(void* mat_a, int ld_a, void* mat_b, int ld_b, voi
     // quantize runs and waits on it with griddepcontrol.wait after its prologue (fp8_gemm_impl.cuh). On for every
     // shape, off for every shape with FSO_DISABLE_PDL=1.
     bool const pdl = fso_pdl_enabled();
+
+    // DeepGEMM v2 tiles that override the route (deep_gemm::jit::use_dense_v2_override): one wave at M <= 256 where the
+    // route needs two or more (up to M = 128 only on a tile whose main loop the kernel compiles once), a quarter fewer
+    // waves for the wide outputs at 256 < M <= 672, and paired 64 x 128 tiles for the narrow outputs at
+    // 256 < M <= 384. Only in the default mode and without FSO_SM90_SWAP_MAX_M, so that the A/B knobs keep their
+    // meaning. The bytes are those of the route.
+    if (sm90_dense_dg2_mode() == Sm90DenseDg2Mode::kRule && sm90_swap_max_m_override() == 0u)
+    {
+        deep_gemm::jit::Dg2DenseConfig v2;
+        if (deep_gemm::jit::use_dense_v2_override(shape_m, shape_n, shape_k, num_device_sms, v2))
+        {
+            auto runtime = deep_gemm::jit::getGlobalCompiler().buildDg2(v2, epi_key);
+            auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
+            deep_gemm::runGemmDg2(kernel, mat_a, ld_a, mat_b, ld_b, mat_d, ld_d, scales_a, scales_b, shape_m, shape_n,
+                shape_k, v2, stream, pdl, epi);
+            return;
+        }
+    }
 
     // Main path: DeepGEMM v2's kernel at DeepGEMM's own configuration where that configuration is one of the tile
     // classes deep_gemm::jit::use_dg2_dense accepts (256 x 128 with multicast on A and 128 x 160 / 192 from M = 512 on;
