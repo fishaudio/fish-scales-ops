@@ -14,6 +14,9 @@
 // Modified by fish-scales-ops (issue #12, FH6): on the 160-wide tile, for which DeepGEMM compiles five copies of the main
 // loop (one per possible weight-scale split point), each copy is unrolled four times instead of eight; see
 // kWideFiveCopies below.
+// Modified by fish-scales-ops (issue #12, R040b): on the one-math-warp-group tiles (BLOCK_M = 64) narrower than 128,
+// and on the 128-wide one in a multicast pair, two accumulator sets let the promotion of one K block overlap the next
+// block's WGMMAs; see kTwoSets below.
 #pragma once
 
 #pragma clang diagnostic push
@@ -327,6 +330,131 @@ sm90_fp8_gemm_1d2d_body(float* sfb, int* grouped_layout,
 
                 // Dispatch `num_former_iters` and launch MMAs
                 dispatch_num_former_iters<0, kGap, kEnd>(kShouldOptimize ? num_former_iters : 0, [&](auto _) {
+                  // fish-scales-ops (issue #12, R040b) rule 1: on a one-math-warp-group tile (BLOCK_M = 64) whose two
+                  // accumulator sets fit the registers (BLOCK_N <= 128), K block k's WGMMAs run into accum or accum_o;
+                  // once they are issued, warpgroup_wait<1> waits for block k - 1 only, whose stage is released and
+                  // whose accumulators are promoted while block k runs on the tensor core. The k loop runs in fully
+                  // unrolled chunks of four blocks, each drained (warpgroup_wait<0>) at its end, and a remainder block
+                  // by block: no WGMMA stays in flight across a loop back edge, which otherwise made ptxas serialize
+                  // every WGMMA (C7514). Blocks are promoted in K order with the same scale products, so the bytes do
+                  // not change. On the H200 (runs/R040b of the issue-12 round, cold weights, base and new in one
+                  // process, two passes) the 72 measured cells of the 64 x 32-96 tiles and of the paired 64 x 128 tile
+                  // (K = 512-9728, M = 128-352) ran 9 % faster at the median (up to 16.5 %) on the pre-quantized call
+                  // and 6 % (up to 9.5 %) on the served one, and none was more than 1 % slower over the two passes. The
+                  // single-CTA 64 x 128 tile keeps one set: its pre-quantized call ran 9-20 % faster, but its served
+                  // call ran 4-6 % slower on 2560 x 9216 at M = 328 / 336. That loss appears only when the GEMM is
+                  // launched behind the activation quantize with PDL, where a single-CTA grid lands in the order the
+                  // SMs drain (with FSO_DISABLE_PDL=1 the same served calls ran 15-17 % faster); the multicast pair
+                  // keeps each cluster in one GPC and kept its gain. With two math warp groups the second set spills
+                  // (128 x 128: 312 bytes of stack); the 16- and 32-row tiles were not measured and keep one set.
+                  constexpr bool kTwoSets = BLOCK_M == 64 and kNumMathThreads == 128 and WGMMA::kNumAccum <= 64
+                      and (BLOCK_N < 128 or kNumTMAMulticast > 1) and kGemmType == GemmType::Normal;
+                  if constexpr (kTwoSets) {
+                    float accum_o[WGMMA::kNumAccum];
+                    uint32_t p_stage = 0;
+                    float p_s00 = 0.f, p_s10 = 0.f, p_s01 = 0.f, p_s11 = 0.f;
+                    bool pending = false;
+                    auto arrive_at = [&](uint32_t s) {
+                        if constexpr (kNumTMAMulticast == 1) {
+                            lane_idx == 0 ? empty_barriers[s]->arrive() : void();
+                        } else {
+                            auto target_cta = scheduler.is_peer_cta_alive ? lane_idx : cute::block_rank_in_cluster();
+                            lane_idx < kNumTMAMulticast ? empty_barriers[s]->arrive(target_cta) : void();
+                        }
+                    };
+                    auto promote = [&](float (&acc)[WGMMA::kNumAccum]) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
+                            const bool predicate = kMustUseUniformedScaleB or i < num_former_iters;
+                            final_accum[i * 4 + 0] += (predicate ? p_s00 : p_s01) * acc[i * 4 + 0];
+                            final_accum[i * 4 + 1] += (predicate ? p_s00 : p_s01) * acc[i * 4 + 1];
+                            final_accum[i * 4 + 2] += (predicate ? p_s10 : p_s11) * acc[i * 4 + 2];
+                            final_accum[i * 4 + 3] += (predicate ? p_s10 : p_s11) * acc[i * 4 + 3];
+                        }
+                    };
+                    auto step = [&](float (&cur)[WGMMA::kNumAccum], float (&prev)[WGMMA::kNumAccum],
+                                    uint32_t k_block_idx) {
+                        const auto a_desc_base_lo = a_desc_lo + stage_idx * (SMEM_A_SIZE_PER_STAGE / 16);
+                        const auto b_desc_base_lo = b_desc_lo + stage_idx * (SMEM_B_SIZE_PER_STAGE / 16);
+                        float scale_b_0 = ptx::ld_shared(smem_sfb + k_block_idx), scale_b_1 = 0.f;
+                        if constexpr (not kMustUseUniformedScaleB)
+                            scale_b_1 = ptx::ld_shared(smem_sfb + k_block_idx + shape_k_scales);
+                        full_barriers[stage_idx]->wait(phase);
+                        auto scale_a_0 = do_wgmma_store ? ptx::ld_shared(smem_sfa[stage_idx] + r_0) : 0;
+                        auto scale_a_1 = do_wgmma_store ? ptx::ld_shared(smem_sfa[stage_idx] + r_1) : 0;
+                        #pragma unroll
+                        for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+                            ptx::warpgroup_fence_operand(cur[i]);
+                        ptx::warpgroup_arrive();
+                        #pragma unroll
+                        for (uint32_t k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
+                            a_desc.reg32_[0] = a_desc_base_lo + (k * WGMMA::K) / 16;
+                            b_desc.reg32_[0] = b_desc_base_lo + k * WGMMA::K / 16;
+                            WGMMA::wgmma(a_desc, b_desc, cur, k);
+                        }
+                        ptx::warpgroup_commit_batch();
+                        // The stage's A-scale loads before its release (one block later)
+                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                        __syncwarp();
+                        #pragma unroll
+                        for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+                            ptx::warpgroup_fence_operand(cur[i]);
+                        if (pending) {
+                            #pragma unroll
+                            for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+                                ptx::warpgroup_fence_operand(prev[i]);
+                            ptx::warpgroup_wait<1>();
+                            #pragma unroll
+                            for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+                                ptx::warpgroup_fence_operand(prev[i]);
+                            arrive_at(p_stage);
+                            if (do_wgmma_store)
+                                promote(prev);
+                        }
+                        p_stage = stage_idx;
+                        p_s00 = scale_a_0 * scale_b_0;
+                        p_s10 = scale_a_1 * scale_b_0;
+                        if constexpr (not kMustUseUniformedScaleB)
+                            p_s01 = scale_a_0 * scale_b_1, p_s11 = scale_a_1 * scale_b_1;
+                        pending = true;
+                    };
+                    auto drain = [&](float (&acc)[WGMMA::kNumAccum]) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+                            ptx::warpgroup_fence_operand(acc[i]);
+                        ptx::warpgroup_wait<0>();
+                        #pragma unroll
+                        for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+                            ptx::warpgroup_fence_operand(acc[i]);
+                        arrive_at(p_stage);
+                        if (do_wgmma_store)
+                            promote(acc);
+                        pending = false;
+                    };
+                    constexpr uint32_t kChunk = 4;
+                    uint32_t k_block_idx = 0;
+                    uint32_t const n_full = num_total_k_blocks / kChunk * kChunk;
+                    #pragma unroll 1
+                    while (k_block_idx < n_full) {
+                        pending = false;
+                        #pragma unroll
+                        for (uint32_t c = 0; c < kChunk; ++ c) {
+                            if ((c & 1u) == 0)
+                                step(accum, accum_o, k_block_idx);
+                            else
+                                step(accum_o, accum, k_block_idx);
+                            advance_pipeline(k_block_idx);
+                        }
+                        drain(accum_o);   // kChunk is even: the chunk's last block ran into accum_o
+                    }
+                    #pragma unroll 1
+                    while (k_block_idx < num_total_k_blocks) {
+                        pending = false;
+                        step(accum, accum_o, k_block_idx);
+                        advance_pipeline(k_block_idx);
+                        drain(accum);
+                    }
+                  } else {
                     #pragma unroll (kGemmType == GemmType::Normal && SHAPE_M == 0 && SHAPE_N == 0 && SHAPE_K == 0 && BLOCK_M == 256 && BLOCK_N == 128 ? 2 : kWideFiveCopies ? 4 : 8)
                     for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                         const auto a_desc_base_lo = a_desc_lo + stage_idx * (SMEM_A_SIZE_PER_STAGE / 16);
@@ -400,6 +528,7 @@ sm90_fp8_gemm_1d2d_body(float* sfb, int* grouped_layout,
                             }
                         }
                     }
+                  }
                 });
             } else {
                 #pragma unroll

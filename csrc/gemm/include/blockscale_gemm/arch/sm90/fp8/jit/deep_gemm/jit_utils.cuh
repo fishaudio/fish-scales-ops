@@ -534,6 +534,32 @@ inline GemmConfig get_dense_gemm_config(
             restage();
         }
     }
+    // Issue #12 (R040b): a fp8_gemm_kernel tile whose width does not divide 128 gets at most 6 stages from the
+    // candidates above. On the narrow ones (24, 40 or 48 wide) 8 or 7 stages run instead when they fit shared memory
+    // and divide the K blocks (K / 128, so that the last ring round is full), and, on a 128-row tile, when the last M
+    // block holds at least 112 rows; otherwise the pick above stands. On the H200 (runs/R040b of the issue-12 round,
+    // cold weights, base and new in one process, four to eight passes) 8 stages ran 2-9 % faster on every such tile
+    // measured (64 x 40 / 48 and 128 x 24 / 40 / 48 at K = 2048-9216: the producer waits less for a free stage).
+    // They were up to 10 % slower on 128-row tiles whose last M block held 88-104 rows (128 x 40 / 48 at M = 224, 232,
+    // 344-360), up to 6 % slower where a ring round is left partial (128 x 48 at K = 7680, 128 x 80 at K = 9728 with
+    // 7 stages), and 0.6-2.5 % slower on the 72- and 96-wide tiles at K = 2048. Only the pipeline depth changes: each
+    // output element is the same sum in K order.
+    if (!swap_ab && 128 % block_n != 0 && block_n <= 48
+        && (block_m != 128 || shape_m % 128 == 0 || shape_m % 128 >= 112))
+    {
+        constexpr int sm90_capacity = 232448;
+        int const k_blocks = static_cast<int>(shape_k / 128);
+        for (int stages : {8, 7})
+        {
+            int const smem = get_smem_size(stages, static_cast<int>(shape_k), block_m, block_n, 128, false);
+            if (smem <= sm90_capacity && k_blocks % stages == 0)
+            {
+                num_stages = stages;
+                smem_size = smem;
+                break;
+            }
+        }
+    }
     return std::make_tuple(block_m, block_n, num_stages, num_tma_multicast, smem_size);
 }
 

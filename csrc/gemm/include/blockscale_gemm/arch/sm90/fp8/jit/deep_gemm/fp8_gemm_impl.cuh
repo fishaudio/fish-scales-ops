@@ -444,6 +444,8 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
 
             // Accumulation for WGMMA or CUDA promotion
             float accum[WGMMA::kNumAccum], final_accum[WGMMA::kNumAccum] = {0};
+            // Issue #12 (R040b) rule 3: the second accumulator set of the dense 128 x 128 tile (see below)
+            [[maybe_unused]] float accum_o[WGMMA::kNumAccum];
 
             // Empty barrier arrival
             auto empty_barrier_arrive = [&](int s)
@@ -467,6 +469,104 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
                         = kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K;
                     DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
 
+                    // Issue #12 (R040b) rule 3: on the dense 128 x 128 tile, when the stage count divides the K blocks
+                    // (every ring round full), step s's WGMMAs run into accum (even s) or accum_o (odd s); once they
+                    // are issued, warpgroup_wait<1> waits for step s - 1 only, whose stage is released and whose
+                    // accumulators are promoted while step s runs on the tensor core; the round's last step is drained
+                    // with warpgroup_wait<0>. Steps are promoted in K order with the same scale products, so the bytes
+                    // do not change. On the H200 (runs/R040b of the issue-12 round, cold weights) this ran 0.3-3.1 %
+                    // faster on the pre-quantized call and level to 3.7 % faster on the served one where the stages
+                    // divide the K blocks (15 cells of 10240 x 2560 and 19456 x 2560 at M = 256-768, 5 stages over 20 K
+                    // blocks), and up to 3.6 % slower where they do not (K = 2048, 9728); on the narrower tiles, whose
+                    // rings are shallower, the later release of each stage cost more than the overlap saved, so they
+                    // keep one set.
+                    constexpr bool kTwoSets = BLOCK_M == 128 and BLOCK_N == 128
+                        and SchedulerType::gemm_type == GemmType::Normal and (SHAPE_K / BLOCK_K) % kNumStages == 0;
+                    if constexpr (kTwoSets)
+                    {
+                        float p_s00 = 0.f, p_s10 = 0.f, p_s01 = 0.f, p_s11 = 0.f;
+                        auto promote = [&](float(&acc)[WGMMA::kNumAccum])
+                        {
+#pragma unroll
+                            for (int i = 0; i < WGMMA::kNumAccum / 4; ++i)
+                            {
+                                bool predicate = kMustUseUniformedScaleB or i < num_former_iters;
+                                final_accum[i * 4 + 0] += (predicate ? p_s00 : p_s01) * acc[i * 4 + 0];
+                                final_accum[i * 4 + 1] += (predicate ? p_s00 : p_s01) * acc[i * 4 + 1];
+                                final_accum[i * 4 + 2] += (predicate ? p_s10 : p_s11) * acc[i * 4 + 2];
+                                final_accum[i * 4 + 3] += (predicate ? p_s10 : p_s11) * acc[i * 4 + 3];
+                            }
+                        };
+                        auto step = [&](float(&acc)[WGMMA::kNumAccum], float(&prev)[WGMMA::kNumAccum], int s)
+                        {
+                            float scale_b_0 = ld_shared(smem_scales_b + k_iter * kNumStages + s), scale_b_1 = 1.0f;
+                            if constexpr (not kMustUseUniformedScaleB)
+                                scale_b_1 = ld_shared(smem_scales_b + k_iter * kNumStages + s + SHAPE_K_SCALES);
+                            full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
+                            auto scale_a_0 = ld_shared(smem_scales_a[s] + r_0),
+                                 scale_a_1 = ld_shared(smem_scales_a[s] + r_1);
+#pragma unroll
+                            for (int i = 0; i < WGMMA::kNumAccum; ++i)
+                                warpgroup_fence_operand(acc[i]);
+                            warpgroup_arrive();
+#pragma unroll
+                            for (int k = 0; k < BLOCK_K / WGMMA::K; ++k)
+                            {
+                                auto desc_a
+                                    = make_smem_desc(smem_a[s] + math_wg_idx * WGMMA::M * BLOCK_K + k * WGMMA::K, 1);
+                                auto desc_b = make_smem_desc(smem_b[s] + k * WGMMA::K, 1);
+                                WGMMA::wgmma(desc_a, desc_b, acc, k);
+                            }
+                            warpgroup_commit_batch();
+                            fso_fence_stage_reads(); // this stage's scale loads before its release
+#pragma unroll
+                            for (int i = 0; i < WGMMA::kNumAccum; ++i)
+                                warpgroup_fence_operand(acc[i]);
+                            if (s > 0)
+                            {
+#pragma unroll
+                                for (int i = 0; i < WGMMA::kNumAccum; ++i)
+                                    warpgroup_fence_operand(prev[i]);
+                                warpgroup_wait<1>();
+#pragma unroll
+                                for (int i = 0; i < WGMMA::kNumAccum; ++i)
+                                    warpgroup_fence_operand(prev[i]);
+                                empty_barrier_arrive(s - 1);
+                                promote(prev);
+                            }
+                            p_s00 = scale_a_0 * scale_b_0;
+                            p_s10 = scale_a_1 * scale_b_0;
+                            if constexpr (not kMustUseUniformedScaleB)
+                                p_s01 = scale_a_0 * scale_b_1, p_s11 = scale_a_1 * scale_b_1;
+                        };
+#pragma unroll
+                        for (int s = 0; s < kNumInnerStages; ++s)
+                        {
+                            if ((s & 1) == 0)
+                                step(accum, accum_o, s);
+                            else
+                                step(accum_o, accum, s);
+                        }
+                        constexpr int kLast = kNumInnerStages - 1;
+                        auto drain = [&](float(&acc)[WGMMA::kNumAccum])
+                        {
+#pragma unroll
+                            for (int i = 0; i < WGMMA::kNumAccum; ++i)
+                                warpgroup_fence_operand(acc[i]);
+                            warpgroup_wait<0>();
+#pragma unroll
+                            for (int i = 0; i < WGMMA::kNumAccum; ++i)
+                                warpgroup_fence_operand(acc[i]);
+                            empty_barrier_arrive(kLast);
+                            promote(acc);
+                        };
+                        if constexpr ((kLast & 1) == 0)
+                            drain(accum);
+                        else
+                            drain(accum_o);
+                    }
+                    else
+                    {
 #pragma unroll
                     for (int s = 0; s < kNumInnerStages; ++s)
                     {
@@ -523,6 +623,8 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
                             final_accum[i * 4 + 2] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 2];
                             final_accum[i * 4 + 3] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 3];
                         }
+                    }
+
                     }
 
 // Wait unaligned cases

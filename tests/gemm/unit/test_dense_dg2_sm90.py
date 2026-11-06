@@ -62,6 +62,8 @@ CELLS = [
     (256, 19456, 2560, "fso"),            # 128 x 160 at M = 256 (DeepGEMM's pick, two waves): fso's kernel
     (2048, 2048, 4096, "fso"),            # DeepGEMM picks one wave of 256 x 128 without multicast
     (64, 2560, 4096, "fso"),              # 64-row tile but K < 8192
+    (128, 2560, 4096, "fso"),             # fp8_gemm_kernel's 64 x 48 tile at 8 stages, which divide its 32 K blocks
+    #                                       (R040b of the issue-12 round; 6 stages before)
     # rule 5: fso's tile leaves at least 48 rows of its last M block empty (below M = 1024)
     (80, 5120, 2048, "dg2 64x80"),        # DeepGEMM's single-CTA pick (fso: 128 x 40, 48 rows empty)
     (136, 2048, 2048, "dg2 64x48"),       # DeepGEMM's single-CTA pick (fso: 64 x 32, 56 rows empty)
