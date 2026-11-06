@@ -65,6 +65,33 @@
 // handed out draws past the live tiles and exits. (A static FC1 first wave would break (4): there an FC2 tile can
 // wait on a CTA that has not landed, see above.)
 //
+// The deferred draw (both modes; issue #13 follow-up, run fso_issue12_20261028/FB5). The scheduler warp draws two tiles
+// ahead of the load warp. When a call has few live (expert, row) pairs, its tiles fill the grid about one and a half
+// times: every CTA draws one tile in the first round, and the second round's tiles are FC2 tiles. A CTA whose first
+// tile is an FC2 tile published not ready could then win a second-round tile while its load warp spins in the first.
+// That second tile's stages stay the first tile's until the first one's FC1 dependency clears and its MMA frees them,
+// so it starts after every other tile and ends the kernel about two microseconds after the rest. Which CTAs win the
+// second round is a race that code layout tips either way. Measured on the B300 at Family B ep2 M = 1 in the
+// published bench: 8 or 9 of the 112 FC2 tiles queued so, and the kernel ended 12.8 us after its wait against 10.8 us
+// where none did; the layer took 17.1 us, against 15.7 us with the hold below.
+// So in that regime (the second-round gate below) a scheduler warp whose last published tile is an FC2 tile published
+// not ready holds its next draw until either every tile has been handed out (the draw counter has passed the live
+// tiles: the next draw can only end the CTA's work) or that tile's FC1 count is complete. It polls the two words with a
+// relaxed load of the counter and the acquire the load warp itself spins with, 256 ns apart. Holding the draw only
+// while tiles remain to be handed out matters: holding it until the dependency clears (or, equivalently, until the
+// CTA's own load warp has passed it) delays the CTA's last draw and with it the exit of its warps and the launch of the
+// dependent kernel, which cost 1 to 2.5 us per layer in measurement.
+// The second-round gate, evaluated by the holding warp from L (read after the kernel-wide wait): the launch has a second
+// round, and its tiles past one per CTA all fit on CTAs whose first tile is an FC1 tile, grid < D <= grid + min(D1,
+// grid) with D the live tiles and D1 the FC1 tiles. Without a second round every tile goes out in the first one; past
+// the bound (for example Family B uniform M = 2) a holding CTA would keep tiles that no other CTA can take yet. In both
+// cases the draw goes out at once and the scheduling stays as it was. Under the bound the token-tile mode draws single
+// tiles (tile pairs need at least kGroupMinTilesPerCta tiles per CTA), so the gate and the counter count tiles in both
+// modes. Freedom from deadlock holds as argued above: a holding CTA has drawn an FC2 tile, so every FC1 tile had been
+// handed out before (1), each to a CTA that runs it without waiting (3); the hold ends at the latest when that tile's
+// FC1 count completes, and every tile is still drawn. The tiles and their arithmetic are unchanged, so the outputs are
+// the same bytes.
+//
 // The counters (int32 [2 + 2G], per call): counter[0] the draws, counter[1] the CTAs that made their last draw,
 // counter[2 + i] done[i], and counter[2 + G + i] the packed facts of slot i (expert | rows << 16, -1 past the active
 // experts). moe_build_routing_compact(..., with_slots=True) returns them (`slot_sched`): the counters zero, the facts
@@ -173,6 +200,14 @@ CUTLASS_DEVICE uint32_t fso_ld_acquire_gpu(int const* p)
 {
     uint32_t v;
     asm volatile("ld.acquire.gpu.global.u32 %0, [%1];\n" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+
+// The deferred draw's poll of the draw counter (slot_moe_scheduler's header): a GPU-scope relaxed load.
+CUTLASS_DEVICE uint32_t fso_ld_relaxed_gpu(int const* p)
+{
+    uint32_t v;
+    asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];\n" : "=r"(v) : "l"(p) : "memory");
     return v;
 }
 
@@ -582,6 +617,50 @@ public:
 #endif
     }
 
+    // The deferred draw (see the header), the scheduler warp's leader lane (lane 0 in token-tile mode, the elected lane in
+    // slot mode). After publishing a live tile: an FC2 tile published not ready arms the hold with its done word and spin
+    // target, any other live tile leaves it as it is (the queue is still behind the armed tile). Before the next draw:
+    // hold while the launch is in the second-round regime, the counter has not passed the live tiles and the armed word
+    // has not reached its target. Compiled for the sm_100 / sm_103 device passes only: the kernel template is also
+    // instantiated in the sm_90a and sm_120a passes, where it is never launched, and its code there stays as it was.
+    CUTLASS_DEVICE void fso_note_deferred_draw(WorkTileInfo const& w)
+    {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030)
+        if (w.live && w.phase == 1 && !w.ready)
+        {
+            defer_word_ = done_counter(w.L_idx);
+            defer_target_ = done_target(w);
+        }
+#else
+        (void) w;
+#endif
+    }
+
+    CUTLASS_DEVICE void fso_wait_deferred_draw()
+    {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030)
+        if (defer_word_ == nullptr)
+            return;
+        int const* const word = defer_word_;
+        defer_word_ = nullptr;
+        // The live tiles D and the FC1 tiles D1, from L (read after the kernel-wide wait). Counted in tiles in both
+        // modes: in the regime the gate admits, the token-tile mode draws single tiles (tile pairs need at least
+        // kGroupMinTilesPerCta tiles per CTA), so a draw is a tile and the counter counts tiles.
+        int64_t const l = live_entries();
+        int64_t const d = static_cast<int64_t>(params_.tiles_m1 + params_.tiles_m2) * l;
+        int64_t const d1 = static_cast<int64_t>(params_.tiles_m1) * l;
+        int64_t const g = params_.grid;
+        if (d <= g || d - g > (d1 < g ? d1 : g))
+            return;
+        while (fso_ld_acquire_gpu(word) < defer_target_)
+        {
+            if (static_cast<int64_t>(fso_ld_relaxed_gpu(params_.counter)) >= d)
+                break;
+            __nanosleep(256);
+        }
+#endif
+    }
+
     // The words the scheduler reads a drawn tile's facts from: slot mode the packed slot facts (`slot_info`), token-tile
     // mode the list entries (non-negative or -1, so `fso_keep_facts`' never-taken test holds for them too).
     CUTLASS_DEVICE int const* facts_words() const
@@ -672,7 +751,10 @@ public:
         {
             int32_t old = 0;
             if (leader)
+            {
+                fso_wait_deferred_draw();
                 old = atomicAdd(params_.counter, 1);
+            }
             if (!list_loaded_)
             {
                 // Once per CTA, right behind its first draw (both in flight together), after the kernel-wide wait.
@@ -739,6 +821,7 @@ public:
                 "r"(static_cast<uint32_t>(w.L_idx)), "r"(pack_batch_rows(w)), "r"(pack_flags(w))
                 : "memory");
             asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];\n" ::"r"(full) : "memory");
+            fso_note_deferred_draw(w);
             if (last_draw)
             {
                 // As in slot mode: the CTA whose last draw completes the grid puts the draw and finish counters back to
@@ -777,7 +860,8 @@ public:
         return __shfl_sync(0xffffffffu, v, i % static_cast<int32_t>(NumThreadsPerWarp));
     }
 
-    // Slot mode: one drawn tile per call.
+    // Slot mode: one drawn tile per call. The deferred draw's state lives in the elected leader's registers from one call
+    // to the next; were a later call to elect another lane, that call would only draw without the hold.
     CUTLASS_DEVICE
     PipelineState<Stages> advance_slot(Pipeline& pipeline, PipelineState<Stages> state)
     {
@@ -791,6 +875,7 @@ public:
             int32_t l_raw = live_;
             if (l_raw < 0)
                 l_raw = *params_.live_slots;
+            fso_wait_deferred_draw();
             int32_t const old = atomicAdd(params_.counter, 1);
             if (live_ < 0)
                 live_ = l_raw < 0 ? 0 : (l_raw > params_.num_slots ? params_.num_slots : l_raw);
@@ -834,6 +919,7 @@ public:
                 "r"(static_cast<uint32_t>(w.L_idx)), "r"(pack_batch_rows(w)), "r"(pack_flags(w))
                 : "memory");
             asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];\n" ::"r"(full) : "memory");
+            fso_note_deferred_draw(w);
             if (last_draw)
             {
                 // As in slot_work_stealing.cuh: the CTA whose last draw completes the grid puts the draw and finish
@@ -1002,6 +1088,9 @@ private:
     int32_t list_regs_[ListMode ? 8 : 1] = {};
     // Token-tile mode: the launch's tiles per draw (0 until L is known).
     int32_t group_size_ = 0;
+    // The deferred draw (the leader lane): the done word and spin target of the FC2 tile that armed the hold.
+    int const* defer_word_ = nullptr;
+    uint32_t defer_target_ = 0;
 };
 
 template <class TileShape, class ClusterShape, uint32_t SchedulerPipelineStageCount>

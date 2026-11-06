@@ -490,7 +490,10 @@ def child_sched():
 
 # ---- fc1fc2 ----------------------------------------------------------------
 
-FC1FC2_ROUTINGS = ["uniform", "hot", "padded", "ep", "allpad", "narrow"]
+# "live1" is a graph bucket in which only the first row is live (every slot of the other rows -1): few live (expert,
+# row) pairs over many CTAs, where an FC2 tile published before its FC1 tiles completed makes its scheduler warp
+# defer its next draw (slot_moe_scheduler.cuh, "The deferred draw"; run fso_issue12_20261028/FB5).
+FC1FC2_ROUTINGS = ["uniform", "hot", "padded", "ep", "allpad", "narrow", "live1"]
 # The token-tile mode (I13-L5b) adds the graded skew and every pair on one expert (top-1), where an expert spans many
 # 128-row blocks and the FC2 tiles of a block wait for both of its halves.
 FC1FC2_LIST_ROUTINGS = FC1FC2_ROUTINGS + ["skew", "one"]
@@ -505,6 +508,10 @@ def fc1fc2_ids(M, E, topk, kind, seed):
         return eight.view(1, topk).expand(M, topk).contiguous().int().cuda()
     if kind in ("skew", "one"):
         return slotx_ids(M, E, topk, kind, seed)
+    if kind == "live1":
+        ids = make_topk(M, E, topk, "uniform", seed)
+        ids[1:] = -1
+        return ids.contiguous()
     return make_topk(M, E, topk, kind, seed)
 
 
