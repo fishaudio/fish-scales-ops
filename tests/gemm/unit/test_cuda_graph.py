@@ -735,7 +735,7 @@ def main():
         (4096,  2560, 9728),  # down M=4096 (cascade + streamk-skip)
         (1024,  2560, 9728),  # down M=1024 (streamk active)
         (  32,  2560, 9728),  # down M=32   (E7 override)
-        (   2,  2560, 9728),  # down M=2    (streamk path)
+        (   2,  2560, 9728),  # down M=2    (the decode single launch since issue #12 F5B; Stream-K before)
         # sm_100/103 decode row (M <= 32): narrow-N picks the vendored
         # in-cluster split-K kernel and wide-N the vendored persistent kernel,
         # and both compile through `cute.compile` on their first eager call.

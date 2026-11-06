@@ -50,6 +50,12 @@ bool launch_sm120_mxfp8_dense_epi_single(int tile_m, int tile_n, int stages, __n
     EPI_MX(128, 64, 2)
     EPI_MX(128, 128, 2)
     EPI_MX(160, 128, 2)
+    // The 3-stage instances of the stage rule (issue #12 F5B; ring mainloop).
+    EPI_MX(64, 128, 3)
+    EPI_MX(96, 128, 3)
+    // The 6-stage decode instances (issue #12 F5B; ring mainloop).
+    EPI_MX(16, 64, 6)
+    EPI_MX(32, 64, 6)
 #undef EPI_MX
     return false;
 }

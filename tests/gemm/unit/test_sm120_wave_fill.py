@@ -1,7 +1,10 @@
 """The wave-fill tile rule of the sm_120/sm_121 dense MXFP8 cascade (arch/sm120/mxfp8/dispatch.cuh,
 sm120_mxfp8_dense_route): above M = 128, a pick that is a single launch whose grid has fewer CTAs than the device has
 SMs is replaced by the existing cascade tile with the smallest waves x (TileM + TileN), waves = ceil(CTAs / SMs); a
-32-row tile is a candidate only when the pick's last M-tile is partial.
+32-row tile is a candidate only when the pick's last M-tile is partial. Among tiles of equal waves x (TileM + TileN)
+the one with the smaller 2 x TileM + TileN wins, the pick included (issue #12 F5B), and the stage rules that follow it
+give a single-wave (64, 128) or (96, 128) route 3 stages and some (32, 64) routes 6 (see test_sm120_ring_stages.py),
+so the table's routes carry their stage counts.
 
 1. **The routes.** On the RTX 5090's 170 SMs the route query ``torch.ops.fish_scales_ops.mxfp8_dense_route_sm120``
    returns the table below for the issue #12 tower and LLM TP2 shapes and the dense families' shapes (the rule's own
@@ -26,49 +29,52 @@ import subprocess
 import sys
 
 TILES = ((32, 64, 4), (32, 128, 4), (64, 64, 4), (64, 128, 2), (96, 128, 2), (128, 64, 2), (128, 128, 2), (160, 128, 2))
+# the routes may also name the ring-mainloop instances of the stage rules (issue #12 F5B): the same tiles as (64, 128,
+# 2), (96, 128, 2) and (32, 64, 4) with 3, 3 and 6 stages
+ROUTE_TILES = TILES + ((64, 128, 3), (96, 128, 3), (32, 64, 6))
 KNOBS = ("FSO_FORCE_TILE", "FSO_FORCE_KSPLIT", "FSO_FORCE_SMALLM", "FSO_FORCE_MIN_BLOCKS", "FSO_FORCE_SCHED_GROUP",
          "FSO_FORCE_TILE_K", "FSO_DISABLE_OVERRIDES", "FSO_DISABLE_STREAMK", "FSO_SMALLM_ROUTE")
 SMS_TABLE = 170
 W_EXPECTED = (  # (M, N, K, TileM, TileN, stages, k_split, tag) at 170 SMs
-    (182, 1280, 1280, 32, 64, 4, 1, "q"), (364, 1280, 1280, 64, 64, 4, 1, "q"),
-    (533, 1280, 1280, 32, 128, 4, 1, "q"), (1079, 1280, 1280, 64, 128, 2, 1, "q"),
-    (182, 5120, 1280, 64, 128, 2, 1, "fc1"), (364, 5120, 1280, 96, 128, 2, 1, "fc1"),
+    (182, 1280, 1280, 32, 64, 6, 1, "q"), (364, 1280, 1280, 64, 64, 4, 1, "q"),
+    (533, 1280, 1280, 32, 128, 4, 1, "q"), (1079, 1280, 1280, 64, 128, 3, 1, "q"),
+    (182, 5120, 1280, 64, 128, 3, 1, "fc1"), (364, 5120, 1280, 96, 128, 3, 1, "fc1"),
     (533, 5120, 1280, 96, 128, 2, 1, "fc1"), (1079, 5120, 1280, 128, 128, 2, 1, "fc1"),
     
     
     (182, 1280, 5120, 32, 64, 4, 1, "fc2"), (364, 1280, 5120, 64, 64, 4, 1, "fc2"),
-    (533, 1280, 5120, 32, 128, 4, 1, "fc2"), (1079, 1280, 5120, 64, 128, 2, 1, "fc2"),
+    (533, 1280, 5120, 32, 128, 4, 1, "fc2"), (1079, 1280, 5120, 64, 128, 3, 1, "fc2"),
     
     
     (182, 1280, 7680, 32, 64, 4, 1, "conv_out"), (364, 1280, 7680, 64, 64, 4, 1, "conv_out"),
-    (533, 1280, 7680, 32, 128, 4, 1, "conv_out"), (1079, 1280, 7680, 64, 128, 2, 1, "conv_out"),
-    (182, 2048, 1280, 64, 64, 4, 1, "proj2"), (364, 2048, 1280, 64, 128, 2, 1, "proj2"),
-    (533, 2048, 1280, 128, 64, 2, 1, "proj2"), (1079, 2048, 1280, 128, 128, 2, 1, "proj2"),
-    (160, 2560, 2048, 64, 64, 4, 1, "qkv_tp2"), (288, 2560, 2048, 64, 128, 2, 1, "qkv_tp2"),
-    (576, 2560, 2048, 96, 128, 2, 1, "qkv_tp2"), (768, 2560, 2048, 96, 128, 2, 1, "qkv_tp2"),
+    (533, 1280, 7680, 32, 128, 4, 1, "conv_out"), (1079, 1280, 7680, 64, 128, 3, 1, "conv_out"),
+    (182, 2048, 1280, 64, 64, 4, 1, "proj2"), (364, 2048, 1280, 64, 128, 3, 1, "proj2"),
+    (533, 2048, 1280, 64, 128, 3, 1, "proj2"), (1079, 2048, 1280, 128, 128, 2, 1, "proj2"),
+    (160, 2560, 2048, 64, 64, 4, 1, "qkv_tp2"), (288, 2560, 2048, 64, 128, 3, 1, "qkv_tp2"),
+    (576, 2560, 2048, 96, 128, 3, 1, "qkv_tp2"), (768, 2560, 2048, 96, 128, 3, 1, "qkv_tp2"),
     (1024, 2560, 2048, 128, 128, 2, 1, "qkv_tp2"), (2048, 2560, 2048, 128, 128, 2, 1, "qkv_tp2"),
     (144, 2048, 2048, 32, 64, 4, 1, "o_tp2"), (160, 2048, 2048, 32, 64, 4, 1, "o_tp2"),
     (288, 2048, 2048, 64, 64, 4, 1, "o_tp2"), (320, 2048, 2048, 64, 64, 4, 1, "o_tp2"),
-    (512, 2048, 2048, 128, 64, 2, 1, "o_tp2"), (768, 2048, 2048, 96, 128, 2, 1, "o_tp2"),
-    (1536, 2048, 2048, 128, 128, 2, 1, "o_tp2"), (160, 6144, 2560, 64, 128, 2, 1, "A_wqkv"),
-    (192, 6144, 2560, 64, 128, 2, 1, "A_wqkv"), (256, 6144, 2560, 96, 128, 2, 1, "A_wqkv"),
+    (512, 2048, 2048, 64, 128, 3, 1, "o_tp2"), (768, 2048, 2048, 96, 128, 3, 1, "o_tp2"),
+    (1536, 2048, 2048, 128, 128, 2, 1, "o_tp2"), (160, 6144, 2560, 64, 128, 3, 1, "A_wqkv"),
+    (192, 6144, 2560, 64, 128, 3, 1, "A_wqkv"), (256, 6144, 2560, 96, 128, 3, 1, "A_wqkv"),
     (512, 6144, 2560, 96, 128, 2, 1, "A_wqkv"), (1024, 6144, 2560, 160, 128, 2, 1, "A_wqkv"),
     (160, 2560, 4096, 64, 64, 4, 1, "A_wo"), (256, 2560, 4096, 64, 64, 4, 1, "A_wo"),
-    (512, 2560, 4096, 128, 64, 2, 1, "A_wo"), (1024, 2560, 4096, 128, 128, 2, 1, "A_wo"),
+    (512, 2560, 4096, 64, 128, 3, 1, "A_wo"), (1024, 2560, 4096, 128, 128, 2, 1, "A_wo"),
     (160, 19456, 2560, 160, 128, 2, 1, "A_gate_up"), (256, 19456, 2560, 128, 128, 2, 1, "A_gate_up"),
     (1024, 19456, 2560, 128, 128, 2, 1, "A_gate_up"), (160, 2560, 9728, 128, 128, 2, 4, "A_down"),
     (256, 2560, 9728, 128, 128, 2, 4, "A_down"), (512, 2560, 9728, 128, 128, 2, 2, "A_down"),
-    (160, 5120, 2048, 64, 128, 2, 1, "B_wqkv"), (192, 5120, 2048, 64, 128, 2, 1, "B_wqkv"),
-    (256, 5120, 2048, 64, 128, 2, 1, "B_wqkv"), (512, 5120, 2048, 96, 128, 2, 1, "B_wqkv"),
+    (160, 5120, 2048, 64, 128, 3, 1, "B_wqkv"), (192, 5120, 2048, 64, 128, 3, 1, "B_wqkv"),
+    (256, 5120, 2048, 64, 128, 3, 1, "B_wqkv"), (512, 5120, 2048, 96, 128, 2, 1, "B_wqkv"),
     (160, 2048, 4096, 32, 64, 4, 1, "BC_wo"), (256, 2048, 4096, 64, 64, 4, 1, "BC_wo"),
-    (512, 2048, 4096, 128, 64, 2, 1, "BC_wo"), (160, 9216, 2048, 96, 128, 2, 1, "C_wqkv_gated"),
+    (512, 2048, 4096, 64, 128, 3, 1, "BC_wo"), (160, 9216, 2048, 96, 128, 2, 1, "C_wqkv_gated"),
     (192, 9216, 2048, 96, 128, 2, 1, "C_wqkv_gated"), (256, 9216, 2048, 128, 128, 2, 1, "C_wqkv_gated"),
     (160, 12288, 2048, 160, 128, 2, 1, "C_gdn_in"), (192, 12288, 2048, 96, 128, 2, 1, "C_gdn_in"),
     (256, 12288, 2048, 128, 128, 2, 1, "C_gdn_in"), (1024, 12288, 2048, 128, 128, 2, 1, "C_gdn_in"),
     (160, 1024, 2048, 32, 64, 4, 1, "C_shared_gate_up"), (192, 1024, 2048, 64, 64, 4, 1, "C_shared_gate_up"),
     (256, 1024, 2048, 64, 64, 4, 1, "C_shared_gate_up"), (512, 1024, 2048, 64, 64, 4, 1, "C_shared_gate_up"),
-    (1024, 1024, 2048, 128, 64, 2, 1, "C_shared_gate_up"), (160, 2048, 512, 32, 64, 4, 1, "C_shared_down"),
-    (256, 2048, 512, 64, 64, 4, 1, "C_shared_down"), (512, 2048, 512, 128, 64, 2, 1, "C_shared_down"),
+    (1024, 1024, 2048, 64, 128, 3, 1, "C_shared_gate_up"), (160, 2048, 512, 32, 64, 4, 1, "C_shared_down"),
+    (256, 2048, 512, 64, 64, 4, 1, "C_shared_down"), (512, 2048, 512, 64, 128, 3, 1, "C_shared_down"),
 )
 # (M, N, K, bias, residual, activation, rule): cells the rules move on the RTX 5090; the bytes checks need only that the
 # forced tiles run, so they run on any sm_120 device
@@ -104,8 +110,8 @@ def case_routes(sms: int) -> None:
             for M in (65, 96, 128, 129, 144, 160, 182, 192, 256, 288, 364, 512, 533, 768, 1079, 1536, 2048, 4096):
                 t, ks, smallm = route_of(M, N, K)
                 n_inv += 1
-                check(t in TILES, f"routes: M={M} N={N} K={K} route {t} is not one of the cascade's tiles")
-                if M > 128 and ks <= 1 and not smallm and t in TILES and ctas(t, M, N) < sms:
+                check(t in ROUTE_TILES, f"routes: M={M} N={N} K={K} route {t} is not one of the cascade's tiles")
+                if M > 128 and ks <= 1 and not smallm and t in ROUTE_TILES and ctas(t, M, N) < sms:
                     best = min(cost(u, M, N, sms) for u in TILES if u[0] != 32)
                     check(cost(t, M, N, sms) <= best,
                           f"routes: M={M} N={N} K={K} under-filled route {t} ({ctas(t, M, N)} CTAs < {sms} SMs) has "

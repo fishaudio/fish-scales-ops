@@ -2244,11 +2244,14 @@ S1C_LLM = ((2560, 2048), (2048, 2048))
 S1C_LLM_MS = (1, 8, 32, 64, 128, 512, 2048)
 S1C_GRID_KS = (1280, 5120, 7680)
 S1C_GRID_MS = (1, 7, 78, 129, 1079)
-# Shapes on which the natural cascade splits K: narrow N with K >= 9728 at several M (TileM 16 / 32 / 64 / 128
-# Stream-K tiles), and tiles_n >= 32 at M <= 32 (K split 2).
-S1C_STREAMK_NATURAL = ((1, 2560, 9728), (7, 2560, 10240), (16, 2560, 9728), (32, 2560, 9728), (64, 2560, 9728),
-                       (100, 2560, 9728), (129, 2560, 9728), (300, 2560, 9728), (8, 4096, 4096), (20, 4096, 4096),
-                       (32, 6144, 5120))
+# Shapes on which the natural cascade splits K: narrow N with K >= 9728 at 16 < M <= 32 (TileM 32) and above M = 64
+# (TileM 64 / 128 Stream-K tiles, K splits 2, 3 and 4). The rest of the decode band runs single launches there since
+# issue #12 F5B (the 6-stage (16, 64) tile at M <= 16 and (32, 64) at 32 < M <= 64 for narrow N, (16, 128, 4) at
+# 32 <= tiles_n < 96 and M <= 32): S1C_DECODE_SINGLE, which were this list's Stream-K cells before.
+S1C_STREAMK_NATURAL = ((32, 2560, 9728), (65, 2560, 9728), (100, 2560, 9728), (129, 2560, 9728), (300, 2560, 9728),
+                       (129, 3072, 9728), (300, 2048, 10240))
+S1C_DECODE_SINGLE = ((1, 2560, 9728), (7, 2560, 10240), (16, 2560, 9728), (64, 2560, 9728), (8, 4096, 4096),
+                     (20, 4096, 4096), (32, 6144, 5120))
 S1C_SINGLE_TILES = ((16, 128, 4), (16, 64, 4), (32, 128, 4), (32, 64, 4), (64, 64, 4), (64, 128, 2), (96, 128, 2),
                     (128, 64, 2), (128, 128, 2), (160, 128, 2))
 S1C_SK_TILES = (((16, 128, 4), 4), ((32, 128, 4), 2), ((32, 64, 4), 4), ((64, 128, 2), 3), ((64, 64, 4), 4),
@@ -2580,9 +2583,10 @@ def _s1c_worker_graphs(w: _S1cWorker, spec: dict) -> None:
             ("fc1 bias+gelu", (78, 5120, 1280), True, "gelu_erf", False),
             ("out_proj bias+residual", (533, 1280, 1280), True, None, True),
             ("fc2 bias+residual", (1079, 1280, 5120), True, None, True),
-            ("streamk16 bias+gelu+residual", (16, 2560, 9728), True, "gelu_erf", True),
-            ("streamk20 bias", (20, 4096, 4096), True, None, False),
-            ("streamk129 bias+residual", (129, 2560, 9728), True, None, True)):
+            ("streamk65 bias+gelu+residual", (65, 2560, 9728), True, "gelu_erf", True),
+            ("streamk100 bias", (100, 2560, 9728), True, None, False),
+            ("streamk129 bias+residual", (129, 2560, 9728), True, None, True),
+            ("down16 bias+gelu+residual", (16, 2560, 9728), True, "gelu_erf", True)):
         route = _s1c_route(M, N, K)
         x = make_x(M, K, seed=M + 1)
         dw = prepared(12, N, K, seed=N + 2)
@@ -2601,9 +2605,10 @@ def _s1c_worker_graphs(w: _S1cWorker, spec: dict) -> None:
                   f"capture on a non-default stream, replay into NaN == eager  {_ok(ok)}")
             calls[(name, path)] = (g, out, ref, (x, dw, xq, sx, b, r))  # the graph reads these: keep them alive
     # Two different captured calls replayed concurrently from one thread, one per stream, 200 times.
-    for a, b2 in ((("fc1 bias+gelu", "2b"), ("streamk16 bias+gelu+residual", "2b")),
-                  (("streamk20 bias", "bf16 x"), ("streamk129 bias+residual", "2b")),
-                  (("streamk16 bias+gelu+residual", "bf16 x"), ("streamk16 bias+gelu+residual", "2b"))):
+    for a, b2 in ((("fc1 bias+gelu", "2b"), ("streamk65 bias+gelu+residual", "2b")),
+                  (("streamk100 bias", "bf16 x"), ("streamk129 bias+residual", "2b")),
+                  (("streamk65 bias+gelu+residual", "bf16 x"), ("streamk65 bias+gelu+residual", "2b")),
+                  (("down16 bias+gelu+residual", "2b"), ("streamk100 bias", "2b"))):
         (g1, o1, r1, _), (g2, o2, r2, _) = calls[a], calls[b2]
         s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
         bad1 = torch.zeros((), dtype=torch.int64, device="cuda")
@@ -2624,7 +2629,7 @@ def _s1c_worker_graphs(w: _S1cWorker, spec: dict) -> None:
     # Two concurrent Stream-K calls on two streams no longer share scratch: each capture allocates its own partial
     # buffer from the torch caching allocator on its own stream (memory history), and the scratch is a torch
     # allocation at all (peak allocated). Eager calls on two streams, interleaved without synchronization, stay exact.
-    M, N, K = 16, 2560, 9728
+    M, N, K = 100, 2560, 9728
     route = _s1c_route(M, N, K)
     want_bytes = (route["scratch"] + 511) // 512 * 512
     xa, xb = make_x(M, K, seed=31), make_x(M, K, seed=32)
@@ -2782,9 +2787,10 @@ def _s1c_specs() -> list:
     natural = ([{"mnk": (M, N, K)} for N, K in S1C_TOWER for M in S1C_TOWER_MS]
                + [{"mnk": (M, N, K)} for N, K in S1C_LLM for M in S1C_LLM_MS]
                + grid
-               + [{"mnk": mnk, "split": "split"} for mnk in S1C_STREAMK_NATURAL])
-    zero = [(7, 1280, 1280), (1079, 1280, 5120), (16, 2560, 9728), (20, 4096, 4096)]
-    producer = [(78, 5120, 1280), (16, 2560, 9728)]
+               + [{"mnk": mnk, "split": "split"} for mnk in S1C_STREAMK_NATURAL]
+               + [{"mnk": mnk, "split": 1} for mnk in S1C_DECODE_SINGLE])
+    zero = [(7, 1280, 1280), (1079, 1280, 5120), (16, 2560, 9728), (100, 2560, 9728)]
+    producer = [(78, 5120, 1280), (16, 2560, 9728), (100, 2560, 9728)]
     specs = [("natural", {}, {"kind": "exact", "label": "natural", "cells": natural, "zero": zero,
                               "producer": producer}),
              ("natural, FSO_DISABLE_PDL=1", {"FSO_DISABLE_PDL": "1"},
@@ -4725,8 +4731,10 @@ def case_q(major: int) -> None:
 
 S3C_SHAPES = ((5120, 1280), (1280, 1280), (2048, 1280), (1280, 5120))  # N x K: fc1, proj1, 2048 x 1280, fc2
 S3C_MS = (1, 7, 78, 129, 533, 1079)
-# Shapes the natural cascade splits K on (narrow N with long K; tiles_n >= 32 at M <= 32): the quantized reduce.
-S3C_STREAMK_NATURAL = ((1, 2560, 9728), (16, 2560, 9728), (129, 2560, 9728), (20, 4096, 4096), (32, 6144, 5120))
+# Shapes the natural cascade splits K on (narrow N with long K above M = 64): the quantized reduce. The decode cells
+# that were Stream-K before issue #12 F5B run single launches (S3C_DECODE_SINGLE, the quantized-output instances).
+S3C_STREAMK_NATURAL = ((65, 2560, 9728), (100, 2560, 9728), (129, 2560, 9728), (300, 2560, 9728), (129, 3072, 9728))
+S3C_DECODE_SINGLE = ((1, 2560, 9728), (16, 2560, 9728), (20, 4096, 4096), (32, 6144, 5120))
 # The forced tiles' grid: the M set on two N x K and one wider cell.
 S3C_FORCED_GRID = [(M, 1280, K) for K in (1280, 5120) for M in S3C_MS] + [(129, 5120, 1280)]
 # (label, bias, activation): linear_quantized takes no residual.
@@ -4839,7 +4847,7 @@ class _S3cWorker:
         for name, (M, N, K), use_b, act in (("fc1 bias+gelu", (78, 5120, 1280), True, "gelu_erf"),
                                             ("proj1 identity", (533, 1280, 1280), False, None),
                                             ("fc2 bias", (1079, 1280, 5120), True, None),
-                                            ("streamk16 bias+gelu", (16, 2560, 9728), True, "gelu_erf"),
+                                            ("streamk65 bias+gelu", (65, 2560, 9728), True, "gelu_erf"),
                                             ("streamk129 gelu", (129, 2560, 9728), False, "gelu_erf")):
             route = _s1c_route(M, N, K)
             x = make_x(M, K, seed=M + 1)
@@ -4866,7 +4874,7 @@ class _S3cWorker:
                       f"capture on a non-default stream, replay into NaN codes / all-ones words == eager  {_ok(ok)}")
                 calls[(name, path)] = (g, out, ref, (x, dw, xq, sx, b))  # the graph reads these: keep them alive
         # Two different captured calls replayed concurrently from one thread, one per stream, 200 times.
-        for a, b2 in ((("fc1 bias+gelu", "2b"), ("streamk16 bias+gelu", "2b")),
+        for a, b2 in ((("fc1 bias+gelu", "2b"), ("streamk65 bias+gelu", "2b")),
                       (("proj1 identity", "bf16 x"), ("streamk129 gelu", "2b")),
                       (("fc2 bias", "bf16 x"), ("fc2 bias", "2b"))):
             (g1, o1, r1, _), (g2, o2, r2, _) = calls[a], calls[b2]
@@ -4962,7 +4970,8 @@ def _s3c_worker(spec_json: str) -> int:
 def _s3c_specs() -> list:
     """(label, env, spec) of every worker of case r."""
     grid = [{"mnk": (M, N, K)} for N, K in S3C_SHAPES for M in S3C_MS]
-    natural = grid + [{"mnk": mnk, "split": "split"} for mnk in S3C_STREAMK_NATURAL]
+    natural = grid + [{"mnk": mnk, "split": "split"} for mnk in S3C_STREAMK_NATURAL] \
+        + [{"mnk": mnk, "split": 1} for mnk in S3C_DECODE_SINGLE]
     forced = [{"mnk": mnk} for mnk in S3C_FORCED_GRID]
     specs = [("natural", {"FSO_SMALLM_ROUTE": "0"}, {"kind": "exact", "label": "natural", "cells": natural}),
              ("natural, FSO_DISABLE_PDL=1", {"FSO_SMALLM_ROUTE": "0", "FSO_DISABLE_PDL": "1"},
@@ -5532,8 +5541,9 @@ def case_s(major: int) -> None:
 
 # Candidate cells (M, N, K); the ones a rule routes (the 2b call's R1 or the bf16-x call's R2) are run: the issue's
 # RTX 5090 TP2 shards qkv [2560 x 2048] and o [2048 x 2048] across the decode band, the tower shapes of case r at
-# decode M, and K = 9728 at M <= 8, where the cascade splits K (Stream-K) and rounds its slices' partials (on the RTX
-# 5090 the rules route none of the K = 9728 cells; they run where a rule takes them).
+# decode M, and K = 9728 at M <= 8, where the cascade runs the single launch of the 6-stage (16, 64) tile (a Stream-K
+# split that rounded its slices' partials before issue #12 F5B; on the RTX 5090 the rules route none of the K = 9728
+# cells; they run where a rule takes them).
 S120_CANDIDATES = tuple((M, N, K) for (N, K) in ((2560, 2048), (2048, 2048)) for M in (1, 4, 8, 16, 32, 48, 64)) \
     + tuple((M, N, K) for (N, K) in ((5120, 1280), (1280, 1280), (2048, 1280), (1280, 5120)) for M in (1, 7, 16)) \
     + ((1, 2560, 9728), (4, 2560, 9728), (8, 2560, 9728))
