@@ -43,6 +43,7 @@ BUDGET_R1, N0_R1 = 73728.0, 16384.0
 R1_RESIDENT_ONLY, R1_NC_MAX = True, 5       # R1's plan guards (smallm_route.h kR1ResidentOnly, kR1NcMax)
 R1_ONE_ROUND = True                         # R1's plan guard kR1OneRound: N / (16 rt) tile groups <= sms
 BUDGET_R2, N0_R2 = 65536.0, 24576.0
+R2_TILE_GROUPS0 = 96.0                      # R2's budget grows in proportion to the tile groups above this many (F5A)
 R2_KEXP_QUARTERS, R2_K_MAX = 1, 1 << 30     # q = 1/4; no K cap
 
 failures: list[str] = []
@@ -84,12 +85,20 @@ def r2_cost(m: int, N: int, K: int) -> float:
     return float(m) * K * (1.0 + N / N0_R2) * r2_kq(K)
 
 
+def r2_budget(M: int, N: int, K: int) -> float:
+    """BUDGET_R2 * max(1, T / R2_TILE_GROUPS0), T = N / (16 rt) the tile groups of the shape's configuration."""
+    _nc, rt, _wk, _cj, _smem = config(M, N, K)
+    t = float(N // (16 * rt))
+    return BUDGET_R2 * (t / R2_TILE_GROUPS0) if t > R2_TILE_GROUPS0 else BUDGET_R2
+
+
 def rule_r2(M: int, N: int, K: int, sms: int = SMS) -> bool:
     if not 1 <= M <= K_MAX_M or K > R2_K_MAX:
         return False
-    if r2_cost(M, N, K) > BUDGET_R2:
+    b = r2_budget(M, N, K)
+    if r2_cost(M, N, K) > b:
         return False
-    if M > 8 and r2_cost((M + 7) // 8 * 8, N, K) > BUDGET_R2:
+    if M > 8 and r2_cost((M + 7) // 8 * 8, N, K) > b:
         return False
     return rule_r1(M, N, K, sms)
 
@@ -142,12 +151,12 @@ Q120A_SHAPES = {  # tag: (N, K), the twelve Q120a decode shapes (issue-12 LLM ro
     "C_shared_down": (2048, 512),
 }
 # The fitted band at the RTX 5090's 170 SMs: (largest M R1 routes, largest M R2 routes) over every M = 1..64, with no
-# hole below the top (the refit on library timings of issue #12 Q120d, runs/Q120d/refit; the table is the refit tool's
-# own rule applied to every M, not the extension's). Shapes whose tile groups need more than one round of the
-# persistent grid on 170 SMs are never routed (0, 0).
+# hole below the top (the refit on library timings of issue #12 Q120d, runs/Q120d/refit, with R2's tile-group term of
+# issue #12 F5A, runs/F5A/refit; the table is the refit tool's own rule applied to every M, not the extension's).
+# Shapes whose tile groups need more than one round of the persistent grid on 170 SMs are never routed (0, 0).
 Q120A_BAND = {
-    "C_shared_down": (40, 40), "C_shared_gate_up": (32, 24), "llm_o_tp2": (32, 24), "llm_qkv_tp2": (24, 24),
-    "llm_o": (16, 8), "A_wo": (8, 8), "A_down": (0, 0), "A_gate_up": (0, 0), "A_wqkv": (0, 0),
+    "C_shared_down": (40, 40), "C_shared_gate_up": (32, 24), "llm_o_tp2": (32, 32), "llm_qkv_tp2": (24, 24),
+    "llm_o": (16, 16), "A_wo": (8, 8), "A_down": (0, 0), "A_gate_up": (0, 0), "A_wqkv": (0, 0),
     "C_gdn_in_proj": (0, 0), "C_wqkv_gated": (0, 0), "llm_qkv": (0, 0),
 }
 

@@ -14,8 +14,8 @@
  *           nc <= 5, and the N / (16 rt) tile groups fit one round of the persistent grid on the device (at most its SM
  *           count: on the RTX 5090's 170 SMs N <= 2720 at rt = 1 and N <= 5440 at rt = 2).
  *   R2, the bf16-x call linear(x, w):           G2 (one launch) instead of quantize + the 2b route when
- *           f(M) <= 65536 and (M <= 8 or f(pad8(M)) <= 65536), f(m) = m * K * (1 + N / 24576) * (K / 2048)^(1/4),
- *           and R1.
+ *           f(M) <= B and (M <= 8 or f(pad8(M)) <= B), f(m) = m * K * (1 + N / 24576) * (K / 2048)^(1/4),
+ *           B = 65536 * max(1, T / 96) with T = N / (16 rt) the plan's tile groups, and R1.
  *
  * Why this form: the family's cost over a pure weight stream grows with the activation every CTA stages (and, in G2,
  * quantizes), M * K bytes, while the cascade amortizes its fixed cost over more rows as N grows, so the budget for
@@ -26,10 +26,16 @@
  * and nc >= 6 (M above 40) loses on the short-K shapes. Where R1 routes the 2b call and R2 does not take G2, the
  * bf16-x call runs quantize + G1, which was measured slower than quantize + the cascade on cells where G1 alone wins
  * (the quantize kernel overlaps the cascade better than the small-M kernel under PDL), so R1's budget is also bound by
- * that call. The kernel's configuration changes with every 8 rows (nc = ceil(M / 8)), so above M = 8 a rule may only
+ * that call. R2's budget grows with the plan's tile groups T above 96 (issue #12 F5A, on the same two passes): G2 pays
+ * its in-kernel quantize in every CTA, a cost that grows with M * K and not with the grid, while quantize + G1, its
+ * alternative where R1 holds, was measured to cost more over G1 the more tile groups G1 launches (at K = 2048 and
+ * M = 28-32 about 3.2 us at T = 64 and 3.7-3.9 us at T = 128). So at the same M * K, G2 wins at T = 128
+ * (2048 x 2048 at M = 28 / 32: -6.6 / -7.0 % against quantize + G1, 2048 x 4096 at M = 12 / 16: -11.0 / -6.6 %) and
+ * loses at T = 64 (1024 x 2048 at M = 28 / 32: +1.4 / +3.3 %). Below 96 tile groups the budget is the one fitted in
+ * Q120d. The kernel's configuration changes with every 8 rows (nc = ceil(M / 8)), so above M = 8 a rule may only
  * take an 8-row bucket whose top passes too (R1 is written in pad8(M) for the same reason). On the 276 measured cells
- * the rules route the 2b call on 83 and the bf16-x call to G2 on 75, and neither call is more than 1 % slower than
- * before on any cell in either pass; they leave on the cascade 39 cells where G1 was more than 3 % faster and 41
+ * the rules route the 2b call on 83 and the bf16-x call to G2 on 80, and neither call is more than 1 % slower than
+ * before on any cell in either pass; they leave on the cascade 39 cells where G1 was more than 3 % faster and 37
  * where G2 was (among them the multi-round shapes that still win, 4096 x 1280, 4096 x 3072 and 5120 x 2048, and
  * 2560 x 9728 at M <= 4, whose 8-row bucket R1 cannot split). R2 implies R1 on every cell; the code requires it.
  *
@@ -71,8 +77,11 @@ constexpr bool kR1ResidentOnly = true;   // R1 plan guard: only plans whose acti
 constexpr int kR1NcMax = 5;              // R1 plan guard: only plans with nc <= kR1NcMax
 constexpr bool kR1OneRound = true;       // R1 plan guard: only plans whose tile groups fit one round of the persistent
                                          // grid on the device (N / (16 rt) <= its SM count)
-constexpr double kBudgetR2 = 65536.0;    // R2: f(m) <= kBudgetR2, f(m) = m * K * (1 + N / kN0R2) * (K / 2048)^q
+constexpr double kBudgetR2 = 65536.0;    // R2: f(m) <= kBudgetR2 * max(1, T / kR2TileGroups0),
+                                         // f(m) = m * K * (1 + N / kN0R2) * (K / 2048)^q
 constexpr double kN0R2 = 24576.0;
+constexpr double kR2TileGroups0 = 96.0;  // R2: the budget grows in proportion to the plan's tile groups T = N / (16 rt)
+                                         // above this many (issue #12 F5A)
 constexpr int kR2KExpQuarters = 1;       // R2: q in quarters, 0 (q = 0), 1 (q = 1/4) or 2 (q = 1/2)
 constexpr int kR2KMax = 1 << 30;         // R2: only for K <= kR2KMax
 
@@ -250,8 +259,9 @@ inline bool rule_r1(int M, int N, int K, int sms)
     return true;
 }
 
-// R2 (the bf16-x call): K <= kR2KMax, f(M) <= kBudgetR2 and, above the first 8-row bucket, f(pad8(M)) <= kBudgetR2 as
-// well, with f(m) = m * K * (1 + N / kN0R2) * (K / 2048)^q; and R1.
+// R2 (the bf16-x call): K <= kR2KMax, f(M) <= B and, above the first 8-row bucket, f(pad8(M)) <= B as well, with
+// f(m) = m * K * (1 + N / kN0R2) * (K / 2048)^q and B = kBudgetR2 * max(1, T / kR2TileGroups0), T = N / (16 rt) the
+// tile groups of the plan config() picks for the shape; and R1.
 inline double r2_kq(int K)
 {
     double const r = double(K) / 2048.0;
@@ -263,13 +273,23 @@ inline double r2_cost(int m, int N, int K)
     return double(m) * double(K) * (1.0 + double(N) / kN0R2) * r2_kq(K);
 }
 
+// R2's budget for the shape: kBudgetR2, scaled by T / kR2TileGroups0 when the plan has more than kR2TileGroups0 tile
+// groups (the plan of M's 8-row bucket: nc, and with it rt, is the same for every M of the bucket).
+inline double r2_budget(int M, int N, int K)
+{
+    Plan const c = config(M, N, K);
+    double const t = double(N / (16 * c.rt));
+    return t > kR2TileGroups0 ? kBudgetR2 * (t / kR2TileGroups0) : kBudgetR2;
+}
+
 inline bool rule_r2(int M, int N, int K, int sms)
 {
     if (M < 1 || M > kMaxM || K > kR2KMax)
         return false;
-    if (r2_cost(M, N, K) > kBudgetR2)
+    double const b = r2_budget(M, N, K);
+    if (r2_cost(M, N, K) > b)
         return false;
-    if (M > 8 && r2_cost((M + 7) / 8 * 8, N, K) > kBudgetR2)
+    if (M > 8 && r2_cost((M + 7) / 8 * 8, N, K) > b)
         return false;
     return rule_r1(M, N, K, sms);
 }

@@ -3053,7 +3053,8 @@ def _w_worker_graphs(w: _WWorker, spec: dict) -> None:
             ("o_tp2 M=24 bias+gelu+residual", (24, 2048, 2048), True, "gelu_erf", True),
             ("down M=1 residual", (1, 2560, 9728), False, None, True),
             ("shared_down M=64 bias", (64, 2048, 512), True, None, False),
-            ("o M=16 bias (2b route only)", (16, 2048, 4096), True, None, False)):
+            ("o M=16 bias", (16, 2048, 4096), True, None, False),
+            ("shared_gate_up M=32 bias (2b route only)", (32, 1024, 2048), True, None, False)):
         r2b, rx = _w_route(M, N, K, False), _w_route(M, N, K, True)
         x = make_x(M, K, seed=M + 1)
         dw = prepared(12, N, K, seed=N + 2)

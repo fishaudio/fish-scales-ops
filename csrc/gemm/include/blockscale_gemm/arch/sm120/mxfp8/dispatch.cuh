@@ -430,13 +430,14 @@ namespace kernels::blockscale_gemm
 // (160,128,2)) fit unchanged — verified at TileM=160 N=128 ST=2:
 // 40+32+2.5+2 = 76 KB.
 //
-// The cascade is sm120_mxfp8_dense_route below: it returns the instance and the K split a call runs, and
-// gemm_dispatch_sm120_mxfp8 (further down) launches it. The rules are the ones this dispatcher has always applied, in
+// The cascade is sm120_mxfp8_dense_route_cascade below, and sm120_mxfp8_dense_route after it applies the wave-fill rule
+// to the cascade's pick: the route returns the instance and the K split a call runs, and gemm_dispatch_sm120_mxfp8
+// (further down) launches it. The cascade's rules are the ones this dispatcher has always applied, in
 // the same order, with each launch statement replaced by the route it launched; the launcher's own clamps of the
 // Stream-K split (sm120_streamk_effective_split) are applied here, so that the route states what runs. One source of
 // truth serves the launch, the Stream-K scratch size the op body allocates (Sm120DenseRoute::streamk_scratch_bytes)
 // and the host-side route query (sm120_mxfp8_dense_route_query in ops/mxfp8_kernel.cu).
-inline Sm120DenseRoute sm120_mxfp8_dense_route(
+inline Sm120DenseRoute sm120_mxfp8_dense_route_cascade(
     uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_device_sms)
 {
     // The route of instance (tm, tn, st) with the given MinBlocksPerSm / SchedGroup, K split and SmallM flag; the
@@ -1017,6 +1018,64 @@ inline Sm120DenseRoute sm120_mxfp8_dense_route(
     }
 #undef DISPATCH_TILE_MX
     // Every branch above returns (the compiler proves the end unreachable).
+}
+
+// The wave-fill rule over the cascade's pick (issue #12 F5A, 2026-11-05): above M = 128, when the pick above is a single
+// launch whose grid has fewer CTAs than the device has SMs, the route takes the existing cascade tile with the smallest
+// waves x (TileM + TileN), waves = ceil(CTAs / SMs), if that is strictly smaller than the pick's own (the first such
+// tile in the list below on a tie; a tie with the pick keeps the pick). A tile of 32 rows is a candidate only when the
+// pick's last M-tile is partial (M is not a multiple of its TileM). FSO_DISABLE_OVERRIDES=1 and the forced diagnostic
+// configurations (FSO_FORCE_TILE / FSO_FORCE_KSPLIT, ...) bypass it, and a Stream-K pick is left alone: the rule only
+// ever exchanges one single-launch tile for another.
+//
+// Why: on the short-K and narrow-N shapes of this band one CTA's main loop takes a time close to proportional to the
+// operand bytes it streams per K step, (TileM + TileN) x 128, so the grid's time is about its waves times that. The
+// cascade's rules above were fitted on the dense families' shapes, and on 1280-wide to 2560-wide outputs at M from 129
+// to about 1100 their picks ran 60-100 CTAs on the RTX 5090's 170 SMs. Measured there (2407 MHz, cold weights,
+// CUDA-graph replay, each tile forced through fso.dense.linear, the issue #12 tower roles with their epilogues and the
+// dense families' shapes, two passes), the rule's tile was faster than the pick on both the 2b and the bf16-x call on
+// each of the 42 cells it moves, by 2-38 %: 1280 x 1280 at M = 1079 from 18.5 to 12.1 us, 1280 x 5120 at M = 364 from
+// 28.7 to 21.7 us, 1280 x 7680 at M = 364 from 41.0 to 28.9 us. A first form without the 32-row condition also moved
+// 1024 x 2048 at M = 192 and 256 from 64 to 32 rows, where the pick's M-tiles were all full and both grids fit one wave,
+// and measured 0.995 and 1.011 of the pick on the 2b call: splitting the rows finer then shortens no CTA's main loop,
+// and the 32-row tiles won only where the pick pads its last M-tile. A pick whose grid already fills the machine is
+// left alone, so the multi-wave tiles of the dense families' large-M cells keep their routes.
+//
+// Bytes: every tile has identity, epilogue and quantized-output instantiations, and the K accumulation order of a
+// single launch does not depend on the tile, so the route gives the bytes of the pick, on both entries and for
+// linear_quantized.
+inline Sm120DenseRoute sm120_mxfp8_dense_route(
+    uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_device_sms)
+{
+    Sm120DenseRoute const r = sm120_mxfp8_dense_route_cascade(shape_m, shape_n, shape_k, num_device_sms);
+    if (shape_m <= 128 || r.k_split > 1 || r.forced_only_instance() || read_disable_overrides()
+        || force_tile_applies(read_force_tile(), shape_k))
+        return r;
+    int const sms = std::max(1, num_device_sms);
+    auto ctas = [&](int tm, int tn)
+    { return static_cast<int>((shape_m + tm - 1) / tm) * static_cast<int>((shape_n + tn - 1) / tn); };
+    if (ctas(r.tile_m, r.tile_n) >= sms)
+        return r;
+    bool const pick_partial = shape_m % static_cast<uint32_t>(r.tile_m) != 0;
+    auto cost = [&](int tm, int tn) { return (ctas(tm, tn) + sms - 1) / sms * (tm + tn); };
+    constexpr int kTiles[8][3]
+        = {{32, 64, 4}, {32, 128, 4}, {64, 64, 4}, {64, 128, 2}, {96, 128, 2}, {128, 64, 2}, {128, 128, 2}, {160, 128, 2}};
+    Sm120DenseRoute w = r;
+    int best = cost(r.tile_m, r.tile_n);
+    for (auto const& t : kTiles)
+    {
+        if (t[0] == 32 && !pick_partial)
+            continue;
+        int const c = cost(t[0], t[1]);
+        if (c < best)
+        {
+            best = c;
+            w.tile_m = t[0];
+            w.tile_n = t[1];
+            w.stages = t[2];
+        }
+    }
+    return w;
 }
 
 // A non-identity epilogue on a route whose instance exists only behind a diagnostic knob: refused, before anything

@@ -256,13 +256,15 @@ device, launch parameters included): R1 routes the 2b call to G1 when
 memory, the kernel covers `M` with at most five 8-row groups (`M ≤ 40`), and the
 `N / 16` (or `N / 32`) tile groups of the kernel's persistent grid fit one round
 on the device (at most its SM count); R2 routes the bf16-x call to G2 when
-`f(M) ≤ 65536` and, above `M = 8`, `f(pad8(M)) ≤ 65536` as well, with
-`f(m) = m · K · (1 + N / 24576) · (K / 2048)^¼`, and R1 holds (the kernel's
+`f(M) ≤ B` and, above `M = 8`, `f(pad8(M)) ≤ B` as well, with
+`f(m) = m · K · (1 + N / 24576) · (K / 2048)^¼` and `B = 65536 · max(1, T / 96)`,
+`T` the kernel's tile groups (`N / 16`, or `N / 32` where a tile group holds two
+16-row tiles), and R1 holds (the kernel's
 configuration changes every 8 rows, so a rule takes a whole 8-row bucket or
 none of it; within the first bucket the row count decides). Above `M = 64`
 nothing changes. On the RTX 5090 (170 SMs) the rules serve the issue's TP2
-projections, `2560 × 2048` up to `M = 24` on both calls and `2048 × 2048` up to
-`M = 32` for the 2b call and `M = 24` for the bf16-x call; shapes with more than 2720 output features (5440
+projections, `2560 × 2048` up to `M = 24` and `2048 × 2048` up to `M = 32`, on
+both calls; shapes with more than 2720 output features (5440
 for `K ≤ 1152`, where a tile group holds two 16-row tiles) stay on the cascade at
 every `M`. The decode cells outside the band stay on the activation quantize +
 the cascade.
