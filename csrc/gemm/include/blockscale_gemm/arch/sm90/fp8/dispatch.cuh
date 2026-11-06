@@ -20,8 +20,10 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -252,6 +254,75 @@ inline bool sm90_dense_splitk_route(void* mat_a, int ld_a, void* mat_b, int ld_b
     return false;
 }
 
+// The cluster occupancy that the co-scheduled DeepGEMM v2 launches need (deep_gemm::jit::dg2_co_schedule, issue #12
+// FH6): how many clusters of c CTAs (c = 2 .. kDg2MaxSchedCluster) the device runs at once at one CTA per SM. Every v2
+// kernel runs one CTA per SM (its 384 or 256 threads fill the register file), so the answer depends only on c and on
+// how the device groups its SMs into GPCs, and a kernel that does nothing, given 200 KB of dynamic shared memory, gives
+// it. A template, like the other kernels of these headers, so that the translation units that compile this header share
+// one entity.
+template <int kUnused = 0>
+__global__ void sm90_cosched_probe_kernel()
+{
+}
+
+// The table, per device, filled on the first call that is not inside a stream capture. cudaOccupancyMaxActiveClusters
+// is a host-side query, but like every host-side cache of this dispatcher the table is filled by an eager call only: a
+// call inside a capture before any eager one gets nullptr, and its v2 launches then run without the cluster attribute,
+// which changes no byte (test_cuda_graph covers both orders). Indexed by the cluster size; entries 0 and 1 unused, 0 for
+// a size the device does not run.
+inline int const* sm90_cosched_max_clusters(cudaStream_t stream)
+{
+    constexpr int kMaxDevices = 64;
+    constexpr int kMax = deep_gemm::jit::kDg2MaxSchedCluster;
+    struct Table
+    {
+        std::atomic<int> known{0};
+        int clusters[kMax + 1] = {};
+    };
+    static Table tables[kMaxDevices];
+    static std::mutex fill;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kMaxDevices)
+        return nullptr;
+    Table& t = tables[dev];
+    if (t.known.load(std::memory_order_acquire) != 0)
+        return t.clusters;
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess || capture != cudaStreamCaptureStatusNone)
+        return nullptr;
+    std::lock_guard<std::mutex> lock(fill);
+    if (t.known.load(std::memory_order_acquire) != 0)
+        return t.clusters;
+    constexpr int kProbeSmem = 200 * 1024;
+    if (cudaFuncSetAttribute(sm90_cosched_probe_kernel<0>, cudaFuncAttributeMaxDynamicSharedMemorySize, kProbeSmem)
+        != cudaSuccess)
+    {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    for (int c = 2; c <= kMax; ++c)
+    {
+        cudaLaunchConfig_t cfg{};
+        cfg.gridDim = dim3(static_cast<unsigned>(c * 64));
+        cfg.blockDim = dim3(128);
+        cfg.dynamicSmemBytes = kProbeSmem;
+        cudaLaunchAttribute attr[1];
+        attr[0].id = cudaLaunchAttributeClusterDimension;
+        attr[0].val.clusterDim = {static_cast<unsigned>(c), 1, 1};
+        cfg.attrs = attr;
+        cfg.numAttrs = 1;
+        int n = 0;
+        if (cudaOccupancyMaxActiveClusters(&n, sm90_cosched_probe_kernel<0>, &cfg) != cudaSuccess)
+        {
+            (void) cudaGetLastError();
+            n = 0;
+        }
+        t.clusters[c] = n;
+    }
+    t.known.store(1, std::memory_order_release);
+    return t.clusters;
+}
+
 // `epilogue`: the dense epilogue of interface v1 (common/epilogue.cuh). Bias, residual and erf-GELU
 // (kDenseEpiServedSm90DeepGemm) are applied by each of the three kernels below to its promoted fp32 accumulator before
 // its one bf16 rounding (deep_gemm/fso_dense_epilogue.cuh), in a JIT variant of the kernel the identity call runs at
@@ -301,14 +372,19 @@ inline void gemm_dispatch_sm90(void* mat_a, int ld_a, void* mat_b, int ld_b, voi
 
     // DeepGEMM v2 tiles that override the route (deep_gemm::jit::use_dense_v2_override): one wave at M <= 256 where the
     // route needs two or more (up to M = 128 only on a tile whose main loop the kernel keeps compact), a quarter fewer
-    // waves for the wide outputs at 256 < M <= 672, and paired 64 x 128 tiles for the narrow outputs at
-    // 256 < M <= 384. Only in the default mode and without FSO_SM90_SWAP_MAX_M, so that the A/B knobs keep their
-    // meaning. The bytes are those of the route.
-    if (sm90_dense_dg2_mode() == Sm90DenseDg2Mode::kRule && sm90_swap_max_m_override() == 0u)
+    // waves for the wide outputs at 256 < M <= 672 (the single-CTA tile co-scheduled where that fits, else the pair
+    // over N), and paired 64 x 128 tiles for the narrow outputs at 256 < M <= 384. A single-CTA v2 launch of either
+    // kind whose M blocks fit one round of clusters runs those clusters for co-scheduling (deep_gemm::jit::
+    // dg2_co_schedule, with the occupancy of sm90_cosched_max_clusters). Only in the default mode and without
+    // FSO_SM90_SWAP_MAX_M, so that the A/B knobs keep their meaning. The bytes are those of the route.
+    bool const v2_rules = sm90_dense_dg2_mode() == Sm90DenseDg2Mode::kRule && sm90_swap_max_m_override() == 0u;
+    int const* const max_clusters = v2_rules ? sm90_cosched_max_clusters(stream) : nullptr;
+    if (v2_rules)
     {
         deep_gemm::jit::Dg2DenseConfig v2;
-        if (deep_gemm::jit::use_dense_v2_override(shape_m, shape_n, shape_k, num_device_sms, v2))
+        if (deep_gemm::jit::use_dense_v2_override(shape_m, shape_n, shape_k, num_device_sms, v2, max_clusters))
         {
+            deep_gemm::jit::dg2_co_schedule(v2, shape_m, shape_n, shape_k, num_device_sms, max_clusters);
             auto runtime = deep_gemm::jit::getGlobalCompiler().buildDg2(v2, epi_key);
             auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
             deep_gemm::runGemmDg2(kernel, mat_a, ld_a, mat_b, ld_b, mat_d, ld_d, scales_a, scales_b, shape_m, shape_n,
@@ -331,6 +407,8 @@ inline void gemm_dispatch_sm90(void* mat_a, int ld_a, void* mat_b, int ld_b, voi
             && (sm90_dense_dg2_k() == 0 || sm90_dense_dg2_k() == shape_k);
         if (all || deep_gemm::jit::use_dg2_dense(dg2, shape_m, shape_n, shape_k, num_device_sms))
         {
+            if (!all && v2_rules)
+                deep_gemm::jit::dg2_co_schedule(dg2, shape_m, shape_n, shape_k, num_device_sms, max_clusters);
             auto runtime = deep_gemm::jit::getGlobalCompiler().buildDg2(dg2, epi_key);
             auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
             deep_gemm::runGemmDg2(kernel, mat_a, ld_a, mat_b, ld_b, mat_d, ld_d, scales_a, scales_b, shape_m, shape_n,

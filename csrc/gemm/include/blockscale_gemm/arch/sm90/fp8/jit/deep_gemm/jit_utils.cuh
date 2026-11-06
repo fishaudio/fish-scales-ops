@@ -675,7 +675,13 @@ inline int dense_swap_ab_token_tile(uint32_t shape_m, uint32_t shape_n, int weig
 //     40 rows short at M = 209-216 (2560 x 4096 and 2560 x 9216 at M = 216: 0.76-0.85 bare, 0.78-0.88 served). At
 //     K = 4096 against the v2 tiles (2560 x 4096 at M = 152-208) the swap-AB launch was level or slower on the bare
 //     GEMM and won only the served call with PDL on, where the v2 grid loses 1.3-4 us behind the activation quantize
-//     (runs/FH1 n1_nsys and its held list): those cells keep the main path.
+//     (runs/FH1 n1_nsys and its held list). Since FH6 (runs/FH6/runs/a1, a2) it takes those whose main path is a
+//     single-CTA v2 tile of four or more 64-row M blocks as well (M = 193-208): that tile reads every weight row once
+//     per M block, more often than swap-AB's three token tiles, its 128 tiles are more than the 120 CTAs the device
+//     co-schedules in clusters of four, and behind the quantize its CTAs scatter over the GPCs (dg2_co_schedule);
+//     2560 x 4096 at M = 200 / 208: 0.82-0.85 of the served call with PDL on, the bare GEMM and PDL off level (+-1 %).
+//     Against three M blocks (M = 145-152) swap-AB reads the weights as often as the v2 tile and lost 11 % on the
+//     bare GEMM (2560 x 4096 at M = 152): those cells keep the main path.
 //   - Wide outputs (128-row weight tiles) with K >= 2560 at 256 < M <= 288, when the launch needs no more waves than
 //     the main path. The main path's 128-row tiles then hold 0-32 rows in their third block, so they waste 96-120 of
 //     every 384 rows they compute, while three token tiles of 88-96 tokens waste at most 16 (288 = 3 x 96). Measured on
@@ -714,6 +720,10 @@ inline int dense_main_path_tiles(uint32_t shape_m, uint32_t shape_n, uint32_t sh
 // Whether the main path runs a dense GEMM on DeepGEMM v2's kernel (use_dg2_dense; defined after it below).
 inline bool dense_main_path_is_v2(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_sms);
 
+// The number of M blocks of the main path's v2 tile when the main path runs a single-CTA v2 configuration, else 0
+// (defined after use_dg2_dense below).
+inline int dense_main_path_v2_single_m_blocks(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_sms);
+
 // Whether gemm_dispatch_sm90 runs a dense GEMM with M > 96 through swap-AB (see above).
 inline bool use_dense_swap_ab_above_96(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_sms)
 {
@@ -736,7 +746,8 @@ inline bool use_dense_swap_ab_above_96(uint32_t shape_m, uint32_t shape_n, uint3
         if (shape_k < 4096u || last < 1 || last > 24 || div_up(static_cast<int>(shape_m), token_tile) != 3
             || tiles > num_sms || 4 * tiles < 3 * num_sms)
             return false;
-        return shape_k >= 8192u || !dense_main_path_is_v2(shape_m, shape_n, shape_k, num_sms);
+        return shape_k >= 8192u || !dense_main_path_is_v2(shape_m, shape_n, shape_k, num_sms)
+            || dense_main_path_v2_single_m_blocks(shape_m, shape_n, shape_k, num_sms) >= 4;
     }
     if (wide_band)
     {
@@ -969,6 +980,10 @@ struct Dg2DenseConfig
     uint32_t num_sms = 0;
     int num_waves = 0;
     int64_t num_cycles = 0;
+    // CTAs per cluster when a single-CTA configuration is launched as clusters for co-scheduling only (dg2_co_schedule,
+    // issue #12 FH6): the cluster attribute places the CTAs of one cluster in one GPC; the kernel uses no multicast and
+    // no cluster barrier. 1 = no cluster attribute.
+    uint32_t sched_cluster = 1;
 
     uint32_t cluster_size() const
     {
@@ -1266,6 +1281,14 @@ inline bool dense_main_path_is_v2(uint32_t shape_m, uint32_t shape_n, uint32_t s
     return use_dg2_dense(dg2, shape_m, shape_n, shape_k, num_sms);
 }
 
+inline int dense_main_path_v2_single_m_blocks(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_sms)
+{
+    Dg2DenseConfig dg2 = get_dg2_dense_config_cached(shape_m, shape_n, shape_k, num_sms);
+    if (!use_dg2_dense(dg2, shape_m, shape_n, shape_k, num_sms) || dg2.cluster_size() != 1)
+        return 0;
+    return div_up(static_cast<int>(shape_m), static_cast<int>(dg2.block_m));
+}
+
 // The number of CTAs of the route gemm_dispatch_sm90 takes before use_dense_v2_override: swap-AB's tiles where
 // use_dense_swap_ab takes the call, else the main path's (dense_main_path_tiles).
 inline int dense_route_tiles(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_sms)
@@ -1305,6 +1328,57 @@ inline bool dg2_tile_config(int block_m, int block_n, int cluster_m, int cluster
         div_up(static_cast<int>(shape_m), block_m) * div_up(static_cast<int>(shape_n), block_n), num_sms);
     c.shape_n = (c.block_m == 128 && c.block_n > 128 && c.cluster_size() == 1) ? shape_n : 0u;
     out = c;
+    return true;
+}
+
+// The largest cluster dg2_co_schedule uses: the measured sizes, 2 to 5 (clusters of five on 2560 x 4096 / 9216 at
+// M = 520-592). The H200 co-schedules only 17 / 15 / 15 clusters of 6 / 7 / 8 CTAs (102-120 CTAs), so few launches
+// with that many M blocks fit one round, and none was measured in one; they keep the single-CTA launch.
+constexpr int kDg2MaxSchedCluster = 5;
+
+// Co-scheduling of a single-CTA v2 launch (fso issue 12, 2026-11-05; /data/bench-runs/fso_issue12_20261028/runs/FH6).
+// The kernel's scheduler gives the M blocks that share one weight block to consecutive CTAs, and a launch without the
+// cluster attribute places consecutive CTAs in one GPC, so on an idle GPU those CTAs read their weight block in one GPC
+// (1.1 GPCs per weight block, traced with %smid). Launched as the programmatic dependent of the activation quantize,
+// which releases it right after its own wait, the grid's CTAs land in the order the SMs drain instead (2.3-3.3 GPCs per
+// weight block): the median CTA's main loop barely changes, but the slowest ones run 35-45 % longer, and the served
+// call lost 2-11 us per call on 64-row tiles of 2560 x 4096 / 9216 at M = 200-288 and 128-row tiles of 12352 x 2560 /
+// 18432 x 2560 at M = 264-288 (a copy of the kernel that took its tile from the SM it ran on removed the loss
+// completely, so placement is the whole effect). Launched as clusters of nm CTAs, nm the number of M blocks, the CTAs
+// that share a weight block are one cluster, which the hardware co-schedules in one GPC wherever it lands; the kernel is
+// unchanged (no multicast, no cluster barrier, each tile computed by one CTA in K order: the same bytes), the grid
+// shrinks to the clusters the device co-schedules at one CTA per SM, `max_clusters[nm]` of them
+// (cudaOccupancyMaxActiveClusters; 66 / 39 / 30 / 22 for nm = 2 / 3 / 4 / 5 on the H200, whose GPCs do not divide by
+// every nm), and the persistent scheduler, which strides tiles by the grid, still hands every cluster the nm M blocks
+// of one weight block in every round. It applies when that grid needs no more rounds than num_sms CTAs; measured with
+// the activation quantize in front (served call) against the single-CTA launch of the same tile: 12352 x 2560 at
+// M = 264 / 288 and 18432 x 2560 at 264 / 288 (three M blocks of 128 rows, 117 CTAs) 2-11 us faster, the bare GEMM
+// level (+0-2 %); 2560 x 4096 / 9216 at M = 288 (five 64-row blocks, 110 CTAs) and 10240 x 2560 at M = 160 / 176 (two
+// blocks) level with the two-CTA multicast pair. Where the co-scheduled grid needs another round (four 64-row blocks of
+// 2560-wide outputs at M = 193-256: 128 tiles against 120 co-scheduled CTAs; 34.9 against 19.0 us) the launch stays
+// single-CTA, and pairs of a four-block weight tile lose (consecutive clusters are placed in different GPCs: 21.9
+// against 19.0 us bare at 2560 x 9216, M = 200). It also needs a weight of at least 8 MiB (N x K >= 2^23 FP8 bytes):
+// what placement costs is the duplicated L2 traffic of the weight, and on the small weights the cluster launch was level
+// or a little slower (Family C's shared-expert gate_up, 1024 x 2048 at M = 160 / 192: +0.7 to +1.2 % served; 5120 x 1280
+// at M = 78 and 2560 x 1280 at M = 546 level), while from 10.5 MiB up (2560 x 4096, 5120 x 2048) every measured cell
+// gained or was level (runs/FH6/runs/a3). Returns whether `cfg` was changed. `max_clusters` may be nullptr (not known: a
+// call inside a stream capture before any eager one), and then nothing changes.
+inline bool dg2_co_schedule(Dg2DenseConfig& cfg, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_sms,
+    int const* max_clusters)
+{
+    if (max_clusters == nullptr || cfg.cluster_size() != 1 || cfg.sched_cluster != 1 || cfg.block_m == 0)
+        return false;
+    if (static_cast<uint64_t>(shape_n) * shape_k < (uint64_t{1} << 23))
+        return false;
+    int const m_blocks = div_up(static_cast<int>(shape_m), static_cast<int>(cfg.block_m));
+    if (m_blocks < 2 || m_blocks > kDg2MaxSchedCluster || max_clusters[m_blocks] <= 0)
+        return false;
+    int const grid = std::min(num_sms / m_blocks, max_clusters[m_blocks]) * m_blocks;
+    int const tiles = m_blocks * div_up(static_cast<int>(shape_n), static_cast<int>(cfg.block_n));
+    if (grid <= 0 || div_up(tiles, grid) > div_up(tiles, num_sms))
+        return false;
+    cfg.sched_cluster = static_cast<uint32_t>(m_blocks);
+    cfg.num_sms = static_cast<uint32_t>(grid);
     return true;
 }
 
@@ -1389,7 +1463,10 @@ inline bool dg2_one_wave_tile(uint32_t shape_m, uint32_t shape_n, uint32_t shape
 //    GEMM but loses 3-11 us per call in the served call with PDL on (the CTA placement of an early-launched
 //    single-CTA grid, runs/FH3); the cluster form keeps that time. Measured at M = 264-672: 12352 x 2560 0.70-0.98 of
 //    the route's bare GEMM and 0.71-0.97 of its served call, 18432 x 2560 0.63-0.99 and 0.67-0.98, 10240 x 2560
-//    (M = 392-504) 0.72-0.91 and 0.74-0.90.
+//    (M = 392-504) 0.72-0.91 and 0.74-0.90. Since FH6 the single-CTA tile runs instead, co-scheduled
+//    (dg2_co_schedule), wherever its clusters of M blocks need no more rounds than its 132-CTA grid: that keeps the
+//    single-CTA bare speed and loses nothing behind the quantize (12352 x 2560 and 18432 x 2560 at M = 264 / 288:
+//    0.86-0.90 of the pair's served call, 0.85-0.90 of its bare GEMM; runs/FH6/runs/held). Elsewhere the pair stays.
 // 3. Paired 64-row tiles for the narrow outputs (256 < M <= 384, K >= 4096). On a narrow output (64-row swap-AB weight
 //    tiles), when the 128-row tiling's last M block would hold at most 96 rows and the 64 x 128 tile runs the GEMM in
 //    one wave on at least three quarters of the SMs (2112 <= N on 132 SMs at five 64-row blocks), run it as a 2 x 1
@@ -1399,8 +1476,12 @@ inline bool dg2_one_wave_tile(uint32_t shape_m, uint32_t shape_n, uint32_t shape
 //    tile reads the weights three times. Measured on 2560 x 4096 and 2560 x 9216 at M = 264-320 and 344-352: 0.82-0.92
 //    of the route's bare GEMM and 0.83-0.91 of its served call. Where the route already is DeepGEMM's 64 x 128 pick
 //    (M = 321-336) the pair was level on the bare GEMM and won only the served call with PDL on (held): no override.
-inline bool use_dense_v2_override_uncached(
-    uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_sms, Dg2DenseConfig& cfg)
+//    FH6 measured it again with interleaved arms (runs/FH6/runs/r3*): on 2560 x 4096 and 2560 x 9216 at M = 324-336
+//    the pair was 9-18 % faster on the served call, but on 2560 x 4096 it was 2-12 % slower on the pre-quantized
+//    call at M = 324-332 and up to 7 % slower with PDL off.
+// `max_clusters`: as dg2_co_schedule (nullptr while the device's cluster occupancy is not known).
+inline bool use_dense_v2_override_uncached(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_sms,
+    Dg2DenseConfig& cfg, int const* max_clusters = nullptr)
 {
     int const m = static_cast<int>(shape_m);
     int const n = static_cast<int>(shape_n);
@@ -1429,8 +1510,12 @@ inline bool use_dense_v2_override_uncached(
         // At least a quarter fewer waves: the 160-wide tile holds 25 % more of the output than the route's 128 x 128,
         // so one wave fewer out of five (19456 x 2560 at M = 512: 5 -> 4) saves nothing (level alone, 4 % slower in
         // the Qwen3-4B MLP block).
-        return waves >= 2 && 4 * (route_waves - waves) >= route_waves
-            && dg2_tile_config(128, bn, 1, 2, shape_m, shape_n, shape_k, num_sms, cfg);
+        if (waves < 2 || 4 * (route_waves - waves) < route_waves)
+            return false;
+        if (dg2_tile_config(128, bn, 1, 1, shape_m, shape_n, shape_k, num_sms, cfg)
+            && dg2_co_schedule(cfg, shape_m, shape_n, shape_k, num_sms, max_clusters))
+            return true;
+        return dg2_tile_config(128, bn, 1, 2, shape_m, shape_n, shape_k, num_sms, cfg);
     }
     int const tiles = div_up(m, 64) * div_up(n, 128);
     int const last = m % 128;
@@ -1444,15 +1529,18 @@ inline bool use_dense_v2_override_uncached(
     return dg2_tile_config(64, 128, 2, 1, shape_m, shape_n, shape_k, num_sms, cfg);
 }
 
-// use_dense_v2_override_uncached behind a small per-thread direct-mapped cache keyed by the shape, so that an eager
-// call pays one lookup instead of the route evaluation.
-inline bool use_dense_v2_override(
-    uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_sms, Dg2DenseConfig& cfg)
+// use_dense_v2_override_uncached behind a small per-thread direct-mapped cache keyed by the shape and by the cluster
+// occupancy table, so that an eager call pays one lookup instead of the route evaluation. `max_clusters` is the
+// per-device table of gemm_dispatch_sm90 (sm90_cosched_max_clusters), constant once it is known, so its address tells
+// the devices (and the not-yet-known case, nullptr) apart.
+inline bool use_dense_v2_override(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_sms, Dg2DenseConfig& cfg,
+    int const* max_clusters = nullptr)
 {
     struct Entry
     {
         uint32_t m = 0, n = 0, k = 0;
         int sms = -1;
+        int const* occupancy = nullptr;
         bool take = false;
         Dg2DenseConfig cfg;
     };
@@ -1460,13 +1548,14 @@ inline bool use_dense_v2_override(
     uint64_t const h = (static_cast<uint64_t>(shape_m) * 0x9E3779B97F4A7C15ull) ^ (static_cast<uint64_t>(shape_n) << 20)
         ^ (static_cast<uint64_t>(shape_k) << 40) ^ static_cast<uint64_t>(num_sms);
     Entry& e = table[(h ^ (h >> 31)) & 255u];
-    if (e.sms != num_sms || e.m != shape_m || e.n != shape_n || e.k != shape_k)
+    if (e.sms != num_sms || e.m != shape_m || e.n != shape_n || e.k != shape_k || e.occupancy != max_clusters)
     {
-        e.take = use_dense_v2_override_uncached(shape_m, shape_n, shape_k, num_sms, e.cfg);
+        e.take = use_dense_v2_override_uncached(shape_m, shape_n, shape_k, num_sms, e.cfg, max_clusters);
         e.m = shape_m;
         e.n = shape_n;
         e.k = shape_k;
         e.sms = num_sms;
+        e.occupancy = max_clusters;
     }
     if (e.take)
         cfg = e.cfg;

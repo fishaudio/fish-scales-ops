@@ -249,7 +249,11 @@ void runGemm(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, 
 // even at size 1, and the hardware then places the CTAs on the SMs in another order. With one CTA per SM the order
 // decides which L2 partition serves each tile's operands; for the 64-row tiles it made the same kernel 25 % slower
 // (Family A down GEMM, M = 160, ncu with cold caches: 22.6 against 17.2-18.2 us, 50 % more L2 lookups and fabric
-// sectors; P2, /data/bench-runs/fso_0.2.1_20261010/P2/runs/gpu2_ncu).
+// sectors; P2, /data/bench-runs/fso_0.2.1_20261010/P2/runs/gpu2_ncu). A single-CTA configuration with
+// cfg.sched_cluster > 1 (jit::dg2_co_schedule, issue #12 FH6) is the one exception: it carries the attribute at that
+// size, so that the CTAs computing the M blocks of one weight block are one cluster and run in one GPC wherever the
+// grid lands; the kernel itself uses no multicast and no cluster barrier, and the grid (cfg.num_sms) is a multiple of
+// the cluster.
 // `epilogue`: the dense epilogue of a kernel built by Compiler::buildDg2 with a non-identity DenseEpilogueKey
 // (sm90_fp8_gemm_1d2d_impl_fso_epilogue, whose last argument it is); nullptr launches DeepGEMM's argument list.
 inline void runGemmDg2(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, int ld_d,
@@ -283,6 +287,13 @@ inline void runGemmDg2(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, 
     {
         attrs[num_attrs].id = cudaLaunchAttributeClusterDimension;
         attrs[num_attrs].val.clusterDim = {cfg.cluster_size(), 1, 1};
+        ++num_attrs;
+    }
+    else if (cfg.sched_cluster > 1)
+    {
+        DG_HOST_ASSERT(cfg.num_sms % cfg.sched_cluster == 0);
+        attrs[num_attrs].id = cudaLaunchAttributeClusterDimension;
+        attrs[num_attrs].val.clusterDim = {cfg.sched_cluster, 1, 1};
         ++num_attrs;
     }
     if (pdl)

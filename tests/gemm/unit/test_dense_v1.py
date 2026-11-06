@@ -1154,13 +1154,15 @@ _SM90_EPI_RULE5 = (
 
 
 # FH1 of the issue-12 round (/data/bench-runs/fso_issue12_20261028/runs/FH1), default mode, (N, K, M) -> (route,
-# block_m, block_n, cluster), as the dispatcher computes them (runs/FH1/tmp/finalinc): DeepGEMM v2's kernel in one wave
-# where the route needs two or more at M <= 256 (deep_gemm::jit::use_dense_v2_override: the fewest rows, then the
-# narrowest tile, up to M = 128 a width with one main loop; 128-row tiles at 128 < M <= 192 paired over M, "c2x1"), its
-# 128 x 160 / 192 pair over N ("c1x2") in a quarter fewer waves for the wide outputs at 256 < M <= 672 (19456 x 2560 at
-# M = 64 keeps fp8_gemm_kernel: its one-wave tiles are 160 or 192 wide), its 64 x 128 pair over M for the narrow
-# outputs at 256 < M <= 384 with K >= 4096; fp8_gemm_kernel_swapAB with three token tiles for the narrow outputs at
-# 144 < M <= 216 (64-row weight tiles, K >= 8192 or against fp8_gemm_kernel's tile) and the wide outputs at
+# block_m, block_n, cluster), as the dispatcher computes them (runs/FH1/tmp/finalinc), with FH6's changes: DeepGEMM
+# v2's kernel in one wave where the route needs two or more at M <= 256 (deep_gemm::jit::use_dense_v2_override: the
+# fewest rows, then the narrowest tile, up to M = 128 a width with a compact main loop, since FH6 also 160 but not 96 or 192;
+# 128-row tiles at 128 < M <= 192 paired over M, "c2x1"), its 128 x 160 / 192 tile in a quarter fewer waves for the
+# wide outputs at 256 < M <= 672 (single-CTA and co-scheduled where its clusters of M blocks fit one round, "c1x1",
+# else the pair over N, "c1x2"), its 64 x 128 pair over M for the narrow outputs at 256 < M <= 384 with K >= 4096
+# (not where the route is DeepGEMM's own 64 x 128); fp8_gemm_kernel_swapAB with three token tiles for the
+# narrow outputs at 144 < M <= 216 (64-row weight tiles, K >= 8192, or against fp8_gemm_kernel's tile, or since FH6
+# against a single-CTA v2 tile of four or more M blocks) and the wide outputs at
 # 256 < M <= 288 (128-row weight tiles), and at 8 <= M <= 32 with 64-row weight tiles and one token tile where they fit
 # one wave; and neighbours each rule keeps (cluster None: the kernel class only). Two cells of _SM90_EPI_REROUTE_CELLS
 # move here from swap-AB (9728 x 2560 at M = 144, 12288 x 2048 at M = 152: one wave of the v2 pair instead of two of
@@ -1172,10 +1174,16 @@ _SM90_EPI_FH1 = {
     (9728, 2560, 160): ("dg2", 128, 160, "c2x1"), (10240, 2560, 256): ("dg2", 128, 160, "c1x1"),
     (2560, 9216, 152): ("swapab", 64, 56, None), (2560, 4096, 216): ("swapab", 64, 72, None),
     (10240, 2560, 272): ("swapab", 128, 96, None),
-    (18432, 2560, 288): ("dg2", 128, 160, "c1x2"), (18432, 2560, 400): ("dg2", 128, 192, "c1x2"),
+    (18432, 2560, 288): ("dg2", 128, 160, "c1x1"), (18432, 2560, 400): ("dg2", 128, 192, "c1x2"),
     (2560, 4096, 288): ("dg2", 64, 128, "c2x1"), (2560, 9216, 344): ("dg2", 64, 128, "c2x1"),
-    (2560, 4096, 200): ("dg2", 64, 80, "c1x1"), (10240, 2560, 296): ("v1", None, None, None),
+    (2560, 4096, 200): ("swapab", 64, 72, None), (10240, 2560, 296): ("v1", None, None, None),
     (2560, 4096, 328): ("dg2", 64, 128, "c1x1"),
+    # FH6 (/data/bench-runs/fso_issue12_20261028/runs/FH6): rule 2's tile single-CTA and co-scheduled where its
+    # clusters of M blocks fit one round (18432 x 2560 and 12352 x 2560 at M = 264 / 288: three blocks); the co-scheduled
+    # main-path tile (2560 x 4096 at M = 536, five blocks); the swap-AB band against a v2 main path of four M blocks
+    # (2560 x 4096 at M = 208) and its neighbour of three (M = 152, kept)
+    (12352, 2560, 264): ("dg2", 128, 160, "c1x1"), (2560, 4096, 536): ("dg2", 128, 128, "c1x1"),
+    (2560, 4096, 208): ("swapab", 64, 72, None),
     # swap-AB at 8 <= M <= 32 with 64-row weight tiles and one token tile up to N = 8448 (get_dense_swap_ab_config);
     # M < 8 keeps rule 2's 128-row tile
     (5120, 2048, 16): ("swapab", 64, 16, None), (6144, 2560, 32): ("swapab", 64, 32, None),

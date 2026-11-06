@@ -538,7 +538,10 @@ schema keeps serving the old calls.
 shape on the capturing thread, like every op in this library: that call creates
 the library's pools (among them the sm_120/121 Stream-K side streams and the
 per-thread workspaces), JIT-compiles the GEMM on sm_90 and the CuTe-DSL kernels
-on sm_100/103. The partial sums of the split routes (the sm_120/121 Stream-K
+on sm_100/103, and on sm_90 reads the device's cluster occupancy, with which the
+GEMM's single-CTA launches co-schedule their M blocks in one GPC (it is read
+outside a capture only; a GEMM captured before it runs without the cluster
+attribute, which changes no byte). The partial sums of the split routes (the sm_120/121 Stream-K
 route, the sm_100/103 two-kernel split-K) come from the torch caching allocator
 on the caller's stream, once per call and graph-private inside a capture, so
 they have no size for the warm-up to fix and two streams never share them.

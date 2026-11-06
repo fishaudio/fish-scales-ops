@@ -87,6 +87,7 @@ CELLS = [
     (64, 18432, 2560, "dg2 64x144"),      # was fp8_gemm_kernel 64 x 72
     (128, 18432, 2560, "dg2 128x144"),    # was fp8_gemm_kernel 128 x 72
     (8, 19456, 2560, "dg2 16x160"),       # one wave needs the 160-wide tile, compact since FH6 (was swap-AB)
+    (64, 19456, 2560, "dg2 64x160"),      # the same (was fp8_gemm_kernel 64 x 80)
     (128, 19456, 2560, "dg2 128x160"),    # the same (was fp8_gemm_kernel 128 x 80)
     (8, 22528, 2560, "fso"),              # one wave needs the 192-wide tile (not compact): kept (swap-AB)
     (160, 9728, 2560, "dg2 128x160 c2x1"),  # was DeepGEMM's 64 x 112 pair
@@ -96,11 +97,14 @@ CELLS = [
     # fp8_gemm_kernel's tile), wide outputs at 256 < M <= 288 (128-row weight tiles, at most 96 tokens)
     (152, 2560, 9216, "swapAB 64x56"),    # was the v2 kernel's 64 x 64
     (216, 2560, 4096, "swapAB 64x72"),    # was fp8_gemm_kernel 128 x 40
-    (200, 2560, 4096, "dg2 64x80"),       # K < 8192 against the v2 main path: kept
+    (200, 2560, 4096, "swapAB 64x72"),    # K < 8192 against a v2 main path of four M blocks (FH6; was dg2 64x80)
+    (208, 2560, 4096, "swapAB 64x72"),    # the same (FH6)
+    (152, 2560, 4096, "dg2 64x64"),       # K < 8192 against a v2 main path of three M blocks: kept
     (272, 10240, 2560, "swapAB 128x96"),  # was fp8_gemm_kernel 128 x 128 (three waves, 96 of 384 rows empty)
     (296, 10240, 2560, "fso"),            # above the band: kept
     # wide outputs at 256 < M <= 672: the v2 kernel's 128 x 160 / 192 pair over N (c1x2) in fewer waves
-    (288, 18432, 2560, "dg2 128x160 c1x2"),
+    (288, 18432, 2560, "dg2 128x160"),    # since FH6 single-CTA, co-scheduled in clusters of its 3 M blocks (COSCHED)
+    (264, 12352, 2560, "dg2 128x160"),    # the same (was the c1x2 pair)
     (400, 18432, 2560, "dg2 128x192 c1x2"),
     (512, 19456, 2560, "fso"),            # one wave fewer out of five (DeepGEMM picks 256 x 112): kept
     (680, 18432, 2560, "fso"),            # above M = 672: kept
@@ -115,9 +119,16 @@ CELLS = [
     (32, 6144, 2560, "swapAB 64x32"),     # was 128 x 16 in two token tiles
     (4, 6144, 2560, "swapAB 128x16"),     # M < 8: kept
     (16, 9216, 2048, "swapAB 128x16"),    # 144 tiles of 64 rows would need two waves: kept
+    # FH6: single-CTA v2 launches whose M blocks fit one round of co-scheduled clusters (COSCHED below)
+    (536, 2560, 4096, "dg2 128x128"),     # five M blocks of 128 rows, 100 tiles
 ]
 GRAPH_CELLS = [(1024, 19456, 2560), (128, 2560, 9728), (80, 5120, 2048), (288, 5120, 2048), (160, 9728, 2560),
-               (288, 18432, 2560), (288, 2560, 4096)]
+               (288, 18432, 2560), (288, 2560, 4096), (264, 12352, 2560), (536, 2560, 4096)]
+# Co-scheduled single-CTA launches (FH6, deep_gemm::jit::dg2_co_schedule), (M, N, K) -> the number of M blocks: the
+# kernel is compiled for its grid (kNumSMs), which must be a multiple of the M blocks and at most the SM count; the
+# cluster attribute itself does not show in the kernel's name, the grid does where the device co-schedules fewer
+# clusters than the SMs would hold (117 CTAs for clusters of 3 and 110 for clusters of 5 on the H200).
+COSCHED = {(288, 18432, 2560): 3, (264, 12352, 2560): 3, (536, 2560, 4096): 5}
 
 
 def kernel_of(names):
@@ -144,6 +155,16 @@ def kernel_of(names):
         if "fp8_gemm_kernel" in n:
             return "fso"
     return "none: " + " | ".join(names)
+
+
+def grid_of(names):
+    """The v2 kernel's compiled CTA count (kNumSMs, the template argument after the multicast flag), or None."""
+    for n in names:
+        m = re.search(r"sm90_fp8_gemm_1d2d_impl<[^,]*, 0u?, \d+u?, 0u?, 1u?, \d+u?, \d+u?, 128u?, 128u?, 128u?, "
+                      r"\d+u?, \d+u?, 128u?, \d+u?, \d+u?, (?:true|false), (\d+)u?", n)
+        if m:
+            return int(m.group(1))
+    return None
 
 
 def matches(got: str, want: str) -> bool:
@@ -179,6 +200,7 @@ def worker(out_path):
         names = [e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]
         key = f"{M},{N},{K}"
         res["kernels"][key] = kernel_of(names)
+        res.setdefault("grids", {})[key] = grid_of(names)
         tensors[key + "/y"] = y.cpu()
         tensors[key + "/yq"] = yq.cpu()
         if (M, N, K) in GRAPH_CELLS:
@@ -252,6 +274,15 @@ def main():
                                 f"expected {want0}")
         print(f"[2] default route: {n_dg2} of {len(CELLS)} cells on sm90_fp8_gemm_1d2d_impl, as expected; "
               "FSO_SM90_DENSE_DG2=0 runs fp8_gemm_kernel on every cell outside the split-K route")
+        # 2b. the co-scheduled launches: a single-CTA tile on a grid that is a multiple of its M blocks
+        sms = torch.cuda.get_device_properties(0).multi_processor_count
+        for (M, N, K), nm in COSCHED.items():
+            key = f"{M},{N},{K}"
+            got, grid = results[None]["kernels"][key], results[None]["grids"].get(key)
+            if " " in got.split(" ", 1)[1] or grid is None or grid % nm != 0 or grid > sms:
+                failures.append(f"{key}: default mode launched {got} on {grid} CTAs, expected a single-CTA tile on a "
+                                f"multiple of {nm} CTAs")
+        print(f"[2b] {len(COSCHED)} co-scheduled single-CTA launches on grids of whole clusters of their M blocks")
         # 3. graph capture and replay
         for key, ok in results[None]["graph"].items():
             if not ok:

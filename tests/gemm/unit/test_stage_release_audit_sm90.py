@@ -39,7 +39,7 @@ DENSE = [  # (N, K, M): default routes, chosen for kernel-family and stage-count
     (2560, 4096, 8), (2560, 4096, 24), (2048, 4096, 16), (2048, 4096, 32), (2560, 9216, 8), (2560, 9216, 48),
     (2560, 9728, 64), (1024, 2048, 16), (1024, 4096, 24), (2048, 512, 8), (2560, 4096, 56), (1280, 5120, 56),
     # the v2 kernel's fourfold-unrolled main loop on its 160-wide tiles (issue 12, FH6): 19456 x 2560 at M <= 128 above
-    # runs the 160-wide one-wave tiles, 12352 x 2560 at M = 264 a 128 x 160 tile
+    # runs the 160-wide one-wave tiles, 12352 x 2560 at M = 264 the co-scheduled single-CTA 128 x 160
     (12352, 2560, 264),
 ]
 FORCED = [(12288, 2048, 136)]  # the swap-AB 128 x 24 tile of the failure, FSO_SM90_SWAP_MAX_M=1024 FSO_SM90_SWAP_BN=24
