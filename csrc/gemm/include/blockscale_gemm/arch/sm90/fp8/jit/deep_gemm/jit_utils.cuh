@@ -1010,6 +1010,9 @@ struct Dg2DenseConfig
     // issue #12 FH6): the cluster attribute places the CTAs of one cluster in one GPC; the kernel uses no multicast and
     // no cluster barrier. 1 = no cluster attribute.
     uint32_t sched_cluster = 1;
+    // The 1D2D kernel's last template argument (dg2_select_wide_two_sets, issue #12 R040c): the single-CTA 64 x 128
+    // tile runs rule 1's two accumulator sets. A separate JIT runtime ("_w2"); the bytes are those of one set.
+    bool wide_two_sets = false;
 
     uint32_t cluster_size() const
     {
@@ -1408,6 +1411,30 @@ inline bool dg2_co_schedule(Dg2DenseConfig& cfg, uint32_t shape_m, uint32_t shap
     return true;
 }
 
+// Rule 1 of the issue-12 R040b round on the single-CTA 64 x 128 tile (fso issue 12, R040c;
+// /data/bench-runs/fso_issue12_20261028/runs/R040c). The 1D2D kernel promotes one K block while the next block's WGMMAs
+// run, with two accumulator sets, on its 64-row tiles narrower than 128 and on the 128-wide multicast pair (kTwoSets in
+// impls/sm90_fp8_gemm_1d2d.cuh). The single-CTA 128-wide tile, plain or co-scheduled, does so only when this sets
+// cfg.wide_two_sets: when the launch has at most kDg2WideTwoSetsMaxMBlocks M blocks and its last M block holds at least
+// kDg2WideTwoSetsMinLastRows of its 64 rows. Its ring holds 8 stages, and the second set holds each stage one block
+// longer. Measured on the H200 (cold weights, base and new in one process, two to six passes, PDL on and off), the 41
+// cells that meet both conditions (K = 1280-14336, M = 64-320, seven of them co-scheduled) ran 17 % faster at the
+// median on the pre-quantized call (1-22 %), 8 % on the served call with PDL on (1-18 %) and 14 % with PDL off (1-18
+// %), and no pass of any of them was slower. With six M blocks (2560 x 9216 at M = 328 / 336) the served call with PDL
+// on ran 4-6 % slower with two sets (R040b). With a last M block half empty or less it ran up to 7.8 % slower at long K
+// (4096 x 14336 at M = 224, 3072 x 9216 at M = 288), also on two-block co-scheduled launches (7424 x 9216 at M = 80, up
+// to 6.7 %); with 8 rows or fewer the pre-quantized call ran 5-12 % slower (5120 x 9216 / 14336 at M = 136) with PDL on
+// and off. The bytes are those of one set.
+constexpr int kDg2WideTwoSetsMaxMBlocks = 5;
+constexpr int kDg2WideTwoSetsMinLastRows = 48;
+
+inline void dg2_select_wide_two_sets(Dg2DenseConfig& cfg, uint32_t shape_m)
+{
+    cfg.wide_two_sets = cfg.block_m == 64 && cfg.block_n == 128 && cfg.cluster_size() == 1
+        && div_up(static_cast<int>(shape_m), 64) <= kDg2WideTwoSetsMaxMBlocks
+        && (shape_m % 64u == 0u || static_cast<int>(shape_m % 64u) >= kDg2WideTwoSetsMinLastRows);
+}
+
 // Whether DeepGEMM v2's 1D2D kernel keeps its main loop compact for a tile `block_n` wide. A width that divides 128
 // (one weight scale per k-block), or whose offsets into the 128-row weight-scale blocks take more than four values
 // (128 / gcd(128, width) > 4: 48, 80, 112, 144, ...), runs one loop with the split point as a variable. The others get
@@ -1480,19 +1507,27 @@ inline bool dg2_one_wave_tile(uint32_t shape_m, uint32_t shape_n, uint32_t shape
 //    0.80-0.84 / 0.83-0.87; 9728 x 2560, 9216 x 2048 and 12288 x 2048 at M = 144-256 0.77-0.94 / 0.79-0.94.
 //    19456 x 2560 takes its 160-wide one-wave tile at M = 1-128 as well, now that the kernel keeps that width's main
 //    loop compact (see dg2_one_wave_tile).
-// 2. Fewer waves for the wide outputs (256 < M <= 672). When the 128-row v2 tile 160 wide, or 192 wide where that needs
-//    fewer waves, needs at least a quarter fewer waves than the route and still two or more (DeepGEMM never clusters a
-//    one-wave launch, and none was measured), run it as a 1 x 2 cluster (two N blocks share each activation tile,
-//    multicast on A). Above M = 256 the route's 128-row tiles (fp8_gemm_kernel's 128 x 96 / 128 x 128, three swap-AB
-//    token tiles) run 3-7 waves on 12352 x 2560 and 18432 x 2560 with a last M block that is mostly empty; the
-//    160-wide tile covers the same M in 2-5 waves. The single-CTA form of the same tile is 4-12 % faster on the bare
-//    GEMM but loses 3-11 us per call in the served call with PDL on (the CTA placement of an early-launched
-//    single-CTA grid, runs/FH3); the cluster form keeps that time. Measured at M = 264-672: 12352 x 2560 0.70-0.98 of
-//    the route's bare GEMM and 0.71-0.97 of its served call, 18432 x 2560 0.63-0.99 and 0.67-0.98, 10240 x 2560
-//    (M = 392-504) 0.72-0.91 and 0.74-0.90. Since FH6 the single-CTA tile runs instead, co-scheduled
-//    (dg2_co_schedule), wherever its clusters of M blocks need no more rounds than its 132-CTA grid: that keeps the
-//    single-CTA bare speed and loses nothing behind the quantize (12352 x 2560 and 18432 x 2560 at M = 264 / 288:
-//    0.86-0.90 of the pair's served call, 0.85-0.90 of its bare GEMM; runs/FH6/runs/held). Elsewhere the pair stays.
+// 2. Fewer waves for the wide outputs (256 <= M <= 672; at M = 256 where rule 1 finds no one-wave tile). When the
+//    128-row v2 tile 160 wide, or 192 wide where that needs fewer waves, needs at least a quarter fewer waves than the
+//    route and still two or more (DeepGEMM never clusters a one-wave launch, and none was measured), run it as a 1 x 2
+//    cluster (two N blocks share each activation tile, multicast on A). Above M = 256 the route's 128-row tiles
+//    (fp8_gemm_kernel's 128 x 96 / 128 x 128, three swap-AB token tiles) run 3-7 waves on 12352 x 2560 and 18432 x 2560
+//    with a last M block that is mostly empty; the 160-wide tile covers the same M in 2-5 waves. The single-CTA form of
+//    the same tile is 4-12 % faster on the bare GEMM but loses 3-11 us per call in the served call with PDL on (the CTA
+//    placement of an early-launched single-CTA grid, runs/FH3); the cluster form keeps that time. Measured at
+//    M = 264-672: 12352 x 2560 0.70-0.98 of the route's bare GEMM and 0.71-0.97 of its served call, 18432 x 2560
+//    0.63-0.99 and 0.67-0.98, 10240 x 2560 (M = 392-504) 0.72-0.91 and 0.74-0.90. Since FH6 the single-CTA tile runs
+//    instead, co-scheduled (dg2_co_schedule), wherever its clusters of M blocks need no more rounds than its 132-CTA
+//    grid: that keeps the single-CTA bare speed and loses nothing behind the quantize (12352 x 2560 and 18432 x 2560 at
+//    M = 264 / 288: 0.86-0.90 of the pair's served call, 0.85-0.90 of its bare GEMM; runs/FH6/runs/held). Elsewhere the
+//    pair stays. The band started above M = 256 until R040c of the issue-12 round, which moved its edge to M = 256
+//    itself: there rule 1 keeps every wide output that a tile at most 192 wide covers in one wave (10240 x 2560,
+//    12352 x 2560, 9216 x 2048, 12288 x 2048), and the wider ones (19456 x 2560, 18432 x 2560) ran fp8_gemm_kernel's
+//    128 x 128 / 128 x 96 tile in three waves; the 128 x 160 tile, co-scheduled in clusters of its two M blocks, covers
+//    them in two. Measured at M = 256 (runs/R040c, base and new in one process, two passes, PDL on and off):
+//    19456 x 2560 ran 0.81-0.84 of fp8_gemm_kernel's time on the pre-quantized call and 0.83-0.86 on the served call,
+//    18432 x 2560 0.84-0.86 and 0.84-0.87, and the shapes that keep their one-wave tile read level, as did the
+//    neighbours at M = 248 and 264.
 // 3. Paired 64-row tiles for the narrow outputs (256 < M <= 384, K >= 4096). On a narrow output (64-row swap-AB weight
 //    tiles), when the 128-row tiling's last M block would hold at most 96 rows and the 64 x 128 tile runs the GEMM in
 //    one wave on at least three quarters of the SMs (2112 <= N on 132 SMs at five 64-row blocks), run it as a 2 x 1
@@ -1513,15 +1548,19 @@ inline bool use_dense_v2_override_uncached(uint32_t shape_m, uint32_t shape_n, u
     int const n = static_cast<int>(shape_n);
     if (shape_m <= 256u)
     {
-        if (div_up(dense_route_tiles(shape_m, shape_n, shape_k, num_sms), num_sms) < 2
-            || !dg2_one_wave_tile(shape_m, shape_n, shape_k, num_sms, cfg))
-            return false;
-        if (cfg.block_m == 128 && shape_m > 128u && shape_m <= 192u)
+        if (div_up(dense_route_tiles(shape_m, shape_n, shape_k, num_sms), num_sms) >= 2
+            && dg2_one_wave_tile(shape_m, shape_n, shape_k, num_sms, cfg))
         {
-            cfg.cluster_m = 2;
-            cfg.shape_n = 0u;
+            if (cfg.block_m == 128 && shape_m > 128u && shape_m <= 192u)
+            {
+                cfg.cluster_m = 2;
+                cfg.shape_n = 0u;
+            }
+            return true;
         }
-        return true;
+        // Rule 2's band starts at M = 256 (R040c): a wide output that no one-wave tile covers there takes it below.
+        if (shape_m < 256u)
+            return false;
     }
     if (shape_m > 672u)
         return false;

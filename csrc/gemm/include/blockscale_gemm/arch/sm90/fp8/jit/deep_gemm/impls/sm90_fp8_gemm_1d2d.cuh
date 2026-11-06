@@ -17,6 +17,9 @@
 // Modified by fish-scales-ops (issue #12, R040b): on the one-math-warp-group tiles (BLOCK_M = 64) narrower than 128,
 // and on the 128-wide one in a multicast pair, two accumulator sets let the promotion of one K block overlap the next
 // block's WGMMAs; see kTwoSets below.
+// Modified by fish-scales-ops (issue #12, R040c): a last template argument, kWideTwoSets, set by the host for each
+// launch (deep_gemm::jit::dg2_select_wide_two_sets), gives the single-CTA 128-wide tile the two accumulator sets when
+// the launch has at most five M blocks and its last M block is at least three quarters full; see kTwoSets below.
 #pragma once
 
 #pragma clang diagnostic push
@@ -65,7 +68,8 @@ template <cute::UMMA::Major kMajorSFB,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
           uint32_t kNumSMs, GemmType kGemmType,
           typename cd_dtype_t,
-          typename epilogue_op_t>
+          typename epilogue_op_t,
+          bool kWideTwoSets>
 CUTLASS_DEVICE void
 sm90_fp8_gemm_1d2d_body(float* sfb, int* grouped_layout,
                         uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
@@ -341,14 +345,18 @@ sm90_fp8_gemm_1d2d_body(float* sfb, int* grouped_layout,
                   // process, two passes) the 72 measured cells of the 64 x 32-96 tiles and of the paired 64 x 128 tile
                   // (K = 512-9728, M = 128-352) ran 9 % faster at the median (up to 16.5 %) on the pre-quantized call
                   // and 6 % (up to 9.5 %) on the served one, and none was more than 1 % slower over the two passes. The
-                  // single-CTA 64 x 128 tile keeps one set: its pre-quantized call ran 9-20 % faster, but its served
-                  // call ran 4-6 % slower on 2560 x 9216 at M = 328 / 336. That loss appears only when the GEMM is
-                  // launched behind the activation quantize with PDL, where a single-CTA grid lands in the order the
-                  // SMs drain (with FSO_DISABLE_PDL=1 the same served calls ran 15-17 % faster); the multicast pair
-                  // keeps each cluster in one GPC and kept its gain. With two math warp groups the second set spills
-                  // (128 x 128: 312 bytes of stack); the 16- and 32-row tiles were not measured and keep one set.
+                  // single-CTA 64 x 128 tile takes them only where the host sets kWideTwoSets (R040c,
+                  // deep_gemm::jit::dg2_select_wide_two_sets: at most five M blocks, the last of them at least three
+                  // quarters full). With six M blocks, on 2560 x 9216 at M = 328 / 336, its pre-quantized call ran
+                  // 17-20 % faster with two sets but its served call ran 4-6 % slower; that loss appears only when the
+                  // GEMM is launched behind the activation quantize with PDL, where a single-CTA grid lands in the
+                  // order the SMs drain (with FSO_DISABLE_PDL=1 the same served calls ran 15-17 % faster), and the
+                  // multicast pair, which keeps each cluster in one GPC, kept its gain. With a last M block half empty
+                  // or less, two sets lost up to 7.8 % on the served call at long K, and with 8 rows or fewer up to
+                  // 12 % on the pre-quantized call. With two math warp groups the second set spills (128 x 128: 312
+                  // bytes of stack); the 16- and 32-row tiles were not measured and keep one set.
                   constexpr bool kTwoSets = BLOCK_M == 64 and kNumMathThreads == 128 and WGMMA::kNumAccum <= 64
-                      and (BLOCK_N < 128 or kNumTMAMulticast > 1) and kGemmType == GemmType::Normal;
+                      and (BLOCK_N < 128 or kNumTMAMulticast > 1 or kWideTwoSets) and kGemmType == GemmType::Normal;
                   if constexpr (kTwoSets) {
                     float accum_o[WGMMA::kNumAccum];
                     uint32_t p_stage = 0;
@@ -658,7 +666,8 @@ template <cute::UMMA::Major kMajorSFB,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
           uint32_t kNumSMs, GemmType kGemmType,
           typename cd_dtype_t,
-          typename epilogue_op_t>
+          typename epilogue_op_t,
+          bool kWideTwoSets = false>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
@@ -670,7 +679,8 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                      "a dense epilogue runs as sm90_fp8_gemm_1d2d_impl_fso_epilogue");
     sm90_fp8_gemm_1d2d_body<kMajorSFB, SHAPE_M, SHAPE_N, SHAPE_K, kNumGroups, BLOCK_M, BLOCK_N, BLOCK_K,
                             kSwizzleAMode, kSwizzleBMode, kSwizzleDMode, kNumStages, kNumTMAThreads, kNumMathThreads,
-                            kNumTMAMulticast, kIsTMAMulticastOnA, kNumSMs, kGemmType, cd_dtype_t, epilogue_op_t>(
+                            kNumTMAMulticast, kIsTMAMulticastOnA, kNumSMs, kGemmType, cd_dtype_t, epilogue_op_t,
+                            kWideTwoSets>(
         sfb, grouped_layout, shape_m, shape_n, shape_k, tensor_map_a, tensor_map_b, tensor_map_d, tensor_map_sfa,
         fso::DenseEpilogue{});
 }
@@ -687,7 +697,8 @@ template <cute::UMMA::Major kMajorSFB,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
           uint32_t kNumSMs, GemmType kGemmType,
           typename cd_dtype_t,
-          typename epilogue_op_t>
+          typename epilogue_op_t,
+          bool kWideTwoSets = false>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm90_fp8_gemm_1d2d_impl_fso_epilogue(float* sfb, int* grouped_layout,
                                      uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
@@ -700,7 +711,8 @@ sm90_fp8_gemm_1d2d_impl_fso_epilogue(float* sfb, int* grouped_layout,
                      "sm90_fp8_gemm_1d2d_impl_fso_epilogue needs epilogue_op_t = Sm90DenseEpilogueOp<...>");
     sm90_fp8_gemm_1d2d_body<kMajorSFB, SHAPE_M, SHAPE_N, SHAPE_K, kNumGroups, BLOCK_M, BLOCK_N, BLOCK_K,
                             kSwizzleAMode, kSwizzleBMode, kSwizzleDMode, kNumStages, kNumTMAThreads, kNumMathThreads,
-                            kNumTMAMulticast, kIsTMAMulticastOnA, kNumSMs, kGemmType, cd_dtype_t, epilogue_op_t>(
+                            kNumTMAMulticast, kIsTMAMulticastOnA, kNumSMs, kGemmType, cd_dtype_t, epilogue_op_t,
+                            kWideTwoSets>(
         sfb, grouped_layout, shape_m, shape_n, shape_k, tensor_map_a, tensor_map_b, tensor_map_d, tensor_map_sfa,
         fso_epilogue);
 }

@@ -4,9 +4,10 @@ arch/sm90/fp8/jit/deep_gemm/impls/), which gemm_dispatch_sm90 runs at DeepGEMM's
 classes deep_gemm::jit::use_dg2_dense accepts (256 x 128 with multicast on A and 128 x 160 / 192 from M = 512 on, every
 DeepGEMM pick but its 80-wide tiles at 128 < M < 256, 64-row tiles at M = 64 / 128 with K >= 8192), at the tiles of
 deep_gemm::jit::use_dense_v2_override (FH1 of the issue-12 round: one wave at M <= 256 where the route needs two or
-more, the 128 x 160 / 192 pair over N in a quarter fewer waves for wide outputs at 256 < M <= 672, the 64 x 128 pair
-over M for narrow outputs at 256 < M <= 384), and fp8_gemm_kernel otherwise. FSO_SM90_DENSE_DG2 (read once per process)
-selects the route: 1 (default) the rule, 0 fp8_gemm_kernel only, all every DeepGEMM configuration.
+more, the 128 x 160 / 192 pair over N in a quarter fewer waves for wide outputs at 256 <= M <= 672 (M = 256 where no
+one-wave tile exists), the 64 x 128 pair over M for narrow outputs at 256 < M <= 384), and fp8_gemm_kernel otherwise.
+FSO_SM90_DENSE_DG2 (read once per process) selects the route: 1 (default) the rule, 0 fp8_gemm_kernel only, all every
+DeepGEMM configuration.
 
 Each mode runs in its own child process over the same cells, and the test checks:
 
@@ -16,9 +17,10 @@ Each mode runs in its own child process over the same cells, and the test checks
      tile (and, where the expectation names one, the cluster: c2x1 pairs two M blocks, c1x2 two N blocks), the cells of
      FH1's two swap-AB bands and of its 64-row weight tiles at 8 <= M <= 32 launch fp8_gemm_kernel_swapAB with the
      expected tile, the cells of the in-cluster split-K route (FH5) launch fp8_gemm_kernel_swapAB_splitk with the
-     expected slice count, and every control cell (swap-AB small M, M = 256 gate_up, one-wave 256 x 128 picks, the
-     neighbours of FH1's rules) launches fso's kernels; FSO_SM90_DENSE_DG2=0 never launches the v2 kernel (the split-K
-     route's cells keep that route in every mode);
+     expected slice count, and every control cell (swap-AB small M, one-wave 256 x 128 picks, the neighbours of FH1's
+     rules) launches fso's kernels; the single-CTA 64 x 128 launches carry the kernel variant of their M blocks (WIDE:
+     two accumulator sets up to five M blocks whose last one holds at least 48 rows, R040c); FSO_SM90_DENSE_DG2=0
+     never launches the v2 kernel (the split-K route's cells keep that route in every mode);
   3. graph capture: in the default mode a CUDA graph of the quantize + GEMM chain on seven v2 cells, with the output
      clobbered between capture and replay, replays to the eager result.
   4. a value other than 0, 1 or all prints one warning and keeps the default.
@@ -59,7 +61,9 @@ CELLS = [
     (224, 2560, 4096, "fso"),             # 128 < M < 256 but DeepGEMM picks 64 x 80: fso's kernel
     (224, 19456, 2560, "dg2 128x160"),
     (16, 2560, 9728, "splitk 3"),         # FH5: split-K, three slices on SMs shared two to one (token tile 16)
-    (256, 19456, 2560, "fso"),            # 128 x 160 at M = 256 (DeepGEMM's pick, two waves): fso's kernel
+    (256, 19456, 2560, "dg2 128x160"),    # R040c: rule 2 from M = 256 where no one-wave tile exists, co-scheduled
+    #                                       in clusters of its 2 M blocks (was fp8_gemm_kernel 128 x 128, three waves)
+    (256, 18432, 2560, "dg2 128x160"),    # the same (was fp8_gemm_kernel 128 x 96)
     (2048, 2048, 4096, "fso"),            # DeepGEMM picks one wave of 256 x 128 without multicast
     (64, 2560, 4096, "fso"),              # 64-row tile but K < 8192
     (128, 2560, 4096, "fso"),             # fp8_gemm_kernel's 64 x 48 tile at 8 stages, which divide its 32 K blocks
@@ -123,14 +127,26 @@ CELLS = [
     (16, 9216, 2048, "swapAB 128x16"),    # 144 tiles of 64 rows would need two waves: kept
     # FH6: single-CTA v2 launches whose M blocks fit one round of co-scheduled clusters (COSCHED below)
     (536, 2560, 4096, "dg2 128x128"),     # five M blocks of 128 rows, 100 tiles
+    # R040c: the single-CTA 64 x 128 tile (DeepGEMM's pick) with two accumulator sets up to five M blocks whose last one
+    # holds at least 48 of its 64 rows (WIDE below)
+    (192, 5120, 2048, "dg2 64x128"),      # three M blocks, the last one full: two sets
+    (160, 5120, 2048, "dg2 64x128"),      # the last block half empty: one set
+    (320, 3072, 6144, "dg2 64x128"),      # five M blocks, the last one full: two sets
 ]
 GRAPH_CELLS = [(1024, 19456, 2560), (128, 2560, 9728), (80, 5120, 2048), (288, 5120, 2048), (160, 9728, 2560),
-               (288, 18432, 2560), (288, 2560, 4096), (264, 12352, 2560), (536, 2560, 4096)]
+               (288, 18432, 2560), (288, 2560, 4096), (264, 12352, 2560), (536, 2560, 4096), (256, 19456, 2560),
+               (192, 5120, 2048)]
 # Co-scheduled single-CTA launches (FH6, deep_gemm::jit::dg2_co_schedule), (M, N, K) -> the number of M blocks: the
 # kernel is compiled for its grid (kNumSMs), which must be a multiple of the M blocks and at most the SM count; the
 # cluster attribute itself does not show in the kernel's name, the grid does where the device co-schedules fewer
 # clusters than the SMs would hold (117 CTAs for clusters of 3 and 110 for clusters of 5 on the H200).
-COSCHED = {(288, 18432, 2560): 3, (264, 12352, 2560): 3, (536, 2560, 4096): 5}
+COSCHED = {(288, 18432, 2560): 3, (264, 12352, 2560): 3, (536, 2560, 4096): 5, (256, 19456, 2560): 2,
+           (256, 18432, 2560): 2}
+# The 1D2D kernel's last template argument, kWideTwoSets (deep_gemm::jit::dg2_select_wide_two_sets, R040c): true on the
+# single-CTA 64 x 128 tile of at most five M blocks whose last block holds at least 48 rows, false on a half-empty last
+# block, on six M blocks and on the multicast pair (which runs two accumulator sets anyway).
+WIDE = {(192, 5120, 2048): True, (320, 3072, 6144): True, (160, 5120, 2048): False, (328, 2560, 4096): False,
+        (288, 2560, 4096): False}
 
 
 def kernel_of(names):
@@ -157,6 +173,15 @@ def kernel_of(names):
         if "fp8_gemm_kernel" in n:
             return "fso"
     return "none: " + " | ".join(names)
+
+
+def wide_of(names):
+    """The v2 kernel's last template argument (kWideTwoSets: true or false), or None."""
+    for n in names:
+        m = re.search(r"sm90_fp8_gemm_1d2d_impl[_a-z]*<.*, (true|false)>\(", n)
+        if m:
+            return m.group(1) == "true"
+    return None
 
 
 def grid_of(names):
@@ -203,6 +228,7 @@ def worker(out_path):
         key = f"{M},{N},{K}"
         res["kernels"][key] = kernel_of(names)
         res.setdefault("grids", {})[key] = grid_of(names)
+        res.setdefault("wide", {})[key] = wide_of(names)
         tensors[key + "/y"] = y.cpu()
         tensors[key + "/yq"] = yq.cpu()
         if (M, N, K) in GRAPH_CELLS:
@@ -285,6 +311,13 @@ def main():
                 failures.append(f"{key}: default mode launched {got} on {grid} CTAs, expected a single-CTA tile on a "
                                 f"multiple of {nm} CTAs")
         print(f"[2b] {len(COSCHED)} co-scheduled single-CTA launches on grids of whole clusters of their M blocks")
+        # 2c. the kernel variant of the 64 x 128 tile (R040c)
+        for (M, N, K), want in WIDE.items():
+            key = f"{M},{N},{K}"
+            got = results[None]["wide"].get(key)
+            if got is not want:
+                failures.append(f"{key}: default mode launched kWideTwoSets = {got}, expected {want}")
+        print(f"[2c] {len(WIDE)} 64 x 128 launches carry the kernel variant of their M blocks and cluster form")
         # 3. graph capture and replay
         for key, ok in results[None]["graph"].items():
             if not ok:

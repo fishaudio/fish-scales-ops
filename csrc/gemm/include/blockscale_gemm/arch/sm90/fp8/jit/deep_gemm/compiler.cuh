@@ -487,7 +487,8 @@ __global__ void dummy_kernel() {
 // sgl-project/DeepGEMM v0.2.0): K-major B scales, M and K at run time, N compiled in only for DeepGEMM's
 // specialize_n case (c.shape_n), one group, BLOCK_K 128, 128-byte swizzles for A and B, c.swizzle_d for D, 128 TMA
 // threads, 128 or 256 math threads, multicast on A when cluster_n > 1, the SM count, GemmType::Normal, BF16 D and the
-// identity epilogue. As in generateKernel, a dummy kernel takes the instantiation's address so that NVRTC emits it.
+// identity epilogue, then fso's kWideTwoSets (c.wide_two_sets, dg2_select_wide_two_sets). As in generateKernel, a dummy
+// kernel takes the instantiation's address so that NVRTC emits it.
 // A non-identity `epilogue` instantiates sm90_fp8_gemm_1d2d_impl_fso_epilogue with epilogue_op_t
 // deep_gemm::Sm90DenseEpilogueOp<kBias, kAct, kResidual> instead; the identity source is unchanged.
 inline std::string generateKernelDg2(Dg2DenseConfig const& c, DenseEpilogueKey const& epilogue = DenseEpilogueKey{})
@@ -501,7 +502,8 @@ inline std::string generateKernelDg2(Dg2DenseConfig const& c, DenseEpilogueKey c
         + std::to_string(c.swizzle_d) + "u, " + std::to_string(c.num_stages) + "u, 128u, "
         + std::to_string(c.num_math_threads()) + "u, " + std::to_string(c.cluster_size()) + "u, "
         + (c.multicast_on_a() ? "true" : "false") + ", " + std::to_string(c.num_sms)
-        + "u, deep_gemm::GemmType::Normal, cutlass::bfloat16_t, " + epilogue_op;
+        + "u, deep_gemm::GemmType::Normal, cutlass::bfloat16_t, " + epilogue_op
+        + (c.wide_two_sets ? ", true" : ", false");
     return R"(
 #include <deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh>
 
@@ -847,7 +849,7 @@ public:
         std::string const name = "gemm_dg2_" + std::to_string(c.block_m) + "x" + std::to_string(c.block_n) + "_s"
             + std::to_string(c.num_stages) + "_c" + std::to_string(c.cluster_m) + "x" + std::to_string(c.cluster_n)
             + "_d" + std::to_string(c.swizzle_d) + "_n" + std::to_string(c.shape_n) + "_sm" + std::to_string(c.num_sms)
-            + epilogue.name_suffix();
+            + (c.wide_two_sets ? "_w2" : "") + epilogue.name_suffix();
         auto& runtimeCache = getGlobalRuntimeCache();
         if (Runtime* cachedRuntime = runtimeCache.find(name))
         {

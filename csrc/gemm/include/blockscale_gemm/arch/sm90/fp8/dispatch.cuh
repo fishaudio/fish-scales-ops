@@ -372,11 +372,14 @@ inline void gemm_dispatch_sm90(void* mat_a, int ld_a, void* mat_b, int ld_b, voi
 
     // DeepGEMM v2 tiles that override the route (deep_gemm::jit::use_dense_v2_override): one wave at M <= 256 where the
     // route needs two or more (up to M = 128 only on a tile whose main loop the kernel keeps compact), a quarter fewer
-    // waves for the wide outputs at 256 < M <= 672 (the single-CTA tile co-scheduled where that fits, else the pair
-    // over N), and paired 64 x 128 tiles for the narrow outputs at 256 < M <= 384. A single-CTA v2 launch of either
-    // kind whose M blocks fit one round of clusters runs those clusters for co-scheduling (deep_gemm::jit::
-    // dg2_co_schedule, with the occupancy of sm90_cosched_max_clusters). Only in the default mode and without
-    // FSO_SM90_SWAP_MAX_M, so that the A/B knobs keep their meaning. The bytes are those of the route.
+    // waves for the wide outputs at 256 <= M <= 672 (at M = 256 where no one-wave tile exists; the single-CTA tile
+    // co-scheduled where that fits, else the pair over N), and paired 64 x 128 tiles for the narrow outputs at
+    // 256 < M <= 384. A single-CTA v2 launch of either kind whose M blocks fit one round of clusters runs those
+    // clusters for co-scheduling (deep_gemm::jit::dg2_co_schedule, with the occupancy of sm90_cosched_max_clusters).
+    // Only in the default mode and without FSO_SM90_SWAP_MAX_M, so that the A/B knobs keep their meaning. Every v2
+    // launch then picks its kernel variant (deep_gemm::jit::dg2_select_wide_two_sets: two accumulator sets on the
+    // single-CTA 64 x 128 tile of at most five M blocks whose last block holds at least 48 rows). The bytes are those
+    // of the route.
     bool const v2_rules = sm90_dense_dg2_mode() == Sm90DenseDg2Mode::kRule && sm90_swap_max_m_override() == 0u;
     int const* const max_clusters = v2_rules ? sm90_cosched_max_clusters(stream) : nullptr;
     if (v2_rules)
@@ -385,6 +388,7 @@ inline void gemm_dispatch_sm90(void* mat_a, int ld_a, void* mat_b, int ld_b, voi
         if (deep_gemm::jit::use_dense_v2_override(shape_m, shape_n, shape_k, num_device_sms, v2, max_clusters))
         {
             deep_gemm::jit::dg2_co_schedule(v2, shape_m, shape_n, shape_k, num_device_sms, max_clusters);
+            deep_gemm::jit::dg2_select_wide_two_sets(v2, shape_m);
             auto runtime = deep_gemm::jit::getGlobalCompiler().buildDg2(v2, epi_key);
             auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
             deep_gemm::runGemmDg2(kernel, mat_a, ld_a, mat_b, ld_b, mat_d, ld_d, scales_a, scales_b, shape_m, shape_n,
@@ -409,6 +413,7 @@ inline void gemm_dispatch_sm90(void* mat_a, int ld_a, void* mat_b, int ld_b, voi
         {
             if (!all && v2_rules)
                 deep_gemm::jit::dg2_co_schedule(dg2, shape_m, shape_n, shape_k, num_device_sms, max_clusters);
+            deep_gemm::jit::dg2_select_wide_two_sets(dg2, shape_m);
             auto runtime = deep_gemm::jit::getGlobalCompiler().buildDg2(dg2, epi_key);
             auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
             deep_gemm::runGemmDg2(kernel, mat_a, ld_a, mat_b, ld_b, mat_d, ld_d, scales_a, scales_b, shape_m, shape_n,
