@@ -300,7 +300,7 @@ inline void gemm_dispatch_sm90(void* mat_a, int ld_a, void* mat_b, int ld_b, voi
     bool const pdl = fso_pdl_enabled();
 
     // DeepGEMM v2 tiles that override the route (deep_gemm::jit::use_dense_v2_override): one wave at M <= 256 where the
-    // route needs two or more (up to M = 128 only on a tile whose main loop the kernel compiles once), a quarter fewer
+    // route needs two or more (up to M = 128 only on a tile whose main loop the kernel keeps compact), a quarter fewer
     // waves for the wide outputs at 256 < M <= 672, and paired 64 x 128 tiles for the narrow outputs at
     // 256 < M <= 384. Only in the default mode and without FSO_SM90_SWAP_MAX_M, so that the A/B knobs keep their
     // meaning. The bytes are those of the route.

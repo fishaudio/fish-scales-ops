@@ -1167,7 +1167,7 @@ _SM90_EPI_RULE5 = (
 # swap-AB); _sm90_swap_ab does not mirror FH1's bands, so every cell in them is listed here.
 _SM90_EPI_FH1 = {
     (18432, 2560, 8): ("dg2", 16, 144, "c1x1"), (18432, 2560, 128): ("dg2", 128, 144, "c1x1"),
-    (19456, 2560, 64): ("v1", None, None, None),
+    (19456, 2560, 64): ("dg2", 64, 160, "c1x1"),  # FH6: the 160-wide main loop is compact, so the one-wave tile qualifies
     (9728, 2560, 144): ("dg2", 128, 160, "c2x1"), (12288, 2048, 152): ("dg2", 128, 192, "c2x1"),
     (9728, 2560, 160): ("dg2", 128, 160, "c2x1"), (10240, 2560, 256): ("dg2", 128, 160, "c1x1"),
     (2560, 9216, 152): ("swapab", 64, 56, None), (2560, 4096, 216): ("swapab", 64, 72, None),

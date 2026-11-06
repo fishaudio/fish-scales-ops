@@ -11,6 +11,9 @@
 // Modified by fish-scales-ops (issue #12, SW1): the math warps execute fence.proxy.async + __syncwarp between the
 // last WGMMA batch of a stage and the stage's release, so that their ld.shared of the TMA-written A scales are
 // performed before the producer can refill the stage (see fso_fence_stage_reads in ../fp8_gemm_impl.cuh).
+// Modified by fish-scales-ops (issue #12, FH6): on the 160-wide tile, for which DeepGEMM compiles five copies of the main
+// loop (one per possible weight-scale split point), each copy is unrolled four times instead of eight; see
+// kWideFiveCopies below.
 #pragma once
 
 #pragma clang diagnostic push
@@ -309,10 +312,22 @@ sm90_fp8_gemm_1d2d_body(float* sfb, int* grouped_layout,
                 constexpr bool kShouldOptimize = BLOCK_K / math::constexpr_gcd(BLOCK_K, BLOCK_N) <= 4 and not kMustUseUniformedScaleB;
                 constexpr uint32_t kGap = math::constexpr_gcd(BLOCK_K, BLOCK_N) / 8;
                 constexpr uint32_t kEnd = kShouldOptimize ? BLOCK_K / 8 : 0;
+                // fish-scales-ops (issue #12, FH6): where `num_former_iters` is dispatched over five values
+                // (128 / gcd(128, BLOCK_N) == 4) on a tile wider than a weight-scale block (160 wide), the five copies of
+                // the loop below, unrolled eight times each, held about 7,100 SASS instructions, and the kernel ran
+                // 3.4 us longer per call behind another GEMM in the Qwen3-4B MLP block (instruction refetch). Unrolled
+                // four times they hold about 4,500, and the kernel was at most 0.7 % slower alone and as fast or faster
+                // behind the activation quantize and with PDL off; unrolled twice (about 3,100) it lost 1.1-1.4 % alone
+                // on 128 x 160 tiles of four M blocks. The 96-wide tile (five copies, about 4,600 instructions) keeps the eightfold unroll: at
+                // K >= 5120 it was up to 1.5 % slower alone unrolled four times and 3.4-5 % slower unrolled twice
+                // (runs/FH6 of the issue-12 round, d3). So does the 192-wide tile (three copies). Only the unroll changes:
+                // the same instructions compute the same products in the same order.
+                constexpr bool kWideFiveCopies = kShouldOptimize and BLOCK_K / math::constexpr_gcd(BLOCK_K, BLOCK_N) == 4 and
+                                                 BLOCK_N > BLOCK_K;
 
                 // Dispatch `num_former_iters` and launch MMAs
                 dispatch_num_former_iters<0, kGap, kEnd>(kShouldOptimize ? num_former_iters : 0, [&](auto _) {
-                    #pragma unroll (kGemmType == GemmType::Normal && SHAPE_M == 0 && SHAPE_N == 0 && SHAPE_K == 0 && BLOCK_M == 256 && BLOCK_N == 128 ? 2 : 8)
+                    #pragma unroll (kGemmType == GemmType::Normal && SHAPE_M == 0 && SHAPE_N == 0 && SHAPE_K == 0 && BLOCK_M == 256 && BLOCK_N == 128 ? 2 : kWideFiveCopies ? 4 : 8)
                     for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                         const auto a_desc_base_lo = a_desc_lo + stage_idx * (SMEM_A_SIZE_PER_STAGE / 16);
                         const auto b_desc_base_lo = b_desc_lo + stage_idx * (SMEM_B_SIZE_PER_STAGE / 16);

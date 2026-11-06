@@ -1308,13 +1308,15 @@ inline bool dg2_tile_config(int block_m, int block_n, int cluster_m, int cluster
     return true;
 }
 
-// Whether DeepGEMM v2's 1D2D kernel compiles its main loop once for a tile `block_n` wide. A width that divides 128
+// Whether DeepGEMM v2's 1D2D kernel keeps its main loop compact for a tile `block_n` wide. A width that divides 128
 // (one weight scale per k-block), or whose offsets into the 128-row weight-scale blocks take more than four values
-// (128 / gcd(128, width) > 4: 48, 80, 112, 144, ...), runs one loop with the split point as a variable. The others
-// (96, 160, 192, 256) get one copy of the unrolled loop per split point (kShouldOptimize in
-// impls/sm90_fp8_gemm_1d2d.cuh): five for 96 and 160, three for 192, so a 160-wide kernel holds about 7,400 SASS
-// instructions against 2,700 for a 144-wide one and 2,100 for fp8_gemm_kernel_swapAB (runs/FH1/runs/dg2_sass).
-inline bool dg2_single_main_loop(int block_n)
+// (128 / gcd(128, width) > 4: 48, 80, 112, 144, ...), runs one loop with the split point as a variable. The others get
+// one copy of the loop per split point (kShouldOptimize in impls/sm90_fp8_gemm_1d2d.cuh): five for 96 and 160, three for
+// 192. Unrolled eight times, as DeepGEMM does, a 160-wide kernel held about 7,400 SASS instructions against 2,700 for a
+// 144-wide one (runs/FH1/runs/dg2_sass). Since issue #12 (FH6) the five copies of the 160-wide loop unroll four times
+// (kWideFiveCopies), about 4,500 instructions, which counts as compact here; the 96-wide tile keeps DeepGEMM's unroll
+// (shorter ones were slower at long K) and the 192-wide one holds about 8,000, so neither does.
+inline bool dg2_compact_main_loop(int block_n)
 {
     int a = 128, b = block_n;
     while (b != 0)
@@ -1323,19 +1325,21 @@ inline bool dg2_single_main_loop(int block_n)
         a = b;
         b = t;
     }
-    return 128 % block_n == 0 || 128 / a > 4;
+    return 128 % block_n == 0 || 128 / a > 4 || (128 / a == 4 && block_n > 128);
 }
 
 // The single-CTA v2 tile with the fewest rows (16 at M <= 16, 32 at M <= 32, then 64, then 128) and, for those rows,
 // the narrowest width (16 to 192 in steps of 16, with the 1D2D kernel's weight-scale split: a width above 128 must
 // have (width - 128) dividing the width or 128) whose launch runs the whole GEMM in one wave on num_sms. Up to
-// M = 128 only widths with one main loop (dg2_single_main_loop) qualify. There the one-wave tile saves the route's
-// partly filled second wave, at most 2 us per call (19456 x 2560, served), while behind another GEMM the copies of the
-// main loop cost a 160-wide kernel 3-4 us per call: in the Qwen3-4B MLP block its gate_up ran 3.4 us longer than alone,
-// next to any other GEMM (fso's swap-AB, fp8_gemm_kernel, another v2 tile, cuBLAS) but not next to a memcpy, the
-// quantize or the SwiGLU kernel (runs/FH1/runs/mlp_decomp), so the block got 4-8 % slower; the 144-wide tile of
-// 18432 x 2560 made its block 1-6 % faster. Above M = 128 the tile replaces a full second wave (2.2-4.8 us served on
-// 12352 x 2560).
+// M = 128 only widths with a compact main loop (dg2_compact_main_loop) qualify, which since FH6 includes the 160-wide
+// tile. There the one-wave tile saves the route's partly filled second wave, at most 2 us per call (19456 x 2560,
+// served), while behind another GEMM the copies of the main loop cost a 160-wide kernel 3-4 us per call: in the
+// Qwen3-4B MLP block its gate_up ran 3.4 us longer than alone, next to any other GEMM (fso's swap-AB, fp8_gemm_kernel,
+// another v2 tile, cuBLAS) but not next to a memcpy, the quantize or the SwiGLU kernel (runs/FH1/runs/mlp_decomp), so
+// the block got 4-8 % slower with five copies unrolled eight times; unrolled four times (FH6) the same 160-wide gate_up
+// left the block level with the route at M = 64 and made it 2-3 % faster at M = 1 and 128 (runs/FH6/runs/d3). The
+// 144-wide tile of 18432 x 2560 made its block 1-6 % faster. Above M = 128 the tile replaces a full second wave
+// (2.2-4.8 us served on 12352 x 2560).
 inline bool dg2_one_wave_tile(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_sms, Dg2DenseConfig& out)
 {
     int const block_ms[] = {16, 32, 64, 128};
@@ -1347,7 +1351,7 @@ inline bool dg2_one_wave_tile(uint32_t shape_m, uint32_t shape_n, uint32_t shape
         {
             if (bn > 128 && (bn % (bn - 128) != 0 && 128 % (bn - 128) != 0))
                 continue;
-            if (shape_m <= 128u && !dg2_single_main_loop(bn))
+            if (shape_m <= 128u && !dg2_compact_main_loop(bn))
                 continue;
             if (div_up(static_cast<int>(shape_m), bm) * div_up(static_cast<int>(shape_n), bn) > num_sms)
                 continue;
@@ -1374,7 +1378,8 @@ inline bool dg2_one_wave_tile(uint32_t shape_m, uint32_t shape_n, uint32_t shape
 //    against 0281c5f's route (runs/FH1/runs/final3_ab), bare GEMM / served call: 18432 x 2560 at M = 8-128 0.78-0.98 /
 //    0.83-0.97 (144 wide); 10240 x 2560 and 12352 x 2560 at M = 136-192 (paired) 0.76-0.95 / 0.78-0.95, at M = 256
 //    0.80-0.84 / 0.83-0.87; 9728 x 2560, 9216 x 2048 and 12288 x 2048 at M = 144-256 0.77-0.94 / 0.79-0.94.
-//    19456 x 2560 keeps the route up to M = 128: its one-wave tiles are 160 or 192 wide (see dg2_one_wave_tile).
+//    19456 x 2560 takes its 160-wide one-wave tile at M = 1-128 as well, now that the kernel keeps that width's main
+//    loop compact (see dg2_one_wave_tile).
 // 2. Fewer waves for the wide outputs (256 < M <= 672). When the 128-row v2 tile 160 wide, or 192 wide where that needs
 //    fewer waves, needs at least a quarter fewer waves than the route and still two or more (DeepGEMM never clusters a
 //    one-wave launch, and none was measured), run it as a 1 x 2 cluster (two N blocks share each activation tile,

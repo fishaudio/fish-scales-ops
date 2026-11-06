@@ -81,12 +81,14 @@ CELLS = [
     # FH1 of the issue-12 round (deep_gemm::jit::use_dense_v2_override and the two swap-AB bands of
     # use_dense_swap_ab_above_96; /data/bench-runs/fso_issue12_20261028/runs/FH1). One wave of the v2 kernel at
     # M <= 256 where the route needs two or more: the fewest rows, then the narrowest tile, single-CTA, paired over
-    # M (c2x1) for 128-row tiles at 128 < M <= 192; up to M = 128 only widths with one main loop (not 96 / 160 / 192).
+    # M (c2x1) for 128-row tiles at 128 < M <= 192; up to M = 128 only widths with a compact main loop, which since FH6
+    # (the five copies of the 160-wide main loop unrolled four times) includes 160 but not 96 or 192.
     (8, 18432, 2560, "dg2 16x144"),       # was fp8_gemm_kernel_swapAB 128 x 16 (two waves of 144 tiles)
     (64, 18432, 2560, "dg2 64x144"),      # was fp8_gemm_kernel 64 x 72
     (128, 18432, 2560, "dg2 128x144"),    # was fp8_gemm_kernel 128 x 72
-    (8, 19456, 2560, "fso"),              # one wave needs a 160- or 192-wide tile: kept (swap-AB)
-    (128, 19456, 2560, "fso"),            # the same: kept (fp8_gemm_kernel 128 x 80)
+    (8, 19456, 2560, "dg2 16x160"),       # one wave needs the 160-wide tile, compact since FH6 (was swap-AB)
+    (128, 19456, 2560, "dg2 128x160"),    # the same (was fp8_gemm_kernel 128 x 80)
+    (8, 22528, 2560, "fso"),              # one wave needs the 192-wide tile (not compact): kept (swap-AB)
     (160, 9728, 2560, "dg2 128x160 c2x1"),  # was DeepGEMM's 64 x 112 pair
     (192, 12288, 2048, "dg2 128x192 c2x1"),
     (256, 10240, 2560, "dg2 128x160"),    # was fp8_gemm_kernel 128 x 80 (three waves)
