@@ -98,9 +98,20 @@ __global__ void scale_1x128_kernel(
 
 // Grouped MoE variant removed 2026-05-21.
 
+// fmaxf over |x[0]| .. |x[N - 1]| as a balanced tree (N a power of two). fmaxf is exact and returns the other operand
+// when one is NaN, so every evaluation order gives the value of the serial chain, all-NaN inputs included.
+template <int N>
+__device__ __forceinline__ float fp8_1x128_absmax_tree(float const* x)
+{
+    if constexpr (N == 2)
+        return fmaxf(fabsf(x[0]), fabsf(x[1]));
+    else
+        return fmaxf(fp8_1x128_absmax_tree<N / 2>(x), fp8_1x128_absmax_tree<N / 2>(x + N / 2));
+}
+
 // 1x128 activation quantize (BF16 -> FP8 E4M3 with one FP32 dequant scale per row and 128-element group), with each
 // group spread over 8 lanes that load 16 elements each (two 16-byte loads), so a warp quantizes four groups at once
-// and every lane does one load, a three-step shuffle reduction and one 16-byte store per group. This is the
+// and every lane does one pair of loads, a three-step shuffle reduction and one 16-byte store per group. This is the
 // organisation of sglang's per_token_group_quant kernel. scale_1x128_kernel above (one warp per group, four
 // elements per lane, five shuffles) and the K % 512 kernel of the quantize op (one warp per four consecutive groups,
 // walked one after the other) carry a serial chain per thread that bounds them by latency at small M.
@@ -113,11 +124,20 @@ __global__ void scale_1x128_kernel(
 // kZeroPadRows also writes 0 into the scales of the padding rows M .. align(M, 4) - 1, as the quantize op's K % 512
 // kernel does; scale_1x128_kernel leaves them unwritten.
 //
+// On sm_90 the GEMM of a bf16-x call waits for this kernel's last store, so its latency sits on that call's critical
+// path. Two things keep it short without touching the arithmetic above:
+//   - group g is the 128 elements at element offset 128 g of the row-major [M, K] input (K = 128 x k_groups), so the
+//     loads take their address from g alone and are issued right after the PDL wait. The row m = g / k_groups and
+//     the K-block kb, which only the scale store needs, are divided out while the loads are in flight (the empty asm
+//     statement keeps the compiler from sinking the division behind the conversion into the lane-0 branch);
+//   - the maximum of |x| inside a lane is a balanced tree (fp8_1x128_absmax_tree), not a serial chain.
+//
 // Requirements (checked by fp8_1x128_lanes_supported): K a multiple of 128, input and output 16-byte aligned.
-// The grid is at most one wave (the CTAs that fit on the device at once) and loops over the groups, so every CTA gets
-// the same share at large M without a partial second wave, and a programmatic dependent launch (pdl) never floods
-// the SMs with waiting CTAs. With pdl the kernel waits for its predecessor before its first global access and then
-// lets its own dependent (the GEMM) launch, so the GEMM's launch and prologue overlap the quantize.
+// The grid is at most one wave (the CTAs that fit on the device at once, fp8_1x128_lanes_ctas_per_sm) and loops over
+// the groups, so every CTA gets the same share at large M without a partial second wave, and a programmatic dependent
+// launch (pdl) never floods the SMs with waiting CTAs. With pdl the kernel waits for its predecessor before its first
+// global access and then lets its own dependent (the GEMM) launch, so the GEMM's launch and prologue overlap the
+// quantize. The kernel runs with 256 threads per CTA (fp8_1x128_lanes).
 template <bool kBf16AmaxFloor, bool kZeroPadRows>
 __global__ void __launch_bounds__(256) scale_1x128_lanes_kernel(__nv_fp8_e4m3* __restrict__ output,
     float* __restrict__ scales, __nv_bfloat16 const* __restrict__ input, int dim_x, int dim_y, bool pdl)
@@ -131,29 +151,35 @@ __global__ void __launch_bounds__(256) scale_1x128_lanes_kernel(__nv_fp8_e4m3* _
             cudaTriggerProgrammaticLaunchCompletion();
     }
 #endif
+    constexpr int kThreads = 256;
     int64_t const k_groups = dim_x / 128;
     int64_t const m_pad = (static_cast<int64_t>(dim_y) + 3) / 4 * 4;
-    int64_t const num_groups = (kZeroPadRows ? m_pad : static_cast<int64_t>(dim_y)) * k_groups;
-    unsigned const lane = threadIdx.x & 31u;
-    unsigned const sub = lane & 7u;                // lane within the group's eight lanes
-    unsigned const sub_mask = 0xFFu << (lane & 24u); // the eight lanes of this group
+    int64_t const real_groups = static_cast<int64_t>(dim_y) * k_groups;
+    int64_t const num_groups = kZeroPadRows ? m_pad * k_groups : real_groups;
+    int const sub = threadIdx.x & 7;                                // lane within the group's eight lanes
+    unsigned const sub_mask = 0xFFu << ((threadIdx.x & 31u) & 24u); // the eight lanes of this group
     float const amax_floor = kBf16AmaxFloor ? __bfloat162float(__float2bfloat16(1e-10f)) : 1e-10f;
 
-    int64_t const stride = (static_cast<int64_t>(gridDim.x) * blockDim.x) >> 3;
-    for (int64_t g = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) >> 3; g < num_groups; g += stride)
+    int64_t const stride = static_cast<int64_t>(gridDim.x) * (kThreads / 8);
+    for (int64_t g = (static_cast<int64_t>(blockIdx.x) * kThreads + threadIdx.x) / 8; g < num_groups; g += stride)
     {
+        uint4 v[2];
+        if (g < real_groups)
+        {
+            uint4 const* const src = reinterpret_cast<uint4 const*>(input + g * 128 + sub * 16);
+            v[0] = __ldg(src);
+            v[1] = __ldg(src + 1);
+        }
         int64_t const m = g / k_groups;
-        int64_t const kb = g - m * k_groups;
-        if (kZeroPadRows && m >= dim_y)
+        int64_t scale_index = (g - m * k_groups) * m_pad + m;
+        asm volatile("" : "+l"(scale_index));
+        if (kZeroPadRows && g >= real_groups)
         {
             if (sub == 0)
-                scales[kb * m_pad + m] = 0.f;
+                scales[scale_index] = 0.f;
             continue;
         }
 
-        int64_t const offset = m * dim_x + kb * 128 + sub * 16;
-        uint4 const v[2] = {*reinterpret_cast<uint4 const*>(input + offset),
-            *reinterpret_cast<uint4 const*>(input + offset + 8)};
         float x[16];
 #pragma unroll
         for (int i = 0; i < 2; ++i)
@@ -168,10 +194,7 @@ __global__ void __launch_bounds__(256) scale_1x128_lanes_kernel(__nv_fp8_e4m3* _
             }
         }
 
-        float amax = fabsf(x[0]);
-#pragma unroll
-        for (int i = 1; i < 16; ++i)
-            amax = fmaxf(amax, fabsf(x[i]));
+        float amax = fp8_1x128_absmax_tree<16>(x);
         amax = fmaxf(amax, __shfl_xor_sync(sub_mask, amax, 4));
         amax = fmaxf(amax, __shfl_xor_sync(sub_mask, amax, 2));
         amax = fmaxf(amax, __shfl_xor_sync(sub_mask, amax, 1));
@@ -188,9 +211,9 @@ __global__ void __launch_bounds__(256) scale_1x128_lanes_kernel(__nv_fp8_e4m3* _
                 make_float2(x[i * 4 + 2] * quant_scale, x[i * 4 + 3] * quant_scale), __NV_SATFINITE, __NV_E4M3);
             words[i] = static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16);
         }
-        *reinterpret_cast<uint4*>(output + offset) = make_uint4(words[0], words[1], words[2], words[3]);
+        *reinterpret_cast<uint4*>(output + g * 128 + sub * 16) = make_uint4(words[0], words[1], words[2], words[3]);
         if (sub == 0)
-            scales[kb * m_pad + m] = 1.f / quant_scale;
+            scales[scale_index] = 1.f / quant_scale;
     }
 #endif
 }
@@ -387,7 +410,10 @@ inline bool fp8_1x128_lanes_supported(__nv_fp8_e4m3 const* mat_quant, __nv_bfloa
         && reinterpret_cast<uintptr_t>(mat) % 16 == 0;
 }
 
-// Resident CTAs per SM of one scale_1x128_lanes_kernel instantiation (256 threads), queried once per process.
+// Resident CTAs per SM of one scale_1x128_lanes_kernel instantiation (256 threads), queried once per process: the
+// grid's one-wave cap. The cap must be the kernel's own occupancy: a grid of fewer CTAs per SM than fit lands unevenly
+// (the SMs that free first take the extra CTAs), which made the quantize slower at large M (run fso_issue12_20261028/
+// FQ90, hold F10).
 template <bool kBf16AmaxFloor, bool kZeroPadRows>
 inline int fp8_1x128_lanes_ctas_per_sm()
 {
