@@ -1,7 +1,7 @@
 # TRIM.diff: the vendored files against flashinfer-python 0.6.18.post1 (flashinfer/gemm/kernels/<file>):
 # the three FP4 trims of 2026-09-22, the fso dense epilogue additions of 2026-10-29 (issue #12, S1b1), the
 # split-K kernel's wide token tiles and reduction rework of 2026-11-02 (issue #12, P5) and the weights-first
-# variant of both kernels of 2026-11-05 (issue #12, FB1).
+# variant of both kernels of 2026-11-05 (issue #12, FB1; its stage cap 2026-11-07, FB1b).
 # Regenerate with: diff -u <wheel file> <vendored file> for each file (labels a/<file> and b/<file>).
 --- a/dense_blockscaled_gemm_sm100.py
 +++ b/dense_blockscaled_gemm_sm100.py
@@ -283,7 +283,7 @@
      @staticmethod
 --- a/dense_blockscaled_gemm_sm100_common.py
 +++ b/dense_blockscaled_gemm_sm100_common.py
-@@ -27,42 +27,253 @@
+@@ -27,42 +27,254 @@
  # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  
  
@@ -470,7 +470,7 @@
 +        the TMA warp issues the weight (kernel operand A under swap-AB) and weight-scale (SFA) copies of its first
 +        tile's first stages before its griddepcontrol.wait, and the activation (B), activation-scale (SFB) copies
 +        of those stages after it, against the same stage barriers. At most `cap` stages, and never every stage, go
-+        before the wait (see `_fso_wf_stages`; fso's decode row passes 4 for a one-CTA tile and 1 for the two-CTA
++        before the wait (see `_fso_wf_stages`; fso's decode row passes 2 for a one-CTA tile and 1 for the two-CTA
 +        tile). Every other warp keeps its wait where
 +        today's kernel has it, so the bias, the residual and the output are touched only after a wait, as before."""
 +        self.fso_wf = bool(weights_first)
@@ -484,7 +484,8 @@
 +        before the wait; G0D measured about 3.7 us per call on the C++ kernel built that way,
 +        runs/G0D/report/probe.md). The cap keeps the activation copies after the wait from queueing behind many
 +        weight copies: with every stage but one filled, fso measured the pre-quantized LLM decode call 0.1-0.2 us
-+        slower; with four on the one-CTA tiles and one on the two-CTA tile, faster (run fso_issue12_20261028/FB1)."""
++        slower; with two on the one-CTA tiles and one on the two-CTA tile, faster (runs fso_issue12_20261028/FB1,
++        FB1b)."""
 +        if self.fso_wf_cap is not None:
 +            return max(0, min(self.num_ab_stage - 1, self.fso_wf_cap))
 +        return self.num_ab_stage - 1
@@ -561,7 +562,7 @@
  
      def _setup_attributes(self) -> None:
          raise NotImplementedError
-@@ -78,6 +289,8 @@
+@@ -78,6 +290,8 @@
          max_active_clusters: cutlass.Constexpr,
          stream: Any,
          epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -570,7 +571,7 @@
      ) -> Any:
          raise NotImplementedError
  
-@@ -395,12 +608,8 @@
+@@ -395,12 +609,8 @@
          as a torch tensor.
  
          Args:
@@ -585,7 +586,7 @@
              mC (cute.Tensor): Output tensor C, shape (m, n).
              sf_m (cutlass.Int64): Scale factor M dim (ceil(m/128)).
              sf_n (cutlass.Int64): Scale factor N dim (ceil(n/128)).
-@@ -414,32 +623,23 @@
+@@ -414,32 +624,23 @@
              swap_ab (cutlass.Constexpr): Whether A/B are swapped (controls C layout).
              epilogue_op (cutlass.Constexpr): Elementwise epilogue function.
          """
@@ -628,7 +629,7 @@
  
          a_tensor = cute.make_tensor(
              a_ptr,
-@@ -489,6 +689,93 @@
+@@ -489,6 +690,93 @@
              epilogue_op,
          )
  

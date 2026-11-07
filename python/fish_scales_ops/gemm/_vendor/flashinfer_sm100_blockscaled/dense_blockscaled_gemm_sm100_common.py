@@ -186,7 +186,7 @@ class _Sm100BlockScaledGemmCommon:
         the TMA warp issues the weight (kernel operand A under swap-AB) and weight-scale (SFA) copies of its first
         tile's first stages before its griddepcontrol.wait, and the activation (B), activation-scale (SFB) copies
         of those stages after it, against the same stage barriers. At most `cap` stages, and never every stage, go
-        before the wait (see `_fso_wf_stages`; fso's decode row passes 4 for a one-CTA tile and 1 for the two-CTA
+        before the wait (see `_fso_wf_stages`; fso's decode row passes 2 for a one-CTA tile and 1 for the two-CTA
         tile). Every other warp keeps its wait where
         today's kernel has it, so the bias, the residual and the output are touched only after a wait, as before."""
         self.fso_wf = bool(weights_first)
@@ -200,7 +200,8 @@ class _Sm100BlockScaledGemmCommon:
         before the wait; G0D measured about 3.7 us per call on the C++ kernel built that way,
         runs/G0D/report/probe.md). The cap keeps the activation copies after the wait from queueing behind many
         weight copies: with every stage but one filled, fso measured the pre-quantized LLM decode call 0.1-0.2 us
-        slower; with four on the one-CTA tiles and one on the two-CTA tile, faster (run fso_issue12_20261028/FB1)."""
+        slower; with two on the one-CTA tiles and one on the two-CTA tile, faster (runs fso_issue12_20261028/FB1,
+        FB1b)."""
         if self.fso_wf_cap is not None:
             return max(0, min(self.num_ab_stage - 1, self.fso_wf_cap))
         return self.num_ab_stage - 1

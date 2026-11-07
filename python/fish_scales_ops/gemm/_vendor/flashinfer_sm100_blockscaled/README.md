@@ -226,7 +226,7 @@ fetches them first. Every edit site carries an `fso-pdl` comment:
 1. `dense_blockscaled_gemm_sm100_common.py`: the attributes `fso_wf` and
    `fso_wf_cap`, their setter `_fso_set_weights_first`, and `_fso_wf_stages()`
    (the number of stages filled before the wait: at most the cap, which fso's
-   decode row sets to 4 on a one-CTA tile and to 1 on the two-CTA tile, and never
+   decode row sets to 2 on a one-CTA tile and to 1 on the two-CTA tile, and never
    all of them, so that no try-acquire ever sits on a stage the consumer cannot
    free before the activation arrives).
 2. `dense_blockscaled_gemm_sm100.py` and `dense_blockscaled_gemm_sm100_splitk.py`:

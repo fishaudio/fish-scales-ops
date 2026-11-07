@@ -606,10 +606,9 @@ def _complete_handle(dw: DenseWeight) -> DenseWeight:
     """Return ``dw`` once its tensors are complete for every kernel launched after this point (sm_100/sm_103).
 
     Why. On sm_100/sm_103 the GEMMs of the decode row read the weight and its scale before their
-    programmatic-dependent-launch wait (the weights-first prologue, issue #12 FB1), and the activation quantize of a
-    bf16-x call can release the GEMM at its own entry, before it waits (its last round of CTAs does). Such a GEMM
-    can therefore overlap the kernel launched right before the call on the same stream, and a weight written by that
-    kernel could be read before it is complete. This function's own last write is such a kernel: the quantize of a
+    programmatic-dependent-launch wait (the weights-first prologue, issue #12 FB1). Such a GEMM can therefore
+    overlap the kernel launched right before the call on the same stream, and a weight written by that kernel could
+    be read before it is complete. This function's own last write is such a kernel: the quantize of a
     bf16 weight (a programmatic-dependent launch itself, which releases its dependents early), or the scale repack
     of a checkpoint. So the handle ends with one plain launch (a one-word fill, no programmatic serialisation) on the
     current stream: a plain launch starts only once every kernel in front of it on the stream has completed and its
