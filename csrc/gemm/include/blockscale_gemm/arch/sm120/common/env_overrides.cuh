@@ -253,5 +253,21 @@ inline bool fso_pdl_enabled()
     return v;
 }
 
+// FSO_BATCH_INVARIANT=1 asks for batch invariance: a row's output depends on that row's input and the weight only,
+// not on M or on the other rows. Read once per process, with the boolean rule of FSO_PRINT_TILE_INFO (unset, empty
+// or starting with 0 is off). On sm_90 the dense GEMM then takes no route whose summation order depends on M: it
+// turns the in-cluster split-K route off (sm90_dense_splitk_mode), and every other sm_90 route computes each output
+// element in one CTA, in K order, with the same scale products (docs/api/dense.md, "Determinism and batch
+// invariance"). On sm_100/103 and sm_120/121 it changes nothing in this release; fso.dense says so once per process.
+inline bool fso_batch_invariant()
+{
+    static bool const v = []
+    {
+        char const* e = std::getenv("FSO_BATCH_INVARIANT");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    return v;
+}
+
 } // namespace kernels::blockscale_gemm
 } // namespace tensorrt_llm

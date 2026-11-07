@@ -120,6 +120,9 @@ inline uint32_t sm90_swap_block_n_override()
 // gives one and 2 elsewhere, for sweeps. With the rule, a forced swap-AB configuration (FSO_SM90_SWAP_MAX_M or
 // FSO_SM90_SWAP_BN set) turns the route off. FSO_SM90_SPLITK_S=<s> (1 to 4), read once per process, replaces the
 // slice count of every call the route takes. Another value of either is ignored with one line on stderr.
+// FSO_BATCH_INVARIANT=1 (fso_batch_invariant) turns the route off whatever FSO_SM90_DENSE_SPLITK says: its slices are
+// added in rank order, not in K order, so a row's bytes inside its band can differ from the same row's at an M outside
+// it; with the route off a row's output is the same for every M. A value other than 0 then gets one line on stderr.
 enum class Sm90SplitKMode
 {
     kRule,
@@ -132,6 +135,15 @@ inline Sm90SplitKMode sm90_dense_splitk_mode()
     static Sm90SplitKMode const mode = []
     {
         char const* e = std::getenv("FSO_SM90_DENSE_SPLITK");
+        if (fso_batch_invariant())
+        {
+            if (e != nullptr && e[0] != '\0' && std::string(e) != "0")
+                std::fprintf(stderr,
+                    "[fish_scales_ops] FSO_BATCH_INVARIANT=1 turns the sm_90 split-K route off; "
+                    "FSO_SM90_DENSE_SPLITK=%s is ignored\n",
+                    e);
+            return Sm90SplitKMode::kOff;
+        }
         if (e == nullptr || e[0] == '\0' || std::string(e) == "1")
             return Sm90SplitKMode::kRule;
         if (std::string(e) == "0")

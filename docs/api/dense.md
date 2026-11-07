@@ -322,7 +322,8 @@ differed from the routes it replaces. 545 of them differed by one unit in the la
 place. The other 21 differed by 2 to 28 units, all on values below 1.6 × 10⁻⁵ in
 outputs whose largest magnitude was about 2. The largest absolute difference was
 one unit in the last place of a value near 1.3. `FSO_SM90_DENSE_SPLITK=0` turns the
-route off and gives the routes and bytes the dispatcher has without it. With
+route off and gives the routes and bytes the dispatcher has without it, and so does
+`FSO_BATCH_INVARIANT=1` (*Determinism and batch invariance*, below). With
 `FSO_SM90_SPLITK_S=1` the kernel runs one slice and sums the blocks in `K` order, as
 the one-CTA routes do; on the test's cells its bytes equal those of the route it
 replaces.
@@ -338,6 +339,49 @@ Qwen3-4B projections at `M` in {1, 7, 64, 1000}.
 gives equals the handles of both int32 forms and of the bf16 weight for the same
 bytes, random codes and scale bytes reach the handle unchanged, and `linear` is
 `torch.equal` across all of them.
+
+## Determinism and batch invariance
+
+Every dense call is deterministic on every architecture: the same inputs give the
+same bytes on every call, CUDA-graph replay, stream and process.
+
+Batch invariance is a stronger property. It means that a row's output depends only
+on that row's input and the weight, not on `M` and not on the other rows. It holds
+when the summation order of every output element is the same at every `M`.
+
+On sm_90 every route but one computes each output element in one CTA. That CTA adds
+the 128-wide blocks along `K` in `K` order, with the same scale products, whatever
+the route. This covers `fp8_gemm_kernel` and its swap-AB form, and DeepGEMM v2's
+1D2D kernel at every tile, cluster and co-scheduled grid. It also covers the
+two-accumulator-set loops of the issue-12 round, which promote the blocks in the
+same `K` order. These routes give identical bytes for the same row: every A/B of
+the issue-12 round compared the outputs across routes, tiles and cluster forms, cell
+by cell. The 1×128 activation quantize is computed row by row. The one exception is
+the in-cluster split-K route of the decode band (above). It adds per-slice partial
+sums in rank order, so a row inside its band can differ from the same row at an `M`
+outside it. In the measurement above that difference was one unit in the last place
+on 0.0094 % of the elements.
+
+`FSO_BATCH_INVARIANT=1` turns off every sm_90 route whose summation order depends
+on `M`. Today that is the split-K route, as with `FSO_SM90_DENSE_SPLITK=0`. With the
+switch set, a row's output on sm_90 is identical for every `M`. It gives up the
+split-K route's speed in its band. On the H200 that route made `2560 × 4096`
+13-16 % faster at `M ≤ 16`, `2048 × 4096` 20-22 % and `2560 × 9216` 22-26 %, and
+2-16 % faster at the top of the band.
+`tests/gemm/unit/test_batch_invariance.py` checks the property on `2560 × 4096`,
+`2560 × 9216` and `2048 × 4096` at `M` in {1, 8, 32, 56, 64, 128, 512}, on the
+bf16-x call and on the pre-quantized call. Without the switch, it shows the
+difference the split-K route makes inside the band.
+
+On sm_100/103 and sm_120/121 the switch does not guarantee batch invariance in this
+release, because their dense routes include split-K and Stream-K forms chosen by
+`M`. Setting it there changes nothing, and the first `linear` or `linear_quantized`
+call of the process warns once.
+
+The switch is read once per process: by the extension on sm_90, and by `fso.dense`
+at its first call elsewhere. It follows the boolean rule of the other switches:
+unset, empty or a value starting with `0` is off. Set it before the first call; a
+captured CUDA graph replays the routes its capture took.
 
 ## Pre-quantized activation (interface v1)
 

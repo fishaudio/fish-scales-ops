@@ -62,10 +62,12 @@ it is built from are in :mod:`fish_scales_ops.compat`.
 import dataclasses
 import math
 import os
+import warnings
 
 import torch
 
 from .._arch import sm_major
+from .._env import env_flag
 from ..gemm import _epilogue
 from ..gemm.fp8 import _sm90_act_scale, linear_fp8, quantize_128x128_fp8
 from ..gemm.mxfp8 import _sm_count, _ue8m0_scale_handle, linear_mxfp8, quantize_1x32_fp8
@@ -78,6 +80,22 @@ __all__ = ["FORMATS", "ACTIVATIONS", "DenseWeight", "prepare_weight", "linear", 
 
 # The activations the epilogue knows (interface v1): None, or one of these names.
 ACTIVATIONS = _epilogue.ACTIVATIONS
+
+# FSO_BATCH_INVARIANT (docs/api/dense.md, "Determinism and batch invariance"): read once per process, at the first
+# dense call. On sm_90 the extension acts on it (no route whose summation order depends on M); on the other
+# architectures it changes nothing in this release, and the first call that finds it set says so once.
+_BATCH_INVARIANT_SEEN = False
+
+
+def _batch_invariant_note(major: int) -> None:
+    global _BATCH_INVARIANT_SEEN
+    if _BATCH_INVARIANT_SEEN:
+        return
+    _BATCH_INVARIANT_SEEN = True
+    if major != 9 and env_flag("FSO_BATCH_INVARIANT"):
+        warnings.warn("fish_scales_ops: FSO_BATCH_INVARIANT=1 makes the dense GEMM batch-invariant on sm_90 only in "
+                      "this release; on this architecture it has no effect (docs/api/dense.md, \"Determinism and "
+                      "batch invariance\")", RuntimeWarning, stacklevel=3)
 
 # The version of the activation contract (the xq / x_scale layout and the quantizer rule) that
 # quantize_activation produces, linear(x_scale=...) accepts and fso/activation_contract.h states.
@@ -955,6 +973,7 @@ def _dense_linear_op(x, weight, scale, kind, bias=None, x_scale=None, residual=N
     neither synchronizes the device nor depends on tensor values. The four-argument
     call is today's op, unchanged."""
     major = sm_major()
+    _batch_invariant_note(major)
     where = _arch_label(_device_arch())
     op = f"fish_scales_ops::dense_linear ({where}, kind {kind!r})"
     _check_operands(op, x, weight, x_scale)
@@ -996,6 +1015,7 @@ def _dense_linear_quantized_op(x, weight, scale, kind, bias=None, x_scale=None, 
     such call; elsewhere (sm_90), after the checks, the op raises NotImplementedError naming the architecture and the
     route, before anything is launched."""
     major = sm_major()
+    _batch_invariant_note(major)
     where = _arch_label(_device_arch())
     op = f"fish_scales_ops::dense_linear_quantized ({where}, kind {kind!r})"
     _check_operands(op, x, weight, x_scale)
