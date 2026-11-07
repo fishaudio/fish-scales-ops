@@ -197,6 +197,16 @@ _WEIGHTS_FIRST = True
 #: (fc2 78/182 -3.0/-2.9 %, conv_out 117 -3.2 %, q 78 -5.4 %; one stage: -1.5/-1.8, -2.4, -3.9 %).
 WF_PRE_WAIT_STAGES_ONE_CTA = 2
 WF_PRE_WAIT_STAGES_TWO_CTA = 1
+#: The fewest mainloop K blocks (128 wide) a CTA's K slice must hold for the weights-first prologue to be built:
+#: ``k / 128 / split_k`` at or above this count builds the weights-first variant, below it today's kernel. A slice
+#: of four blocks is barely longer than the pipeline that fills it; there the two early weight stages gained nothing
+#: and cost 1.0-1.8 % on the pre-quantized call and 0.4-1.2 % on the bf16-x call (the B300, cold weights: shared.down
+#: 2048 x 512, one slice, M 1-16; shared.gate_up 1024 x 2048, four slices, M 1-8; PERF2's re-measure of the trunk and
+#: run fso_issue12_20261028/FB1c, hold K). From five blocks the prologue pays: the tower's 1280 x 1280 projections
+#: (two slices of five) gain 5.4-5.8 % on the pre-quantized call and 1.6-3.2 % on the bf16-x call, fc2 (four slices
+#: of ten) 3.1 %, conv_out (four of fifteen) 3.2 %. Slices of six to eight blocks on the 8-token tile (2048 x 1536
+#: and 5120 x 2048 at M <= 8, 2048 x 4096 at M <= 8) are within -0.4..+1.4 % either way.
+WF_MIN_K_BLOCKS = 5
 
 
 def _pdl_enabled() -> bool:
@@ -206,10 +216,13 @@ def _pdl_enabled() -> bool:
     return _PDL
 
 
-def _weights_first() -> bool:
+def _weights_first(k_blocks: Optional[int] = None) -> bool:
     """True when the kernels are built in the weights-first form: under PDL, which is the only setting in which a
-    load can be issued before the kernel in front has finished (see ``_WEIGHTS_FIRST``)."""
-    return _WEIGHTS_FIRST and _pdl_enabled()
+    load can be issued before the kernel in front has finished (see ``_WEIGHTS_FIRST``), and, when the CTA's K slice
+    is given as its count of 128-wide K blocks, only for a slice of at least ``WF_MIN_K_BLOCKS`` of them."""
+    if not (_WEIGHTS_FIRST and _pdl_enabled()):
+        return False
+    return k_blocks is None or k_blocks >= WF_MIN_K_BLOCKS
 
 
 def _wf_pre_wait_stages(cluster) -> int:
@@ -944,7 +957,7 @@ def _epi_flags(epilogue) -> _EpiFlagsT:
 
 
 def _get_compiled(st: dict, cfg: _ConfigT, sf_m: int, sf_n: int, sf_k: int,
-                  epi: _EpiFlagsT = None):
+                  epi: _EpiFlagsT = None, k: Optional[int] = None):
     """One ``cute.compile`` per (tactic, epilogue); the problem shape stays symbolic.
 
     The compiled entry takes the three operands as CuTe tensors with dynamic
@@ -968,7 +981,9 @@ def _get_compiled(st: dict, cfg: _ConfigT, sf_m: int, sf_n: int, sf_k: int,
     """
     tile, cluster, swap_ab, split_k = cfg
     pdl = _pdl_enabled()
-    wf = _weights_first()
+    # The weights-first form is a compile-time variant; ``k`` is the call's K, so one tactic has at most two
+    # compiled entries, one per side of WF_MIN_K_BLOCKS (the problem shape itself stays symbolic).
+    wf = _weights_first(None if k is None else k // 128 // split_k)
     cap = _wf_pre_wait_stages(cluster) if wf else None
     key = (tile, cluster, swap_ab, split_k, pdl, epi, wf, cap)
     fn = st["compiled"].get(key)
@@ -1154,7 +1169,7 @@ def linear_mxfp8_decode(x_fp8: torch.Tensor, w_fp8: torch.Tensor,
     sf_n = (kernel_n + 127) // 128
     sf_k = (k // 32 + 3) // 4
 
-    fn = _get_compiled(st, config, sf_m, sf_n, sf_k, epi)
+    fn = _get_compiled(st, config, sf_m, sf_n, sf_k, epi, k)
     cutlass, make_ptr = st["cutlass"], st["make_ptr"]
     gmem = st["cute"].AddressSpace.gmem
     ct_a = _operand_tensor(st, kernel_a, cutlass.Float8E4M3FN, 1)

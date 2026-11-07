@@ -5949,7 +5949,6 @@ def case_x(major: int) -> None:
         return
     from fish_scales_ops.gemm import _sm100_decode, _sm100_dispatch
     pdl = os.environ.get("FSO_DISABLE_PDL") != "1"
-    weights_first = pdl and _sm100_decode._weights_first()
     ext = _pdl_probe() if pdl else None
     spin = 2_000_000  # ns
     if pdl:
@@ -5974,8 +5973,12 @@ def case_x(major: int) -> None:
         torch.cuda.synchronize()
         calls = {"bf16-x": lambda d: D.linear(x, d, bias=b), "2b": lambda d: D.linear(xq, d, x_scale=sx, bias=b)}
         route = _sm100_dispatch.plan(M, N, K, _q_epilogue(M, N, bias=b) if b is not None else None)
-        reads_early = weights_first and route == "sm100.decode"
-        tag = f"N={N:5d} K={K:5d} M={M:5d} {route}"
+        # the decode row builds its weights-first prologue only for a K slice of at least WF_MIN_K_BLOCKS mainloop
+        # blocks (128 wide): k / 128 / split_k of the tactic it picks
+        cfg = _sm100_decode.pick_config(M, N, K) if route == "sm100.decode" else None
+        k_blocks = K // 128 // (cfg[3] if cfg else 1)
+        reads_early = route == "sm100.decode" and pdl and _sm100_decode._weights_first(k_blocks)
+        tag = f"N={N:5d} K={K:5d} M={M:5d} {route}{' wf' if reads_early else ''}"
         if pdl:
             # x1: producer -> prepare_weight -> linear
             for entry, call in calls.items():
