@@ -398,6 +398,53 @@ inline void runGemmSwapABSplitK(cudaKernel_t kernel, void* mat_w, int ld_w, void
     DG_HOST_ASSERT(status == cudaSuccess);
 }
 
+// Launches fp8_gemm_kernel_swapAB_splitk2 (fso_dense_splitk2.cuh) at `c`: the weight [N, K] fp8 in 128-byte-swizzled
+// boxes of c.block_w() rows (64 or 128), the activation [M, K] fp8 in boxes of c.block_t rows, D [M, N] bf16 in
+// unswizzled boxes of min(tokens per warp-group, M) rows by 16 columns; the scales and the epilogue as
+// runGemmSwapABSplitK. Grid c.tiles * c.splits CTAs of fso_dense_splitk2_smem::kNumThreads threads, a cluster of
+// c.splits CTAs along x when c.splits > 1, programmatic stream serialization when `pdl`.
+inline void runGemmSwapABSplitK2(cudaKernel_t kernel, void* mat_w, int ld_w, void* mat_x, int ld_x, void* mat_d,
+    int ld_d, float* scales_w, float* scales_x, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+    jit::DenseSplitK2Config const& c, cudaStream_t stream, bool pdl, fso::DenseEpilogue const& epilogue)
+{
+    DG_HOST_ASSERT(c.valid() && shape_m <= c.block_t);
+    auto tma_w = make_2d_tma_desc(reinterpret_cast<__nv_fp8_e4m3*>(mat_w), Layout::RowMajor, shape_n, shape_k,
+        c.block_w(), 128u, static_cast<uint64_t>(ld_w), CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B);
+    auto tma_x = make_2d_tma_desc(reinterpret_cast<__nv_fp8_e4m3*>(mat_x), Layout::RowMajor, shape_m, shape_k,
+        c.block_t, 128u, static_cast<uint64_t>(ld_x), CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B);
+    // The D box covers at most M rows; its rows are 32 bytes apart in the staging strip.
+    auto tma_d = make_2d_tma_desc(reinterpret_cast<__nv_bfloat16*>(mat_d), Layout::RowMajor, shape_m, shape_n,
+        std::min(c.wg_tokens(), shape_m), 16u, static_cast<uint64_t>(ld_d) * 2,
+        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
+
+    DG_HOST_ASSERT(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, c.smem) == cudaSuccess);
+    cudaLaunchConfig_t config = {};
+    config.gridDim = dim3(c.ctas(), 1, 1);
+    config.blockDim = dim3(fso_dense_splitk2_smem::kNumThreads, 1, 1);
+    config.dynamicSmemBytes = c.smem;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[2];
+    unsigned int num_attrs = 0;
+    if (c.splits > 1)
+    {
+        attrs[num_attrs].id = cudaLaunchAttributeClusterDimension;
+        attrs[num_attrs].val.clusterDim = {c.splits, 1, 1};
+        ++num_attrs;
+    }
+    if (pdl)
+    {
+        attrs[num_attrs].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[num_attrs].val.programmaticStreamSerializationAllowed = 1;
+        ++num_attrs;
+    }
+    config.attrs = num_attrs == 0 ? nullptr : attrs;
+    config.numAttrs = num_attrs;
+    fso::DenseEpilogue epi = epilogue; // non-const: cudaLaunchKernelEx takes the arguments' addresses as void*
+    auto status = cudaLaunchKernelEx(&config, kernel, const_cast<float const*>(scales_w),
+        const_cast<float const*>(scales_x), shape_m, shape_n, tma_w, tma_x, tma_d, epi);
+    DG_HOST_ASSERT(status == cudaSuccess);
+}
+
 // `pdl`: as runGemm. `epilogue` (GemmType::Normal only): as runGemm, with NormalSchedulerInputSwapABWithEpilogue.
 template <typename LayoutIndexType>
 void runGemmSwapAB(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, int ld_d,

@@ -113,16 +113,19 @@ inline uint32_t sm90_swap_block_n_override()
     return v;
 }
 
-// FSO_SM90_DENSE_SPLITK, read once per process: the in-cluster split-K route of the dense GEMM
-// (fp8_gemm_kernel_swapAB_splitk). Unset or "1": the rule (deep_gemm::jit::dense_splitk_preferred_slices and the
-// band of dense_splitk_max_m; the default); "0": off, every call takes the routes below; "force": every call the
-// kernel can serve (M <= 64, K % 128 == 0, N % 8 == 0), outside the band too, with the rule's slice count where it
-// gives one and 2 elsewhere, for sweeps. With the rule, a forced swap-AB configuration (FSO_SM90_SWAP_MAX_M or
-// FSO_SM90_SWAP_BN set) turns the route off. FSO_SM90_SPLITK_S=<s> (1 to 4), read once per process, replaces the
-// slice count of every call the route takes. Another value of either is ignored with one line on stderr.
-// FSO_BATCH_INVARIANT=1 (fso_batch_invariant) turns the route off whatever FSO_SM90_DENSE_SPLITK says: its slices are
-// added in rank order, not in K order, so a row's bytes inside its band can differ from the same row's at an M outside
-// it; with the route off a row's output is the same for every M. A value other than 0 then gets one line on stderr.
+// FSO_SM90_DENSE_SPLITK, read once per process: the in-cluster split-K routes of the dense GEMM, the one-warp-group
+// route of the decode band (fp8_gemm_kernel_swapAB_splitk) and the two-warp-group route above it
+// (fp8_gemm_kernel_swapAB_splitk2, 56 < M <= 128). Unset or "1": the rules (deep_gemm::jit::dense_splitk_preferred_slices
+// and the band of dense_splitk_max_m; deep_gemm::jit::get_dense_splitk2_config; the default); "0": off, every call
+// takes the routes below; "force": every call the one-warp-group kernel can serve (M <= 64, K % 128 == 0, N % 8 == 0),
+// outside its band too, with its rule's slice count where it gives one and 2 elsewhere, and the two-warp-group route
+// off, for sweeps of that kernel. With the rules, a forced swap-AB configuration (FSO_SM90_SWAP_MAX_M or
+// FSO_SM90_SWAP_BN set) turns both routes off. FSO_SM90_SPLITK_S=<s> (1 to 4), read once per process, replaces the slice
+// count of every call either route takes. Another value of either is ignored with one line on stderr.
+// FSO_BATCH_INVARIANT=1 (fso_batch_invariant) turns both routes off whatever FSO_SM90_DENSE_SPLITK says: their slices
+// are added in rank order, not in K order, so a row's bytes inside their bands can differ from the same row's at an M
+// outside them; with the routes off a row's output is the same for every M. A value other than 0 then gets one line on
+// stderr.
 enum class Sm90SplitKMode
 {
     kRule,
@@ -335,6 +338,103 @@ inline int const* sm90_cosched_max_clusters(cudaStream_t stream)
     return t.clusters;
 }
 
+// The cluster co-residency the two-warp-group split-K route needs (deep_gemm::jit::get_dense_splitk2_config): how many
+// clusters of c CTAs (c = 2 .. kDenseSplitK2MaxSplits) the device runs at once at one CTA per SM. The split-K kernel
+// requests at least kDenseSplitKOneCtaPerSmBytes of shared memory, so it runs one CTA per SM, and the answer depends
+// only on c and on how the device groups its SMs into GPCs: the probe kernel of sm90_cosched_max_clusters, given 200 KB
+// of dynamic shared memory, gives it. Filled per device by the first call that is not inside a stream capture, as that
+// table; a call inside a capture before any eager one gets nullptr and the route is not taken (an eager call comes
+// first in practice: the route's JIT compile cannot run inside a capture either). Indexed by the cluster size; entries
+// 0 and 1 unused.
+inline int const* sm90_splitk2_max_clusters(cudaStream_t stream)
+{
+    constexpr int kMaxDevices = 64;
+    constexpr int kMax = deep_gemm::jit::kDenseSplitK2MaxSplits;
+    struct Table
+    {
+        std::atomic<int> known{0};
+        int clusters[kMax + 1] = {};
+    };
+    static Table tables[kMaxDevices];
+    static std::mutex fill;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kMaxDevices)
+        return nullptr;
+    Table& t = tables[dev];
+    if (t.known.load(std::memory_order_acquire) != 0)
+        return t.clusters;
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess || capture != cudaStreamCaptureStatusNone)
+        return nullptr;
+    std::lock_guard<std::mutex> lock(fill);
+    if (t.known.load(std::memory_order_acquire) != 0)
+        return t.clusters;
+    constexpr int kProbeSmem = 200 * 1024;
+    if (cudaFuncSetAttribute(sm90_cosched_probe_kernel<0>, cudaFuncAttributeMaxDynamicSharedMemorySize, kProbeSmem)
+        != cudaSuccess)
+    {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    for (int c = 2; c <= kMax; ++c)
+    {
+        cudaLaunchConfig_t cfg{};
+        cfg.gridDim = dim3(static_cast<unsigned>(c * 64));
+        cfg.blockDim = dim3(128);
+        cfg.dynamicSmemBytes = kProbeSmem;
+        cudaLaunchAttribute attr[1];
+        attr[0].id = cudaLaunchAttributeClusterDimension;
+        attr[0].val.clusterDim = {static_cast<unsigned>(c), 1, 1};
+        cfg.attrs = attr;
+        cfg.numAttrs = 1;
+        int n = 0;
+        if (cudaOccupancyMaxActiveClusters(&n, sm90_cosched_probe_kernel<0>, &cfg) != cudaSuccess)
+        {
+            (void) cudaGetLastError();
+            n = 0;
+        }
+        t.clusters[c] = n;
+    }
+    t.known.store(1, std::memory_order_release);
+    return t.clusters;
+}
+
+// Runs the dense GEMM on the two-warp-group split-K route (fp8_gemm_kernel_swapAB_splitk2) when FSO_SM90_DENSE_SPLITK
+// and the rule (deep_gemm::jit::get_dense_splitk2_config, with the co-residency of sm90_splitk2_max_clusters) take it,
+// and returns whether it did; false leaves the call to the routes below. As on the route of sm90_dense_splitk_route the
+// decision depends on (M, N, K) and the device only, never on the epilogue, so the identity call, every epilogue call,
+// the bf16-x call and the pre-quantized call of a shape take the same route. FSO_SM90_SPLITK_S replaces the rule's
+// slice count (the layout stays the rule's).
+inline bool sm90_dense_splitk2_route(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, int ld_d,
+    float* scales_a, float* scales_b, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, cudaStream_t stream,
+    int num_device_sms, fso::DenseEpilogue const& epilogue, deep_gemm::jit::DenseEpilogueKey const& epi_key, bool pdl)
+{
+    Sm90SplitKMode const mode = sm90_dense_splitk_mode();
+    // Off with the knob or FSO_BATCH_INVARIANT=1 (the slices are added in rank order, as on the one-warp-group route),
+    // and in the force mode, which sweeps the one-warp-group kernel on every call that kernel can serve.
+    if (mode != Sm90SplitKMode::kRule)
+        return false;
+    if (sm90_swap_max_m_override() != 0u || sm90_swap_block_n_override() != 0u)
+        return false;
+    int const* const max_clusters = sm90_splitk2_max_clusters(stream);
+    deep_gemm::jit::DenseSplitK2Config c
+        = deep_gemm::jit::get_dense_splitk2_config(shape_m, shape_n, shape_k, num_device_sms, max_clusters);
+    if (!c.valid())
+        return false;
+    if (uint32_t const forced = sm90_dense_splitk_slices_override())
+    {
+        c = deep_gemm::jit::make_dense_splitk2_config(shape_m, shape_n, shape_k, c.weight_halves, forced);
+        if (!c.valid())
+            return false;
+    }
+    auto runtime = deep_gemm::jit::getGlobalCompiler().buildSplitK2(shape_k, c, epi_key);
+    auto kernel = reinterpret_cast<cudaKernel_t>(runtime->getKernel());
+    // The kernel's weight is gemm_dispatch_sm90's B and its activation A, as on the swap-AB route below.
+    deep_gemm::runGemmSwapABSplitK2(kernel, mat_b, ld_b, mat_a, ld_a, mat_d, ld_d, scales_b, scales_a, shape_m,
+        shape_n, shape_k, c, stream, pdl, epilogue);
+    return true;
+}
+
 // `epilogue`: the dense epilogue of interface v1 (common/epilogue.cuh). Bias, residual and erf-GELU
 // (kDenseEpiServedSm90DeepGemm) are applied by each of the three kernels below to its promoted fp32 accumulator before
 // its one bf16 rounding (deep_gemm/fso_dense_epilogue.cuh), in a JIT variant of the kernel the identity call runs at
@@ -359,8 +459,13 @@ inline void gemm_dispatch_sm90(void* mat_a, int ld_a, void* mat_b, int ld_b, voi
     constexpr uint32_t block_k = 128;
     constexpr uint32_t num_problems = 1;
 
-    // The in-cluster split-K route first (sm90_dense_splitk_route above): where few weight tiles leave most of the SMs
-    // idle at decode sizes, the CTAs of a cluster divide K between them and add their partial sums in rank order.
+    // The split-K routes first, where few weight tiles leave most of the SMs idle: the CTAs of a cluster divide K between
+    // them and add their partial sums in rank order. The two-warp-group route (sm90_dense_splitk2_route above) for
+    // 56 < M <= 128, then the one-warp-group route of the decode band (sm90_dense_splitk_route above), which keeps the
+    // M = 57-64 calls at K >= 8192 that the first one's rule does not take.
+    if (sm90_dense_splitk2_route(mat_a, ld_a, mat_b, ld_b, mat_d, ld_d, scales_a, scales_b, shape_m, shape_n, shape_k,
+            stream, num_device_sms, epilogue, epi_key, fso_pdl_enabled()))
+        return;
     if (sm90_dense_splitk_route(mat_a, ld_a, mat_b, ld_b, mat_d, ld_d, scales_a, scales_b, shape_m, shape_n, shape_k,
             stream, num_device_sms, epilogue, epi_key, fso_pdl_enabled()))
         return;

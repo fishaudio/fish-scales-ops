@@ -33,6 +33,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "fso_dense_splitk2_layout.cuh"
 #include "fso_dense_splitk_layout.cuh"
 #include "scheduler.cuh"
 #include "tensorrt_llm/common/logger.h"
@@ -979,6 +980,140 @@ inline DenseSplitKConfig get_dense_splitk_config(uint32_t m, uint32_t n, uint32_
     if (splits < 2 || m > dense_splitk_max_m(splits, k))
         return DenseSplitKConfig{};
     return make_dense_splitk_config(m, n, k, splits, /*one_cta_per_sm=*/true);
+}
+
+// ------------------------------------------------------------------------------------------------------------------
+// The two-warp-group split-K route of the dense GEMM (fp8_gemm_kernel_swapAB_splitk2, fso_dense_splitk2.cuh), above
+// the decode band of the route above: one weight tile of 64 rows (token halves) or 128 rows (weight halves) per cluster
+// of `splits` CTAs that divide K between them, one token tile covering all of M (at most 128).
+struct DenseSplitK2Config
+{
+    bool weight_halves = false; // the layout: 128-row weight tiles split between the warp-groups, else token halves
+    uint32_t block_t = 0;       // token tile: M rounded up to 16 (token halves, at least 32) or 8 (weight halves, 16)
+    uint32_t splits = 0;        // CTAs per cluster, each taking one slice of K; 0 when the route does not apply
+    uint32_t stages = 0;        // pipeline stages per CTA
+    uint32_t smem = 0;          // dynamic shared memory per CTA in bytes
+    uint32_t tiles = 0;         // weight tiles = clusters
+
+    [[nodiscard]] bool valid() const
+    {
+        return splits != 0;
+    }
+
+    [[nodiscard]] uint32_t ctas() const
+    {
+        return tiles * splits;
+    }
+
+    [[nodiscard]] uint32_t block_w() const
+    {
+        return deep_gemm::fso_dense_splitk2_smem::block_w(weight_halves);
+    }
+
+    // The tokens one warp-group multiplies (its WGMMA's N) and so the rows of one D box.
+    [[nodiscard]] uint32_t wg_tokens() const
+    {
+        return deep_gemm::fso_dense_splitk2_smem::wg_tokens(weight_halves, block_t);
+    }
+};
+
+// The two-warp-group split-K launch of an M x N x K dense GEMM in the given layout with `splits` K slices, whatever the
+// route rule says: the token tile of the layout covering M, the most stages (at most 8 and at most the slice's K
+// blocks) whose shared memory (fso_dense_splitk2_layout.cuh) fits, raised to kDenseSplitKOneCtaPerSmBytes so that the
+// CTAs never share an SM. Invalid when the kernel cannot serve the shape: M = 0 or above 128, K not a multiple of 128,
+// N not a multiple of 8, a slice count outside 1 .. 8 or above K / 128, or not even one stage fitting.
+inline DenseSplitK2Config make_dense_splitk2_config(
+    uint32_t m, uint32_t n, uint32_t k, bool weight_halves, uint32_t splits)
+{
+    namespace L = deep_gemm::fso_dense_splitk2_smem;
+    DenseSplitK2Config c;
+    if (m == 0 || m > 128 || n == 0 || k == 0 || k % 128 != 0 || n % 8 != 0 || splits < 1 || splits > L::kNumSlabs
+        || splits > k / 128)
+        return c;
+    constexpr uint32_t kCapacity = 232448; // sm_90 dynamic shared memory per block
+    uint32_t const block_t = weight_halves ? std::max(16u, (m + 7) / 8 * 8) : std::max(32u, (m + 15) / 16 * 16);
+    if (block_t > 128)
+        return c;
+    uint32_t const kb_slice = (k / 128 + splits - 1) / splits;
+    uint32_t stages = std::min(8u, kb_slice);
+    while (stages >= 1 && L::total_bytes(weight_halves, block_t, splits, stages, kb_slice) > kCapacity)
+        --stages;
+    if (stages < 1)
+        return c;
+    c.weight_halves = weight_halves;
+    c.block_t = block_t;
+    c.stages = stages;
+    c.smem = std::max(L::total_bytes(weight_halves, block_t, splits, stages, kb_slice), kDenseSplitKOneCtaPerSmBytes);
+    c.tiles = (n + L::block_w(weight_halves) - 1) / L::block_w(weight_halves);
+    c.splits = splits;
+    return c;
+}
+
+// The largest cluster the two-warp-group split-K route uses (the kernel's 8 slabs; the H200 co-schedules 15 clusters
+// of 8 CTAs at one CTA per SM).
+constexpr int kDenseSplitK2MaxSplits = 8;
+
+// The band of the two-warp-group split-K route: 56 < M <= 128 and K >= 4096. Below it the one-warp-group route takes
+// its own band (M <= 56 for 4096 <= K < 8192; M <= 64 for K >= 8192, where gemm_dispatch_sm90 asks this route first, so
+// that it takes M = 57-64 wherever its rule accepts the shape). Above M = 128 split-K does not pay (the casebook's
+// bound).
+inline bool dense_splitk2_in_band(uint32_t m, uint32_t k)
+{
+    return m > 56u && m <= 128u && k >= 4096u;
+}
+
+// The two-warp-group split-K configuration of an M x N x K dense GEMM on `num_sms` SMs, invalid where the route does
+// not take it (issue #12, FH7; /data/bench-runs/fso_issue12_20261028/runs/FH7, sweeps sweep1 and sweep2). `max_clusters[c]`
+// (c = 2 .. kDenseSplitK2MaxSplits) is the number of clusters of c CTAs the device runs at once at one CTA per SM
+// (cudaOccupancyMaxActiveClusters; 66 / 39 / 30 / 22 / 17 / 15 / 15 on the H200); nullptr while that is not known (a call
+// inside a stream capture before any eager one), and then the route is not taken.
+//
+// Slices and layout. For each layout, with tiles = ceil(N / tile height) (64 rows for token halves, 128 for weight
+// halves), S is the largest count from 2 up to kDenseSplitK2MaxSplits for which every cluster of the launch is resident
+// at once (max_clusters[S] >= tiles), the grid fits the SMs (S x tiles <= num_sms) and each slice holds at least two K
+// blocks (K / 128 >= 2 S); the layout with more CTAs is taken, token halves on a tie. On the H200 that is token halves
+// with S = 6 for N = 1024, 5 for N = 1280 and 3 for N = 2048 (96-100 CTAs), weight halves with S = 5 for N = 2560 (100
+// CTAs, where 64-row tiles place only S = 2), and token halves with S = 2 from N = 3072 on.
+//
+// Acceptance (against the trunk's routes, cold weights, both calls): the launch has at least half the SMs; and
+//   - token halves: S >= 5 at every M of the band, or S >= 3 up to M = 104. Every measured cell of N = 1024 (S = 6)
+//     and N = 1280 (S = 5, K = 5120 and 7680) at M = 57-128 ran 0.60-0.89 of the trunk's time; N = 2048 x 4096
+//     (S = 3) 0.82-0.91 at M = 57-104, but 1.01-1.02 at M = 112 (against fp8_gemm_kernel's two 64-row blocks, the
+//     second nearly full) and 1.05 at M = 128 (each warp-group's 64-token promotion per K block outweighs the shorter
+//     chain). With S = 2 the route was level or slower at K = 4096 (2560 x 4096 1.00-1.12, 4096 x 4096 0.89-1.04
+//     depending on M) and at a 128-token tile (2560 x 9728 1.33);
+//   - weight halves: K >= 8192 and M <= 104 (each warp-group then multiplies the whole token tile): 2560 x 9728 and
+//     2560 x 9216 at M = 57-104 ran 0.80-0.95 of the trunk's routes (FH5's at M = 57-64) on both calls; at M = 112,
+//     2560 x 9728 still ran 0.88 but 2560 x 9216 1.00, at M = 128 1.13, and at K = 4096 (2560 x 4096) 0.98 at
+//     M <= 72 and 1.04-1.29 above.
+inline DenseSplitK2Config get_dense_splitk2_config(
+    uint32_t m, uint32_t n, uint32_t k, int num_sms, int const* max_clusters)
+{
+    if (max_clusters == nullptr || num_sms <= 0 || !dense_splitk2_in_band(m, k) || k % 128 != 0 || n % 8 != 0)
+        return DenseSplitK2Config{};
+    uint32_t const sms = static_cast<uint32_t>(num_sms);
+    DenseSplitK2Config best;
+    for (bool weight_halves : {false, true})
+    {
+        uint32_t const rows = deep_gemm::fso_dense_splitk2_smem::block_w(weight_halves);
+        uint32_t const tiles = (n + rows - 1) / rows;
+        for (uint32_t s = kDenseSplitK2MaxSplits; s >= 2; --s)
+        {
+            if (static_cast<uint32_t>(std::max(0, max_clusters[s])) < tiles || s * tiles > sms || 2 * s > k / 128)
+                continue;
+            DenseSplitK2Config const c = make_dense_splitk2_config(m, n, k, weight_halves, s);
+            if (!c.valid())
+                continue;
+            if (c.ctas() > best.ctas())
+                best = c;
+            break;
+        }
+    }
+    if (!best.valid() || 2 * best.ctas() < sms)
+        return DenseSplitK2Config{};
+    bool const accept
+        = best.weight_halves ? (k >= 8192u && m <= 104u) : (best.splits >= 5 || (best.splits >= 3 && m <= 104u));
+    return accept ? best : DenseSplitK2Config{};
 }
 
 // ------------------------------------------------------------------------------------------------------------------

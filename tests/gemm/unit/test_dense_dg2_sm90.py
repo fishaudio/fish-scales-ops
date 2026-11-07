@@ -17,7 +17,8 @@ Each mode runs in its own child process over the same cells, and the test checks
      tile (and, where the expectation names one, the cluster: c2x1 pairs two M blocks, c1x2 two N blocks), the cells of
      FH1's two swap-AB bands and of its 64-row weight tiles at 8 <= M <= 32 launch fp8_gemm_kernel_swapAB with the
      expected tile, the cells of the in-cluster split-K route (FH5) launch fp8_gemm_kernel_swapAB_splitk with the
-     expected slice count, and every control cell (swap-AB small M, one-wave 256 x 128 picks, the neighbours of FH1's
+     expected slice count, those of the two-warp-group split-K route (FH7) fp8_gemm_kernel_swapAB_splitk2 with the
+     expected layout, token tile and slice count, and every control cell (swap-AB small M, one-wave 256 x 128 picks, the neighbours of FH1's
      rules) launches fso's kernels; the single-CTA 64 x 128 launches carry the kernel variant of their M blocks (WIDE:
      two accumulator sets up to five M blocks whose last one holds at least 48 rows, R040c); FSO_SM90_DENSE_DG2=0
      never launches the v2 kernel (the split-K route's cells keep that route in every mode);
@@ -48,12 +49,13 @@ CELLS = [
     (512, 6144, 2560, "dg2 128x192"),     # 128 x 192
     (2048, 10008, 2048, "dg2 256x128"),   # N not a multiple of 2 x 128: the multicast pairs end in an odd tail
     (512, 10008, 2048, "dg2 128x160"),    # N not a multiple of 160, multicast on B
-    (64, 2560, 9728, "splitk 2"),         # FH5: the in-cluster split-K route takes M <= 64 at K >= 8192 for N <= 4224
-    #                                       (it was the v2 decode class, 64 x 32; the 64-row v2 tile stays at M = 128)
+    (56, 2560, 9728, "splitk 2"),         # FH5: the in-cluster split-K route takes M <= 64 at K >= 8192 for N <= 4224
+    (64, 2560, 9728, "splitk2 w128 t64 s5"),  # FH7: the two-warp-group split-K route is asked first at 56 < M <= 128
+    #                                       (FH5's route at M = 57-64 before; the 64-row v2 tile stays at M = 128)
     (128, 2560, 9728, "dg2 64x48"),
-    (100, 2560, 9728, "fso"),             # decode M with a partly filled last 64-row block: fso's kernel
-    #                                       (fp8_gemm_kernel_swapAB with a 40-token tile since H4 of issue 12)
-    (96, 2560, 9728, "fso"),              # (fp8_gemm_kernel_swapAB with a 32-token tile since H3 of issue 12)
+    (100, 2560, 9728, "splitk2 w128 t104 s5"),  # FH7 (fp8_gemm_kernel_swapAB with a 40-token tile before, H4)
+    (96, 2560, 9728, "splitk2 w128 t96 s5"),    # FH7 (fp8_gemm_kernel_swapAB with a 32-token tile before, H3)
+    (112, 2560, 9728, "fso"),             # FH7's weight-halves layout stops at a 104-token tile: fp8_gemm_kernel
     (160, 19456, 2560, "dg2 128x160"),    # 128 < M < 256: DeepGEMM's pick (multicast on B)
     (160, 2560, 9728, "dg2 64x64"),
     (192, 6144, 2560, "dg2 64x144"),
@@ -74,9 +76,9 @@ CELLS = [
     (136, 2048, 4096, "fso"),             # the same at K = 4096: fp8_gemm_kernel_swapAB (40 tokens) since H4
     # rule-5 shapes that the swap-AB route takes since H3 of issue 12 (64 < M <= 96 with a 64-row weight tile:
     # fp8_gemm_kernel_swapAB, which this test counts as "fso"): the v2 kernel's 64 x 32 tile at M = 78 / 80
-    (80, 2048, 4096, "fso"),
+    (80, 2048, 4096, "splitk2 w64 t80 s3"),  # FH7: the two-warp-group split-K route (swap-AB before, H3)
     (78, 2048, 1280, "fso"),
-    (78, 1280, 5120, "fso"),              # (was fp8_gemm_kernel: 80 tiles of the v2 kernel, under three quarters)
+    (78, 1280, 5120, "splitk2 w64 t80 s5"),  # FH7 (swap-AB before; fp8_gemm_kernel before H3)
     (288, 5120, 2048, "dg2 128x128"),     # DeepGEMM picks a two-CTA cluster: fso's one-wave tile on the v2 kernel
     (416, 5120, 2048, "dg2 128x160"),     # one wave instead of fso's two
     (533, 1280, 5120, "dg2 64x96"),
@@ -152,7 +154,8 @@ WIDE = {(192, 5120, 2048): True, (320, 3072, 6144): True, (160, 5120, 2048): Fal
 def kernel_of(names):
     """"dg2 <block_m>x<block_n>" (with " c2x1" for a two-CTA cluster that shares the weight, multicast on B, and
     " c1x2" for one that shares the activation, multicast on A), "splitk <slices>" for the in-cluster split-K kernel
-    fp8_gemm_kernel_swapAB_splitk, "swapAB <weight rows>x<token tile>" for fp8_gemm_kernel_swapAB, "fso" for
+    fp8_gemm_kernel_swapAB_splitk, "splitk2 w<weight rows> t<token tile> s<slices>" for the two-warp-group one
+    fp8_gemm_kernel_swapAB_splitk2, "swapAB <weight rows>x<token tile>" for fp8_gemm_kernel_swapAB, "fso" for
     fp8_gemm_kernel. The v2 kernel's template arguments run <major, 0, N, 0, 1,
     BLOCK_M, BLOCK_N, 128, 128, 128, swizzle, stages, 128, threads, cluster size, multicast on A, ...>."""
     for n in names:
@@ -161,6 +164,10 @@ def kernel_of(names):
         if m:
             cluster = "" if m.group(3) == "1" else (" c1x2" if m.group(4) == "true" else " c2x1")
             return f"dg2 {m.group(1)}x{m.group(2)}{cluster}"
+    for n in names:
+        m = re.search(r"fp8_gemm_kernel_swapAB_splitk2<\d+u?, (true|false), (\d+)u?, (\d+)u?,", n)
+        if m:
+            return f"splitk2 {'w128' if m.group(1) == 'true' else 'w64'} t{m.group(2)} s{m.group(3)}"
     for n in names:
         m = re.search(r"fp8_gemm_kernel_swapAB_splitk<\d+u?, \d+u?, (\d+)u?,", n)
         if m:

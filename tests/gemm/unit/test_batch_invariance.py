@@ -5,14 +5,16 @@ invariance").
 sm_90 (the guarantee of this release). Each mode runs in its own child process, because the extension reads the
 switch once per process:
 
-  1. switch on: for o 2560 x 4096, down 2560 x 9216 and llm_o 2048 x 4096, the first M rows of one fixed activation
-     give, at every M in {1, 8, 32, 56, 64, 128, 512}, rows that are torch.equal to the same rows at M = 512, on the
-     bf16-x call (fso.dense.linear(x, w)) and on the pre-quantized call (quantize_activation + linear with x_scale);
-     and no call launches the in-cluster split-K kernel (fp8_gemm_kernel_swapAB_splitk).
-  2. negative control, switch unset: the split-K route takes the decode band (M <= 56 at K = 4096, M <= 64 at
-     K = 9216), and somewhere in the band a row differs from the same row at M = 512, by a few units in the last
-     place at most (the route adds its per-slice partial sums in rank order, not in K order). The cells outside the
-     band stay identical.
+  1. switch on: for o 2560 x 4096, down 2560 x 9216, llm_o 2048 x 4096 and conv_out 1280 x 7680, the first M rows of
+     one fixed activation give, at every M in {1, 8, 32, 56, 64, 72, 96, 117, 128, 512}, rows that are torch.equal to
+     the same rows at M = 512, on the bf16-x call (fso.dense.linear(x, w)) and on the pre-quantized call
+     (quantize_activation + linear with x_scale); and no call launches an in-cluster split-K kernel
+     (fp8_gemm_kernel_swapAB_splitk of the decode band, fp8_gemm_kernel_swapAB_splitk2 above it).
+  2. negative control, switch unset: the split-K routes take their bands (the one-warp-group route M <= 56 at
+     K = 4096, M <= 64 at K = 9216; the two-warp-group route, issue #12 FH7, the cells of 56 < M <= 128 its rule takes:
+     _splitk2 mirrors it on the H200's 132 SMs), and somewhere in the bands a row differs from the same row at
+     M = 512, by a few units in the last place at most (the routes add their per-slice partial sums in rank order, not
+     in K order). The cells outside the bands stay identical.
   3. the switch with FSO_SM90_DENSE_SPLITK=force: the switch wins (no split-K launch) and one line on stderr says so.
 
 sm_100/103 and sm_120/121 (no guarantee in this release): with the switch set, the first dense call warns once
@@ -26,9 +28,34 @@ import subprocess
 import sys
 import tempfile
 
-SHAPES = [("o", 2560, 4096), ("down", 2560, 9216), ("llm_o", 2048, 4096)]
-MS = [1, 8, 32, 56, 64, 128, 512]
+SHAPES = [("o", 2560, 4096), ("down", 2560, 9216), ("llm_o", 2048, 4096), ("conv_out", 1280, 7680)]
+MS = [1, 8, 32, 56, 64, 72, 96, 117, 128, 512]
 M_MAX = max(MS)
+# Clusters of c CTAs the H200 runs at once at one CTA per SM (FH5, FH6, FH7 of the issue-12 round).
+_CLUSTERS_132 = {2: 66, 3: 39, 4: 30, 5: 22, 6: 17, 7: 15, 8: 15}
+
+
+def _splitk2(m, n, k, sms):
+    """Whether the two-warp-group split-K route takes an M x N x K call on `sms` SMs (mirror of
+    deep_gemm::jit::get_dense_splitk2_config on 132 SMs); None where the mirror does not know the device."""
+    if not (56 < m <= 128 and k >= 4096):
+        return False
+    if sms != 132:
+        return None
+    best = None
+    for wh in (False, True):
+        tiles = -(-n // (128 if wh else 64))
+        for s in range(8, 1, -1):
+            if _CLUSTERS_132[s] < tiles or s * tiles > sms or 2 * s > k // 128:
+                continue
+            t = max(16, -(-m // 8) * 8) if wh else max(32, -(-m // 16) * 16)
+            if best is None or s * tiles > best[3]:
+                best = (wh, s, t, s * tiles)
+            break
+    if best is None or 2 * best[3] < sms:
+        return False
+    wh, s, t, _ = best
+    return (k >= 8192 and m <= 104) if wh else (s >= 5 or (s >= 3 and m <= 104))
 
 
 def worker(out_path, ms):
@@ -131,21 +158,29 @@ def main_sm90(torch, tmp):
                                 f"{on['kernels'][f'{name},{m}']}")
     print(f"[1] FSO_BATCH_INVARIANT=1: {n_rows} rows over {len(SHAPES)} shapes, {len(MS)} M and 2 calls are identical "
           f"to the same rows at M = {M_MAX}; no split-K launch")
-    # 2. negative control: split-K in the band, some row differs there by a few ulps at most, identical outside it
-    total_diff, band_cells, worst, worst_abs = 0, 0, 0, 0.0
-    for name, _, k in SHAPES:
+    # 2. negative control: split-K in the bands, some row differs there by a few ulps at most, identical outside them
+    total_diff, band_cells, worst, worst_abs, band2_cells = 0, 0, 0, 0.0, 0
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    for name, n, k in SHAPES:
         band = 64 if k >= 8192 else 56
         for m in MS:
             split = any("splitk" in kn for kn in off["kernels"][f"{name},{m}"])
-            if split != (m <= band):
-                failures.append(f"switch unset: {name} M = {m}: split-K launched = {split}, expected {m <= band}")
+            split2 = any("splitk2" in kn for kn in off["kernels"][f"{name},{m}"])
+            want2 = _splitk2(m, n, k, sms)
+            if want2 is None:
+                want2 = split2  # an unknown device: the launch decides which band the cell is in
+            in_band = m <= band or want2
+            band2_cells += want2
+            if split != in_band or split2 != want2:
+                failures.append(f"switch unset: {name} M = {m}: split-K launched = {split} (two-warp-group {split2}), "
+                                f"expected {in_band} ({want2})")
             for call in ("bf16x", "prequant"):
                 y, ref = t_off[f"{name},{m},{call}"], t_off[f"{name},{M_MAX},{call}"][:m]
                 d = (y != ref)
                 nd = int(d.sum())
-                if m > band and nd:
-                    failures.append(f"switch unset: {name} {call} M = {m} (outside the band): {nd} elements differ")
-                if m <= band:
+                if not in_band and nd:
+                    failures.append(f"switch unset: {name} {call} M = {m} (outside the bands): {nd} elements differ")
+                if in_band:
                     band_cells += 1
                     total_diff += nd
                     if nd:
@@ -153,17 +188,20 @@ def main_sm90(torch, tmp):
                         worst = max(worst, int(u.max()) if u.numel() else 0)
                         rel = float((y[d].float() - ref[d].float()).abs().max() / ref.float().abs().max())
                         worst_abs = max(worst_abs, rel)
-                # the switch-on bytes are the bytes this process gives outside the band
-                if m > band and not torch.equal(y, t_on[f"{name},{m},{call}"]):
-                    failures.append(f"{name} {call} M = {m}: the switch changed bytes outside the band")
+                # the switch-on bytes are the bytes this process gives outside the bands
+                if not in_band and not torch.equal(y, t_on[f"{name},{m},{call}"]):
+                    failures.append(f"{name} {call} M = {m}: the switch changed bytes outside the bands")
     if total_diff == 0:
-        failures.append("switch unset: no element in the split-K band differs from M = 512 (the control shows nothing)")
+        failures.append("switch unset: no element in the split-K bands differs from M = 512 (the control shows nothing)")
+    if sms == 132 and band2_cells == 0:
+        failures.append("switch unset: no cell of the two-warp-group split-K route (the control does not reach it)")
     # one bf16 rounding of a partial sum: far below the output's scale (FH5: at most one unit in the last place of the
     # largest outputs; a few more units on values that nearly cancel)
     if worst_abs > 2.0 ** -6:
         failures.append(f"switch unset: an element in the band differs by {worst_abs:.2e} of the output's "
                         f"largest value")
-    print(f"[2] switch unset: split-K takes the band; {total_diff} elements over {band_cells} band cells differ from "
+    print(f"[2] switch unset: split-K takes the bands ({band2_cells} cells of the two-warp-group route); "
+          f"{total_diff} elements over {band_cells} band cells differ from "
           f"the same rows at M = {M_MAX} (at most {worst} units in the last place, {worst_abs:.1e} of the largest "
           f"output); outside the band identical")
     # 3. the switch wins over FSO_SM90_DENSE_SPLITK=force
