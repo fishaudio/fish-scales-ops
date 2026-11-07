@@ -252,14 +252,16 @@ for the shape (the host query
 verdicts and the configuration for a device of `sms` multiprocessors;
 `mxfp8_dense_smallm_route_sm120(M, N, K, bf16x)` the route of one call on this
 device, launch parameters included): R1 routes the 2b call to G1 when
-`pad8(M) · K · (1 + N / 16384) ≤ 73728`, the activation stays resident in shared
-memory, the kernel covers `M` with at most five 8-row groups (`M ≤ 40`), and the
-`N / 16` (or `N / 32`) tile groups of the kernel's persistent grid fit one round
-on the device (at most its SM count); R2 routes the bf16-x call to G2 when
-`f(M) ≤ B` and, above `M = 8`, `f(pad8(M)) ≤ B` as well, with
-`f(m) = m · K · (1 + N / 24576) · (K / 2048)^¼` and `B = 65536 · max(1, T / 96)`,
-`T` the kernel's tile groups (`N / 16`, or `N / 32` where a tile group holds two
-16-row tiles), and R1 holds (the kernel's
+`pad8(M) · K · (1 + N / 16384) ≤ 73728 · fill`, the activation stays resident in
+shared memory, the kernel covers `M` with at most five 8-row groups (`M ≤ 40`), and
+the `T = N / 16` (or `N / 32`) tile groups of the kernel's persistent grid fit one
+round on the device (at most its SM count); `fill` is the share of the kernel's
+8-step weight ring that one tile group fills per warp, `min(1, (K / 32 / wk) · rt / 8)`
+(`wk` the warps that split `K`, `rt` the 16-row tiles of a tile group), where the
+grid has at least 128 tile groups and so streams the weight at the DRAM rate, and 1
+otherwise. R2 routes the bf16-x call to G2 when `f(M) ≤ B` and, above `M = 8`,
+`f(pad8(M)) ≤ B` as well, with `f(m) = m · K · (1 + N / 24576) · (K / 2048)^¼` and
+`B = 65536 · max(1, T / 96)`, and R1 holds (the kernel's
 configuration changes every 8 rows, so a rule takes a whole 8-row bucket or
 none of it; within the first bucket the row count decides). Above `M = 64`
 nothing changes. On the RTX 5090 (170 SMs) the rules serve the issue's TP2

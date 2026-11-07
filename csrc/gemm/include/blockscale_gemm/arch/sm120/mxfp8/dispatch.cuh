@@ -1122,6 +1122,84 @@ inline Sm120DenseRoute sm120_mxfp8_dense_route_cascade(
 // Bytes: every tile has identity, epilogue and quantized-output instantiations, and the K accumulation order of a
 // single launch does not depend on the tile, so the route gives the bytes of the pick, on both entries and for
 // linear_quantized.
+// The multi-wave tile rule (issue #12 F5C). Above M = 128, when the route is a single launch with more tiles than the
+// device has SMs, its persistent grid runs ceil(tiles / SMs) rounds of tiles, and the last round holds only the
+// remainder: gate_up 19456 x 2560 at M = 1024 on (128, 128) runs 7.15 waves, so its eighth round keeps 26 of the 170
+// SMs busy for a whole tile time (14 % of the call), and o_tp2 2048 x 2048 at M = 1536 runs 1.13 waves, so half of the
+// call is a second round of 22 tiles. The rule estimates every existing single-launch tile's time on the shape as
+//     cost(tile) = t(tile, kt) x ceil(tiles(tile) / SMs),     kt = ceil(K / 128),
+// where t is the tile's measured time per tile in a launch that keeps every SM busy, from the table below: a line in
+// the k-tile count per tile, one for the 1 x 1 x 1 cluster launch of 1 to 4 waves and one for the plain launch from 4
+// waves (launch_sm120_mxfp8_gemm_kernel; the large tiles draw enough power in long plain launches to run at a lower
+// clock, which the second line carries). It takes the tile of least cost when that cost is below kMultiWaveMargin of
+// the route's own; the stage rules after it then apply to the new tile as to any route. The margin keeps the routes
+// whose candidates the table cannot separate: on the measured shapes the table's per-tile time of a 96-row tile in a
+// launch of 4 or more waves was up to 10 % below its time on the wide real shapes, and at a 5 % margin no moved cell
+// was slower. Only kt >= kMultiWaveKtMin is covered (the table's measured range).
+//
+// The table: t = a + b x kt microseconds at 2407 MHz on the RTX 5090, from calibration shapes whose tile count is an
+// exact number of waves (N = 17 x TileN, M = 10 x W x TileM; W = 2, 3 for the cluster line, W = 4, 8 for the plain
+// line; the slope of the call time over W, so the per-call part drops out), cold weights, graph replay, K = 1280,
+// 2560, 4096 and 9728 (issue #12 F5C, runs/F5C/report/table_*.md).
+//
+// Bytes: every tile of the table has identity, dense-epilogue and quantized-output instances, and the K accumulation
+// order of a single launch does not depend on the tile, so the rule gives the route's bytes on every call form.
+struct Sm120TileLine
+{
+    int tm, tn, st;
+    float a_cluster, b_cluster, a_plain, b_plain;
+};
+constexpr float kMultiWaveMargin = 0.95f;
+constexpr int kMultiWaveKtMin = 10;
+constexpr Sm120TileLine kSm120TileLines[] = {
+    {160, 128, 2, -0.384f, 1.4163f, 0.913f, 1.5325f},
+    {128, 128, 2, 0.476f, 1.1356f, 0.466f, 1.2665f},
+    {128, 64, 2, 0.620f, 0.7466f, -1.130f, 0.8338f},
+    {96, 128, 2, -0.020f, 0.9463f, -0.546f, 1.0002f},
+    {64, 128, 2, 0.601f, 0.7479f, 0.542f, 0.7346f},
+    {64, 64, 4, 1.465f, 0.4570f, 0.857f, 0.4565f},
+    {32, 128, 4, 1.993f, 0.5465f, 1.291f, 0.5495f},
+    {32, 64, 4, 0.946f, 0.3471f, 0.775f, 0.3370f},
+};
+
+inline void sm120_mxfp8_multiwave_tile(
+    Sm120DenseRoute& r, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int sms)
+{
+    int const kt = static_cast<int>((shape_k + 127) / 128);
+    if (kt < kMultiWaveKtMin)
+        return;
+    auto cost = [&](Sm120TileLine const& e)
+    {
+        long const tiles = static_cast<long>((shape_m + e.tm - 1) / e.tm) * static_cast<long>((shape_n + e.tn - 1) / e.tn);
+        bool const plain = tiles >= 4L * sms;
+        float const per_tile = plain ? e.a_plain + e.b_plain * kt : e.a_cluster + e.b_cluster * kt;
+        return per_tile * static_cast<float>((tiles + sms - 1) / sms);
+    };
+    float pick_cost = -1.0f;
+    for (auto const& e : kSm120TileLines)
+        if (e.tm == r.tile_m && e.tn == r.tile_n && e.st == r.stages)
+            pick_cost = cost(e);
+    if (pick_cost <= 0.0f)
+        return;   // a route outside the table keeps its tile
+    Sm120TileLine const* best = nullptr;
+    float best_cost = kMultiWaveMargin * pick_cost;
+    for (auto const& e : kSm120TileLines)
+    {
+        float const c = cost(e);
+        if (c < best_cost)
+        {
+            best_cost = c;
+            best = &e;
+        }
+    }
+    if (best != nullptr)
+    {
+        r.tile_m = best->tm;
+        r.tile_n = best->tn;
+        r.stages = best->st;
+    }
+}
+
 inline Sm120DenseRoute sm120_mxfp8_dense_route(
     uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_device_sms)
 {
@@ -1131,6 +1209,9 @@ inline Sm120DenseRoute sm120_mxfp8_dense_route(
     int const sms = std::max(1, num_device_sms);
     auto ctas = [&](int tm, int tn)
     { return static_cast<int>((shape_m + tm - 1) / tm) * static_cast<int>((shape_n + tn - 1) / tn); };
+    // The cascade's own pick decides which of the tile rules 1 and 1b applies: 1 to an under-filled single launch, 1b to
+    // one of more tiles than SMs (a tile rule 1 picks is not re-examined by 1b).
+    int const pick_ctas = ctas(r.tile_m, r.tile_n);
     // 1. The wave-fill rule (F5A), with the tie-break of issue #12 F5B: among tiles of equal waves x (TileM + TileN),
     // the one with the smaller 2 x TileM + TileN wins, the pick included (before F5B a tie kept the pick). 2 x TileM +
     // TileN is in proportion to the shared-memory ldmatrix bytes a k-tile costs in the 2 x 4 math-warp layout of these
@@ -1139,7 +1220,7 @@ inline Sm120DenseRoute sm120_mxfp8_dense_route(
     // over (128, 64). Measured on the RTX 5090 (2407 MHz, cold weights, graph replay, the same process): wo 2560 x
     // 4096 at M = 512, 160 CTAs either way, (64, 128, 2) 26.29 against the pick (128, 64, 2) 27.50 us. It moves none of
     // the 42 cells F5A's rule moves; it moves 9 cells of (128, 64, 2) picks at M = 512-1079 to (64, 128).
-    if (shape_m > 128 && r.k_split <= 1 && ctas(r.tile_m, r.tile_n) < sms)
+    if (shape_m > 128 && r.k_split <= 1 && pick_ctas < sms)
     {
         bool const pick_partial = shape_m % static_cast<uint32_t>(r.tile_m) != 0;
         auto cost = [&](int tm, int tn) { return (ctas(tm, tn) + sms - 1) / sms * (tm + tn); };
@@ -1164,6 +1245,9 @@ inline Sm120DenseRoute sm120_mxfp8_dense_route(
             }
         }
     }
+    // 1b. The multi-wave tile rule (issue #12 F5C): see sm120_mxfp8_multiwave_tile below.
+    if (shape_m > 128 && r.k_split <= 1 && pick_ctas > sms)
+        sm120_mxfp8_multiwave_tile(r, shape_m, shape_n, shape_k, sms);
     // 2. The stage rule (issue #12 F5B): a single-wave launch (no more tiles than SMs) of (64, 128) or (96, 128) runs
     // the 3-stage instance (the ring mainloop of fp8/gemm_1d1d.cuh) instead of the 2-stage one when its tile has 3 or
     // more M-tiles, or 2 M-tiles and no more tiles than 3/4 of the SMs. Why: with several M-tiles every weight panel is

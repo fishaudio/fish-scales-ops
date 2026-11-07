@@ -4,14 +4,19 @@ SMs is replaced by the existing cascade tile with the smallest waves x (TileM + 
 32-row tile is a candidate only when the pick's last M-tile is partial. Among tiles of equal waves x (TileM + TileN)
 the one with the smaller 2 x TileM + TileN wins, the pick included (issue #12 F5B), and the stage rules that follow it
 give a single-wave (64, 128) or (96, 128) route 3 stages and some (32, 64) routes 6 (see test_sm120_ring_stages.py),
-so the table's routes carry their stage counts.
+so the table's routes carry their stage counts. The multi-wave tile rule (issue #12 F5C) handles the other side: above
+M = 128, a pick that is a single launch of more tiles than SMs takes the tile of least t(tile, kt) x ceil(tiles / SMs)
+when that cost is below 0.95 of the pick's own, t from the measured per-tile table of dispatch.cuh (kSm120TileLines: a
+line in kt = K / 128 per tile for the cluster launch of 1 to 4 waves and one for the plain launch from 4), for K >= 1280.
 
 1. **The routes.** On the RTX 5090's 170 SMs the route query ``torch.ops.fish_scales_ops.mxfp8_dense_route_sm120``
    returns the table below for the issue #12 tower and LLM TP2 shapes and the dense families' shapes (the rule's own
    arithmetic applied to the cascade's picks, issue #12 F5A; a change of the rule or of the cascade must update the
-   table on purpose). On any device: every route above M = 64 is one of the cascade's tiles, and an under-filled
-   single-launch route above M = 128 has a waves x (TileM + TileN) no larger than any tile with more than 32 rows.
-2. **The bytes do not depend on the tile.** On cells the rule moves, the natural route and other forced single-launch
+   table on purpose). On any device: every route above M = 64 is one of the cascade's tiles, an under-filled
+   single-launch route above M = 128 has a waves x (TileM + TileN) no larger than any tile with more than 32 rows, and a
+   single launch of more tiles than SMs above M = 128 (K >= 1280) costs, by the multi-wave rule's table, no more than
+   the cheapest tile over the rule's 0.95 margin.
+2. **The bytes do not depend on the tile.** On cells the rules move, the natural route and other forced single-launch
    tiles (``FSO_FORCE_TILE``, one subprocess each, since the knob is read once per process) give the same output on
    the 2b call and on the bf16-x call, with the issue #12 tower epilogues (bias, bias + residual, bias + erf-GELU), and
    the bf16-x call equals the 2b call byte for byte.
@@ -29,6 +34,16 @@ import subprocess
 import sys
 
 TILES = ((32, 64, 4), (32, 128, 4), (64, 64, 4), (64, 128, 2), (96, 128, 2), (128, 64, 2), (128, 128, 2), (160, 128, 2))
+# The multi-wave tile rule's table (dispatch.cuh kSm120TileLines, kMultiWaveMargin, kMultiWaveKtMin; issue #12 F5C):
+# per tile, the time per tile a + b x kt (us) in the cluster launch (1 to 4 waves) and in the plain launch (4 or more)
+MW_LINES = {
+    (160, 128, 2): (-0.384, 1.4163, 0.913, 1.5325), (128, 128, 2): (0.476, 1.1356, 0.466, 1.2665),
+    (128, 64, 2): (0.620, 0.7466, -1.130, 0.8338), (96, 128, 2): (-0.020, 0.9463, -0.546, 1.0002),
+    (64, 128, 2): (0.601, 0.7479, 0.542, 0.7346), (64, 64, 4): (1.465, 0.4570, 0.857, 0.4565),
+    (32, 128, 4): (1.993, 0.5465, 1.291, 0.5495), (32, 64, 4): (0.946, 0.3471, 0.775, 0.3370),
+}
+MW_MARGIN = 0.95
+MW_KT_MIN = 10
 # the routes may also name the ring-mainloop instances of the stage rules (issue #12 F5B): the same tiles as (64, 128,
 # 2), (96, 128, 2) and (32, 64, 4) with 3, 3 and 6 stages
 ROUTE_TILES = TILES + ((64, 128, 3), (96, 128, 3), (32, 64, 6))
@@ -39,13 +54,9 @@ W_EXPECTED = (  # (M, N, K, TileM, TileN, stages, k_split, tag) at 170 SMs
     (182, 1280, 1280, 32, 64, 6, 1, "q"), (364, 1280, 1280, 64, 64, 4, 1, "q"),
     (533, 1280, 1280, 32, 128, 4, 1, "q"), (1079, 1280, 1280, 64, 128, 3, 1, "q"),
     (182, 5120, 1280, 64, 128, 3, 1, "fc1"), (364, 5120, 1280, 96, 128, 3, 1, "fc1"),
-    (533, 5120, 1280, 96, 128, 2, 1, "fc1"), (1079, 5120, 1280, 128, 128, 2, 1, "fc1"),
-    
-    
+    (533, 5120, 1280, 160, 128, 2, 1, "fc1"), (1079, 5120, 1280, 160, 128, 2, 1, "fc1"),
     (182, 1280, 5120, 32, 64, 4, 1, "fc2"), (364, 1280, 5120, 64, 64, 4, 1, "fc2"),
     (533, 1280, 5120, 32, 128, 4, 1, "fc2"), (1079, 1280, 5120, 64, 128, 3, 1, "fc2"),
-    
-    
     (182, 1280, 7680, 32, 64, 4, 1, "conv_out"), (364, 1280, 7680, 64, 64, 4, 1, "conv_out"),
     (533, 1280, 7680, 32, 128, 4, 1, "conv_out"), (1079, 1280, 7680, 64, 128, 3, 1, "conv_out"),
     (182, 2048, 1280, 64, 64, 4, 1, "proj2"), (364, 2048, 1280, 64, 128, 3, 1, "proj2"),
@@ -56,30 +67,39 @@ W_EXPECTED = (  # (M, N, K, TileM, TileN, stages, k_split, tag) at 170 SMs
     (144, 2048, 2048, 32, 64, 4, 1, "o_tp2"), (160, 2048, 2048, 32, 64, 4, 1, "o_tp2"),
     (288, 2048, 2048, 64, 64, 4, 1, "o_tp2"), (320, 2048, 2048, 64, 64, 4, 1, "o_tp2"),
     (512, 2048, 2048, 64, 128, 3, 1, "o_tp2"), (768, 2048, 2048, 96, 128, 3, 1, "o_tp2"),
-    (1536, 2048, 2048, 128, 128, 2, 1, "o_tp2"), (160, 6144, 2560, 64, 128, 3, 1, "A_wqkv"),
+    (1536, 2048, 2048, 160, 128, 2, 1, "o_tp2"), (160, 6144, 2560, 64, 128, 3, 1, "A_wqkv"),
     (192, 6144, 2560, 64, 128, 3, 1, "A_wqkv"), (256, 6144, 2560, 96, 128, 3, 1, "A_wqkv"),
     (512, 6144, 2560, 96, 128, 2, 1, "A_wqkv"), (1024, 6144, 2560, 160, 128, 2, 1, "A_wqkv"),
     (160, 2560, 4096, 64, 64, 4, 1, "A_wo"), (256, 2560, 4096, 64, 64, 4, 1, "A_wo"),
     (512, 2560, 4096, 64, 128, 3, 1, "A_wo"), (1024, 2560, 4096, 128, 128, 2, 1, "A_wo"),
     (160, 19456, 2560, 160, 128, 2, 1, "A_gate_up"), (256, 19456, 2560, 128, 128, 2, 1, "A_gate_up"),
-    (1024, 19456, 2560, 128, 128, 2, 1, "A_gate_up"), (160, 2560, 9728, 128, 128, 2, 4, "A_down"),
+    (1024, 19456, 2560, 96, 128, 2, 1, "A_gate_up"), (160, 2560, 9728, 128, 128, 2, 4, "A_down"),
     (256, 2560, 9728, 128, 128, 2, 4, "A_down"), (512, 2560, 9728, 128, 128, 2, 2, "A_down"),
     (160, 5120, 2048, 64, 128, 3, 1, "B_wqkv"), (192, 5120, 2048, 64, 128, 3, 1, "B_wqkv"),
-    (256, 5120, 2048, 64, 128, 3, 1, "B_wqkv"), (512, 5120, 2048, 96, 128, 2, 1, "B_wqkv"),
+    (256, 5120, 2048, 64, 128, 3, 1, "B_wqkv"), (512, 5120, 2048, 128, 128, 2, 1, "B_wqkv"),
     (160, 2048, 4096, 32, 64, 4, 1, "BC_wo"), (256, 2048, 4096, 64, 64, 4, 1, "BC_wo"),
     (512, 2048, 4096, 64, 128, 3, 1, "BC_wo"), (160, 9216, 2048, 96, 128, 2, 1, "C_wqkv_gated"),
     (192, 9216, 2048, 96, 128, 2, 1, "C_wqkv_gated"), (256, 9216, 2048, 128, 128, 2, 1, "C_wqkv_gated"),
-    (160, 12288, 2048, 160, 128, 2, 1, "C_gdn_in"), (192, 12288, 2048, 96, 128, 2, 1, "C_gdn_in"),
-    (256, 12288, 2048, 128, 128, 2, 1, "C_gdn_in"), (1024, 12288, 2048, 128, 128, 2, 1, "C_gdn_in"),
+    (160, 12288, 2048, 160, 128, 2, 1, "C_gdn_in"), (192, 12288, 2048, 64, 128, 2, 1, "C_gdn_in"),
+    (256, 12288, 2048, 96, 128, 2, 1, "C_gdn_in"), (1024, 12288, 2048, 160, 128, 2, 1, "C_gdn_in"),
     (160, 1024, 2048, 32, 64, 4, 1, "C_shared_gate_up"), (192, 1024, 2048, 64, 64, 4, 1, "C_shared_gate_up"),
     (256, 1024, 2048, 64, 64, 4, 1, "C_shared_gate_up"), (512, 1024, 2048, 64, 64, 4, 1, "C_shared_gate_up"),
     (1024, 1024, 2048, 64, 128, 3, 1, "C_shared_gate_up"), (160, 2048, 512, 32, 64, 4, 1, "C_shared_down"),
     (256, 2048, 512, 64, 64, 4, 1, "C_shared_down"), (512, 2048, 512, 64, 128, 3, 1, "C_shared_down"),
+    (1280, 2560, 2048, 160, 128, 2, 1, "qkv_tp2"), (1536, 2560, 2048, 96, 128, 2, 1, "qkv_tp2"),
+    (4096, 1024, 2048, 128, 128, 2, 1, "C_shared_gate_up"), (2048, 5120, 2048, 128, 128, 2, 1, "B_wqkv"),
+    (4096, 5120, 2048, 128, 128, 2, 1, "B_wqkv"), (1024, 9216, 2048, 160, 128, 2, 1, "C_wqkv_gated"),
+    (2048, 9216, 2048, 160, 128, 2, 1, "C_wqkv_gated"), (4096, 6144, 2560, 160, 128, 2, 1, "A_wqkv"),
+    (4096, 19456, 2560, 160, 128, 2, 1, "A_gate_up"), (2048, 2048, 512, 128, 128, 2, 1, "C_shared_down"),
+    (8192, 2048, 512, 160, 128, 2, 1, "C_shared_down"),
 )
 # (M, N, K, bias, residual, activation, rule): cells the rules move on the RTX 5090; the bytes checks need only that the
 # forced tiles run, so they run on any sm_120 device
 A_CELLS = ((364, 1280, 1280, True, False, None, "a"), (1079, 1280, 5120, True, True, None, "a"),
-           (182, 1280, 1280, True, False, "gelu_erf", "a"), (160, 2048, 4096, False, False, None, "a"))
+           (182, 1280, 1280, True, False, "gelu_erf", "a"), (160, 2048, 4096, False, False, None, "a"),
+           # the multi-wave tile rule (issue #12 F5C): 128 x 128 -> 160 x 128 (one wave instead of two), and 128 x 128 ->
+           # 96 x 128 with the tower's bias + erf-GELU epilogue
+           (1536, 2048, 2048, False, False, None, "mw"), (1079, 5120, 1280, True, False, "gelu_erf", "mw"))
 failures: list[str] = []
 
 
@@ -103,8 +123,18 @@ def route_of(M, N, K):
     return (r[0], r[1], r[2]), r[5], bool(r[6])
 
 
+def mw_cost(t, M, N, K, sms):
+    """The multi-wave tile rule's cost of tile t (its 2- or 4-stage line of MW_LINES): t(kt) x ceil(tiles / sms)."""
+    base = {(64, 128, 3): (64, 128, 2), (96, 128, 3): (96, 128, 2), (32, 64, 6): (32, 64, 4)}.get(t, t)
+    e = MW_LINES[base]
+    kt = -(-K // 128)
+    n = ctas(base, M, N)
+    a, b = (e[2], e[3]) if n >= 4 * sms else (e[0], e[1])
+    return (a + b * kt) * -(-n // sms)
+
+
 def case_routes(sms: int) -> None:
-    n_inv = 0
+    n_inv = n_mw = 0
     for N in (1024, 1280, 2048, 2560, 4096, 5120, 6144, 9216, 12288, 19456):
         for K in (512, 1280, 2048, 4096, 5120, 7680, 9728):
             for M in (65, 96, 128, 129, 144, 160, 182, 192, 256, 288, 364, 512, 533, 768, 1079, 1536, 2048, 4096):
@@ -116,8 +146,19 @@ def case_routes(sms: int) -> None:
                     check(cost(t, M, N, sms) <= best,
                           f"routes: M={M} N={N} K={K} under-filled route {t} ({ctas(t, M, N)} CTAs < {sms} SMs) has "
                           f"waves x (TM + TN) {cost(t, M, N, sms)} > {best} of a tile with more than 32 rows")
-    print(f"  1  {n_inv} cells: every route is a cascade tile, and the under-filled single launches above M = 128 have "
-          f"the smallest waves x (TM + TN) among the tiles with more than 32 rows  {'OK' if not failures else 'FAILED'}")
+                # the multi-wave tile rule (issue #12 F5C): a single launch of more tiles than SMs above M = 128 (in the
+                # table's k-tile range) has a table cost within the rule's margin of the cheapest tile's
+                if (M > 128 and ks <= 1 and not smallm and t in ROUTE_TILES and ctas(t, M, N) > sms
+                        and -(-K // 128) >= MW_KT_MIN):
+                    n_mw += 1
+                    best = min(mw_cost(u, M, N, K, sms) for u in MW_LINES)
+                    check(mw_cost(t, M, N, K, sms) * MW_MARGIN <= best * (1 + 1e-6),
+                          f"routes: M={M} N={N} K={K} multi-wave route {t} ({ctas(t, M, N)} CTAs > {sms} SMs) costs "
+                          f"{mw_cost(t, M, N, K, sms):.1f} > {best / MW_MARGIN:.1f} (the cheapest tile's {best:.1f} over "
+                          f"the margin {MW_MARGIN})")
+    print(f"  1  {n_inv} cells: every route is a cascade tile, the under-filled single launches above M = 128 have "
+          f"the smallest waves x (TM + TN) among the tiles with more than 32 rows, and the {n_mw} multi-wave single "
+          f"launches cost no more than the cheapest tile over the margin  {'OK' if not failures else 'FAILED'}")
     if sms != SMS_TABLE:
         print(f"  1  the route table is for {SMS_TABLE} SMs; this device has {sms}: table not checked")
         return

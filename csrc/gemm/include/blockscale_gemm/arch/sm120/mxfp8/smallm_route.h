@@ -10,9 +10,11 @@
  * K {1280, 3072, 5120, 7680}). Both serve the decode band only: nothing above M = 64 changes.
  *
  *   R1, the 2b call linear(xq, w, x_scale=sx):  G1 instead of the CUTLASS cascade when
- *           pad8(M) * K * (1 + N / 16384) <= 73728, the activation stays resident in shared memory (no K chunks),
- *           nc <= 5, and the N / (16 rt) tile groups fit one round of the persistent grid on the device (at most its SM
- *           count: on the RTX 5090's 170 SMs N <= 2720 at rt = 1 and N <= 5440 at rt = 2).
+ *           pad8(M) * K * (1 + N / 16384) <= 73728 * fill, the activation stays resident in shared memory (no K
+ *           chunks), nc <= 5, and the N / (16 rt) tile groups fit one round of the persistent grid on the device (at
+ *           most its SM count: on the RTX 5090's 170 SMs N <= 2720 at rt = 1 and N <= 5440 at rt = 2); fill is the
+ *           share of the kernel's 8-step weight ring one tile group fills per warp, min(1, (K / 32 / wk) rt / 8),
+ *           where the grid has at least 128 tile groups, and 1 otherwise (issue #12 F5C).
  *   R2, the bf16-x call linear(x, w):           G2 (one launch) instead of quantize + the 2b route when
  *           f(M) <= B and (M <= 8 or f(pad8(M)) <= B), f(m) = m * K * (1 + N / 24576) * (K / 2048)^(1/4),
  *           B = 65536 * max(1, T / 96) with T = N / (16 rt) the plan's tile groups, and R1.
@@ -38,6 +40,19 @@
  * before on any cell in either pass; they leave on the cascade 39 cells where G1 was more than 3 % faster and 37
  * where G2 was (among them the multi-round shapes that still win, 4096 x 1280, 4096 x 3072 and 5120 x 2048, and
  * 2560 x 9728 at M <= 4, whose 8-row bucket R1 cannot split). R2 implies R1 on every cell; the code requires it.
+ *
+ * R1's ring-fill term (issue #12 F5C, on F5B's two passes of both sets, taken on the cascade of issue #12 F5B): the
+ * kernel streams a tile group's weight through an 8-step register ring per warp, and a tile group of (K / 32 / wk) rt
+ * steps fewer than 8 leaves the ring partly empty, so the kernel runs above the DRAM stream (at K = 1280, 5 of 8
+ * steps, 0.7 us above it on 2560 x 1280) where a grid of 128 tile groups or more would stream at the DRAM rate; the
+ * cascade's (32, 64, 6) route of F5B streams such a shape at that rate. Scaling the budget by the ring's fill un-routes
+ * exactly 2560 x 1280 at M = 32 and 40 (G1 2.9 / 6.7 % slower than the cascade, and the bf16-x call 6.5 / 12.1 %
+ * slower than the chain), the only cells where G1 lost, and no other cell: at K >= 2048 a tile group fills the ring
+ * (wk = 8, rt = 1), at K <= 1024 the plan takes two tiles per group (rt = 2) and fills it too, and below 128 tile
+ * groups the grid does not stream at the DRAM rate, so the term is 1 there. The remaining routed loss, 2048 x 2048 at
+ * M = 32 on the bf16-x call (G2 5 % slower than quantize + the cascade, but faster than quantize + G1), has no rule
+ * fix that keeps linear(x) == linear(quantize_activation(x)): the bf16-x call must take the 2b call's route, and
+ * un-routing R1 there would make the 2b call 10 % slower.
  *
  * R2 implies R1. That keeps interface v1's identity linear(xq, w, x_scale=sx) == linear(x, w) byte for byte, with
  * xq, sx = quantize_activation(x): where R2 picks G2 the 2b call runs G1, and G2 equals quantize + G1 bit for bit
@@ -71,12 +86,14 @@ constexpr int kSmemMargin = 1024;
 constexpr int kRing = 8;                   // weight-load ring depth, in steps (smallm_tc.cuh)
 constexpr int kRedStride = 20;             // reduction buffer floats per (warp, tile, column): 16 rows + pad
 // The rules' constants (see the comment at the top of this file).
-constexpr double kBudgetR1 = 73728.0;    // R1: pad8(M) * K * (1 + N / kN0R1) <= kBudgetR1
+constexpr double kBudgetR1 = 73728.0;    // R1: pad8(M) * K * (1 + N / kN0R1) <= kBudgetR1 * fill
 constexpr double kN0R1 = 16384.0;
 constexpr bool kR1ResidentOnly = true;   // R1 plan guard: only plans whose activation stays resident (cj == 0)
 constexpr int kR1NcMax = 5;              // R1 plan guard: only plans with nc <= kR1NcMax
 constexpr bool kR1OneRound = true;       // R1 plan guard: only plans whose tile groups fit one round of the persistent
                                          // grid on the device (N / (16 rt) <= its SM count)
+constexpr int kR1DramTileGroups = 128;   // R1's ring-fill term (issue #12 F5C): applies to plans of at least this many
+                                         // tile groups, whose grid streams the weight at the DRAM rate
 constexpr double kBudgetR2 = 65536.0;    // R2: f(m) <= kBudgetR2 * max(1, T / kR2TileGroups0),
                                          // f(m) = m * K * (1 + N / kN0R2) * (K / 2048)^q
 constexpr double kN0R2 = 24576.0;
@@ -235,28 +252,34 @@ inline Plan config(int M, int N, int K)
     return p;
 }
 
-// R1 (the 2b call): pad8(M) * K * (1 + N / kN0R1) <= kBudgetR1, for the plan config() picks for the shape when it
-// passes R1's plan guards (kR1ResidentOnly: the activation resident in shared memory; nc <= kR1NcMax; kR1OneRound: the
-// N / (16 rt) tile groups fit one round of the persistent grid on a device of `sms` multiprocessors). `sms` is the
-// device's SM count (the launch paths pass the current device's; the host query op takes it as an argument).
+// R1's ring fill (issue #12 F5C): the steps of the kRing-step weight ring that one tile group of the plan gives each
+// warp, (K / 32 / wk) * rt, over kRing, at most 1; 1 for a plan of fewer than kR1DramTileGroups tile groups.
+inline double r1_ring_fill(Plan const& c, int N, int K)
+{
+    if (N / (16 * c.rt) < kR1DramTileGroups)
+        return 1.0;
+    double const steps = double(K / 32) / double(c.wk) * double(c.rt);
+    return steps < double(kRing) ? steps / double(kRing) : 1.0;
+}
+
+// R1 (the 2b call): pad8(M) * K * (1 + N / kN0R1) <= kBudgetR1 * r1_ring_fill, for the plan config() picks for the
+// shape when it passes R1's plan guards (kR1ResidentOnly: the activation resident in shared memory; nc <= kR1NcMax;
+// kR1OneRound: the N / (16 rt) tile groups fit one round of the persistent grid on a device of `sms`
+// multiprocessors). `sms` is the device's SM count (the launch paths pass the current device's; the host query op
+// takes it as an argument).
 inline bool rule_r1(int M, int N, int K, int sms)
 {
     if (M < 1 || M > kMaxM)
         return false;
-    double const s = double((M + 7) / 8 * 8) * double(K);
-    if (s * (1.0 + double(N) / kN0R1) > kBudgetR1)
+    Plan const c = config(M, N, K);
+    if (kR1ResidentOnly && c.cj != 0)
         return false;
-    if (kR1ResidentOnly || kR1NcMax < 8 || kR1OneRound)
-    {
-        Plan const c = config(M, N, K);
-        if (kR1ResidentOnly && c.cj != 0)
-            return false;
-        if (c.nc > kR1NcMax)
-            return false;
-        if (kR1OneRound && N / (16 * c.rt) > sms)
-            return false;
-    }
-    return true;
+    if (c.nc > kR1NcMax)
+        return false;
+    if (kR1OneRound && N / (16 * c.rt) > sms)
+        return false;
+    double const s = double((M + 7) / 8 * 8) * double(K);
+    return s * (1.0 + double(N) / kN0R1) <= kBudgetR1 * r1_ring_fill(c, N, K);
 }
 
 // R2 (the bf16-x call): K <= kR2KMax, f(M) <= B and, above the first 8-row bucket, f(pad8(M)) <= B as well, with
