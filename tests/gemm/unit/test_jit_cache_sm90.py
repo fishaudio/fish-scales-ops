@@ -10,9 +10,11 @@ compiler and every JIT header file. Until 2026-09-30 the cache shared TensorRT-L
 the default mode, so cubins built from other source were loaded for matching names.
 
 This script drives worker subprocesses (each one a fresh process: the in-memory cache and the once-per-process
-knobs start empty) that run the same workload: dense linear_fp8 at a normal shape (M = 128) and a swap-AB small-M
-shape (M = 16), and fso.moe.layer at a swap-AB cell that takes the two-resident-CTA kernel (name suffix _c2) and a
-non-swap cell whose FC1 is the fused SwiGLU kernel. It checks:
+knobs start empty) that run the same workload: dense linear_fp8 at a normal shape (M = 128), at a small-M shape the
+in-cluster split-K route takes (2048 x 2048, M = 16), at a swap-AB small-M shape (5120 x 2048, M = 16) and at a shape
+the two-warp-group split-K route takes (1280 x 5120, M = 78), and
+fso.moe.layer at a swap-AB cell that takes the two-resident-CTA kernel (name suffix _c2) and a non-swap cell whose
+FC1 is the fused SwiGLU kernel. It checks:
 
   1. dump mode (FSO_JIT_DUMP_CUBIN=1) writes one cubin directory per kernel, named <16 hex>_<kernel name>;
   2. a second process with the same environment loads every kernel from those directories (FSO_JIT_DEBUG log) and
@@ -54,6 +56,8 @@ GARBAGE = b"not a cubin: planted by test_jit_cache_sm90 and must never be loaded
 REQUIRED = {
     "dense non-swap": re.compile(r"^gemm_\d.*_Normal$"),
     "dense swap-AB": re.compile(r"^gemm_swapAB_.*_Normal$"),
+    "dense in-cluster split-K": re.compile(r"^gemm_swapAB_splitk_\d+_t\d+_s\d+_st\d+$"),
+    "dense two-warp-group split-K": re.compile(r"^gemm_swapAB_splitk2_\d+_w(64|128)_t\d+_s\d+_st\d+$"),
     "grouped swap-AB, two CTAs per SM": re.compile(r"^gemm_swapAB_.*_GroupedContiguous_c2$"),
     "fused SwiGLU FC1": re.compile(r"^gemm_2wg_swiglu_.*_GroupedContiguous$"),
 }
@@ -69,14 +73,17 @@ def worker(out_path):
           flush=True)
     assert props.major == 9, "sm_90 only"
     outs = {}
-    for M in (128, 16):  # M = 128: non-swap; M = 16: swap-AB (M < 32)
+    # M = 128 on 2048 x 2048: non-swap; M = 16 on 2048 x 2048: the in-cluster split-K route (32 weight tiles); M = 16
+    # on 5120 x 2048: swap-AB (80 weight tiles, more than the split-K route takes); M = 78 on 1280 x 5120: the
+    # two-warp-group split-K route (issue #12 FH7).
+    for M, N, K in ((128, 2048, 2048), (16, 2048, 2048), (16, 5120, 2048), (78, 1280, 5120)):
         g = torch.Generator(device="cuda")
         g.manual_seed(100 + M)
-        x = torch.randn(M, 2048, device="cuda", dtype=torch.bfloat16, generator=g)
-        w = torch.randn(2048, 2048, device="cuda", dtype=torch.bfloat16, generator=g) / 45.0
+        x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, generator=g)
+        w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16, generator=g) / (K ** 0.5)
         xq, sx = fso.compat.quantize_1x128_fp8(x)
         wq, sw = fso.compat.quantize_128x128_fp8(w)
-        outs[f"dense_M{M}"] = fso.compat.linear_fp8(xq, wq, sx, sw)
+        outs[f"dense_M{M}_N{N}"] = fso.compat.linear_fp8(xq, wq, sx, sw)
 
     E, TOPK, H, I = 32, 8, 2048, 512
     g = torch.Generator(device="cuda")

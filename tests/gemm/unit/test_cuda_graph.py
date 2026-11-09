@@ -652,7 +652,49 @@ def run_fused_graph_cases():
     print("  mxfp8 fused pool     capture without eager warmup refused with a message  OK")
 
 
+# sm_90 co-scheduled DeepGEMM v2 launches (issue #12 FH6, deep_gemm::jit::dg2_co_schedule). The dispatcher reads the
+# device's cluster occupancy once per process (sm90_cosched_max_clusters), on its first call outside a capture, and a
+# single-CTA v2 launch whose M blocks fit one round of clusters then carries the cluster attribute. Two orders:
+#   * warmed up eagerly first (the shapes below, through _check_graph_op): the table is known when the capture starts,
+#     the captured launch is the co-scheduled one, and it must replay bit-exactly;
+#   * the first sm_90 GEMM of a process inside a capture (child process): the table is not read inside the capture, the
+#     launch runs without the cluster attribute, and it must still capture and replay the eager result.
+_SM90_COSCHED_SHAPES = ((264, 12352, 2560), (536, 2560, 4096))
+
+
+def test_sm90_capture_first():
+    M, N, K = _SM90_COSCHED_SHAPES[0]
+    x, w = _make_inputs(M, N, K)
+    xq, sx = fso.compat.quantize_1x128_fp8(x)
+    wq, sw = fso.compat.quantize_128x128_fp8(w)
+    torch.cuda.synchronize()
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=s):
+        captured = fso.compat.linear_fp8(xq, wq, sx, sw)
+    captured.fill_(float("nan"))
+    g.replay()
+    torch.cuda.synchronize()
+    ref = fso.compat.linear_fp8(xq, wq, sx, sw)  # eager, after the capture: the co-scheduled launch
+    torch.cuda.synchronize()
+    assert torch.equal(captured, ref), "the GEMM captured before the occupancy was known differs from the eager one"
+    print(f"  linear_fp8        {_shape_str(M, N, K)}  first GEMM inside a capture, replay == eager  OK")
+
+
+def run_sm90_capture_first_case():
+    import subprocess
+    env = dict(os.environ)
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "--sm90-capture-first"], env=env,
+                       capture_output=True, text=True)
+    print(r.stdout, end="")
+    assert r.returncode == 0, f"sm_90 capture-first case failed (exit {r.returncode}):\n{r.stderr[-3000:]}"
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--sm90-capture-first":
+        test_sm90_capture_first()
+        return
     if len(sys.argv) > 2 and sys.argv[1] == "--fused-case":
         if sys.argv[2] == "graph":
             test_fused_grouped_graph()
@@ -693,7 +735,7 @@ def main():
         (4096,  2560, 9728),  # down M=4096 (cascade + streamk-skip)
         (1024,  2560, 9728),  # down M=1024 (streamk active)
         (  32,  2560, 9728),  # down M=32   (E7 override)
-        (   2,  2560, 9728),  # down M=2    (streamk path)
+        (   2,  2560, 9728),  # down M=2    (the decode single launch since issue #12 F5B; Stream-K before)
         # sm_100/103 decode row (M <= 32): narrow-N picks the vendored
         # in-cluster split-K kernel and wide-N the vendored persistent kernel,
         # and both compile through `cute.compile` on their first eager call.
@@ -721,6 +763,14 @@ def main():
             for M, N, K in shapes: test_linear_fp8(M, N, K, prepack=False)
     else:
         print("== linear_bf16 / linear_fp8: skipped (no block-FP8 1×128 on this arch) ==")
+
+    if sm[0] == 9:
+        print("\n== sm_90 co-scheduled DeepGEMM v2 launches (eager first, then capture) ==")
+        for M, N, K in _SM90_COSCHED_SHAPES:
+            test_linear_bf16(M, N, K)
+            test_linear_fp8(M, N, K)
+        print("\n== sm_90 first dense GEMM inside a capture (subprocess) ==")
+        run_sm90_capture_first_case()
 
     if sm[0] in (10, 12):
         print("\n== linear_mxfp8 (1×32) ==")

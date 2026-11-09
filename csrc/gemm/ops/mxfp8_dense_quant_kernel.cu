@@ -58,6 +58,12 @@ bool launch_sm120_mxfp8_dense_quant_single(int tile_m, int tile_n, int stages, _
     QUANT_MX(128, 64, 2)
     QUANT_MX(128, 128, 2)
     QUANT_MX(160, 128, 2)
+    // The 3-stage instances of the stage rule (issue #12 F5B; ring mainloop).
+    QUANT_MX(64, 128, 3)
+    QUANT_MX(96, 128, 3)
+    // The 6-stage decode instances (issue #12 F5B; ring mainloop).
+    QUANT_MX(16, 64, 6)
+    QUANT_MX(32, 64, 6)
 #undef QUANT_MX
     return false;
 }

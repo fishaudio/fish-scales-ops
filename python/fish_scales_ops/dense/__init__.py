@@ -62,10 +62,12 @@ it is built from are in :mod:`fish_scales_ops.compat`.
 import dataclasses
 import math
 import os
+import warnings
 
 import torch
 
 from .._arch import sm_major
+from .._env import env_flag
 from ..gemm import _epilogue
 from ..gemm.fp8 import _sm90_act_scale, linear_fp8, quantize_128x128_fp8
 from ..gemm.mxfp8 import _sm_count, _ue8m0_scale_handle, linear_mxfp8, quantize_1x32_fp8
@@ -78,6 +80,22 @@ __all__ = ["FORMATS", "ACTIVATIONS", "DenseWeight", "prepare_weight", "linear", 
 
 # The activations the epilogue knows (interface v1): None, or one of these names.
 ACTIVATIONS = _epilogue.ACTIVATIONS
+
+# FSO_BATCH_INVARIANT (docs/api/dense.md, "Determinism and batch invariance"): read once per process, at the first
+# dense call. On sm_90 the extension acts on it (no route whose summation order depends on M); on the other
+# architectures it changes nothing in this release, and the first call that finds it set says so once.
+_BATCH_INVARIANT_SEEN = False
+
+
+def _batch_invariant_note(major: int) -> None:
+    global _BATCH_INVARIANT_SEEN
+    if _BATCH_INVARIANT_SEEN:
+        return
+    _BATCH_INVARIANT_SEEN = True
+    if major != 9 and env_flag("FSO_BATCH_INVARIANT"):
+        warnings.warn("fish_scales_ops: FSO_BATCH_INVARIANT=1 makes the dense GEMM batch-invariant on sm_90 only in "
+                      "this release; on this architecture it has no effect (docs/api/dense.md, \"Determinism and "
+                      "batch invariance\")", RuntimeWarning, stacklevel=3)
 
 # The version of the activation contract (the xq / x_scale layout and the quantizer rule) that
 # quantize_activation produces, linear(x_scale=...) accepts and fso/activation_contract.h states.
@@ -571,17 +589,35 @@ def prepare_weight(w, *, format, scale=None) -> DenseWeight:
             return DenseWeight("bsfp8", fmt, arch, k, n, q, sq)
         else:
             q, sq = quantize_1x32_fp8(wd)
-        return DenseWeight("mxfp8", fmt, arch, k, n, q, sq)
+        return _complete_handle(DenseWeight("mxfp8", fmt, arch, k, n, q, sq))
 
     if is_fp8:
         if isinstance(scale, torch.Tensor) and scale.dtype == torch.uint8:
             sq = _ue8m0_scale(scale, n, k, w.device, major, ctx)
         else:
             sq = _mxfp8_scale(scale, n, k, w.device, major, ctx)
-        return DenseWeight("mxfp8", fmt, arch, k, n, _aligned_storage(wd.contiguous()),
-                           _aligned_storage(sq, 32 if major == 10 else 16))
+        return _complete_handle(DenseWeight("mxfp8", fmt, arch, k, n, _aligned_storage(wd.contiguous()),
+                                            _aligned_storage(sq, 32 if major == 10 else 16)))
     q, sq = quantize_1x32_fp8(wd)
-    return DenseWeight("mxfp8", fmt, arch, k, n, q, sq)
+    return _complete_handle(DenseWeight("mxfp8", fmt, arch, k, n, q, sq))
+
+
+def _complete_handle(dw: DenseWeight) -> DenseWeight:
+    """Return ``dw`` once its tensors are complete for every kernel launched after this point (sm_100/sm_103).
+
+    Why. On sm_100/sm_103 the GEMMs of the decode row read the weight and its scale before their
+    programmatic-dependent-launch wait (the weights-first prologue, issue #12 FB1). Such a GEMM can therefore
+    overlap the kernel launched right before the call on the same stream, and a weight written by that kernel could
+    be read before it is complete. This function's own last write is such a kernel: the quantize of a
+    bf16 weight (a programmatic-dependent launch itself, which releases its dependents early), or the scale repack
+    of a checkpoint. So the handle ends with one plain launch (a one-word fill, no programmatic serialisation) on the
+    current stream: a plain launch starts only once every kernel in front of it on the stream has completed and its
+    writes are visible, and anything launched after it can overlap at most that fill. ``prepare_weight`` followed
+    directly by ``linear`` is then safe (test_dense_v1, case x). The fill costs one tiny launch per prepared weight,
+    at load time; nothing synchronises the host."""
+    if dw.arch // 10 == 10:
+        torch.zeros(1, dtype=torch.int32, device=dw.weight.device)
+    return dw
 
 
 
@@ -936,6 +972,7 @@ def _dense_linear_op(x, weight, scale, kind, bias=None, x_scale=None, residual=N
     neither synchronizes the device nor depends on tensor values. The four-argument
     call is today's op, unchanged."""
     major = sm_major()
+    _batch_invariant_note(major)
     where = _arch_label(_device_arch())
     op = f"fish_scales_ops::dense_linear ({where}, kind {kind!r})"
     _check_operands(op, x, weight, x_scale)
@@ -977,6 +1014,7 @@ def _dense_linear_quantized_op(x, weight, scale, kind, bias=None, x_scale=None, 
     such call; elsewhere (sm_90), after the checks, the op raises NotImplementedError naming the architecture and the
     route, before anything is launched."""
     major = sm_major()
+    _batch_invariant_note(major)
     where = _arch_label(_device_arch())
     op = f"fish_scales_ops::dense_linear_quantized ({where}, kind {kind!r})"
     _check_operands(op, x, weight, x_scale)

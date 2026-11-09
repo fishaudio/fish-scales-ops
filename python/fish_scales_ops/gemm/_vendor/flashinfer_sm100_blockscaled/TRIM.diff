@@ -1,31 +1,45 @@
 # TRIM.diff: the vendored files against flashinfer-python 0.6.18.post1 (flashinfer/gemm/kernels/<file>):
-# the three FP4 trims of 2026-09-22, the fso dense epilogue additions of 2026-10-29 (issue #12, S1b1) and the
-# split-K kernel's wide token tiles and reduction rework of 2026-11-02 (issue #12, P5).
+# the three FP4 trims of 2026-09-22, the fso dense epilogue additions of 2026-10-29 (issue #12, S1b1), the
+# split-K kernel's wide token tiles and reduction rework of 2026-11-02 (issue #12, P5) and the weights-first
+# variant of both kernels of 2026-11-05 (issue #12, FB1; its stage cap 2026-11-07, FB1b).
 # Regenerate with: diff -u <wheel file> <vendored file> for each file (labels a/<file> and b/<file>).
 --- a/dense_blockscaled_gemm_sm100.py
 +++ b/dense_blockscaled_gemm_sm100.py
-@@ -87,6 +87,7 @@
+@@ -87,6 +87,9 @@
          cluster_shape_mn: Tuple[int, int],
          use_prefetch: bool = False,
          enable_pdl: bool = True,
 +        fso_epilogue: Optional[Tuple[bool, int, bool]] = None,
++        fso_weights_first: bool = False,
++        fso_wf_cap: Optional[int] = None,
      ):
          """Initializes the configuration for a Blackwell dense GEMM kernel.
  
-@@ -104,9 +105,12 @@
+@@ -104,15 +107,23 @@
              sf_vec_size (int): Scalefactor vector size.
              mma_tiler_mn (Tuple[int, int]): Shape of the Matrix Multiply-Accumulate (MMA) tile (M, N).
              cluster_shape_mn (Tuple[int, int]): Cluster dimensions (M, N) for parallel processing.
 +            fso_epilogue: fso-epilogue, None (today's kernel) or (has_bias, act, has_residual);
 +                see _Sm100BlockScaledGemmCommon.
++            fso_weights_first: fso-pdl, False (today's kernel) or True (the weight stages before the
++                griddepcontrol.wait); see _Sm100BlockScaledGemmCommon._fso_set_weights_first.
          """
  
          self.acc_dtype = cutlass.Float32
 +        self._fso_set_epilogue(fso_epilogue)  # fso-epilogue
++        self._fso_set_weights_first(fso_weights_first, fso_wf_cap)  # fso-pdl
          self.sf_vec_size = sf_vec_size
          self.use_2cta_instrs = mma_tiler_mn[0] == 256
          self.cluster_shape_mn = cluster_shape_mn
-@@ -326,6 +330,8 @@
+         # K dimension is deferred in _setup_attributes
+         self.mma_tiler = (*mma_tiler_mn, 1)
+         self.use_prefetch = use_prefetch
++        if self.fso_wf and use_prefetch:  # fso-pdl: the peeled first tile issues no prefetch
++            raise ValueError("fso_weights_first does not support use_prefetch=True")
+         self.enable_pdl = enable_pdl
+         self.cta_group = (
+             tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
+@@ -326,6 +337,8 @@
          max_active_clusters: cutlass.Constexpr,
          stream: cuda.CUstream,
          epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -34,7 +48,7 @@
      ):
          """Execute the GEMM operation in steps:
          - Setup static attributes before smem/grid/tma computation
-@@ -451,6 +457,8 @@
+@@ -451,6 +464,8 @@
              self.tile_sched_params,
              epilogue_op,
              alpha,
@@ -43,7 +57,7 @@
          ).launch(
              grid=grid,
              block=[self.threads_per_cta, 1, 1],
-@@ -489,6 +497,8 @@
+@@ -489,6 +504,8 @@
          tile_sched_params: utils.PersistentTileSchedulerParams,
          epilogue_op: cutlass.Constexpr,
          alpha: cute.Tensor,
@@ -52,7 +66,7 @@
      ):
          """
          GPU device kernel performing the Persistent batched GEMM computation.
-@@ -669,6 +679,10 @@
+@@ -669,6 +686,10 @@
          tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
          # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
          tCgC = thr_mma.partition_C(gC_mnl)
@@ -63,7 +77,139 @@
  
          #
          # Partition global/shared tensor for TMA load A/B
-@@ -1225,6 +1239,13 @@
+@@ -778,7 +799,13 @@
+         # behavior is controlled by use_pdl= in .launch(). The griddepcontrol
+         # instructions are effectively no-ops when PDL is not enabled at
+         # the driver level.
+-        griddepcontrol_wait()
++        if cutlass.const_expr(self.fso_wf):
++            # fso-pdl: weights first. Every warp but the TMA warp waits here, as in today's kernel; the TMA warp
++            # waits inside its branch below, after the weight stages of its first tile.
++            if warp_idx != self.tma_warp_id:
++                griddepcontrol_wait()
++        else:
++            griddepcontrol_wait()
+ 
+         #
+         # Specialized TMA load warp
+@@ -796,6 +823,116 @@
+                 pipeline.PipelineUserType.Producer, self.num_ab_stage
+             )
+ 
++            if cutlass.const_expr(self.fso_wf):
++                # fso-pdl: the CTA's first tile, peeled out of the loop below. (1) Before the wait: acquire up to
++                # _fso_wf_stages() stages and issue only the weight (A) and weight-scale (SFA) copies; each acquire
++                # arms the stage's full barrier with the whole stage's bytes, so no stage completes before its
++                # activation lands. (2) griddepcontrol_wait. (3) The activation (B) and activation-scale (SFB)
++                # copies of the same stages, into the same stages and barriers. (4) The tile's remaining k-blocks,
++                # as the loop does them. Then the scheduler advances once, as at the end of a loop iteration, and
++                # the loop serves the CTA's later tiles unchanged. A CTA whose first tile is not valid (none is
++                # launched today: the grid never exceeds the tile count) issues nothing and only waits.
++                fso_coord = work_tile.tile_idx
++                fso_mnl = (
++                    fso_coord[0] // cute.size(tiled_mma.thr_id.shape),
++                    fso_coord[1],
++                    fso_coord[2],
++                )
++                fso_tAgA = tAgA[(None, fso_mnl[0], None, fso_mnl[2])]
++                fso_tBgB = tBgB[(None, fso_mnl[1], None, fso_mnl[2])]
++                fso_tAgSFA = tAgSFA[(None, fso_mnl[0], None, fso_mnl[2])]
++                fso_slice_n = fso_mnl[1]
++                if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
++                    fso_slice_n = fso_mnl[1] // 2
++                fso_tBgSFB = tBgSFB[(None, fso_slice_n, None, fso_mnl[2])]
++                fso_cnt = cutlass.Int32(0)
++                if work_tile.is_valid_tile:
++                    fso_cnt = k_block_cnt
++                fso_pre = fso_cnt
++                if fso_pre > self._fso_wf_stages():
++                    fso_pre = cutlass.Int32(self._fso_wf_stages())
++                ab_producer_state.reset_count()
++                fso_act_state = ab_producer_state.clone()
++                fso_peek = cutlass.Boolean(1)
++                if ab_producer_state.count < fso_pre:
++                    fso_peek = ab_pipeline.producer_try_acquire(ab_producer_state)
++                for _fso_k in cutlass.range(0, fso_pre, 1, unroll=1):
++                    ab_pipeline.producer_acquire(ab_producer_state, fso_peek)
++                    cute.copy(
++                        tma_atom_a,
++                        fso_tAgA[(None, ab_producer_state.count)],
++                        tAsA[(None, ab_producer_state.index)],
++                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
++                        mcast_mask=a_full_mcast_mask,
++                    )
++                    cute.copy(
++                        tma_atom_sfa,
++                        fso_tAgSFA[(None, ab_producer_state.count)],
++                        tAsSFA[(None, ab_producer_state.index)],
++                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
++                        mcast_mask=sfa_full_mcast_mask,
++                    )
++                    ab_producer_state.advance()
++                    fso_peek = cutlass.Boolean(1)
++                    if ab_producer_state.count < fso_pre:
++                        fso_peek = ab_pipeline.producer_try_acquire(ab_producer_state)
++                griddepcontrol_wait()
++                for _fso_k in cutlass.range(0, fso_pre, 1, unroll=1):
++                    cute.copy(
++                        tma_atom_b,
++                        fso_tBgB[(None, fso_act_state.count)],
++                        tBsB[(None, fso_act_state.index)],
++                        tma_bar_ptr=ab_pipeline.producer_get_barrier(fso_act_state),
++                        mcast_mask=b_full_mcast_mask,
++                    )
++                    cute.copy(
++                        tma_atom_sfb,
++                        fso_tBgSFB[(None, fso_act_state.count)],
++                        tBsSFB[(None, fso_act_state.index)],
++                        tma_bar_ptr=ab_pipeline.producer_get_barrier(fso_act_state),
++                        mcast_mask=sfb_full_mcast_mask,
++                    )
++                    fso_act_state.advance()
++                fso_peek = cutlass.Boolean(1)
++                if ab_producer_state.count < fso_cnt:
++                    fso_peek = ab_pipeline.producer_try_acquire(ab_producer_state)
++                for _fso_k in cutlass.range(fso_pre, fso_cnt, 1, unroll=1):
++                    ab_pipeline.producer_acquire(ab_producer_state, fso_peek)
++                    cute.copy(
++                        tma_atom_a,
++                        fso_tAgA[(None, ab_producer_state.count)],
++                        tAsA[(None, ab_producer_state.index)],
++                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
++                        mcast_mask=a_full_mcast_mask,
++                    )
++                    cute.copy(
++                        tma_atom_b,
++                        fso_tBgB[(None, ab_producer_state.count)],
++                        tBsB[(None, ab_producer_state.index)],
++                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
++                        mcast_mask=b_full_mcast_mask,
++                    )
++                    cute.copy(
++                        tma_atom_sfa,
++                        fso_tAgSFA[(None, ab_producer_state.count)],
++                        tAsSFA[(None, ab_producer_state.index)],
++                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
++                        mcast_mask=sfa_full_mcast_mask,
++                    )
++                    cute.copy(
++                        tma_atom_sfb,
++                        fso_tBgSFB[(None, ab_producer_state.count)],
++                        tBsSFB[(None, ab_producer_state.index)],
++                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
++                        mcast_mask=sfb_full_mcast_mask,
++                    )
++                    ab_producer_state.advance()
++                    fso_peek = cutlass.Boolean(1)
++                    if ab_producer_state.count < fso_cnt:
++                        fso_peek = ab_pipeline.producer_try_acquire(ab_producer_state)
++                tile_sched.advance_to_next_work()
++                work_tile = tile_sched.get_current_work()
++
+             while work_tile.is_valid_tile:
+                 # Get tile coord from tile scheduler
+                 cur_tile_coord = work_tile.tile_idx
+@@ -1225,6 +1362,13 @@
                      epi_tidx, tma_atom_c, tCgC, epi_tile, sC
                  )
              )
@@ -77,7 +223,7 @@
  
              #
              # Persistent tile scheduling loop
-@@ -1269,6 +1290,10 @@
+@@ -1269,6 +1413,10 @@
                          *mma_tile_coord_mnl,
                      )
                  ]
@@ -88,7 +234,7 @@
  
                  if cutlass.const_expr(self.overlapping_accum):
                      acc_stage_index = acc_consumer_state.phase
-@@ -1328,10 +1353,17 @@
+@@ -1328,10 +1476,17 @@
                      #
                      # Convert to C type
                      #
@@ -110,7 +256,7 @@
                      tRS_rC.store(acc_vec)
  
                      #
-@@ -1469,8 +1501,9 @@
+@@ -1469,8 +1624,9 @@
          is_valid = True
  
          # Check valid ab_dtype
@@ -121,7 +267,7 @@
              cutlass.Float8E5M2,
              cutlass.Float8E4M3FN,
          }:
-@@ -1522,10 +1555,10 @@
+@@ -1522,10 +1678,10 @@
          Returns:
              bool: True if the layouts are valid, False otherwise.
          """
@@ -137,7 +283,7 @@
      @staticmethod
 --- a/dense_blockscaled_gemm_sm100_common.py
 +++ b/dense_blockscaled_gemm_sm100_common.py
-@@ -27,42 +27,224 @@
+@@ -27,42 +27,254 @@
  # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  
  
@@ -313,6 +459,36 @@
 +    fso_epi_bias: bool = False
 +    fso_epi_act: int = 0
 +    fso_epi_res: bool = False
++    # fso-pdl: set by _fso_set_weights_first from the kernels' __init__.
++    fso_wf: bool = False
++
++    # fso-pdl: the most stages filled before the wait (None: every stage but one).
++    fso_wf_cap = None
++
++    def _fso_set_weights_first(self, weights_first: bool, cap=None) -> None:
++        """fso-pdl: `weights_first` False is today's kernel, byte for byte. True builds the weights-first variant:
++        the TMA warp issues the weight (kernel operand A under swap-AB) and weight-scale (SFA) copies of its first
++        tile's first stages before its griddepcontrol.wait, and the activation (B), activation-scale (SFB) copies
++        of those stages after it, against the same stage barriers. At most `cap` stages, and never every stage, go
++        before the wait (see `_fso_wf_stages`; fso's decode row passes 2 for a one-CTA tile and 1 for the two-CTA
++        tile). Every other warp keeps its wait where
++        today's kernel has it, so the bias, the residual and the output are touched only after a wait, as before."""
++        self.fso_wf = bool(weights_first)
++        self.fso_wf_cap = None if cap is None else int(cap)
++
++    def _fso_wf_stages(self) -> int:
++        """fso-pdl: the most stages the weights-first TMA warp fills before its griddepcontrol.wait: `fso_wf_cap`,
++        and never every stage. One stage is always left free: the producer's try-acquire of the stage after the last
++        one it filled must find that stage empty, because the consumer can free none of them before the activation
++        copies that follow the wait (with every stage filled, that try-wait sits on a stage that cannot complete
++        before the wait; G0D measured about 3.7 us per call on the C++ kernel built that way,
++        runs/G0D/report/probe.md). The cap keeps the activation copies after the wait from queueing behind many
++        weight copies: with every stage but one filled, fso measured the pre-quantized LLM decode call 0.1-0.2 us
++        slower; with two on the one-CTA tiles and one on the two-CTA tile, faster (runs fso_issue12_20261028/FB1,
++        FB1b)."""
++        if self.fso_wf_cap is not None:
++            return max(0, min(self.num_ab_stage - 1, self.fso_wf_cap))
++        return self.num_ab_stage - 1
 +
 +    def _fso_set_epilogue(self, fso_epilogue: Optional[Tuple[bool, int, bool]]) -> None:
 +        """fso-epilogue: `fso_epilogue` is None (today's kernel, byte for byte) or `(has_bias, act, has_residual)`
@@ -386,7 +562,7 @@
  
      def _setup_attributes(self) -> None:
          raise NotImplementedError
-@@ -78,6 +260,8 @@
+@@ -78,6 +290,8 @@
          max_active_clusters: cutlass.Constexpr,
          stream: Any,
          epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -395,7 +571,7 @@
      ) -> Any:
          raise NotImplementedError
  
-@@ -395,12 +579,8 @@
+@@ -395,12 +609,8 @@
          as a torch tensor.
  
          Args:
@@ -410,7 +586,7 @@
              mC (cute.Tensor): Output tensor C, shape (m, n).
              sf_m (cutlass.Int64): Scale factor M dim (ceil(m/128)).
              sf_n (cutlass.Int64): Scale factor N dim (ceil(n/128)).
-@@ -414,32 +594,23 @@
+@@ -414,32 +624,23 @@
              swap_ab (cutlass.Constexpr): Whether A/B are swapped (controls C layout).
              epilogue_op (cutlass.Constexpr): Elementwise epilogue function.
          """
@@ -453,7 +629,7 @@
  
          a_tensor = cute.make_tensor(
              a_ptr,
-@@ -489,6 +660,93 @@
+@@ -489,6 +690,93 @@
              epilogue_op,
          )
  
@@ -616,11 +792,13 @@
              and split_k_slices in cls.SUPPORTED_SPLIT_K_SLICES
              and k % (tile_k * split_k_slices) == 0
          )
-@@ -230,18 +260,22 @@
+@@ -230,18 +260,28 @@
          mma_tiler_mn: Tuple[int, int],
          split_k_slices: int,
          enable_pdl: bool = True,
 +        fso_epilogue: Optional[Tuple[bool, int, bool]] = None,
++        fso_weights_first: bool = False,
++        fso_wf_cap: Optional[int] = None,
      ):
          """Configure one low-M split-K tactic.
  
@@ -633,14 +811,18 @@
              enable_pdl: Whether to enable programmatic dependent launch.
 +            fso_epilogue: fso-epilogue, None (today's kernel) or
 +                (has_bias, act, has_residual); see _Sm100BlockScaledGemmCommon.
++            fso_weights_first: fso-pdl, False (today's kernel) or True (the
++                weight stages before the griddepcontrol.wait); see
++                _Sm100BlockScaledGemmCommon._fso_set_weights_first.
          """
  
          self.acc_dtype = cutlass.Float32
 +        self._fso_set_epilogue(fso_epilogue)  # fso-epilogue
++        self._fso_set_weights_first(fso_weights_first, fso_wf_cap)  # fso-pdl
          if sf_vec_size != 32:
              raise ValueError(
                  f"MXFP8 split-K requires sf_vec_size=32, got {sf_vec_size}"
-@@ -249,7 +283,7 @@
+@@ -249,7 +289,7 @@
          self.sf_vec_size = sf_vec_size
          if mma_tiler_mn not in self.SUPPORTED_MMA_TILER_MN:
              raise ValueError(
@@ -649,7 +831,7 @@
                  f"got {mma_tiler_mn}"
              )
          if split_k_slices not in self.SUPPORTED_SPLIT_K_SLICES:
-@@ -393,10 +427,17 @@
+@@ -393,10 +433,17 @@
          self.reduce_values_per_thread = (
              cute.size(self.epi_tile[0]) * cute.size(self.epi_tile[1])
          ) // (self.num_epilogue_threads)
@@ -670,7 +852,7 @@
          )
          self.reduce_smem_bytes = (
              self.reduce_mailbox_elements * cutlass.Float32.width // 8
-@@ -454,6 +495,10 @@
+@@ -454,6 +501,10 @@
          )
  
          self.overlapping_accum = self.num_acc_stage == 1
@@ -681,7 +863,7 @@
          sf_atom_mn = 32
          self.num_sfa_tmem_cols = (
              self.cta_tile_shape_mnk[0] // sf_atom_mn
-@@ -485,6 +530,8 @@
+@@ -485,6 +536,8 @@
          max_active_clusters: cutlass.Constexpr,
          stream: cuda.CUstream,
          epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -690,7 +872,7 @@
      ):
          """Execute the GEMM operation in steps:
          - Setup static attributes before smem/grid/tma computation
-@@ -610,6 +657,8 @@
+@@ -610,6 +663,8 @@
              self.epi_tile,
              epilogue_op,
              alpha,
@@ -699,7 +881,7 @@
          ).launch(
              grid=grid,
              block=[self.threads_per_cta, 1, 1],
-@@ -647,6 +696,8 @@
+@@ -647,6 +702,8 @@
          epi_tile: cute.Tile,
          epilogue_op: cutlass.Constexpr,
          alpha: cute.Tensor,
@@ -708,7 +890,7 @@
      ):
          """
          GPU device kernel performing the Persistent batched GEMM computation.
-@@ -825,6 +876,10 @@
+@@ -825,6 +882,10 @@
          tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
          # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
          tCgC = thr_mma.partition_C(gC_mnl)
@@ -719,7 +901,144 @@
  
          #
          # Partition global/shared tensor for TMA load A/B
-@@ -1336,6 +1391,13 @@
+@@ -934,7 +995,13 @@
+         # behavior is controlled by use_pdl= in .launch(). The griddepcontrol
+         # instructions are effectively no-ops when PDL is not enabled at
+         # the driver level.
+-        griddepcontrol_wait()
++        if cutlass.const_expr(self.fso_wf):
++            # fso-pdl: weights first. Every warp but the TMA warp waits here, as in today's kernel; the TMA warp
++            # waits inside its branch below, after the weight stages of its tile.
++            if warp_idx != self.tma_warp_id:
++                griddepcontrol_wait()
++        else:
++            griddepcontrol_wait()
+ 
+         #
+         # Specialized TMA load warp
+@@ -952,6 +1019,121 @@
+                 pipeline.PipelineUserType.Producer, self.num_ab_stage
+             )
+ 
++            if cutlass.const_expr(self.fso_wf):
++                # fso-pdl: the CTA's tile (the scheduler gives each CTA exactly one), peeled out of the loop below.
++                # (1) Before the wait: acquire up to _fso_wf_stages() stages of this CTA's K slice and issue only
++                # the weight (A) and weight-scale (SFA) copies; each acquire arms the stage's full barrier with the
++                # whole stage's bytes, so no stage completes before its activation lands. (2) griddepcontrol_wait.
++                # (3) The activation (B) and activation-scale (SFB) copies of the same stages, into the same
++                # stages and barriers. (4) The slice's remaining k-blocks, as the loop does them. Then the
++                # scheduler advances once, as at the end of a loop iteration, and the loop finds no further tile.
++                fso_coord = work_tile.tile_idx
++                fso_mnl = (
++                    fso_coord[0] // cute.size(tiled_mma.thr_id.shape),
++                    fso_coord[1],
++                    fso_coord[2],
++                )
++                fso_l = fso_mnl[2]
++                fso_k0 = cutlass.Int32(0)
++                if cutlass.const_expr(self.split_k_slices > 1):
++                    # C L is the split-K index; dense inputs always use L=0.
++                    fso_l = cutlass.Int32(0)
++                    fso_k0 = cutlass.Int32(fso_mnl[2]) * k_block_cnt
++                fso_tAgA = tAgA[(None, fso_mnl[0], None, fso_l)]
++                fso_tBgB = tBgB[(None, fso_mnl[1], None, fso_l)]
++                fso_tAgSFA = tAgSFA[(None, fso_mnl[0], None, fso_l)]
++                fso_slice_n = fso_mnl[1]
++                if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
++                    fso_slice_n = fso_mnl[1] // 2
++                fso_tBgSFB = tBgSFB[(None, fso_slice_n, None, fso_l)]
++                fso_cnt = cutlass.Int32(0)
++                if work_tile.is_valid_tile:
++                    fso_cnt = k_block_cnt
++                fso_pre = fso_cnt
++                if fso_pre > self._fso_wf_stages():
++                    fso_pre = cutlass.Int32(self._fso_wf_stages())
++                ab_producer_state.reset_count()
++                fso_act_state = ab_producer_state.clone()
++                fso_peek = cutlass.Boolean(1)
++                if ab_producer_state.count < fso_pre:
++                    fso_peek = ab_pipeline.producer_try_acquire(ab_producer_state)
++                for _fso_k in cutlass.range(0, fso_pre, 1, unroll=1):
++                    ab_pipeline.producer_acquire(ab_producer_state, fso_peek)
++                    cute.copy(
++                        tma_atom_a,
++                        fso_tAgA[(None, fso_k0 + ab_producer_state.count)],
++                        tAsA[(None, ab_producer_state.index)],
++                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
++                        mcast_mask=a_full_mcast_mask,
++                    )
++                    cute.copy(
++                        tma_atom_sfa,
++                        fso_tAgSFA[(None, fso_k0 + ab_producer_state.count)],
++                        tAsSFA[(None, ab_producer_state.index)],
++                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
++                        mcast_mask=sfa_full_mcast_mask,
++                    )
++                    ab_producer_state.advance()
++                    fso_peek = cutlass.Boolean(1)
++                    if ab_producer_state.count < fso_pre:
++                        fso_peek = ab_pipeline.producer_try_acquire(ab_producer_state)
++                griddepcontrol_wait()
++                for _fso_k in cutlass.range(0, fso_pre, 1, unroll=1):
++                    cute.copy(
++                        tma_atom_b,
++                        fso_tBgB[(None, fso_k0 + fso_act_state.count)],
++                        tBsB[(None, fso_act_state.index)],
++                        tma_bar_ptr=ab_pipeline.producer_get_barrier(fso_act_state),
++                        mcast_mask=b_full_mcast_mask,
++                    )
++                    cute.copy(
++                        tma_atom_sfb,
++                        fso_tBgSFB[(None, fso_k0 + fso_act_state.count)],
++                        tBsSFB[(None, fso_act_state.index)],
++                        tma_bar_ptr=ab_pipeline.producer_get_barrier(fso_act_state),
++                        mcast_mask=sfb_full_mcast_mask,
++                    )
++                    fso_act_state.advance()
++                fso_peek = cutlass.Boolean(1)
++                if ab_producer_state.count < fso_cnt:
++                    fso_peek = ab_pipeline.producer_try_acquire(ab_producer_state)
++                for _fso_k in cutlass.range(fso_pre, fso_cnt, 1, unroll=1):
++                    ab_pipeline.producer_acquire(ab_producer_state, fso_peek)
++                    cute.copy(
++                        tma_atom_a,
++                        fso_tAgA[(None, fso_k0 + ab_producer_state.count)],
++                        tAsA[(None, ab_producer_state.index)],
++                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
++                        mcast_mask=a_full_mcast_mask,
++                    )
++                    cute.copy(
++                        tma_atom_b,
++                        fso_tBgB[(None, fso_k0 + ab_producer_state.count)],
++                        tBsB[(None, ab_producer_state.index)],
++                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
++                        mcast_mask=b_full_mcast_mask,
++                    )
++                    cute.copy(
++                        tma_atom_sfa,
++                        fso_tAgSFA[(None, fso_k0 + ab_producer_state.count)],
++                        tAsSFA[(None, ab_producer_state.index)],
++                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
++                        mcast_mask=sfa_full_mcast_mask,
++                    )
++                    cute.copy(
++                        tma_atom_sfb,
++                        fso_tBgSFB[(None, fso_k0 + ab_producer_state.count)],
++                        tBsSFB[(None, ab_producer_state.index)],
++                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
++                        mcast_mask=sfb_full_mcast_mask,
++                    )
++                    ab_producer_state.advance()
++                    fso_peek = cutlass.Boolean(1)
++                    if ab_producer_state.count < fso_cnt:
++                        fso_peek = ab_pipeline.producer_try_acquire(ab_producer_state)
++                tile_sched.advance_to_next_work()
++                work_tile = tile_sched.get_current_work()
++
+             while work_tile.is_valid_tile:
+                 # Get tile coord from tile scheduler
+                 cur_tile_coord = work_tile.tile_idx
+@@ -1336,6 +1518,13 @@
                      epi_tidx, tma_atom_c, tCgC, epi_tile, sC
                  )
              )
@@ -733,7 +1052,7 @@
  
              #
              # Persistent tile scheduling loop
-@@ -1382,6 +1444,12 @@
+@@ -1382,6 +1571,12 @@
                          0,
                      )
                  ]
@@ -746,7 +1065,7 @@
  
                  if cutlass.const_expr(self.overlapping_accum):
                      acc_stage_index = acc_consumer_state.phase
-@@ -1411,124 +1479,135 @@
+@@ -1411,124 +1606,135 @@
                  # Store accumulator to global memory in sub-tiles
                  #
                  subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])

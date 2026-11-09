@@ -213,6 +213,42 @@ shipped kernel at the same token tile and split (checked on 67 cells against
 the scratch fork's shipped walk and layout, and on the decode band against the
 previous fish-scales-ops build, run `fso_issue12_20261028/runs/P5int`).
 
+## What was added: weights first (issue #12, FB1, 2026-11-05)
+
+Under programmatic dependent launch the GEMM of a dense call is created while
+the kernel in front of it still runs (the activation quantize of a bf16-x
+call, which releases it early), but as shipped both kernels execute
+`griddepcontrol_wait()` in every warp before the role split, so the TMA warp
+issues its first weight copy only after that kernel has finished. The weights
+are not written by the kernel in front, so both kernels gained a variant that
+fetches them first. Every edit site carries an `fso-pdl` comment:
+
+1. `dense_blockscaled_gemm_sm100_common.py`: the attributes `fso_wf` and
+   `fso_wf_cap`, their setter `_fso_set_weights_first`, and `_fso_wf_stages()`
+   (the number of stages filled before the wait: at most the cap, which fso's
+   decode row sets to 2 on a one-CTA tile and to 1 on the two-CTA tile, and never
+   all of them, so that no try-acquire ever sits on a stage the consumer cannot
+   free before the activation arrives).
+2. `dense_blockscaled_gemm_sm100.py` and `dense_blockscaled_gemm_sm100_splitk.py`:
+   the constructor arguments `fso_weights_first=False` and `fso_wf_cap=None`; with
+   the first, every warp but
+   the TMA warp waits where it waited before (so the bias, the residual and
+   the output are touched only after a wait, as before), and the TMA warp
+   handles the CTA's first tile in a block peeled out of its tile loop:
+   acquire up to `_fso_wf_stages()` stages and issue only the weight (A, swap-AB)
+   and weight-scale (SFA) copies; `griddepcontrol_wait()`; the activation (B)
+   and activation-scale (SFB) copies of the same stages, against the same
+   barriers; then the tile's remaining k-blocks as the loop issues them. Each
+   acquire arms the stage's full barrier with the whole stage's bytes, so the
+   MMA warp reads a stage only once its activation has landed too. The tile
+   loop itself is unchanged and serves the CTA's later tiles.
+
+A kernel built without the argument (`fso_weights_first=False`, the default)
+generates exactly the code it generated before; `_sm100_decode` builds the
+weights-first variant whenever PDL is on and today's kernel when
+`FSO_DISABLE_PDL=1`. The loads are only reordered, so the output bytes are the
+same either way (test_dense_v1, cases q and x).
+
 `TRIM.diff` is the diff of the three files against the wheel's (the trims
 above and these additions together); the first column of `MANIFEST.md5` is
 the md5 of the files as they are here.
@@ -221,9 +257,10 @@ the md5 of the files as they are here.
 
 There is no build step and no patch queue: the files are the unit of vendoring.
 To refresh them, extract the same three paths from a newer `flashinfer-python`
-wheel, re-apply the three trims, the fso epilogue additions and the split-K
-changes above (`TRIM.diff` holds all of them; the trims are one contiguous hunk
-each, the additions are the `fso-epilogue` and `fso-p5` sites), update the version, date and md5 table
+wheel, re-apply the three trims, the fso epilogue additions, the split-K
+changes and the weights-first variant above (`TRIM.diff` holds all of them; the
+trims are one contiguous hunk each, the additions are the `fso-epilogue`,
+`fso-p5` and `fso-pdl` sites), update the version, date and md5 table
 here and in `MANIFEST.md5`, regenerate `TRIM.diff`, and re-run
 `tests/gemm/unit/test_mxfp8_decode_sm100.py`, case q of
 `tests/gemm/unit/test_dense_v1.py` and the decode band of

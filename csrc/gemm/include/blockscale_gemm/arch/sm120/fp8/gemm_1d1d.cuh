@@ -249,6 +249,19 @@ struct SM120DenseQuantBuilder : SM120DenseEpiBuilder<KT_>
     static constexpr bool kDenseQuantOut = true;
 };
 
+// The ring mainloop (issue #12 F5B): a builder that defines kRingMainloop = true selects it (the sm_120 MXFP8 builder
+// does for a dense instance whose A/B stage count does not divide the scale span, mxfp8/utils.cuh); every other builder,
+// the 1x128 block-FP8 one included, keeps the original loop and its machine code. See SM120BlockScaledKernel::mma.
+template <class KT, class = void>
+struct KtRingMainloop : std::false_type
+{
+};
+
+template <class KT>
+struct KtRingMainloop<KT, std::void_t<decltype(KT::kRingMainloop)>> : std::integral_constant<bool, KT::kRingMainloop>
+{
+};
+
 template <class KT, class = void>
 struct KtDenseQuantOut : std::false_type
 {
@@ -348,6 +361,14 @@ struct SM120BlockScaledKernel
     static constexpr int kPreWaitBStages = KT::kGroupedLayoutSmem ? 1 : 0;
     static_assert(kPreWaitBStages >= 0 && kPreWaitBStages <= KT::AB_Stages,
         "the pre-wait B copies belong to the first round of AB_Stages stages");
+    // The ring mainloop (issue #12 F5B; see mma() and load_ab()): dense instances whose A/B stage count does not divide
+    // the scale span. Their A/B stages form a ring of any depth, and their k-tile count is not padded to the ring.
+    static constexpr bool kRingMainloop = KtRingMainloop<KT>::value;
+    static_assert(!kRingMainloop
+            || (!KT::kGroupedLayoutSmem && !KT::kSeparateSmemD && !FusedSwiGLUEpi && !ScatterCombineEpi && !CompactActs),
+        "the ring mainloop serves the dense instances only (no grouped scheduler, no fused epilogue)");
+    // The k-tile count's alignment: the original loop runs whole rounds of AB_Stages stages, the ring the real count.
+    static constexpr int32_t kKTileAlign = kRingMainloop ? 1 : KT::AB_Stages;
 
     // A math thread hands a shared-memory stage (A/B or SFA/SFB) back to the TMA producer
     // once it has issued its shared-to-register copies of that stage. Those copies
@@ -764,6 +785,9 @@ struct SM120BlockScaledKernel
     // copy before the PDL wait, so the first round issues only their A copy.
     // `act_row0` is the compact layout's first activation row of the tile's expert
     // (unused otherwise); the weights B keep the expert as their batch index.
+    // kRingMainloop instances keep the ring position (the stage the tile's first k-tile goes to) in the bits of
+    // `phase` above its parity bit 0, advanced past the tile's last k-tile on return, so that the CTA's next tile
+    // continues the ring there (see mma()).
     template <class BlkCoord>
     CUTE_DEVICE static void load_ab(Params const& params, SharedStorage& shared_storage, BlkCoord const& blk_coord,
         int32_t k_tile_count, uint32_t& phase, uint32_t& store_phase, bool first_tile = false, int act_row0 = 0)
@@ -876,6 +900,32 @@ struct SM120BlockScaledKernel
                 phase ^= 1; // flip phase
                 k_tile_idx = KT::AB_Stages;
             }
+        }
+        if constexpr (kRingMainloop)
+        {
+            // The ring: k-tile i goes to the stage after k-tile i - 1's, wrapping at AB_Stages, and the parity flips
+            // on every wrap. The tile's k-tiles are not padded to the ring, so a tile may end anywhere in it.
+            int stage = static_cast<int>(phase >> 1);
+            uint32_t parity = phase & 1u;
+            for (; k_tile_idx < k_tile_count; ++k_tile_idx)
+            {
+                ab_empty_mbar[stage].wait(parity);
+                auto& ab_full_barrier = ab_full_mbar[stage];
+                auto tma_copy_a
+                    = params.tma_load_a.with(*recast_ptr<typename KT::ProducerBarrierType>(&ab_full_barrier));
+                cute::copy(tma_copy_a, tAgA(_, _, _, k_tile_idx), tAsA(_, _, _, stage));
+                auto tma_copy_b
+                    = params.tma_load_b.with(*recast_ptr<typename KT::ProducerBarrierType>(&ab_full_barrier));
+                cute::copy(tma_copy_b, tBgB(_, _, _, k_tile_idx), tBsB(_, _, _, stage));
+                ab_full_barrier.arrive_and_expect_tx(KT::TmaABTransactionBytes);
+                stage = (stage + 1 == KT::AB_Stages) ? 0 : stage + 1;
+                if (stage == 0)
+                {
+                    parity ^= 1u;
+                }
+            }
+            phase = (static_cast<uint32_t>(stage) << 1) | parity;
+            return;
         }
         for (; k_tile_idx < k_tile_count; k_tile_idx += KT::AB_Stages)
         {
@@ -1075,11 +1125,129 @@ struct SM120BlockScaledKernel
         auto& sf_empty_mbar = cute::get<3>(mbarriers);
         auto& store_full_mbar = cute::get<4>(mbarriers);
         auto& store_empty_mbar = cute::get<5>(mbarriers);
-        for (int32_t sf_tile_idx = 0; sf_tile_idx < sf_tile_count - 1; ++sf_tile_idx)
+        if constexpr (kRingMainloop)
         {
+            // The ring mainloop (issue #12 F5B): the original loop's order of work -- per scale span (KT::
+            // kNumTileKPerSF k-tiles) the span's scale words, then per k-tile: wait for its stage, copy the whole
+            // k-tile's A/B fragments, release the stage (release_stage, the issue #11 proxy fence and the arrive),
+            // then the k-tile's MMAs -- on A/B stages that form a ring of any depth: k-tile i uses the stage after
+            // k-tile i - 1's, so AB_Stages need not divide the span (3 stages fit the 64- to 128-row tiles with
+            // 128-wide K-tiles in the 99 KB of shared memory where 4 do not). The MMAs, their operands and their
+            // order are the original loop's, so the bytes are those of the same tile with 2 or 4 stages. k_tile_count
+            // is the real k-tile count (not padded to the ring), so the last span holds 1 to kNumTileKPerSF k-tiles
+            // and a tile may end anywhere in the ring. `ab_phase` carries the ring position to the CTA's next tile in
+            // its bits above the parity bit 0 (as load_ab's `phase` does on the producer side).
+            static_assert(KT::kNumTileKPerSF == 4, "the last span's k-tile count is dispatched over 1..4");
+            int stage = static_cast<int>(ab_phase >> 1);
+            uint32_t ab_parity = ab_phase & 1u;
+            [[maybe_unused]] bool first_span = true;
+            auto run_span = [&](auto num_k_tiles, bool last_span)
+            {
+                constexpr int NT = decltype(num_k_tiles)::value;
+                sf_full_mbar[0].wait(sf_phase);
+#if defined(FSO_PROLOGUE_TRACE)
+                if (first_span && thread_idx == 0)
+                {
+                    prologue_trace::put(trc_first_tile, prologue_trace::kFirstOperands);
+                    if (trc_cta_first != nullptr)
+                    {
+                        trc_cta_first[17] = prologue_trace::gtimer();
+                    }
+                }
+                first_span = false;
+#endif
+                cute::copy(s2r_copy_SFA, tXsSFA(_, _, _, Int<0>{}), tXrSFA);
+                cute::copy(s2r_copy_SFB, tXsSFB(_, _, _, Int<0>{}), tXrSFB);
+                release_stage(sf_empty_mbar[0]);
+                sf_phase ^= 1;
+                cute::for_each(cute::make_int_sequence<NT>{},
+                    [&](auto t)
+                    {
+                        constexpr int tv = decltype(t)::value;
+                        ab_full_mbar[stage].wait(ab_parity);
+                        cute::copy(s2r_copy_A, tXsA(_, _, _, stage), tXrA);
+                        cute::copy(s2r_copy_B, tXsB(_, _, _, stage), tXrB);
+                        release_stage(ab_empty_mbar[stage]);
+                        stage = (stage + 1 == KT::AB_Stages) ? 0 : stage + 1;
+                        if (stage == 0)
+                        {
+                            ab_parity ^= 1u;
+                        }
+                        if (last_span && tv == NT - 1)
+                        {
+                            // wait for all threads to finish loading (the epilogue's staging tile aliases the stages)
+                            cutlass::arch::NamedBarrier::sync(KT::kNumMathThreads, 0);
+                        }
+                        cute::gemm(mma, make_zip_tensor(tCrA, tCrSFA_frg(_, _, _, Int<tv>{})),
+                            make_zip_tensor(tCrB, tCrSFB_frg(_, _, _, Int<tv>{})), accum);
+                    });
+            };
+            for (int32_t span = 0; span < sf_tile_count - 1; ++span)
+            {
+                run_span(Int<4>{}, false);
+            }
+            int32_t const last_span_k_tiles = k_tile_count - 4 * (sf_tile_count - 1);
+            if (last_span_k_tiles == 4)
+            {
+                run_span(Int<4>{}, true);
+            }
+            else if (last_span_k_tiles == 3)
+            {
+                run_span(Int<3>{}, true);
+            }
+            else if (last_span_k_tiles == 2)
+            {
+                run_span(Int<2>{}, true);
+            }
+            else
+            {
+                run_span(Int<1>{}, true);
+            }
+            ab_phase = (static_cast<uint32_t>(stage) << 1) | ab_parity;
+        }
+        else
+        {
+            for (int32_t sf_tile_idx = 0; sf_tile_idx < sf_tile_count - 1; ++sf_tile_idx)
+            {
+                sf_full_mbar[0].wait(sf_phase);
+#if defined(FSO_PROLOGUE_TRACE)
+                if (sf_tile_idx == 0 && thread_idx == 0)
+                {
+                    prologue_trace::put(trc_first_tile, prologue_trace::kFirstOperands);
+                    if (trc_cta_first != nullptr)
+                    {
+                        trc_cta_first[17] = prologue_trace::gtimer();
+                    }
+                }
+#endif
+                cute::copy(s2r_copy_SFA, tXsSFA(_, _, _, Int<0>{}), tXrSFA);
+                cute::copy(s2r_copy_SFB, tXsSFB(_, _, _, Int<0>{}), tXrSFB);
+                release_stage(sf_empty_mbar[0]);
+
+                cute::for_each(cute::make_int_sequence<KT::kNumStagePerSF>{},
+                    [&](auto iter)
+                    {
+                        cute::for_each(cute::make_int_sequence<KT::AB_Stages>{},
+                            [&](auto read_stage)
+                            {
+                                ab_full_mbar[read_stage].wait(ab_phase);
+                                cute::copy(s2r_copy_A, tXsA(_, _, _, read_stage), tXrA);
+                                cute::copy(s2r_copy_B, tXsB(_, _, _, read_stage), tXrB);
+                                release_stage(ab_empty_mbar[read_stage]);
+
+                                auto tCrSFA_stage = tCrSFA_frg(_, _, _, iter * KT::AB_Stages + read_stage);
+                                auto tCrSFB_stage = tCrSFB_frg(_, _, _, iter * KT::AB_Stages + read_stage);
+                                cute::gemm(
+                                    mma, make_zip_tensor(tCrA, tCrSFA_stage), make_zip_tensor(tCrB, tCrSFB_stage), accum);
+                            });
+                        ab_phase ^= 1; // flip phase
+                    });
+                sf_phase ^= 1;         // flip phase
+            }
+
             sf_full_mbar[0].wait(sf_phase);
 #if defined(FSO_PROLOGUE_TRACE)
-            if (sf_tile_idx == 0 && thread_idx == 0)
+            if (sf_tile_count == 1 && thread_idx == 0)
             {
                 prologue_trace::put(trc_first_tile, prologue_trace::kFirstOperands);
                 if (trc_cta_first != nullptr)
@@ -1092,92 +1260,57 @@ struct SM120BlockScaledKernel
             cute::copy(s2r_copy_SFB, tXsSFB(_, _, _, Int<0>{}), tXrSFB);
             release_stage(sf_empty_mbar[0]);
 
-            cute::for_each(cute::make_int_sequence<KT::kNumStagePerSF>{},
-                [&](auto iter)
-                {
-                    cute::for_each(cute::make_int_sequence<KT::AB_Stages>{},
-                        [&](auto read_stage)
-                        {
-                            ab_full_mbar[read_stage].wait(ab_phase);
-                            cute::copy(s2r_copy_A, tXsA(_, _, _, read_stage), tXrA);
-                            cute::copy(s2r_copy_B, tXsB(_, _, _, read_stage), tXrB);
-                            release_stage(ab_empty_mbar[read_stage]);
-
-                            auto tCrSFA_stage = tCrSFA_frg(_, _, _, iter * KT::AB_Stages + read_stage);
-                            auto tCrSFB_stage = tCrSFB_frg(_, _, _, iter * KT::AB_Stages + read_stage);
-                            cute::gemm(
-                                mma, make_zip_tensor(tCrA, tCrSFA_stage), make_zip_tensor(tCrB, tCrSFB_stage), accum);
-                        });
-                    ab_phase ^= 1; // flip phase
-                });
-            sf_phase ^= 1;         // flip phase
-        }
-
-        sf_full_mbar[0].wait(sf_phase);
-#if defined(FSO_PROLOGUE_TRACE)
-        if (sf_tile_count == 1 && thread_idx == 0)
-        {
-            prologue_trace::put(trc_first_tile, prologue_trace::kFirstOperands);
-            if (trc_cta_first != nullptr)
+            // Last SF span. k_tile_count is aligned to AB_Stages (NOT to the
+            // 4-k-tile SF span), so on short-K shapes (e.g. K=768 with
+            // Stages=2: 6 real k-tiles) the final span consumes only
+            // last_batches * AB_Stages of its 4 slices instead of padding to a
+            // full span of zero-fill iterations. Dense shapes (every K a
+            // multiple of 512) always take the full-span branch bit-for-bit.
+            int32_t const last_batches
+                = (k_tile_count - KT::kNumTileKPerSF * (sf_tile_count - 1) + KT::AB_Stages - 1) / KT::AB_Stages;
+            auto run_last_span = [&](auto num_batches)
             {
-                trc_cta_first[17] = prologue_trace::gtimer();
-            }
-        }
-#endif
-        cute::copy(s2r_copy_SFA, tXsSFA(_, _, _, Int<0>{}), tXrSFA);
-        cute::copy(s2r_copy_SFB, tXsSFB(_, _, _, Int<0>{}), tXrSFB);
-        release_stage(sf_empty_mbar[0]);
-
-        // Last SF span. k_tile_count is aligned to AB_Stages (NOT to the
-        // 4-k-tile SF span), so on short-K shapes (e.g. K=768 with
-        // Stages=2: 6 real k-tiles) the final span consumes only
-        // last_batches * AB_Stages of its 4 slices instead of padding to a
-        // full span of zero-fill iterations. Dense shapes (every K a
-        // multiple of 512) always take the full-span branch bit-for-bit.
-        int32_t const last_batches
-            = (k_tile_count - KT::kNumTileKPerSF * (sf_tile_count - 1) + KT::AB_Stages - 1) / KT::AB_Stages;
-        auto run_last_span = [&](auto num_batches)
-        {
-            cute::for_each(cute::make_int_sequence<decltype(num_batches)::value>{},
-                [&](auto iter)
-                {
-                    cute::for_each(cute::make_int_sequence<KT::AB_Stages>{},
-                        [&](auto read_stage)
-                        {
-                            ab_full_mbar[read_stage].wait(ab_phase);
-                            cute::copy(s2r_copy_A, tXsA(_, _, _, read_stage), tXrA);
-                            cute::copy(s2r_copy_B, tXsB(_, _, _, read_stage), tXrB);
-                            release_stage(ab_empty_mbar[read_stage]);
-                            if constexpr (iter == decltype(num_batches)::value - 1
-                                && read_stage == KT::AB_Stages - 1)
+                cute::for_each(cute::make_int_sequence<decltype(num_batches)::value>{},
+                    [&](auto iter)
+                    {
+                        cute::for_each(cute::make_int_sequence<KT::AB_Stages>{},
+                            [&](auto read_stage)
                             {
-                                cutlass::arch::NamedBarrier::sync(
-                                    KT::kNumMathThreads, 0); // wait for all threads to finish loading
-                            }
-                            auto tCrSFA_stage = tCrSFA_frg(_, _, _, iter * KT::AB_Stages + read_stage);
-                            auto tCrSFB_stage = tCrSFB_frg(_, _, _, iter * KT::AB_Stages + read_stage);
-                            cute::gemm(
-                                mma, make_zip_tensor(tCrA, tCrSFA_stage), make_zip_tensor(tCrB, tCrSFB_stage), accum);
-                        });
-                    ab_phase ^= 1; // flip phase
-                });
-        };
-        if constexpr (KT::kNumStagePerSF == 1)
-        {
-            run_last_span(cute::Int<1>{});
-        }
-        else
-        {
-            if (last_batches == KT::kNumStagePerSF)
-            {
-                run_last_span(cute::Int<KT::kNumStagePerSF>{});
-            }
-            else
+                                ab_full_mbar[read_stage].wait(ab_phase);
+                                cute::copy(s2r_copy_A, tXsA(_, _, _, read_stage), tXrA);
+                                cute::copy(s2r_copy_B, tXsB(_, _, _, read_stage), tXrB);
+                                release_stage(ab_empty_mbar[read_stage]);
+                                if constexpr (iter == decltype(num_batches)::value - 1
+                                    && read_stage == KT::AB_Stages - 1)
+                                {
+                                    cutlass::arch::NamedBarrier::sync(
+                                        KT::kNumMathThreads, 0); // wait for all threads to finish loading
+                                }
+                                auto tCrSFA_stage = tCrSFA_frg(_, _, _, iter * KT::AB_Stages + read_stage);
+                                auto tCrSFB_stage = tCrSFB_frg(_, _, _, iter * KT::AB_Stages + read_stage);
+                                cute::gemm(
+                                    mma, make_zip_tensor(tCrA, tCrSFA_stage), make_zip_tensor(tCrB, tCrSFB_stage), accum);
+                            });
+                        ab_phase ^= 1; // flip phase
+                    });
+            };
+            if constexpr (KT::kNumStagePerSF == 1)
             {
                 run_last_span(cute::Int<1>{});
             }
+            else
+            {
+                if (last_batches == KT::kNumStagePerSF)
+                {
+                    run_last_span(cute::Int<KT::kNumStagePerSF>{});
+                }
+                else
+                {
+                    run_last_span(cute::Int<1>{});
+                }
+            }
+            sf_phase ^= 1;         // flip phase
         }
-        sf_phase ^= 1;         // flip phase
 #if defined(FSO_PROLOGUE_TRACE)
         if (thread_idx == 0)
         {
@@ -1661,7 +1794,8 @@ struct SM120BlockScaledKernel
         // without re-running the dense tables on every arch that instantiates
         // this template.
         int32_t const k_real_tiles = (K + KT::kTileK - 1) / KT::kTileK;
-        int32_t const k_tile_count = (k_real_tiles + KT::AB_Stages - 1) / KT::AB_Stages * KT::AB_Stages;
+        // The ring mainloop takes the real k-tile count (issue #12 F5B; see mma()): kKTileAlign is 1 there.
+        int32_t const k_tile_count = (k_real_tiles + kKTileAlign - 1) / kKTileAlign * kKTileAlign;
         int32_t const sf_tile_count = (k_tile_count + KT::kNumTileKPerSF - 1) / KT::kNumTileKPerSF;
 
         // Stage grouped_layout into shared memory as an INCLUSIVE per-group

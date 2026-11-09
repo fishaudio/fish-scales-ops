@@ -4,17 +4,24 @@ Every ``linear_mxfp8`` call on Blackwell datacenter (SM100/SM103) enters
 here. The tiers, in order:
 
 0. **Swap-AB kernels** (see :mod:`._sm100_decode`) — the M ≤ 64 decode band
-   and the narrow-N long-K band above it. Two vendored NVIDIA/FlashInfer
-   CuTe-DSL kernels in swap-AB orientation with an 8/16/32-wide token tile up
-   to M = 32 — an in-cluster split-K kernel for narrow-N shapes and the plain
-   persistent kernel for wide-N shapes — and, from M = 33 to 64, the
-   persistent kernel with a 64-wide token tile and the 2-CTA 256-row weight
-   tile in a cluster of two; the long-K narrow-N cells of that upper band stay
-   with the C++ cascade. Above M = 64 the row takes the narrow-N (N ≤ 4096)
-   long-K (K ≥ 4096) cells up to where tier 1's grid fills the machine: the
-   split-K kernel with 64-wide token tiles where its clusters fit one wave,
-   the persistent 2-CTA form where they do not, outside the cascade's
-   two-kernel split-K and wave-tile rules (issue #12, P5).
+   and the narrow-N long-K and short-K bands above it. Two vendored
+   NVIDIA/FlashInfer CuTe-DSL kernels in swap-AB orientation with an
+   8/16/32-wide token tile up to M = 32 — an in-cluster split-K kernel for
+   narrow-N shapes and the plain persistent kernel for wide-N shapes — and,
+   from M = 33 to 64, the split-K kernel with a 64-wide token tile on the
+   narrow-N cells with 4096 ≤ K < 8192 and elsewhere the persistent kernel
+   with a 64-wide token tile and the 2-CTA 256-row weight tile in a cluster of
+   two; the K ≥ 8192 narrow-N cells of that upper band stay with the C++
+   cascade. Above M = 64 the row takes the narrow-N (N ≤ 4096) long-K
+   (K ≥ 4096) cells up to where tier 1's grid fills the machine: the split-K
+   kernel with 64-wide token tiles where its clusters fit one wave, the
+   persistent 2-CTA form where they do not, outside the cascade's two-kernel
+   split-K and wave-tile rules (issue #12, P5); and the narrow-N short-K
+   (1024 ≤ K ≤ 2560) cells while the same split-K form, in two slices, has at
+   most 80 CTAs (FB2). On short-K cells it does not own by shape it also takes
+   two kinds of call on the 1-SM persistent 128 x 64 form while that grid fits
+   one wave (FB2): the identity call of a wide-N cell, and the erf-GELU call
+   where the cascade's short-K rule would leave its 64-wide tile.
    This row exists only when the installed
    ``nvidia-cutlass-dsl`` is at least 4.5.0; below that it is inert and the
    three tiers below behave exactly as they did before it was added.
@@ -60,7 +67,12 @@ persistent form first, while its clusters fit one wave), so the feature is
 never absent and never refused for want of a kernel — the C++ cascade, the
 last tier, serves everything, the quantized output of ``linear_quantized``
 included (issue #12 S3b); no other tier writes the quantized output, so every
-``linear_quantized`` call lands on the cascade.
+``linear_quantized`` call lands on the cascade. The fields also pick the
+route on two kinds of short-K cell (FB2): the swap-AB row takes the identity
+call of a wide-N cell above the decode band and the erf-GELU call where the
+cascade's short-K tile rule would leave its 64-wide tile, while their bias
+and residual calls keep the tier the shape gives them (a bias call measured
+slower on the row's form, whose epilogue adds the bias element by element).
 :func:`route` runs the call on the tier it lands on; :func:`plan` names that
 tier for a shape and an epilogue without running anything, so a caller that
 launches work before the GEMM (the activation quantize of
@@ -94,17 +106,25 @@ def _candidates(m: int, n: int, k: int, epilogue: Optional[_epilogue.Epilogue]) 
     configuration its picker chose (None for tier 1, which has no configuration). The C++ cascade is not yielded:
     it is the fall-through when the iterator is exhausted. Host-only: the pickers and the availability probes run,
     nothing on the device."""
-    # Swap-AB row: the decode band M <= 64 and the narrow-N long-K band above
-    # it. It is asked first because every tier below loses those cells — tier
-    # 1 and tier 2 cannot narrow their N tile below 128 and tier 3 answers a
-    # narrow-N decode cell with two serialised launches or, from M = 33, with a
-    # 256-row token tile that is three quarters empty; above M = 64 on narrow
-    # N with long K every tier below runs 10-64 CTAs over the whole K.
+    # Swap-AB row: the decode band M <= 64 and the narrow-N long-K and short-K
+    # bands above it. It is asked first because every tier below loses those
+    # cells — tier 1 and tier 2 cannot narrow their N tile below 128 and tier 3
+    # answers a narrow-N decode cell with two serialised launches or, from
+    # M = 33, with a 256-row token tile that is three quarters empty; above
+    # M = 64 on narrow N every tier below runs 10-64 CTAs over the whole K.
     # ``pick_config`` returns None for every cell it does not own, so the tiers
     # below are reached exactly as before on those.
     from . import _sm100_decode
     if _serves(DECODE, epilogue):
         cfg = _sm100_decode.pick_config(m, n, k)
+        if cfg is None:
+            # Calls the row takes on short-K cells it does not own by shape (FB2): the identity call of a wide-N
+            # cell while the row's 1-SM persistent grid fits one wave, and an erf-GELU call where the cascade's
+            # short-K rule would leave its 64-wide tile; the bias and residual calls of those cells keep their tier.
+            if epilogue is None:
+                cfg = _sm100_decode.pick_identity_config(m, n, k)
+            elif epilogue.activation is not None:
+                cfg = _sm100_decode.pick_activation_config(m, n, k)
         if cfg is not None and _sm100_decode.enabled() and \
                 (epilogue is None or _sm100_decode.epilogue_available()):
             yield DECODE, cfg

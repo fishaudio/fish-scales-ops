@@ -42,9 +42,13 @@ The cases, each run where the hardware exists and skipped with a message elsewhe
 
   The sm_90 dense epilogue (charter section 10), each case sm_90 only:
   g.  order-free exact accumulator on every route of gemm_dispatch_sm90 (swap-AB at M = 1, 7, 32 and, above M = 32,
-      on four cells of 32 < M < 64, eight of 64 < M <= 96 and seven of 96 < M <= 100 / 128 < M <= 160 (one- and
+      on four cells of 32 < M < 64, eight of 64 < M <= 96 and five of 96 < M <= 100 / 128 < M <= 160 (one- and
       two-wave launches) where the dispatcher takes it (the kernel name must show the rule's tile) and four plus six
-      plus eight neighbours it keeps on the main path; DeepGEMM v2's
+      plus eight neighbours it keeps on the main path; in the default mode, FH1's routes and neighbours: DeepGEMM v2's
+      tiles of use_dense_v2_override, single and paired over M or N, the two swap-AB bands with three token tiles and
+      swap-AB's 64-row weight tiles at 8 <= M <= 32, the kernel name showing the tile and the cluster, among them two
+      former swap-AB cells of 128 < M <= 160 (9728 x
+      2560 at M = 144, 12288 x 2048 at M = 152), which now take the v2 kernel's pair over M; DeepGEMM v2's
       kernel and fp8_gemm_kernel at M = 78, 129, 1079, forced in child processes with FSO_SM90_DENSE_DG2=all and =0;
       the default mode in this process; at M = 78 the three N = 1280 shapes take swap-AB in every mode, and at
       M = 129 1280x5120 and 1280x7680 do),
@@ -161,8 +165,17 @@ The cases, each run where the hardware exists and skipped with a message elsewhe
       (identity, bias, residual, bias + GELU, linear_quantized) runs the tile a test-local mirror of the rule names
       (checked on the MMA atom of the kernel that ran) and plan() names the tier it ran on; the -0.0 corner;
       capture on a non-default stream; two-stream concurrent replay (200 x) of two short-K tiles.
-      FSO_DISABLE_PDL=1 (children) gives the digests of the decode, smm, wide and shortk families. `--case q` runs
-      this case alone.
+      fb2 (the B300 swap-AB route rules): section-10 exactness, both entry paths, every call checked for the tier it
+      ran on, on the cells of each rule: the narrow-N long-K class at 32 < M <= 64 on the split-K form with the
+      64-wide token tile (1280 x 5120 in four slices, 2048 / 2560 x 4096 in two); the narrow-N short-K band (two
+      slices while the split-K grid has at most 80 CTAs: 1280 x 1280 at M = 65 / 129 / 256, 2048 x 1280 at 117,
+      1024 x 2048 at 320, 2560 x 2048 at 96, 2048 x 2048 at 80); the identity call of wide-N short-K cells on the
+      1-SM persistent 128 x 64 form, their bias / residual calls on the tier they had; the erf-GELU calls the row
+      takes where the cascade's short-K rule would leave its 64-wide tile; each rule's picker against the tactic and
+      on the cells one step outside it; linear_quantized planned on the cascade; the -0.0 corner; capture on a
+      non-default stream (both entries); four captured calls replayed concurrently on four streams (200 x).
+      FSO_DISABLE_PDL=1 (children) gives the digests of the decode, smm, wide, shortk and fb2 families. `--case q`
+      runs this case alone.
 
   The sm_120/sm_121 quantized output, fso.dense.linear_quantized (S3c), sm_120/sm_121 only:
   r.  sm_120/sm_121, linear_quantized on every route of the MXFP8 cascade, each in its own subprocess (the natural
@@ -189,12 +202,17 @@ The cases, each run where the hardware exists and skipped with a message elsewhe
       the bf16 call and no quantize kernel; capture on a non-default stream (replay into a clobbered output ==
       eager); FSO_DISABLE_PDL=1 gives the same digests; two different split-K quantized calls captured on two
       streams and replayed concurrently 200 times; torch.compile(fullgraph=True) keeps one dense_linear_quantized
-      node; the real op's output metadata equals its fake's. natural: on the card's own routing, on cells whose
-      bf16 call takes the decode row (its narrow-N long-K band above M = 64 and that band's fall-through from
-      tier 1 included, P5), tier 1 or tier 2, the quantized call is planned on and runs on the cascade
-      (no other tier's kernel) and equals quantize_activation of the bf16 cascade call (linear_mxfp8_raw) from both
-      entries; the codes that differ from quantize_activation(linear(...)) on the bf16 call's own route are
-      counted and printed. sm_120/sm_121 (the small-M route of case w does not write the quantized output, so
+      node; the real op's output metadata equals its fake's. On every forced TMA tile narrower than 256 the
+      erf-GELU calls run the epilogue in two warpgroups and the identity / bias calls in one; the 256-wide and
+      direct-store tiles run one for every call (FB3). mwg (FB3): the two-warpgroup kernels of the cascade's own
+      picks at fc1 M = 533 / 1079 and proj1 M = 533, each erf-GELU call captured and replayed 200 times
+      bit-identically, two of them replayed concurrently on two streams 200 times.
+      natural: on the card's own routing, on cells whose bf16 call takes the decode row (its narrow-N long-K band above
+      M = 64 and that band's fall-through from tier 1 included, P5), tier 1 or tier 2, the quantized call is planned on
+      and runs on the cascade (no other tier's kernel) and equals quantize_activation of the bf16 cascade call
+      (linear_mxfp8_raw) from both entries; the codes that differ from quantize_activation(linear(...)) on the bf16
+      call's own route are counted and printed.
+      sm_120/sm_121 (the small-M route of case w does not write the quantized output, so
       linear_quantized runs on the cascade while the bf16 call of a routed decode-band cell runs on the small-M
       route): two subprocesses on the same cells and data, FSO_SMALLM_ROUTE=0 and the rules, on the issue's TP2 qkv /
       o shards across the decode band, the tower shapes at decode M and K = 9728 at M <= 8 (a Stream-K cascade): the
@@ -204,7 +222,41 @@ The cases, each run where the hardware exists and skipped with a message elsewhe
       the small-M route are counted and printed. (b) and (f) treat linear_quantized as served where the route of the
       call applies it. `--case s` runs this case alone.
 
-usage: python tests/gemm/unit/test_dense_v1.py [--case a|b|c|d|e|f|g|o|w|p|q|r|s]
+  t.  sm_90 only (FH5): the in-cluster split-K route (fp8_gemm_kernel_swapAB_splitk) of the decode band. The cells
+      the rule takes run the split-K kernel at the slice count and token tile the dispatcher's rule gives (the mirror
+      _sm90_splitk, with the H200's occupancy at one and at two CTAs per SM), their neighbours past each K class's band
+      edge and past 66 weight tiles do not; on the rule's cells every epilogue variant and the identity give section
+      10's bytes (exact integer accumulators) from the bf16-x call and the 2b call, bias = 0 gives the bytes of
+      bias = None with the -0.0 corner; on random data the bf16-x call equals the 2b call and 20 repeated calls give
+      the same bytes; child processes compare the route with the route off (FSO_SM90_DENSE_SPLITK=0: the share of
+      elements that differ and the largest difference in bf16 ulps are printed) and the one-slice kernel
+      (FSO_SM90_SPLITK_S=1) with the swap-AB route (bit for bit), and run section 10 on forced cells with 2, 3 and 4
+      slices (token tiles up to 64, an N that is not a multiple of 64). Cases h, i, j and m carry split-K cells too
+      (capture on a side stream, PDL off == on, two streams, and a producer that writes bias / residual, or the weight
+      and its scale, 2 ms after releasing its dependents). `--case t` runs this case alone. Since FH7 the two-warp-group
+      route (case u) is asked first, so M = 57-64 at K >= 8192 leaves this route where that one takes it.
+  u.  sm_90 only (FH7): the two-warp-group split-K route (fp8_gemm_kernel_swapAB_splitk2) above the decode band,
+      56 < M <= 128 and K >= 4096. The cells the rule takes run the kernel at the layout (64-row weight tiles split by
+      tokens, or 128-row tiles split by weight rows), token tile and slice count the dispatcher's rule gives (the mirror
+      _sm90_splitk2, with the H200's cluster occupancy), their neighbours do not; on the rule's cells every epilogue
+      variant and the identity give section 10's bytes from both entries, bias = 0 gives the bytes of bias = None; on
+      random data the bf16-x call equals the 2b call and 20 repeated calls give the same bytes; child processes compare
+      the route with the route off (FSO_SM90_DENSE_SPLITK=0: the share of elements that differ, the largest difference
+      in bf16 ulps and against the output's largest value, which must stay below 2^-6) and with one slice
+      (FSO_SM90_SPLITK_S=1: bit for bit the bytes of the route off, which sums the K blocks in the same order), and
+      run section 10 at forced slice counts 2, 3 and 4. `--case u` runs this case alone.
+
+  The weight handle and the weights-first GEMMs (issue #12, FB1), sm_100/sm_103 only:
+  x.  prepare_weight -> linear back to back, both entries, behind a producer that releases its dependents at once and
+      finishes 2 ms later: equal to the synchronized call (prepare_weight ends with a plain launch). A weight written
+      by the kernel launched right before a pre-quantized call: on the decode row with weights first it is read before
+      it is complete (the control: the call differs), on every other route after (the guard: the call is equal).
+      prepare_weight with its plain launch dropped: the differing calls are counted (data). A captured graph whose
+      weight bytes are rewritten in place (memcpy, gather kernel) and replayed equals the eager call on the new
+      weight. fso.compat.linear_fp8 packing FP32 scales inside the call equals the call on pre-packed scales.
+      `--case x` runs this case alone.
+
+usage: python tests/gemm/unit/test_dense_v1.py [--case a|b|c|d|e|f|g|o|w|p|q|r|s|t|u|x]
 """
 import os
 import re
@@ -964,7 +1016,9 @@ def case_f(major: int) -> None:
 # The routes of gemm_dispatch_sm90 and how a call reaches each: M < 32 (or M = 32 with N < 16384) runs the swap-AB
 # fp8_gemm_kernel_swapAB, and so do 32 < M < 64 and 64 < M <= 96 where the main path's tile is empty enough and the
 # swap-AB launch fits one wave, and 96 < M <= 100 and 128 < M <= 160 on the shapes of the H4 rule (one or two waves;
-# deep_gemm::jit::use_dense_swap_ab, mirrored by _sm90_swap_ab below); otherwise
+# deep_gemm::jit::use_dense_swap_ab, mirrored by _sm90_swap_ab below), and in FH1's two bands, 144 < M <= 216 and
+# 256 < M <= 288 (not mirrored: their cells are listed in _SM90_EPI_FH1); in the default mode the tiles of
+# deep_gemm::jit::use_dense_v2_override come next (_SM90_EPI_FH1); otherwise
 # FSO_SM90_DENSE_DG2 decides between DeepGEMM v2's sm90_fp8_gemm_1d2d_impl ("all": every call; default: its tile
 # classes) and fp8_gemm_kernel ("0": every call). The variable is read once per process, so the "0" and "all" passes
 # run in child processes of this script (--sm90-epilogue-mode).
@@ -1049,7 +1103,8 @@ def _sm90_swap_ab_tile(M: int, N: int, sms: int):
 
 
 def _sm90_swap_ab(M: int, N: int, K: int, sms: int) -> bool:
-    """Whether gemm_dispatch_sm90 takes the swap-AB route (mirror of deep_gemm::jit::use_dense_swap_ab)."""
+    """Whether gemm_dispatch_sm90 takes the swap-AB route (mirror of deep_gemm::jit::use_dense_swap_ab, without FH1's
+    bands at 144 < M <= 216 and 256 < M <= 288, whose cells _SM90_EPI_FH1 lists with their route)."""
     if M < 32 or (M == 32 and N < 16384):
         return True
     if M > 96:  # mirror of use_dense_swap_ab_above_96
@@ -1107,6 +1162,52 @@ _SM90_EPI_RULE5 = (
     (5120, 2048, 416, 128, 160, 5), (5120, 2048, 448, 128, 160, 5),
     (2048, 4096, 288, 64, 80, 11), (2048, 4096, 320, 64, 80, 11),
     (2048, 4096, 416, 128, 64, 8), (2048, 4096, 448, 128, 64, 8), (2048, 4096, 576, 128, 80, 7))
+
+
+# FH1 of the issue-12 round (/data/bench-runs/fso_issue12_20261028/runs/FH1), default mode, (N, K, M) -> (route,
+# block_m, block_n, cluster), as the dispatcher computes them (runs/FH1/tmp/finalinc), with FH6's changes: DeepGEMM
+# v2's kernel in one wave where the route needs two or more at M <= 256 (deep_gemm::jit::use_dense_v2_override: the
+# fewest rows, then the narrowest tile, up to M = 128 a width with a compact main loop, since FH6 also 160 but not 96 or 192;
+# 128-row tiles at 128 < M <= 192 paired over M, "c2x1"), its 128 x 160 / 192 tile in a quarter fewer waves for the
+# wide outputs at 256 < M <= 672 (single-CTA and co-scheduled where its clusters of M blocks fit one round, "c1x1",
+# else the pair over N, "c1x2"), its 64 x 128 pair over M for the narrow outputs at 256 < M <= 384 with K >= 4096
+# (not where the route is DeepGEMM's own 64 x 128); fp8_gemm_kernel_swapAB with three token tiles for the
+# narrow outputs at 144 < M <= 216 (64-row weight tiles, K >= 8192, or against fp8_gemm_kernel's tile, or since FH6
+# against a single-CTA v2 tile of four or more M blocks) and the wide outputs at
+# 256 < M <= 288 (128-row weight tiles), and at 8 <= M <= 32 with 64-row weight tiles and one token tile where they fit
+# one wave; and neighbours each rule keeps (cluster None: the kernel class only). Two cells of _SM90_EPI_REROUTE_CELLS
+# move here from swap-AB (9728 x 2560 at M = 144, 12288 x 2048 at M = 152: one wave of the v2 pair instead of two of
+# swap-AB); _sm90_swap_ab does not mirror FH1's bands, so every cell in them is listed here.
+_SM90_EPI_FH1 = {
+    (18432, 2560, 8): ("dg2", 16, 144, "c1x1"), (18432, 2560, 128): ("dg2", 128, 144, "c1x1"),
+    (19456, 2560, 64): ("dg2", 64, 160, "c1x1"),  # FH6: the 160-wide main loop is compact, so the one-wave tile qualifies
+    (9728, 2560, 144): ("dg2", 128, 160, "c2x1"), (12288, 2048, 152): ("dg2", 128, 192, "c2x1"),
+    (9728, 2560, 160): ("dg2", 128, 160, "c2x1"), (10240, 2560, 256): ("dg2", 128, 160, "c1x1"),
+    (2560, 9216, 152): ("swapab", 64, 56, None), (2560, 4096, 216): ("swapab", 64, 72, None),
+    (10240, 2560, 272): ("swapab", 128, 96, None),
+    (18432, 2560, 288): ("dg2", 128, 160, "c1x1"), (18432, 2560, 400): ("dg2", 128, 192, "c1x2"),
+    (2560, 4096, 288): ("dg2", 64, 128, "c2x1"), (2560, 9216, 344): ("dg2", 64, 128, "c2x1"),
+    (2560, 4096, 200): ("swapab", 64, 72, None), (10240, 2560, 296): ("v1", None, None, None),
+    (2560, 4096, 328): ("dg2", 64, 128, "c1x1"),
+    # FH6 (/data/bench-runs/fso_issue12_20261028/runs/FH6): rule 2's tile single-CTA and co-scheduled where its
+    # clusters of M blocks fit one round (18432 x 2560 and 12352 x 2560 at M = 264 / 288: three blocks); the co-scheduled
+    # main-path tile (2560 x 4096 at M = 536, five blocks); the swap-AB band against a v2 main path of four M blocks
+    # (2560 x 4096 at M = 208) and its neighbour of three (M = 152, kept)
+    (12352, 2560, 264): ("dg2", 128, 160, "c1x1"), (2560, 4096, 536): ("dg2", 128, 128, "c1x1"),
+    (2560, 4096, 208): ("swapab", 64, 72, None),
+    # swap-AB at 8 <= M <= 32 with 64-row weight tiles and one token tile up to N = 8448 (get_dense_swap_ab_config);
+    # M < 8 keeps rule 2's 128-row tile
+    (5120, 2048, 16): ("swapab", 64, 16, None), (6144, 2560, 32): ("swapab", 64, 32, None),
+    (6144, 2560, 4): ("swapab", 128, 16, None),
+}
+
+
+def _dg2_cluster_re(bm: int, bn: int, cluster: str) -> str:
+    """A regular expression on the v2 kernel's name for the tile and its cluster: after the stage count come
+    <128, threads, cluster size, multicast on A, ...>; "c2x1" pairs two M blocks (multicast on B), "c1x2" two N
+    blocks (multicast on A), "c1x1" is a single CTA."""
+    size, on_a = {"c1x1": (1, "false"), "c2x1": (2, "false"), "c1x2": (2, "true")}[cluster]
+    return rf"0u, 1u, {bm}u, {bn}u, 128u, 128u, 128u, \d+u, \d+u, 128u, \d+u, {size}u, {on_a}, "
 
 
 def _dg2_tile_re(bm: int, bn: int, stages=None) -> str:
@@ -1299,12 +1400,118 @@ def _kernels_of(fn):
     return out, names
 
 
+# Clusters of 2, 3 and 4 CTAs the occupancy calculator places at once, at one CTA per SM (the split-K kernel requests
+# at least 114 KB of shared memory) and at the kernel's own size where two CTAs fit an SM, by SM count: the H200's 132
+# SMs (FH5 runs/FH5/scripts/occ_probe.py). Elsewhere the route mirror is not exact.
+_SM90_SPLITK_CLUSTERS = {132: {1: {2: 66, 3: 39, 4: 30}, 2: {2: 132, 3: 79, 4: 62}}}
+
+
+def _sm90_splitk_pref(N: int, K: int, sms: int) -> int:
+    """The split-K route's preferred slice count (mirror of deep_gemm::jit::dense_splitk_preferred_slices)."""
+    if not N or not K or K % 128:
+        return 0
+    tiles, kb = -(-N // 64), K // 128
+    for s in (4, 3):
+        if 4 * s * tiles <= 3 * sms and 2 * s <= kb:
+            return s
+    if K > 4096 and 3 * tiles <= sms and 6 <= kb:
+        return 3
+    if 2 * tiles <= sms and 4 <= kb:
+        return 2
+    return 0
+
+
+def _sm90_splitk_max_m(s: int, K: int) -> int:
+    """The largest M the route takes at s slices (mirror of deep_gemm::jit::dense_splitk_max_m)."""
+    if K >= 8192:
+        return 64
+    if K >= 4096:
+        return 56
+    return 40 if (K >= 2048 and s >= 3) else 24
+
+
+def _sm90_splitk(M: int, N: int, K: int, sms: int) -> int:
+    """The slice count of the in-cluster split-K route (fp8_gemm_kernel_swapAB_splitk) for an M x N x K dense GEMM on
+    `sms` SMs, 0 when gemm_dispatch_sm90 does not take the route: the preferred count at one CTA per SM, or at the
+    kernel's own size with a token tile of at most 24 rows, lowered one step while one cluster per 64-row weight tile
+    does not fit at once (the mirror of sm90_dense_splitk_route in dispatch.cuh)."""
+    if M == 0 or M > 64 or K % 128 or N % 8:
+        return 0
+    if _sm90_splitk2(M, N, K, sms) is not None:  # the two-warp-group route is asked first (M = 57-64 at K >= 8192)
+        return 0
+    cap = _SM90_SPLITK_CLUSTERS.get(sms)
+    tiles, tok = -(-N // 64), max(16, -(-M // 8) * 8)
+    s = _sm90_splitk_pref(N, K, sms)
+    while s >= 2:
+        if M > _sm90_splitk_max_m(s, K):
+            return 0
+        if cap is None or tiles <= cap[1][s] or (tok <= 24 and tiles <= cap[2][s]):
+            return s
+        s -= 1
+    return 0
+
+
+def _splitk_re(K: int, M: int, S: int) -> str:
+    """A regular expression on the split-K kernel's name: <SHAPE_K, BLOCK_T = max(16, M rounded up to 8), S, ...>."""
+    return rf"fp8_gemm_kernel_swapAB_splitk<{K}u, {max(16, -(-M // 8) * 8)}u, {S}u, "
+
+
+# Clusters of 2 .. 8 CTAs the occupancy calculator places at once at one CTA per SM, by SM count: the H200's 132 SMs
+# (FH5, FH6 and FH7 of the issue-12 round). Elsewhere the mirror of the two-warp-group route is not exact.
+_SM90_SPLITK2_CLUSTERS = {132: {2: 66, 3: 39, 4: 30, 5: 22, 6: 17, 7: 15, 8: 15}}
+
+
+def _sm90_splitk2(M: int, N: int, K: int, sms: int):
+    """(weight halves, slices, token tile) of the two-warp-group split-K route (fp8_gemm_kernel_swapAB_splitk2) for an
+    M x N x K dense GEMM on `sms` SMs, or None when gemm_dispatch_sm90 does not take it (the mirror of
+    deep_gemm::jit::get_dense_splitk2_config): 56 < M <= 128, K >= 4096; per layout (64-row weight tiles split by tokens,
+    128-row tiles split by weight rows) the largest S <= 8 whose clusters all fit at once, whose grid fits the SMs and
+    whose slices hold at least two K blocks; the layout with more CTAs (token halves on a tie); at least half the SMs;
+    token halves with S >= 5, or S >= 3 and M <= 104; weight halves with K >= 8192 and M <= 104."""
+    if not (56 < M <= 128 and K >= 4096 and K % 128 == 0 and N % 8 == 0):
+        return None
+    cap = _SM90_SPLITK2_CLUSTERS.get(sms)
+    if cap is None:
+        return None
+    best = None
+    for wh in (False, True):
+        tiles = -(-N // (128 if wh else 64))
+        for s in range(8, 1, -1):
+            if cap[s] < tiles or s * tiles > sms or 2 * s > K // 128:
+                continue
+            t = max(16, -(-M // 8) * 8) if wh else max(32, -(-M // 16) * 16)
+            if best is None or s * tiles > best[3]:
+                best = (wh, s, t, s * tiles)
+            break
+    if best is None or 2 * best[3] < sms:
+        return None
+    wh, s, t, _ = best
+    ok = (K >= 8192 and M <= 104) if wh else (s >= 5 or (s >= 3 and M <= 104))
+    return (wh, s, t) if ok else None
+
+
+def _splitk2_re(K: int, cfg) -> str:
+    """A regular expression on the two-warp-group split-K kernel's name: <SHAPE_K, weight halves, BLOCK_T, S, ...>."""
+    wh, s, t = cfg
+    return rf"fp8_gemm_kernel_swapAB_splitk2<{K}u, {'true' if wh else 'false'}, {t}u, {s}u, "
+
+
 def _sm90_route(names) -> str:
-    """The sm_90 dense kernel among `names` and whether it is an epilogue variant: 'dg2', 'v1', 'swapab' (+ '+epi')."""
+    """The sm_90 dense kernel among `names` and whether it is an epilogue variant: 'dg2', 'v1', 'swapab', 'splitk',
+    'splitk2' (+ '+epi')."""
     gemm = [n for n in names if "fp8_gemm_kernel" in n or "sm90_fp8_gemm_1d2d_impl" in n]
     if len(gemm) != 1:
         return f"?{len(gemm)} GEMM kernels"
     n = gemm[0]
+    if "fp8_gemm_kernel_swapAB_splitk2" in n:
+        m = re.search(r"fp8_gemm_kernel_swapAB_splitk2<\d+u, (?:true|false), \d+u, \d+u, \d+u, (true|false), (\d+), "
+                      r"(true|false)>", n)
+        epi = m is not None and (m.group(1) == "true" or m.group(2) != "0" or m.group(3) == "true")
+        return "splitk2" + ("+epi" if epi else "")
+    if "fp8_gemm_kernel_swapAB_splitk" in n:
+        m = re.search(r"fp8_gemm_kernel_swapAB_splitk<\d+u, \d+u, \d+u, \d+u, (true|false), (\d+), (true|false)>", n)
+        epi = m is not None and (m.group(1) == "true" or m.group(2) != "0" or m.group(3) == "true")
+        return "splitk" + ("+epi" if epi else "")
     if "sm90_fp8_gemm_1d2d_impl" in n:
         return "dg2" + ("+epi" if "sm90_fp8_gemm_1d2d_impl_fso_epilogue" in n else "")
     if "fp8_gemm_kernel_swapAB" in n:
@@ -1366,12 +1573,22 @@ def case_g(major: int, mode: str) -> None:
     ms = (_SM90_EPI_SWAP_MS if mode == "default" else ()) + _SM90_EPI_MAIN_MS
     cells = [(N, K, M, None, "") for N, K in _SM90_EPI_SHAPES for M in ms]
     for N, K, M in (_SM90_EPI_REROUTE_CELLS if mode == "default" else ()):
-        tile = _sm90_swap_ab_tile(M, N, sms) if _sm90_swap_ab(M, N, K, sms) else None
+        if (N, K, M) in _SM90_EPI_FH1:  # moved by FH1's rules: listed below with its new route
+            continue
+        tile = _sm90_swap_ab_tile(M, N, sms) if _sm90_swap_ab(M, N, K, sms) and \
+            _sm90_splitk2(M, N, K, sms) is None else None
         cells.append((N, K, M, None, "") if tile is None else
                      (N, K, M, _swap_tile_re(N, K, *tile), f"swap {tile[0]}x{tile[1]}"))
     cells += [(N, K, M, _dg2_tile_re(256, 128), "256x128") for N, K, M, m in _SM90_EPI_TWO_WAVE if m == mode]
     if mode == "default":  # the cells rule 5 re-routes: the v2 kernel at the rule's configuration
         cells += [(N, K, M, _dg2_tile_re(bm, bn, ns), f"{bm}x{bn} s{ns}") for N, K, M, bm, bn, ns in _SM90_EPI_RULE5]
+        for (N, K, M), (route, bm, bn, cluster) in _SM90_EPI_FH1.items():  # FH1's routes and their neighbours
+            if route == "dg2":
+                cells.append((N, K, M, _dg2_cluster_re(bm, bn, cluster), f"{bm}x{bn} {cluster}"))
+            elif route == "swapab":
+                cells.append((N, K, M, _swap_tile_re(N, K, bm, bn), f"swap {bm}x{bn}"))
+            else:
+                cells.append((N, K, M, None, ""))
     routes_seen = set()
     for N, K, M, want_tile, tile_label in cells:
         x, wq, acc, b, r, r0, n0 = _exact_inputs(M, N, K, seed=M * 131 + N * 7 + K)
@@ -1381,7 +1598,14 @@ def case_g(major: int, mode: str) -> None:
         dws = {s: D.prepare_weight(wq, format="bsfp8",
                                    scale=torch.full((nb, K // 128), 2.0 ** -s, device="cuda")) for s in (0, 8)}
         xq, sx = D.quantize_activation(x)
-        want_route = "swapab" if _sm90_swap_ab(M, N, K, sms) else want_main
+        if _sm90_splitk2(M, N, K, sms) is not None:
+            want_route = "splitk2"  # the two-warp-group split-K route (FH7), asked before every route below
+        elif _sm90_splitk(M, N, K, sms):
+            want_route = "splitk"  # the in-cluster split-K route (FH5), taken before every route below
+        elif mode == "default" and (N, K, M) in _SM90_EPI_FH1:
+            want_route = _SM90_EPI_FH1[(N, K, M)][0]  # FH1's route (bands _sm90_swap_ab does not mirror)
+        else:
+            want_route = "swapab" if _sm90_swap_ab(M, N, K, sms) else want_main
         if want_route is None and 32 < M < 64:  # a main-path neighbour of the swap-AB band (no DG2 class there)
             want_route = "v1"
         if want_route is None and mode == "default" and (N, K, M) in _SM90_EPI_H3_MAIN:
@@ -1474,7 +1698,9 @@ def _graph_calls(major: int):
     for N, K, M in ((1280, 1280, 7), (5120, 1280, 78), (1280, 5120, 1079), (1280, 7680, 129), (5120, 1280, 1),
                     (2048, 1280, 40), (5120, 2048, 36),  # swap-AB above M = 32 (64- and 128-row tiles)
                     (2048, 4096, 80), (5120, 2048, 96),  # swap-AB above M = 64 (64- and 128-row tiles)
-                    (2560, 4096, 136), (9728, 2560, 144)):  # above M = 128 (64-row; 128-row, two waves)
+                    (2560, 4096, 136), (9728, 2560, 144),  # above M = 128 (64-row; 128-row, two waves)
+                    (2560, 4096, 8), (2560, 9216, 24),  # the in-cluster split-K route (S = 2, S = 3)
+                    (1280, 7680, 117), (2560, 9728, 96)):  # the two-warp-group split-K route (FH7)
         dw = prepared(major, N, K, seed=71 + N + K)
         x = make_x(M, K, seed=72 + M)
         xq, sx = D.quantize_activation(x)
@@ -1542,7 +1768,9 @@ def case_j(major: int) -> None:
              # swap-AB above M = 64, 64- and 128-row weight tiles
              ("N= 2048 K= 4096 M=   80 bias+gelu, bf16-x", "N= 5120 K= 2048 M=   96 bias+gelu+residual, 2b"),
              # swap-AB above M = 128, 64-row tiles and 128-row tiles on two waves
-             ("N= 2560 K= 4096 M=  136 bias+residual, 2b", "N= 9728 K= 2560 M=  144 bias+gelu+residual, 2b"))
+             ("N= 2560 K= 4096 M=  136 bias+residual, 2b", "N= 9728 K= 2560 M=  144 bias+gelu+residual, 2b"),
+             # the in-cluster split-K route, S = 2 and S = 3: two cluster launches side by side
+             ("N= 2560 K= 4096 M=    8 bias+gelu, bf16-x", "N= 2560 K= 9216 M=   24 bias+gelu+residual, 2b"))
     for la, lb in pairs:
         fa, fb = calls[la], calls[lb]
         ra, rb = fa().clone(), fb().clone()
@@ -1679,9 +1907,9 @@ def case_n(major: int, mode: str) -> None:
         return
     ms = ((7, 32) if mode == "default" else ()) + (78, 1079)
     cells = [(N, K, ms) for N, K in ((1280, 1280), (5120, 1280))]
-    if mode == "default":  # swap-AB above M = 32, 64 and 128 (case g): 64- and 128-row weight tiles
+    if mode == "default":  # swap-AB above M = 32, 64 and 128 (case g): 64- and 128-row weight tiles; FH1's routes
         cells += [(2048, 1280, (40,)), (5120, 2048, (36, 96)), (2048, 4096, (80,)), (2560, 4096, (136,)),
-                  (9728, 2560, (144,))]
+                  (6144, 2560, (160,)), (2560, 4096, (216, 288)), (18432, 2560, (8, 288))]
     for N, K, cell_ms in cells:
         dw = prepared(major, N, K, seed=111 + N)
         for M in cell_ms:
@@ -1813,7 +2041,9 @@ def case_m(major: int, mode: str) -> None:
     ext.slow_copy2(t0, t1, t0, t1, 1, 1000)
     ext.early_read(t1, torch.zeros(1, dtype=torch.int32, device="cuda"))
     torch.cuda.synchronize()
-    for N, K, M in ((1280, 1280, 7), (5120, 1280, 78), (1280, 5120, 1079), (1280, 7680, 129)):
+    for N, K, M in ((1280, 1280, 7), (5120, 1280, 78), (1280, 5120, 1079), (1280, 7680, 129),
+                    (2560, 4096, 8), (2560, 9216, 24),  # the in-cluster split-K route (S = 2, 3)
+                    (1280, 5120, 78), (2560, 9216, 72)):  # the two-warp-group split-K route (FH7: token / weight halves)
         dw = prepared(major, N, K, seed=101 + N)
         x = make_x(M, K, seed=102 + M)
         xq, sx = D.quantize_activation(x)
@@ -1847,6 +2077,378 @@ def case_m(major: int, mode: str) -> None:
             print(f"  m  [{mode:7s}] N={N:5d} K={K:5d} M={M:5d} {entry:6s}: behind a producer that writes bias / "
                   f"residual 2 ms after releasing its dependents == on the final tensors {_ok(ok)}; control: a "
                   f"pre-wait reader saw {n_stale} of {N} bias elements stale {_ok(ctrl)}")
+    if mode != "default":
+        return
+    # The weight and its scale written late: the split-K kernels read them only after their griddepcontrol.wait too
+    # (fso_dense_splitk.cuh, fso_dense_splitk2.cuh), so a call right behind a producer that rewrites the handle's
+    # tensors in place (a reload,
+    # or prepare_weight's kernels just before) gives the bytes of the call on the final tensors. The 2b call follows
+    # the producer directly; the bf16-x call has the activation quantize in between. 5120 x 2048 (the swap-AB route)
+    # is the reference.
+    for N, K, M in ((2560, 4096, 8), (2560, 9216, 24), (1280, 7680, 78), (2560, 9728, 64), (5120, 2048, 8)):
+        dw = prepared(major, N, K, seed=105 + N)
+        x = make_x(M, K, seed=106 + M)
+        xq, sx = D.quantize_activation(x)
+        w_src, s_src = dw.weight.clone(), dw.scale.clone()
+        for entry, call in (("bf16-x", lambda: D.linear(x, dw)), ("2b", lambda: D.linear(xq, dw, x_scale=sx))):
+            want = call()
+            torch.cuda.synchronize()
+            stale = torch.zeros(1, dtype=torch.int32, device="cuda")
+            dw.weight.zero_(), dw.scale.zero_()
+            torch.cuda.synchronize()
+            ext.slow_copy2(w_src.view(torch.int16), dw.weight.view(torch.int16), s_src.view(torch.int16),
+                           dw.scale.view(torch.int16), 8, spin)
+            ext.early_read(dw.scale.view(torch.int16), stale)
+            torch.cuda.synchronize()
+            n_stale = int(stale.item())
+            dw.weight.zero_(), dw.scale.zero_()
+            torch.cuda.synchronize()
+            ext.slow_copy2(w_src.view(torch.int16), dw.weight.view(torch.int16), s_src.view(torch.int16),
+                           dw.scale.view(torch.int16), 8, spin)
+            got = call()
+            torch.cuda.synchronize()
+            ok = bytes_equal(got, want)
+            ctrl = n_stale > 0
+            _check(ok, f"m N={N} K={K} M={M} {entry}: the call behind a producer that writes the weight late != the "
+                       f"call on the final weight")
+            _check(ctrl, f"m N={N} K={K} M={M} {entry}: the weight control saw no stale element (no overlap)")
+            print(f"  m  [{mode:7s}] N={N:5d} K={K:5d} M={M:5d} {entry:6s}: behind a producer that writes the weight "
+                  f"and its scale 2 ms after releasing its dependents == on the final weight {_ok(ok)}; control: a "
+                  f"pre-wait reader saw {n_stale} scale halves stale {_ok(ctrl)}")
+
+
+# --- (t) the sm_90 in-cluster split-K route (FH5) --------------------------------------------------------------------
+# fp8_gemm_kernel_swapAB_splitk (deep_gemm/fso_dense_splitk.cuh): one 64-row weight tile per cluster of S CTAs that
+# divide K and add their fp32 partial sums in rank order (p_0 + p_1 + ... + p_{S-1}), then apply the epilogue once and
+# round. The cells the rule takes (N, K, M; _sm90_splitk mirrors the dispatcher): S = 2 with token tiles 16, 48 and 56
+# on 2560 x 4096, S = 3 on 2048 x 4096 (token tile 32), S = 4 on 1280 x 5120 at M = 56, S = 3 sharing SMs on the 40
+# tiles of 2560 x 9216 at M = 8 and S = 2 one CTA per SM from M = 25 (token tiles 40 and 56), S = 4 on 1024 x 2048, S = 2
+# on the 4 K blocks of 2048 x 512 and on the 64 tiles of 4096 x 2048; and neighbours it leaves on the routes below it
+# (one row past each K class's band edge, 80 and 67 weight tiles). The forced cells (FSO_SM90_DENSE_SPLITK=force with
+# FSO_SM90_SPLITK_S = 2, 3, 4 in child processes) cover token tiles up to 64 and an N that is not a multiple of 64,
+# each with clusters that fit one CTA per SM.
+_SM90_SPLITK_CELLS = ((2560, 4096, 1), (2560, 4096, 16), (2560, 4096, 48), (2560, 4096, 56), (2048, 4096, 1),
+                      (2048, 4096, 32), (1280, 5120, 56), (2560, 9216, 8), (2560, 9216, 40), (2560, 9728, 56),
+                      (1024, 2048, 16), (2048, 512, 16), (4096, 2048, 8))
+_SM90_SPLITK_OFF = ((2560, 4096, 57), (2048, 7680, 57), (1024, 2048, 41), (2048, 512, 25), (5120, 2048, 8),
+                    (4288, 4096, 16))
+_SM90_SPLITK_FORCED = {2: ((2560, 4096, 40), (2528, 9216, 24), (4096, 4096, 7)),
+                       3: ((2048, 4096, 64), (2496, 9216, 7), (1280, 5120, 33)),
+                       4: ((1024, 4096, 7), (1920, 9216, 48), (1240, 2048, 64))}
+_T_FILE_ENV = "FSO_TEST_DENSE_V1_T_OUT"
+
+
+def _t_random_outputs() -> dict:
+    """{(N, K, M, call): output} on random data for the cells of the rule: the identity bf16-x call and the bias + GELU
+    + residual 2b call."""
+    outs = {}
+    for N, K, M in _SM90_SPLITK_CELLS:
+        dw = prepared(9, N, K, seed=301 + N + K)
+        x = make_x(M, K, seed=302 + M)
+        xq, sx = D.quantize_activation(x)
+        g = torch.Generator(device="cuda").manual_seed(303 + M + N)
+        b = (torch.randn(N, device="cuda", generator=g) * 0.1).bfloat16()
+        r = torch.randn(M, N, device="cuda", generator=g).bfloat16()
+        outs[(N, K, M, "bf16-x")] = D.linear(x, dw).clone()
+        outs[(N, K, M, "2b+epi")] = D.linear(xq, dw, x_scale=sx, bias=b, residual=r, activation="gelu_erf").clone()
+    return outs
+
+
+def _t_exact_cell(N: int, K: int, M: int, want_s: int, tag: str) -> None:
+    """Section 10 on one split-K cell: every epilogue variant and the identity give RN_bf16(act(acc + b) + r) from both
+    entries on the split-K kernel with `want_s` slices (the kernel name), and bias = 0 gives the bytes of bias = None."""
+    x, wq, acc, b, r, r0, n0 = _exact_inputs(M, N, K, seed=M * 131 + N * 7 + K)
+    nb = (N + 127) // 128
+    dws = {s: D.prepare_weight(wq, format="bsfp8", scale=torch.full((nb, K // 128), 2.0 ** -s, device="cuda"))
+           for s in (0, 8)}
+    xq, sx = D.quantize_activation(x)
+    want_re = _splitk_re(K, M, want_s)
+    for label, hb, act, hr in (("identity", False, None, False),) + _SM90_EPI_VARIANTS:
+        s = 8 if act else 0
+        exp = _expected(acc * 2.0 ** -s, b, r, act, hb, hr)
+        kw = dict(bias=b if hb else None, activation=act, residual=r if hr else None)
+        y1, k1 = _kernels_of(lambda: D.linear(x, dws[s], **kw))
+        y2, k2 = _kernels_of(lambda: D.linear(xq, dws[s], x_scale=sx, **kw))
+        route1, route2 = _sm90_route(k1), _sm90_route(k2)
+        want_route = "splitk" + ("" if label == "identity" else "+epi")
+        route_ok = route1 == route2 == want_route and all(any(re.search(want_re, k) for k in ks) for ks in (k1, k2))
+        ok1, ok2 = bytes_equal(y1, exp), bytes_equal(y2, exp)
+        ok = ok1 and ok2 and route_ok
+        _check(ok, f"t {tag} N={N} K={K} M={M} {label}: bf16-x {ok1}, 2b {ok2}, route {route1} / {route2} (want "
+                   f"{want_route} S={want_s})")
+        print(f"  t  {tag} N={N:5d} K={K:5d} M={M:3d} S={want_s} {label:19s}: route {route1:11s} bf16-x {_ok(ok1)}, "
+              f"2b {_ok(ok2)} == RN_bf16(act(acc + b) + r)  {_ok(ok)}")
+    dw = dws[0]
+    z = torch.zeros(N, dtype=torch.bfloat16, device="cuda")
+    for entry, call in (("bf16-x", lambda **kw: D.linear(x, dw, **kw)),
+                        ("2b", lambda **kw: D.linear(xq, dw, x_scale=sx, **kw))):
+        y_none, y_zero = call(), call(bias=z)
+        yr_none, yr_zero = call(residual=r), call(bias=z, residual=r)
+        corner = "" if r0 is None else \
+            f"; the -0.0 corner's no-bias bytes 0x{int(y_none.view(torch.int16)[r0, n0]) & 0xFFFF:04x}"
+        ok = bytes_equal(y_none, y_zero) and bytes_equal(yr_none, yr_zero)
+        _check(ok, f"t {tag} N={N} K={K} M={M} {entry}: bias = 0 != bias = None")
+        print(f"  t  {tag} N={N:5d} K={K:5d} M={M:3d} {entry:6s} bias=0 == bias=None (with and without residual"
+              f"{corner})  {_ok(ok)}")
+
+
+def _t_worker(mode: str) -> int:
+    """A child of case (t): "off" / "s1" save _t_random_outputs() (FSO_SM90_DENSE_SPLITK=0, or FSO_SM90_SPLITK_S=1);
+    "force<s>" runs section 10 on the forced cells with s slices."""
+    major, _ = _arch()
+    if mode in ("off", "s1"):
+        torch.save({k: v.cpu() for k, v in _t_random_outputs().items()}, os.environ[_T_FILE_ENV])
+        return 0
+    s = int(mode[len("force"):])
+    for N, K, M in _SM90_SPLITK_FORCED[s]:
+        _t_exact_cell(N, K, M, s, f"[force S={s}]")
+    return _finish(f"t child {mode}: ALL PASS")
+
+
+def _t_child(mode: str, env_extra: dict, out: str = "") -> bool:
+    import subprocess
+    env = {k: v for k, v in os.environ.items() if not k.startswith("FSO_SM90_")}
+    env.update(env_extra)
+    if out:
+        env[_T_FILE_ENV] = out
+    p = subprocess.run([sys.executable, os.path.abspath(__file__), "--t-worker", mode], env=env, capture_output=True,
+                       text=True, timeout=3600)
+    for line in p.stdout.splitlines():
+        print(f"    | {line}")
+    if p.returncode != 0:
+        tail = (p.stderr or "").strip().splitlines()[-5:]
+        _check(False, f"t child {mode}: exit status {p.returncode}; {' / '.join(tail)}")
+    return p.returncode == 0
+
+
+def _bf16_ulps(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """|a - b| in units in the last place of bf16, on the monotonic integer image of the bit patterns (+0 and -0 both
+    map to 0)."""
+    def ordered(t):
+        v = t.view(torch.int16).to(torch.int32)
+        m = v & 0x7FFF
+        return torch.where(v < 0, -m, m)
+    return (ordered(a) - ordered(b)).abs()
+
+
+def case_t(major: int) -> None:
+    """The sm_90 in-cluster split-K route: its routes, section-10 exactness on every epilogue variant from both entries,
+    bias = 0, bf16-x == 2b, determinism, the one-slice kernel against the swap-AB route, and the difference of the
+    split route from the one-CTA-per-element route it replaces."""
+    if major != 9:
+        print(f"  t  sm_90 only; skipped on {_arch_label()}")
+        return
+    sms = _sm90_sms()
+    # Routes: the rule's cells run the split-K kernel at the mirror's slice count and token tile; the neighbours do not.
+    for N, K, M in _SM90_SPLITK_CELLS + _SM90_SPLITK_OFF:
+        s = _sm90_splitk(M, N, K, sms)
+        dw = prepared(major, N, K, seed=311 + N)
+        x = make_x(M, K, seed=312 + M)
+        _, ks = _kernels_of(lambda: D.linear(x, dw))
+        route = _sm90_route(ks)
+        cfg2 = _sm90_splitk2(M, N, K, sms)  # a neighbour above the band that the two-warp-group route takes (FH7)
+        ok = (route == "splitk" and any(re.search(_splitk_re(K, M, s), k) for k in ks)) if s else \
+            (route == "splitk2" and any(re.search(_splitk2_re(K, cfg2), k) for k in ks)) if cfg2 else \
+            (route in ("swapab", "v1", "dg2"))
+        _check(ok, f"t route N={N} K={K} M={M}: {route}, want {'splitk S=' + str(s) if s else 'not splitk'}")
+        print(f"  t  route N={N:5d} K={K:5d} M={M:3d}: {route:8s} (rule: {'S=' + str(s) if s else 'off'})  {_ok(ok)}")
+    for N, K, M in _SM90_SPLITK_CELLS:
+        _t_exact_cell(N, K, M, _sm90_splitk(M, N, K, sms), "[rule]")
+    # Random data: bf16-x == 2b, and 20 repeated calls give the same bytes (a fixed summation order).
+    outs = _t_random_outputs()
+    for N, K, M in _SM90_SPLITK_CELLS:
+        dw = prepared(major, N, K, seed=301 + N + K)
+        x = make_x(M, K, seed=302 + M)
+        xq, sx = D.quantize_activation(x)
+        y1, y2 = D.linear(x, dw), D.linear(xq, dw, x_scale=sx)
+        same = bytes_equal(y1, y2) and bytes_equal(y1, outs[(N, K, M, "bf16-x")])
+        rep = all(bytes_equal(D.linear(x, dw), y1) for _ in range(20))
+        ok = same and rep
+        _check(ok, f"t random N={N} K={K} M={M}: bf16-x == 2b {same}, 20 calls identical {rep}")
+        print(f"  t  random N={N:5d} K={K:5d} M={M:3d}: bf16-x == 2b {_ok(same)}, 20 repeated calls identical "
+              f"{_ok(rep)}")
+    # Children: the route off (the one-CTA-per-element swap-AB route) and the split-K kernel with one slice.
+    tmp = tempfile.mkdtemp(prefix="fso_test_dense_v1_t_")
+    off_file, s1_file = os.path.join(tmp, "off.pt"), os.path.join(tmp, "s1.pt")
+    if _t_child("off", {"FSO_SM90_DENSE_SPLITK": "0"}, off_file) and \
+            _t_child("s1", {"FSO_SM90_SPLITK_S": "1"}, s1_file):
+        off, s1 = torch.load(off_file), torch.load(s1_file)
+        for key, y in outs.items():
+            N, K, M, call = key
+            yo, y1 = off[key].cuda(), s1[key].cuda()
+            one_ok = bytes_equal(y1, yo)
+            _check(one_ok, f"t N={N} K={K} M={M} {call}: the one-slice split-K kernel != the swap-AB route")
+            ulps = _bf16_ulps(y, yo)
+            n_diff = int((ulps > 0).sum())
+            print(f"  t  N={N:5d} K={K:5d} M={M:3d} {call:6s}: one-slice split-K == swap-AB route {_ok(one_ok)}; the "
+                  f"rule's split route differs from it in {n_diff} of {y.numel()} elements "
+                  f"({100.0 * n_diff / y.numel():.3f} %), at most {int(ulps.max())} bf16 ulp")
+    for s in (2, 3, 4):
+        _t_child(f"force{s}", {"FSO_SM90_DENSE_SPLITK": "force", "FSO_SM90_SPLITK_S": str(s)})
+
+
+# --- (u) the sm_90 two-warp-group split-K route (FH7) ---------------------------------------------------------------
+# fp8_gemm_kernel_swapAB_splitk2 (deep_gemm/fso_dense_splitk2.cuh): above the decode band (56 < M <= 128, K >= 4096) a
+# weight tile of 64 rows (token halves: each math warp-group multiplies it by half of the token tile) or 128 rows (weight
+# halves: each warp-group multiplies its 64 rows by the whole token tile) per cluster of S CTAs that divide K and add
+# their fp32 partial sums in rank order. The cells the rule takes (N, K, M; _sm90_splitk2 mirrors the dispatcher on 132
+# SMs): token halves with S = 5 on 1280 x 7680 / 5120 (token tiles 64, 80, 96, 128, and an N that is not a multiple of 64),
+# S = 3 on 2048 x 4096 (token tiles 80 and 112 at M = 104) and S = 6 on 1024 x 4096 (128); weight halves with S = 5 on
+# 2560 x 9728 / 9216 (token tiles 64, 72, 104, M = 64 taken from the one-warp-group route); and neighbours it leaves on
+# the routes below it (S = 3 above M = 104, K < 8192 and M above 104 for weight halves, S = 2, M above 128, K < 4096,
+# M inside the one-warp-group band). Children: the route off (FSO_SM90_DENSE_SPLITK=0), one slice
+# (FSO_SM90_SPLITK_S=1) and section 10 at forced slice counts 2, 3 and 4 (FSO_SM90_SPLITK_S).
+_SM90_SPLITK2_CELLS = ((1280, 7680, 78), (1280, 5120, 117), (1280, 7680, 57), (1240, 5120, 96), (2048, 4096, 80),
+                       (2048, 4096, 104), (1024, 4096, 128), (2560, 9728, 64), (2560, 9728, 72), (2560, 9216, 100))
+_SM90_SPLITK2_OFF = ((2048, 4096, 112), (2048, 4096, 128), (2560, 4096, 80), (2560, 9728, 112), (4096, 4096, 96),
+                     (1280, 7680, 136), (1280, 2048, 96), (2048, 7680, 56))
+_U_FILE_ENV = "FSO_TEST_DENSE_V1_U_OUT"
+
+
+def _u_random_outputs() -> dict:
+    """{(N, K, M, call): output} on random data for the cells of the rule: the identity bf16-x call and the bias + GELU
+    + residual 2b call."""
+    outs = {}
+    for N, K, M in _SM90_SPLITK2_CELLS:
+        dw = prepared(9, N, K, seed=401 + N + K)
+        x = make_x(M, K, seed=402 + M)
+        xq, sx = D.quantize_activation(x)
+        g = torch.Generator(device="cuda").manual_seed(403 + M + N)
+        b = (torch.randn(N, device="cuda", generator=g) * 0.1).bfloat16()
+        r = torch.randn(M, N, device="cuda", generator=g).bfloat16()
+        outs[(N, K, M, "bf16-x")] = D.linear(x, dw).clone()
+        outs[(N, K, M, "2b+epi")] = D.linear(xq, dw, x_scale=sx, bias=b, residual=r, activation="gelu_erf").clone()
+    return outs
+
+
+def _u_exact_cell(N: int, K: int, M: int, cfg, tag: str) -> None:
+    """Section 10 on one cell of the two-warp-group route: every epilogue variant and the identity give
+    RN_bf16(act(acc + b) + r) from both entries on that kernel at `cfg` (the kernel name), and bias = 0 gives the bytes
+    of bias = None."""
+    x, wq, acc, b, r, r0, n0 = _exact_inputs(M, N, K, seed=M * 137 + N * 11 + K)
+    nb = (N + 127) // 128
+    dws = {s: D.prepare_weight(wq, format="bsfp8", scale=torch.full((nb, K // 128), 2.0 ** -s, device="cuda"))
+           for s in (0, 8)}
+    xq, sx = D.quantize_activation(x)
+    want_re = _splitk2_re(K, cfg)
+    for label, hb, act, hr in (("identity", False, None, False),) + _SM90_EPI_VARIANTS:
+        s = 8 if act else 0
+        exp = _expected(acc * 2.0 ** -s, b, r, act, hb, hr)
+        kw = dict(bias=b if hb else None, activation=act, residual=r if hr else None)
+        y1, k1 = _kernels_of(lambda: D.linear(x, dws[s], **kw))
+        y2, k2 = _kernels_of(lambda: D.linear(xq, dws[s], x_scale=sx, **kw))
+        route1, route2 = _sm90_route(k1), _sm90_route(k2)
+        want_route = "splitk2" + ("" if label == "identity" else "+epi")
+        route_ok = route1 == route2 == want_route and all(any(re.search(want_re, k) for k in ks) for ks in (k1, k2))
+        ok1, ok2 = bytes_equal(y1, exp), bytes_equal(y2, exp)
+        ok = ok1 and ok2 and route_ok
+        _check(ok, f"u {tag} N={N} K={K} M={M} {label}: bf16-x {ok1}, 2b {ok2}, route {route1} / {route2} (want "
+                   f"{want_route} {cfg})")
+        print(f"  u  {tag} N={N:5d} K={K:5d} M={M:3d} {label:19s}: route {route1:12s} bf16-x {_ok(ok1)}, "
+              f"2b {_ok(ok2)} == RN_bf16(act(acc + b) + r)  {_ok(ok)}")
+    dw = dws[0]
+    z = torch.zeros(N, dtype=torch.bfloat16, device="cuda")
+    for entry, call in (("bf16-x", lambda **kw: D.linear(x, dw, **kw)),
+                        ("2b", lambda **kw: D.linear(xq, dw, x_scale=sx, **kw))):
+        y_none, y_zero = call(), call(bias=z)
+        yr_none, yr_zero = call(residual=r), call(bias=z, residual=r)
+        ok = bytes_equal(y_none, y_zero) and bytes_equal(yr_none, yr_zero)
+        _check(ok, f"u {tag} N={N} K={K} M={M} {entry}: bias = 0 != bias = None")
+        print(f"  u  {tag} N={N:5d} K={K:5d} M={M:3d} {entry:6s} bias=0 == bias=None (with and without residual)  "
+              f"{_ok(ok)}")
+
+
+def _u_worker(mode: str) -> int:
+    """A child of case (u): "off" / "s1" save _u_random_outputs() (FSO_SM90_DENSE_SPLITK=0, or FSO_SM90_SPLITK_S=1);
+    "s<k>" (k = 2 .. 4) runs section 10 on the rule's cells with k slices (FSO_SM90_SPLITK_S=k; the layout and token
+    tile stay the rule's)."""
+    if mode in ("off", "s1"):
+        torch.save({k: v.cpu() for k, v in _u_random_outputs().items()}, os.environ[_U_FILE_ENV])
+        return 0
+    k = int(mode[1:])
+    sms = _sm90_sms()
+    for N, K, M in _SM90_SPLITK2_CELLS:
+        cfg = _sm90_splitk2(M, N, K, sms)
+        if cfg is None or 2 * k > K // 128:
+            continue
+        _u_exact_cell(N, K, M, (cfg[0], k, cfg[2]), f"[S={k}]")
+    return _finish(f"u child {mode}: ALL PASS")
+
+
+def _u_child(mode: str, env_extra: dict, out: str = "") -> bool:
+    import subprocess
+    env = {k: v for k, v in os.environ.items() if not k.startswith("FSO_SM90_")}
+    env.update(env_extra)
+    if out:
+        env[_U_FILE_ENV] = out
+    p = subprocess.run([sys.executable, os.path.abspath(__file__), "--u-worker", mode], env=env, capture_output=True,
+                       text=True, timeout=3600)
+    for line in p.stdout.splitlines():
+        print(f"    | {line}")
+    if p.returncode != 0:
+        tail = (p.stderr or "").strip().splitlines()[-5:]
+        _check(False, f"u child {mode}: exit status {p.returncode}; {' / '.join(tail)}")
+    return p.returncode == 0
+
+
+def case_u(major: int) -> None:
+    """The sm_90 two-warp-group split-K route: its routes, section-10 exactness on every epilogue variant from both
+    entries, bias = 0, bf16-x == 2b, determinism, forced slice counts, and the difference of the split route from the
+    routes it replaces (and of the one-slice kernel from them)."""
+    if major != 9:
+        print(f"  u  sm_90 only; skipped on {_arch_label()}")
+        return
+    sms = _sm90_sms()
+    if sms not in _SM90_SPLITK2_CLUSTERS:
+        print(f"  u  the route mirror knows the H200's 132 SMs only; this device has {sms}: skipped")
+        return
+    for N, K, M in _SM90_SPLITK2_CELLS + _SM90_SPLITK2_OFF:
+        cfg = _sm90_splitk2(M, N, K, sms)
+        _check(((N, K, M) in _SM90_SPLITK2_CELLS) == (cfg is not None),
+               f"u mirror N={N} K={K} M={M}: {cfg} (the test's cell lists disagree with the mirror)")
+        dw = prepared(major, N, K, seed=411 + N)
+        x = make_x(M, K, seed=412 + M)
+        _, ks = _kernels_of(lambda: D.linear(x, dw))
+        route = _sm90_route(ks)
+        ok = (route == "splitk2" and any(re.search(_splitk2_re(K, cfg), k) for k in ks)) if cfg else \
+            (route in ("swapab", "v1", "dg2", "splitk"))
+        _check(ok, f"u route N={N} K={K} M={M}: {route}, want {cfg if cfg else 'not splitk2'}")
+        print(f"  u  route N={N:5d} K={K:5d} M={M:3d}: {route:8s} (rule: {cfg if cfg else 'off'})  {_ok(ok)}")
+    for N, K, M in _SM90_SPLITK2_CELLS:
+        _u_exact_cell(N, K, M, _sm90_splitk2(M, N, K, sms), "[rule]")
+    outs = _u_random_outputs()
+    for N, K, M in _SM90_SPLITK2_CELLS:
+        dw = prepared(major, N, K, seed=401 + N + K)
+        x = make_x(M, K, seed=402 + M)
+        xq, sx = D.quantize_activation(x)
+        y1, y2 = D.linear(x, dw), D.linear(xq, dw, x_scale=sx)
+        same = bytes_equal(y1, y2) and bytes_equal(y1, outs[(N, K, M, "bf16-x")])
+        rep = all(bytes_equal(D.linear(x, dw), y1) for _ in range(20))
+        ok = same and rep
+        _check(ok, f"u random N={N} K={K} M={M}: bf16-x == 2b {same}, 20 calls identical {rep}")
+        print(f"  u  random N={N:5d} K={K:5d} M={M:3d}: bf16-x == 2b {_ok(same)}, 20 repeated calls identical "
+              f"{_ok(rep)}")
+    tmp = tempfile.mkdtemp(prefix="fso_test_dense_v1_u_")
+    off_file, s1_file = os.path.join(tmp, "off.pt"), os.path.join(tmp, "s1.pt")
+    if _u_child("off", {"FSO_SM90_DENSE_SPLITK": "0"}, off_file) and \
+            _u_child("s1", {"FSO_SM90_SPLITK_S": "1"}, s1_file):
+        off, s1 = torch.load(off_file), torch.load(s1_file)
+        for key, y in outs.items():
+            N, K, M, call = key
+            yo, y1 = off[key].cuda(), s1[key].cuda()
+            ulps = _bf16_ulps(y, yo)
+            n_diff = int((ulps > 0).sum())
+            rel = float((y.float() - yo.float()).abs().max() / yo.float().abs().max())
+            small = rel <= 2.0 ** -6
+            _check(small, f"u N={N} K={K} M={M} {call}: the split route differs from the route off by {rel:.2e} of "
+                          f"the output's largest value")
+            one_ok = bytes_equal(y1, yo)
+            _check(one_ok, f"u N={N} K={K} M={M} {call}: the one-slice two-warp-group kernel != the route off")
+            print(f"  u  N={N:5d} K={K:5d} M={M:3d} {call:6s}: the split route differs from the route off in {n_diff} of "
+                  f"{y.numel()} elements ({100.0 * n_diff / y.numel():.3f} %), at most {int(ulps.max())} bf16 ulp, "
+                  f"{rel:.1e} of the largest output {_ok(small)}; one slice == the route off {_ok(one_ok)}")
+    for k in (2, 3, 4):
+        _u_child(f"s{k}", {"FSO_SM90_SPLITK_S": str(k)})
 
 
 # --- (o) the sm_120/sm_121 dense epilogue (S1c) ---------------------------------------------------------------------
@@ -1872,11 +2474,14 @@ S1C_LLM = ((2560, 2048), (2048, 2048))
 S1C_LLM_MS = (1, 8, 32, 64, 128, 512, 2048)
 S1C_GRID_KS = (1280, 5120, 7680)
 S1C_GRID_MS = (1, 7, 78, 129, 1079)
-# Shapes on which the natural cascade splits K: narrow N with K >= 9728 at several M (TileM 16 / 32 / 64 / 128
-# Stream-K tiles), and tiles_n >= 32 at M <= 32 (K split 2).
-S1C_STREAMK_NATURAL = ((1, 2560, 9728), (7, 2560, 10240), (16, 2560, 9728), (32, 2560, 9728), (64, 2560, 9728),
-                       (100, 2560, 9728), (129, 2560, 9728), (300, 2560, 9728), (8, 4096, 4096), (20, 4096, 4096),
-                       (32, 6144, 5120))
+# Shapes on which the natural cascade splits K: narrow N with K >= 9728 at 16 < M <= 32 (TileM 32) and above M = 64
+# (TileM 64 / 128 Stream-K tiles, K splits 2, 3 and 4). The rest of the decode band runs single launches there since
+# issue #12 F5B (the 6-stage (16, 64) tile at M <= 16 and (32, 64) at 32 < M <= 64 for narrow N, (16, 128, 4) at
+# 32 <= tiles_n < 96 and M <= 32): S1C_DECODE_SINGLE, which were this list's Stream-K cells before.
+S1C_STREAMK_NATURAL = ((32, 2560, 9728), (65, 2560, 9728), (100, 2560, 9728), (129, 2560, 9728), (300, 2560, 9728),
+                       (129, 3072, 9728), (300, 2048, 10240))
+S1C_DECODE_SINGLE = ((1, 2560, 9728), (7, 2560, 10240), (16, 2560, 9728), (64, 2560, 9728), (8, 4096, 4096),
+                     (20, 4096, 4096), (32, 6144, 5120))
 S1C_SINGLE_TILES = ((16, 128, 4), (16, 64, 4), (32, 128, 4), (32, 64, 4), (64, 64, 4), (64, 128, 2), (96, 128, 2),
                     (128, 64, 2), (128, 128, 2), (160, 128, 2))
 S1C_SK_TILES = (((16, 128, 4), 4), ((32, 128, 4), 2), ((32, 64, 4), 4), ((64, 128, 2), 3), ((64, 64, 4), 4),
@@ -2208,9 +2813,10 @@ def _s1c_worker_graphs(w: _S1cWorker, spec: dict) -> None:
             ("fc1 bias+gelu", (78, 5120, 1280), True, "gelu_erf", False),
             ("out_proj bias+residual", (533, 1280, 1280), True, None, True),
             ("fc2 bias+residual", (1079, 1280, 5120), True, None, True),
-            ("streamk16 bias+gelu+residual", (16, 2560, 9728), True, "gelu_erf", True),
-            ("streamk20 bias", (20, 4096, 4096), True, None, False),
-            ("streamk129 bias+residual", (129, 2560, 9728), True, None, True)):
+            ("streamk65 bias+gelu+residual", (65, 2560, 9728), True, "gelu_erf", True),
+            ("streamk100 bias", (100, 2560, 9728), True, None, False),
+            ("streamk129 bias+residual", (129, 2560, 9728), True, None, True),
+            ("down16 bias+gelu+residual", (16, 2560, 9728), True, "gelu_erf", True)):
         route = _s1c_route(M, N, K)
         x = make_x(M, K, seed=M + 1)
         dw = prepared(12, N, K, seed=N + 2)
@@ -2229,9 +2835,10 @@ def _s1c_worker_graphs(w: _S1cWorker, spec: dict) -> None:
                   f"capture on a non-default stream, replay into NaN == eager  {_ok(ok)}")
             calls[(name, path)] = (g, out, ref, (x, dw, xq, sx, b, r))  # the graph reads these: keep them alive
     # Two different captured calls replayed concurrently from one thread, one per stream, 200 times.
-    for a, b2 in ((("fc1 bias+gelu", "2b"), ("streamk16 bias+gelu+residual", "2b")),
-                  (("streamk20 bias", "bf16 x"), ("streamk129 bias+residual", "2b")),
-                  (("streamk16 bias+gelu+residual", "bf16 x"), ("streamk16 bias+gelu+residual", "2b"))):
+    for a, b2 in ((("fc1 bias+gelu", "2b"), ("streamk65 bias+gelu+residual", "2b")),
+                  (("streamk100 bias", "bf16 x"), ("streamk129 bias+residual", "2b")),
+                  (("streamk65 bias+gelu+residual", "bf16 x"), ("streamk65 bias+gelu+residual", "2b")),
+                  (("down16 bias+gelu+residual", "2b"), ("streamk100 bias", "2b"))):
         (g1, o1, r1, _), (g2, o2, r2, _) = calls[a], calls[b2]
         s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
         bad1 = torch.zeros((), dtype=torch.int64, device="cuda")
@@ -2252,7 +2859,7 @@ def _s1c_worker_graphs(w: _S1cWorker, spec: dict) -> None:
     # Two concurrent Stream-K calls on two streams no longer share scratch: each capture allocates its own partial
     # buffer from the torch caching allocator on its own stream (memory history), and the scratch is a torch
     # allocation at all (peak allocated). Eager calls on two streams, interleaved without synchronization, stay exact.
-    M, N, K = 16, 2560, 9728
+    M, N, K = 100, 2560, 9728
     route = _s1c_route(M, N, K)
     want_bytes = (route["scratch"] + 511) // 512 * 512
     xa, xb = make_x(M, K, seed=31), make_x(M, K, seed=32)
@@ -2410,9 +3017,10 @@ def _s1c_specs() -> list:
     natural = ([{"mnk": (M, N, K)} for N, K in S1C_TOWER for M in S1C_TOWER_MS]
                + [{"mnk": (M, N, K)} for N, K in S1C_LLM for M in S1C_LLM_MS]
                + grid
-               + [{"mnk": mnk, "split": "split"} for mnk in S1C_STREAMK_NATURAL])
-    zero = [(7, 1280, 1280), (1079, 1280, 5120), (16, 2560, 9728), (20, 4096, 4096)]
-    producer = [(78, 5120, 1280), (16, 2560, 9728)]
+               + [{"mnk": mnk, "split": "split"} for mnk in S1C_STREAMK_NATURAL]
+               + [{"mnk": mnk, "split": 1} for mnk in S1C_DECODE_SINGLE])
+    zero = [(7, 1280, 1280), (1079, 1280, 5120), (16, 2560, 9728), (100, 2560, 9728)]
+    producer = [(78, 5120, 1280), (16, 2560, 9728), (100, 2560, 9728)]
     specs = [("natural", {}, {"kind": "exact", "label": "natural", "cells": natural, "zero": zero,
                               "producer": producer}),
              ("natural, FSO_DISABLE_PDL=1", {"FSO_DISABLE_PDL": "1"},
@@ -2689,7 +3297,8 @@ def _w_worker_graphs(w: _WWorker, spec: dict) -> None:
             ("o_tp2 M=24 bias+gelu+residual", (24, 2048, 2048), True, "gelu_erf", True),
             ("down M=1 residual", (1, 2560, 9728), False, None, True),
             ("shared_down M=64 bias", (64, 2048, 512), True, None, False),
-            ("o M=16 bias (2b route only)", (16, 2048, 4096), True, None, False)):
+            ("o M=16 bias", (16, 2048, 4096), True, None, False),
+            ("shared_gate_up M=32 bias (2b route only)", (32, 1024, 2048), True, None, False)):
         r2b, rx = _w_route(M, N, K, False), _w_route(M, N, K, True)
         x = make_x(M, K, seed=M + 1)
         dw = prepared(12, N, K, seed=N + 2)
@@ -3411,41 +4020,51 @@ def case_p(major: int) -> None:
 #   shortk   (issue #12, T1) the cascade's short-K tile rule (pick_short_k_tile): exactness on the cells whose bias
 #            calls tier 1 declines and on the tier-1 cells whose residual / GELU calls take the rule's tiles, the tile each cascade
 #            call ran checked against a test-local mirror of the rule, the -0.0 corner, capture, two streams.
-#   */nopdl  the decode, smm, wide and shortk families again with FSO_DISABLE_PDL=1; their output digests must match.
+#   fb2      (FB2) the swap-AB route rules of the B300 adoption round: exactness on each rule's cells with every call's
+#            tier (Q_FB2_CELLS), the rules' tactics and edges (Q_FB2_TACTICS, Q_FB2_EDGES), linear_quantized on the
+#            cascade, the -0.0 corner, capture, four streams.
+#   */nopdl  the decode, smm, wide, shortk and fb2 families again with FSO_DISABLE_PDL=1; their output digests must
+#            match.
 
 Q_ENV = {"FSO_PRINT_TILE_INFO": "1"}
 # Narrow-N shapes whose decode cells split K in-cluster (tiles_n <= 32; K % 256 == 0 and K / split >= 512).
 Q_SPLIT_SHAPES = ((1280, 5120), (1280, 7680), (2048, 4096), (1280, 1280))
 Q_SPLIT_MS = (1, 7, 8, 16, 32)
-# The persistent form: wide N at M <= 32 (one K slice) and the 64-wide token tile from M = 33.
-Q_PERSIST_CELLS = tuple((5120, 1280, M) for M in (12, 33, 48, 64)) + tuple((1280, 5120, M) for M in (33, 48, 64)) \
-    + ((1280, 1280, 48),)
+# The persistent form: wide N at M <= 32 (one K slice) and the 64-wide token tile from M = 33, on wide N and on the
+# narrow-N cells with K < 4096. (Since FB2 the narrow-N long-K cells of 32 < M <= 64, 1280 x 5120 among them, run on the
+# split-K form with the 64-wide token tile: Q_FB2_CELLS.)
+Q_PERSIST_CELLS = tuple((5120, 1280, M) for M in (12, 33, 48, 64)) + ((1280, 1280, 48), (2048, 2048, 64))
 # Cells tier 1 owns (should_route, outside the decode band and the wave rule). fc1 [5120 x 1280] at the tower rungs
 # M = 78 / 117 / 533 is NOT one of them: there the cascade's wave rule (`_sm100_smm.wave_tile_owns`, 148 SMs: a
-# 128x64 tile puts 80 CTAs on the machine) owns the cell by shape, identity included, so fc1 enters tier 1 at M = 182.
-# Nor, for the bias, are the narrow-N short-K cells at 64 < M <= 256 (1280 x 1280 and 2048 x 1280 at M = 78 / 129 / 182:
+# 128x64 tile puts 80 CTAs on the machine) owns the cell by shape, identity included, so fc1 enters tier 1 at M = 129.
+# Nor, for the bias, are the narrow-N short-K cells at 64 < M <= 256 (2048 x 1280 at M = 129 / 182:
 # `_sm100_smm.short_k_owns`, issue #12 T1), whose bias calls the shortk family below runs on the cascade; the bias stays
-# on tier 1 from M = 257.
-Q_SMM_CELLS = ((5120, 1280, 182), (5120, 1280, 129), (5120, 1280, 1079), (1280, 1280, 364), (1280, 1280, 257),
+# on tier 1 from M = 257. Nor, since FB2, fc1 at M = 129-192, whose identity and erf-GELU calls the swap-AB row takes
+# (Q_FB2_CELLS); from M = 193 the row's 1-SM grid no longer fits one wave and every call keeps its tier.
+Q_SMM_CELLS = ((5120, 1280, 208), (5120, 1280, 256), (5120, 1280, 1079), (1280, 1280, 364), (1280, 1280, 257),
                (2048, 1280, 364), (2048, 1280, 1079))
 # (issue #12, T1) the cascade's short-K tile rule (pick_short_k_tile in dispatch.cuh), on the card's own routing.
 # Cells whose bias calls tier 1 declines (narrow N, 1024 <= K <= 2560, 64 < M <= 256): the identity stays on tier 1,
 # every other call runs on the cascade, on the 1-SM 128 x 64 tile, except the bias and residual calls at 128 < M <= 256,
-# which take the 2-SM 256 x 64 tile.
-Q_SHORTK_DECLINE_CELLS = ((1280, 1280, 65), (1280, 1280, 78), (1280, 1280, 129), (1280, 1280, 256), (2048, 1280, 117),
-                          (2048, 1280, 182), (1024, 2048, 96), (2048, 2048, 80), (2048, 2560, 200))
+# which take the 2-SM 256 x 64 tile. Since FB2 the swap-AB row's narrow-N short-K band takes every call of the cells
+# whose split-K grid (2 x tiles_n x ceil(M / 64) CTAs) has at most 80 CTAs (1280 x 1280 to M = 256, 2048-wide to
+# M = 128, 1024 x 2048 to M = 320: Q_FB2_CELLS), so the cells left here are 1536- and 2048-wide above M = 128.
+Q_SHORTK_DECLINE_CELLS = ((2048, 1280, 129), (2048, 1280, 182), (2048, 1280, 256), (2048, 2048, 160), (1536, 1280, 200),
+                          (2048, 2560, 200))
 # Cells tier 1 keeps for the identity and the bias, whose residual / GELU / quantized calls take the rule's tiles on
-# the cascade: 5120 x 1280 at M = 182 (2-SM 256 x 128, TileK 128) and 364 (1-SM 128 x 128), 1280 x 1280 at M = 364
-# (1-SM 128 x 64) and 1079 (2-SM 256 x 128), 2048 x 1280 at M = 533 (2-SM 256 x 128) and 1079 (1-SM 128 x 128).
-Q_SHORTK_EPI_CELLS = ((5120, 1280, 182), (5120, 1280, 364), (1280, 1280, 364), (1280, 1280, 1079), (2048, 1280, 533),
+# the cascade: 5120 x 1280 at M = 256 (2-SM 256 x 128, TileK 128) and 364 (1-SM 128 x 128), 1280 x 1280 at M = 364
+# (1-SM 128 x 64) and 1079 (2-SM 256 x 128), 2048 x 1280 at M = 600 (2-SM 256 x 128) and 1079 (1-SM 128 x 128). (At
+# 5120 x 1280 M = 129-192 and 2048 x 1280 M = 513-576 the erf-GELU calls run on the swap-AB row since FB2:
+# Q_FB2_CELLS.)
+Q_SHORTK_EPI_CELLS = ((5120, 1280, 256), (5120, 1280, 364), (1280, 1280, 364), (1280, 1280, 1079), (2048, 1280, 600),
                       (2048, 1280, 1079))
 # (issue #12, T1b) cells the wave rule owns (2368 <= N <= 4736 at M <= 128: tier 1 declines every call), so every call
 # runs on the cascade: the 1-SM 128 x 64 tile where the activation is under 128 KiB (the empty-pair guard of
 # pick_wave_tile: the fused q / k / v 3840 x 1280 at M = 78 and 102, 4096 x 1280 at M = 65, 3840 x 1536 at M = 85), the
-# 2-SM 256 x 64 tile from 128 KiB on (3840 x 1280 at M = 103 and 117, 3840 x 1536 at M = 86, the tp2 qkv shard
-# 2560 x 2048 at M = 96).
+# 2-SM 256 x 64 tile from 128 KiB on (3840 x 1280 at M = 103 and 117, 3840 x 1536 at M = 86). (The tp2 qkv shard
+# 2560 x 2048 at M = 96 runs on the swap-AB row's narrow-N short-K band since FB2.)
 Q_SHORTK_WAVE_CELLS = ((3840, 1280, 78), (3840, 1280, 102), (3840, 1280, 103), (3840, 1280, 117), (4096, 1280, 65),
-                       (3840, 1536, 85), (3840, 1536, 86), (2560, 2048, 96))
+                       (3840, 1536, 85), (3840, 1536, 86))
 # plan / route agreement grids: the issue-12 shapes (tower, stem, LLM tp1 and tp2) and the Family A / B / C dense
 # projections of docs/perf/README.md.
 Q_AGREE_SHAPES = tuple(dict.fromkeys(SHAPES + ((2560, 2048), (2048, 2048),
@@ -3471,6 +4090,24 @@ Q_WIDE_FALLTHROUGH = ((1280, 5120, 1079, ((256, 128), (2, 1), True, 1)),)
 Q_WIDE_FORCED_TACTICS = (((128, 64), (1, 1), True, 2), ((128, 64), (1, 1), True, 4), ((128, 128), (1, 1), True, 2),
                          ((128, 128), (1, 1), True, 4), ((256, 64), (2, 1), True, 1), ((256, 128), (2, 1), True, 1))
 Q_WIDE_FORCED_CELLS = ((2048, 4096, 129), (1280, 5120, 200), (1280, 7680, 65))
+# (FB2) the route rules of the B300 swap-AB adoption round: (N, K, M, identity tier, bias tier, residual tier,
+# activation tier) on natural routing. The narrow-N long-K class at 32 < M <= 64 on the split-K form with the 64-wide
+# token tile (four slices on 1280 x 5120, two on 2048 / 2560 x 4096); the narrow-N short-K band (two slices while the
+# split-K grid has at most 80 CTAs); the identity call of wide-N short-K cells on the 1-SM persistent 128 x 64 form
+# (its bias / residual calls keep their tier); the erf-GELU call where the cascade's short-K rule would leave its
+# 64-wide tile (fc1 5120 x 1280 at M = 129-192, 2048 x 1280 at 513-576, 2560 x 1280 at 385-448, 6144 x 2560 at
+# 129-192), whose identity / bias / residual calls keep tier 1 or the cascade.
+_DEC, _SMM, _CAS = "sm100.decode", "sm100.smm", "sm100.cascade"
+Q_FB2_CELLS = tuple((1280, 5120, M, _DEC, _DEC, _DEC, _DEC) for M in (33, 48, 64)) + (
+    (2048, 4096, 48, _DEC, _DEC, _DEC, _DEC), (2560, 4096, 40, _DEC, _DEC, _DEC, _DEC),
+    (1280, 1280, 65, _DEC, _DEC, _DEC, _DEC), (1280, 1280, 129, _DEC, _DEC, _DEC, _DEC),
+    (1280, 1280, 256, _DEC, _DEC, _DEC, _DEC), (2048, 1280, 117, _DEC, _DEC, _DEC, _DEC),
+    (1024, 2048, 320, _DEC, _DEC, _DEC, _DEC), (2560, 2048, 96, _DEC, _DEC, _DEC, _DEC),
+    (2048, 2048, 80, _DEC, _DEC, _DEC, _DEC),
+    (5120, 2048, 96, _DEC, _CAS, _CAS, _CAS), (9216, 2048, 128, _DEC, _CAS, _CAS, _CAS),
+    (5120, 1280, 78, _DEC, _CAS, _CAS, _CAS), (5120, 1280, 182, _DEC, _SMM, _CAS, _DEC),
+    (6144, 2560, 160, _DEC, _SMM, _CAS, _DEC), (2048, 1280, 533, _SMM, _SMM, _CAS, _DEC),
+    (2560, 1280, 448, _SMM, _SMM, _CAS, _DEC))
 
 
 def _q_tier(names) -> str:
@@ -3574,16 +4211,18 @@ def _q_epilogue(M: int, N: int, bias=None, residual=None, activation=None):
 
 
 def _q_cell(M: int, N: int, K: int, seed: int, ext, dig: _PDigest, local: list, stats: dict, want_tier: str,
-            fallthrough_tier: str = None, bias_tier: str = None) -> None:
+            fallthrough_tier: str = None, bias_tier: str = None, act_tier: str = None) -> None:
     """The exactness cases of section 10 on one cell, each call checked for the route it ran on: `want_tier` for
     the identity, `bias_tier or want_tier` for the bias (issue #12 T1: the bias calls of the short-K narrow-N cells
-    leave tier 1), and `fallthrough_tier or want_tier` for residual / GELU calls (tier 1 serves the bias alone, so
-    those fall through to the cascade there)."""
+    leave tier 1), `fallthrough_tier or want_tier` for residual calls (tier 1 serves the bias alone, so those fall
+    through to the cascade there), and `act_tier or fallthrough_tier or want_tier` for erf-GELU calls (FB2: the
+    swap-AB row takes them where the cascade's short-K rule would leave its 64-wide tile)."""
     from fish_scales_ops.gemm import _sm100_dispatch
     L = D.linear
     tag = f"M={M} N={N} K={K}"
     ft = fallthrough_tier or want_tier
     bt = bias_tier or want_tier
+    at = act_tier or ft
     x, w = _p_ints(M, N, K, seed, sparse=False)
     dw = _p_weight(w)
     xq, sx = D.quantize_activation(x)
@@ -3631,7 +4270,8 @@ def _q_cell(M: int, N: int, K: int, seed: int, ext, dig: _PDigest, local: list, 
     # plan() must name the tier each call ran on.
     for label, epi, tier in (("bias", _q_epilogue(M, N, bias=b), bt),
                              ("residual", _q_epilogue(M, N, residual=r), ft),
-                             ("bias+residual", _q_epilogue(M, N, bias=b, residual=r), ft)):
+                             ("bias+residual", _q_epilogue(M, N, bias=b, residual=r), ft),
+                             ("bias+gelu", _q_epilogue(M, N, bias=b, activation="gelu_erf"), at)):
         p = _sm100_dispatch.plan(M, N, K, epi)
         if p != tier:
             local.append(f"{tag} plan({label}) = {p}, but the call ran on {tier}")
@@ -3645,11 +4285,11 @@ def _q_cell(M: int, N: int, K: int, seed: int, ext, dig: _PDigest, local: list, 
     gl0 = ext.gelu_ref(accs.float().contiguous())
     zs = (accs == 0) & (bd == 0)
     run("bias + gelu_erf", lambda: L(xsq, dws, x_scale=ssx, bias=b, activation="gelu_erf"),
-        torch.where(zs, y0s, gl.bfloat16()), ft, one_kernel=(ft == "sm100.decode"))
+        torch.where(zs, y0s, gl.bfloat16()), at, one_kernel=(at == "sm100.decode"))
     run("bias + gelu_erf + residual", lambda: L(xsq, dws, x_scale=ssx, bias=b, residual=r, activation="gelu_erf"),
-        (gl + r.float()).bfloat16(), ft)
+        (gl + r.float()).bfloat16(), at)
     run("gelu_erf (bf16 x)", lambda: L(xs, dws, activation="gelu_erf"), torch.where(accs == 0, y0s, gl0.bfloat16()),
-        ft)
+        at)
     stats["gelu_active"] += int(((accs + bd).abs() < 4).sum())
     dig.add(y0s)
     stats["cells"] += 1
@@ -3713,14 +4353,14 @@ def _q_two_streams(local: list) -> None:
 
 
 def _q_shortk_two_streams(local: list) -> None:
-    """(issue #12, T1) different fused calls on the cascade's short-K tiles (1-SM 128 x 64 with bias + residual,
+    """(issue #12, T1) different fused calls on the cascade's short-K tiles (2-SM 256 x 64 with bias + residual,
     1-SM 128 x 128 with bias + erf-GELU, and (T1b) the fused q / k / v 3840 x 1280 at M = 78 with bias on the 1-SM
     128 x 64 tile the empty-pair guard picks) captured on one stream each of one thread and replayed concurrently 200
     times; each must equal its serial result every time."""
     L = D.linear
     calls = []
-    for (N, K, M, seed, kw) in ((1280, 1280, 78, 211, dict(residual=True)), (5120, 1280, 364, 212,
-                                                                            dict(activation="gelu_erf")),
+    for (N, K, M, seed, kw) in ((2048, 1280, 129, 211, dict(residual=True)), (5120, 1280, 364, 212,
+                                                                             dict(activation="gelu_erf")),
                                 (3840, 1280, 78, 213, dict())):
         dw = prepared(10, N, K, seed=seed)
         x = make_x(M, K, seed=seed + 1)
@@ -3827,9 +4467,12 @@ def _q_pdl(local: list, stats: dict) -> None:
     cells = ((1280, 5120, 7, dict(bias=True, residual=True, activation="gelu_erf"), "sm100.decode"),
              (5120, 1280, 48, dict(bias=True, residual=True, activation="gelu_erf"), "sm100.decode"),
              (5120, 1280, 182, dict(bias=True, residual=False, activation=None), "sm100.smm"),
-             (1280, 1280, 78, dict(bias=True, residual=True, activation=None), "sm100.cascade"),
-             # (T1) a bias-only call of a narrow-N short-K cell tier 1 declines: the cascade's 128 x 64 tile
-             (1280, 1280, 78, dict(bias=True, residual=False, activation=None), "sm100.cascade"),
+             (2048, 1280, 129, dict(bias=True, residual=True, activation=None), "sm100.cascade"),
+             # (T1) a bias-only call of a narrow-N short-K cell tier 1 declines: the cascade's short-K tile
+             (2048, 1280, 129, dict(bias=True, residual=False, activation=None), "sm100.cascade"),
+             # (FB2) the narrow-N short-K band's split-K form, and an erf-GELU call the row takes from the cascade
+             (1280, 1280, 78, dict(bias=True, residual=True, activation=None), "sm100.decode"),
+             (5120, 1280, 182, dict(bias=True, residual=False, activation="gelu_erf"), "sm100.decode"),
              # (P5) the narrow-N long-K band: its split-K form, and the fall-through of a tier-1 cell onto the row
              (2048, 4096, 129, dict(bias=True, residual=True, activation="gelu_erf"), "sm100.decode"),
              (1280, 5120, 1079, dict(bias=True, residual=True, activation=None), "sm100.decode"))
@@ -4013,7 +4656,7 @@ def _q_wide(ext, dig: _PDigest, local: list, stats: dict) -> None:
         _q_cell(M, N, K, M * 1009 + N * 17 + K, ext, dig, local, stats, "sm100.decode")
     # The band's top: tier 1 keeps o at M = 640 (the 128-wide persistent form is not used on the band, see
     # _narrow_long_k_config) and fc2 at M = 1079 (90 cuBLAS CTAs); a K below 4096 and a wide N are not the band.
-    for (N, K, M) in ((2048, 4096, 640), (1280, 5120, 1079), (2560, 4096, 512), (1280, 1280, 182), (5120, 4096, 182)):
+    for (N, K, M) in ((2048, 4096, 640), (1280, 5120, 1079), (2560, 4096, 512), (3840, 1280, 182), (5120, 4096, 182)):
         got = _sm100_decode.pick_config(M, N, K)
         if got is not None:
             local.append(f"wide M={M} N={N} K={K}: pick_config {got}, expected None (not the band)")
@@ -4040,6 +4683,117 @@ def _q_wide(ext, dig: _PDigest, local: list, stats: dict) -> None:
                    local)
     _q_wide_determinism(local, stats)
     _q_wide_two_streams(local)
+
+
+# (FB2) the tactic each Q_FB2_CELLS cell's swap-AB calls must run: (N, K, M) -> (picker, tactic). "config" is
+# pick_config (the cell is the row's by shape, every call); "identity" pick_identity_config and "activation"
+# pick_activation_config (the row takes only those calls of the cell).
+_FB2_T64 = lambda s: ((128, 64), (1, 1), True, s)  # noqa: E731
+_FB2_P128 = ((128, 64), (1, 1), True, 1)
+Q_FB2_TACTICS = {(1280, 5120, 33): ("config", _FB2_T64(4)), (1280, 5120, 48): ("config", _FB2_T64(4)),
+                 (1280, 5120, 64): ("config", _FB2_T64(4)), (2048, 4096, 48): ("config", _FB2_T64(2)),
+                 (2560, 4096, 40): ("config", _FB2_T64(2)), (1280, 1280, 65): ("config", _FB2_T64(2)),
+                 (1280, 1280, 129): ("config", _FB2_T64(2)), (1280, 1280, 256): ("config", _FB2_T64(2)),
+                 (2048, 1280, 117): ("config", _FB2_T64(2)), (1024, 2048, 320): ("config", _FB2_T64(2)),
+                 (2560, 2048, 96): ("config", _FB2_T64(2)), (2048, 2048, 80): ("config", _FB2_T64(2)),
+                 (5120, 2048, 96): ("identity", _FB2_P128), (9216, 2048, 128): ("identity", _FB2_P128),
+                 (5120, 1280, 78): ("identity", _FB2_P128), (5120, 1280, 182): ("identity", _FB2_P128),
+                 (6144, 2560, 160): ("identity", _FB2_P128), (2048, 1280, 533): ("activation", _FB2_P128),
+                 (2560, 1280, 448): ("activation", _FB2_P128)}
+# (FB2) the rules' edges: (N, K, M, picker, expected) on cells one step outside (None) and inside each rule.
+Q_FB2_EDGES = (
+    # the narrow-N short-K band: 80 CTAs of the split-K grid at most
+    (1280, 1280, 256, "config", _FB2_T64(2)), (1280, 1280, 257, "config", None),
+    (2048, 1280, 128, "config", _FB2_T64(2)), (2048, 1280, 129, "config", None),
+    (1024, 2048, 320, "config", _FB2_T64(2)), (1024, 2048, 321, "config", None),
+    (3840, 1280, 65, "config", None), (2048, 512, 128, "config", None), (2048, 1152, 128, "config", None),
+    # the narrow-N long-K class at 32 < M <= 64: the cascade's two-kernel split-K keeps K >= 8192; a K no split divides
+    # keeps the wide-token form
+    (2560, 9728, 48, "config", None), (2560, 8064, 40, "config", ((256, 64), (2, 1), True, 1)),
+    # identity calls of wide-N short-K cells: the 1-SM grid fits one wave; K <= 2560; narrow N is not the rule's
+    (5120, 2048, 192, "identity", _FB2_P128), (5120, 2048, 193, "identity", None),
+    (9216, 2048, 128, "identity", _FB2_P128), (9216, 2048, 129, "identity", None),
+    (12288, 2048, 96, "identity", None), (5120, 4096, 96, "identity", None), (4096, 2048, 96, "identity", None),
+    (5120, 896, 96, "identity", None),
+    # erf-GELU calls: the cascade's 1-SM 128 x 64 grid overflows one wave while the row's grid fits
+    (5120, 1280, 128, "activation", None), (5120, 1280, 129, "activation", _FB2_P128),
+    (5120, 1280, 192, "activation", _FB2_P128), (5120, 1280, 193, "activation", None),
+    (2048, 1280, 512, "activation", None), (2048, 1280, 513, "activation", _FB2_P128),
+    (2048, 1280, 576, "activation", _FB2_P128), (2048, 1280, 577, "activation", None),
+    (1280, 1280, 1079, "activation", None), (5120, 4096, 182, "activation", None))
+
+
+def _q_fb2(ext, dig: _PDigest, local: list, stats: dict) -> None:
+    """(FB2) The route rules of the B300 swap-AB adoption: see Q_FB2_CELLS and the family list above case q."""
+    from fish_scales_ops.gemm import _sm100_decode
+    from fish_scales_ops.gemm import _epilogue as E, _sm100_dispatch
+    pickers = {"config": _sm100_decode.pick_config, "identity": _sm100_decode.pick_identity_config,
+               "activation": _sm100_decode.pick_activation_config}
+    for (N, K, M, picker, want) in Q_FB2_EDGES:
+        got = pickers[picker](M, N, K)
+        if got != want:
+            local.append(f"fb2 edge M={M} N={N} K={K}: {picker} picker {got}, expected {want}")
+    for (N, K, M, t_id, t_bias, t_res, t_act) in Q_FB2_CELLS:
+        picker, want = Q_FB2_TACTICS[(N, K, M)]
+        got = pickers[picker](M, N, K)
+        if got != want:
+            local.append(f"fb2 M={M} N={N} K={K}: {picker} picker {got}, expected {want}")
+        if picker != "config" and _sm100_decode.pick_config(M, N, K) is not None:
+            local.append(f"fb2 M={M} N={N} K={K}: pick_config owns a cell the rule takes only by call")
+        # linear_quantized stays on the cascade, which alone writes the quantized output
+        eq = E.make("case q", m=M, n=N, device=torch.device("cuda", torch.cuda.current_device()), quantized=True,
+                    bias=torch.zeros(N, dtype=torch.bfloat16, device="cuda"), activation="gelu_erf")
+        if _sm100_dispatch.plan(M, N, K, eq) != "sm100.cascade":
+            local.append(f"fb2 M={M} N={N} K={K}: linear_quantized not planned on the cascade")
+        _q_cell(M, N, K, M * 1009 + N * 17 + K, ext, dig, local, stats, t_id, t_res, bias_tier=t_bias, act_tier=t_act)
+    _q_zero_corner(78, 1280, 1280, "sm100.decode", local, stats, "zero_byte_fb2_shortk")
+    _q_zero_corner(96, 5120, 2048, "sm100.decode", local, stats, "zero_byte_fb2_identity", bias_tier="sm100.cascade")
+    _q_zero_corner(48, 2048, 4096, "sm100.decode", local, stats, "zero_byte_fb2_split64")
+    calls = []
+    for (N, K, M, seed, kw) in ((1280, 1280, 182, 51, dict(residual=True)), (5120, 1280, 182, 52,
+                                                                            dict(activation="gelu_erf")),
+                                (2048, 4096, 48, 53, dict(residual=True, activation="gelu_erf"))):
+        x, w = _p_ints(M, N, K, seed, sparse=False)
+        dw = _p_weight(w)
+        xq, sx = D.quantize_activation(x)
+        b = torch.randn(N, device="cuda").bfloat16()
+        r = torch.randn(M, N, device="cuda").bfloat16() if kw.get("residual") else None
+        act = kw.get("activation")
+        _p_capture(f"fb2 M={M} N={N} K={K} {kw} (2b)",
+                   lambda: D.linear(xq, dw, x_scale=sx, bias=b, residual=r, activation=act), local)
+        _p_capture(f"fb2 M={M} N={N} K={K} {kw} (bf16 x)", lambda: D.linear(x, dw, bias=b, residual=r, activation=act),
+                   local)
+        calls.append(lambda xq=xq, dw=dw, sx=sx, b=b, r=r, act=act: D.linear(xq, dw, x_scale=sx, bias=b, residual=r,
+                                                                             activation=act))
+    # identity on the 1-SM persistent form (no epilogue tensors)
+    x, w = _p_ints(160, 6144, 2560, 54, sparse=False)
+    dw = _p_weight(w)
+    xq, sx = D.quantize_activation(x)
+    _p_capture("fb2 M=160 N=6144 K=2560 identity (bf16 x)", lambda: D.linear(x, dw), local)
+    calls.append(lambda xq=xq, dw=dw, sx=sx: D.linear(xq, dw, x_scale=sx))
+    # 200 concurrent replays of the four captured calls on four streams, each against its serial result
+    refs = [c().clone() for c in calls]
+    torch.cuda.synchronize()
+    streams = [torch.cuda.Stream() for _ in calls]
+    graphs, outs = [], []
+    for c, s in zip(calls, streams):
+        s.wait_stream(torch.cuda.current_stream())
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            outs.append(c())
+        graphs.append(g)
+    torch.cuda.synchronize()
+    bad = [torch.zeros((), dtype=torch.int64, device="cuda") for _ in calls]
+    for _ in range(200):
+        for i in range(len(calls)):
+            with torch.cuda.stream(streams[i]):
+                graphs[i].replay()
+                bad[i] += (_bits(outs[i]) != _bits(refs[i])).sum()
+    torch.cuda.synchronize()
+    nbad = [int(t) for t in bad]
+    stats["determinism_cells"] += len(calls)
+    if any(nbad):
+        local.append(f"fb2 concurrent replay on four streams: {nbad} mismatching elements over 200 iterations")
 
 
 def q_worker(label: str) -> int:
@@ -4074,7 +4828,7 @@ def q_worker(label: str) -> int:
         for (N, K, M) in Q_SMM_CELLS:
             _q_cell(M, N, K, M * 1009 + N * 17 + K, ext, dig, local, stats, "sm100.smm", "sm100.cascade")
         _q_zero_corner(364, 1280, 1280, "sm100.smm", local, stats, "zero_byte_smm")
-        _q_zero_corner(129, 5120, 1280, "sm100.smm", local, stats, "zero_byte_smm_wide")
+        _q_zero_corner(208, 5120, 1280, "sm100.smm", local, stats, "zero_byte_smm_wide")
         for (N, K, M, seed) in ((5120, 1280, 182, 21), (1280, 1280, 364, 22)):
             x, w = _p_ints(M, N, K, seed, sparse=False)
             dw = _p_weight(w)
@@ -4096,8 +4850,8 @@ def q_worker(label: str) -> int:
         for (N, K, M) in Q_SHORTK_WAVE_CELLS:
             _q_cell(M, N, K, M * 1009 + N * 17 + K, ext, dig, local, stats, "sm100.cascade")
             _q_shortk_tiles(M, N, K, local, stats)
-        _q_zero_corner(78, 1280, 1280, "sm100.smm", local, stats, "zero_byte_shortk", bias_tier="sm100.cascade")
-        for (N, K, M, seed) in ((1280, 1280, 78, 41), (5120, 1280, 364, 42), (1280, 1280, 1079, 43),
+        _q_zero_corner(129, 2048, 1280, "sm100.smm", local, stats, "zero_byte_shortk", bias_tier="sm100.cascade")
+        for (N, K, M, seed) in ((2048, 1280, 129, 41), (5120, 1280, 364, 42), (1280, 1280, 1079, 43),
                                 (3840, 1280, 78, 44)):
             x, w = _p_ints(M, N, K, seed, sparse=False)
             dw = _p_weight(w)
@@ -4113,6 +4867,9 @@ def q_worker(label: str) -> int:
     elif label == "wide":
         ext = _sm100_gelu_ext()
         _q_wide(ext, dig, local, stats)
+    elif label == "fb2":
+        ext = _sm100_gelu_ext()
+        _q_fb2(ext, dig, local, stats)
     elif label == "agree":
         _q_agree(local, stats)
     elif label == "pdl":
@@ -4146,12 +4903,13 @@ def case_q(major: int) -> None:
     if not _sm100_decode.enabled():
         print("  q  SKIP: the CuTe-DSL decode row is not available in this environment")
         return
-    runs = [("decode", {}), ("smm", {}), ("wide", {}), ("shortk", {}), ("agree", {}), ("pdl", {}),
+    runs = [("decode", {}), ("smm", {}), ("wide", {}), ("shortk", {}), ("fb2", {}), ("agree", {}), ("pdl", {}),
             ("decode/nopdl", {"FSO_DISABLE_PDL": "1"}), ("smm/nopdl", {"FSO_DISABLE_PDL": "1"}),
-            ("wide/nopdl", {"FSO_DISABLE_PDL": "1"}), ("shortk/nopdl", {"FSO_DISABLE_PDL": "1"})]
+            ("wide/nopdl", {"FSO_DISABLE_PDL": "1"}), ("shortk/nopdl", {"FSO_DISABLE_PDL": "1"}),
+            ("fb2/nopdl", {"FSO_DISABLE_PDL": "1"})]
     digests = {}
-    tactic_re = re.compile(r"^\[fso sm100 decode(?: fall-through)?\] M=(\d+) N=(\d+) K=(\d+) -> (\S+) "
-                           r"tiler=\((\d+), (\d+)\)")
+    tactic_re = re.compile(r"^\[fso sm100 decode(?: fall-through| identity| activation)?\] M=(\d+) N=(\d+) K=(\d+) "
+                           r"-> (\S+) tiler=\((\d+), (\d+)\)")
     for label, env in runs:
         worker = label.split("/")[0]
         r, summary = _q_spawn(worker, env)
@@ -4186,7 +4944,7 @@ def case_q(major: int) -> None:
         if not ok and summary is not None:
             for f in summary["failures"][:10]:
                 print(f"       {f}")
-    for k in ("decode", "smm", "wide", "shortk"):
+    for k in ("decode", "smm", "wide", "shortk", "fb2"):
         same = k in digests and digests.get(k) == digests.get(f"{k}/nopdl")
         _check(same, f"q: FSO_DISABLE_PDL=1 changed the bytes of family {k}")
         print(f"  q  PDL on / off, family {k}: identical bytes  {_ok(same)}")
@@ -4203,8 +4961,10 @@ def case_q(major: int) -> None:
 
 S3C_SHAPES = ((5120, 1280), (1280, 1280), (2048, 1280), (1280, 5120))  # N x K: fc1, proj1, 2048 x 1280, fc2
 S3C_MS = (1, 7, 78, 129, 533, 1079)
-# Shapes the natural cascade splits K on (narrow N with long K; tiles_n >= 32 at M <= 32): the quantized reduce.
-S3C_STREAMK_NATURAL = ((1, 2560, 9728), (16, 2560, 9728), (129, 2560, 9728), (20, 4096, 4096), (32, 6144, 5120))
+# Shapes the natural cascade splits K on (narrow N with long K above M = 64): the quantized reduce. The decode cells
+# that were Stream-K before issue #12 F5B run single launches (S3C_DECODE_SINGLE, the quantized-output instances).
+S3C_STREAMK_NATURAL = ((65, 2560, 9728), (100, 2560, 9728), (129, 2560, 9728), (300, 2560, 9728), (129, 3072, 9728))
+S3C_DECODE_SINGLE = ((1, 2560, 9728), (16, 2560, 9728), (20, 4096, 4096), (32, 6144, 5120))
 # The forced tiles' grid: the M set on two N x K and one wider cell.
 S3C_FORCED_GRID = [(M, 1280, K) for K in (1280, 5120) for M in S3C_MS] + [(129, 5120, 1280)]
 # (label, bias, activation): linear_quantized takes no residual.
@@ -4317,7 +5077,7 @@ class _S3cWorker:
         for name, (M, N, K), use_b, act in (("fc1 bias+gelu", (78, 5120, 1280), True, "gelu_erf"),
                                             ("proj1 identity", (533, 1280, 1280), False, None),
                                             ("fc2 bias", (1079, 1280, 5120), True, None),
-                                            ("streamk16 bias+gelu", (16, 2560, 9728), True, "gelu_erf"),
+                                            ("streamk65 bias+gelu", (65, 2560, 9728), True, "gelu_erf"),
                                             ("streamk129 gelu", (129, 2560, 9728), False, "gelu_erf")):
             route = _s1c_route(M, N, K)
             x = make_x(M, K, seed=M + 1)
@@ -4344,7 +5104,7 @@ class _S3cWorker:
                       f"capture on a non-default stream, replay into NaN codes / all-ones words == eager  {_ok(ok)}")
                 calls[(name, path)] = (g, out, ref, (x, dw, xq, sx, b))  # the graph reads these: keep them alive
         # Two different captured calls replayed concurrently from one thread, one per stream, 200 times.
-        for a, b2 in ((("fc1 bias+gelu", "2b"), ("streamk16 bias+gelu", "2b")),
+        for a, b2 in ((("fc1 bias+gelu", "2b"), ("streamk65 bias+gelu", "2b")),
                       (("proj1 identity", "bf16 x"), ("streamk129 gelu", "2b")),
                       (("fc2 bias", "bf16 x"), ("fc2 bias", "2b"))):
             (g1, o1, r1, _), (g2, o2, r2, _) = calls[a], calls[b2]
@@ -4440,7 +5200,8 @@ def _s3c_worker(spec_json: str) -> int:
 def _s3c_specs() -> list:
     """(label, env, spec) of every worker of case r."""
     grid = [{"mnk": (M, N, K)} for N, K in S3C_SHAPES for M in S3C_MS]
-    natural = grid + [{"mnk": mnk, "split": "split"} for mnk in S3C_STREAMK_NATURAL]
+    natural = grid + [{"mnk": mnk, "split": "split"} for mnk in S3C_STREAMK_NATURAL] \
+        + [{"mnk": mnk, "split": 1} for mnk in S3C_DECODE_SINGLE]
     forced = [{"mnk": mnk} for mnk in S3C_FORCED_GRID]
     specs = [("natural", {"FSO_SMALLM_ROUTE": "0"}, {"kind": "exact", "label": "natural", "cells": natural}),
              ("natural, FSO_DISABLE_PDL=1", {"FSO_SMALLM_ROUTE": "0", "FSO_DISABLE_PDL": "1"},
@@ -4696,6 +5457,65 @@ def _s_two_streams(local: list) -> None:
         local.append(f"two-stream concurrent replay: {nbad} mismatching elements over 200 iterations")
 
 
+# The quantized output's two-warpgroup kernels (issue #12 FB3) on the cascade's own picks, N x K x M: the tower's fc1 at
+# M = 533 (the wave rule's 1-SM 128 x 192 tile) and 1079 (the band rule's 2-SM 256 x 128 TileK 256 tile) and proj1 at
+# M = 533 (the short-K rule's 1-SM 128 x 64 tile), all with the TMA epilogue and two accumulator stages.
+S_MWG_CELLS = ((5120, 1280, 533), (5120, 1280, 1079), (1280, 1280, 533))
+
+
+def _s_multiwg(local: list, stats: dict) -> None:
+    """Determinism of the two-warpgroup kernels (dense_epilogue_gemm.cuh, kDenseQuantEpiWarpgroups): every call of
+    S_MWG_CELLS (bias + erf-GELU, the 2b entry) is captured on a stream of its own and replayed 200 times, each replay
+    bit-identical to the eager call (codes and scale words); then the first two are replayed concurrently on their two
+    streams 200 times, each against its serial result."""
+    calls = []
+    for (N, K, M) in S_MWG_CELLS:
+        dw = prepared(10, N, K, seed=M + N)
+        x = make_x(M, K, seed=M + N + 1)
+        xq, sx = D.quantize_activation(x)
+        b = (torch.randn(N, device="cuda") * 0.5).bfloat16()
+        calls.append((f"M={M} N={N} K={K}", lambda xq=xq, dw=dw, sx=sx, b=b: D.linear_quantized(
+            xq, dw, x_scale=sx, bias=b, activation="gelu_erf")))
+    refs = [tuple(t.clone() for t in c()) for _, c in calls]
+    torch.cuda.synchronize()
+    streams, graphs, outs = [], [], []
+    for _, c in calls:
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            outs.append(c())
+        streams.append(s)
+        graphs.append(g)
+    torch.cuda.synchronize()
+
+    def mismatches(i):
+        return (outs[i][0].view(torch.uint8) != refs[i][0].view(torch.uint8)).sum() + (outs[i][1] != refs[i][1]).sum()
+
+    for i, (label, _) in enumerate(calls):
+        bad = torch.zeros((), dtype=torch.int64, device="cuda")
+        torch.cuda.synchronize()  # the counter's fill (default stream) before the replay stream adds to it
+        with torch.cuda.stream(streams[i]):
+            for _ in range(200):
+                graphs[i].replay()
+                bad += mismatches(i)
+        torch.cuda.synchronize()
+        if int(bad):
+            local.append(f"two warpgroups {label}: {int(bad)} mismatching elements over 200 replays")
+        stats["mwg_replayed"] = stats.get("mwg_replayed", 0) + 1
+    bad = [torch.zeros((), dtype=torch.int64, device="cuda") for _ in range(2)]
+    torch.cuda.synchronize()
+    for _ in range(200):
+        for i in range(2):
+            with torch.cuda.stream(streams[i]):
+                graphs[i].replay()
+                bad[i] += mismatches(i)
+    torch.cuda.synchronize()
+    nbad = [int(t) for t in bad]
+    if any(nbad):
+        local.append(f"two warpgroups, two-stream concurrent replay: {nbad} mismatching elements over 200 iterations")
+
+
 def _s_refuse(force: str, word: str, local: list) -> None:
     N, K, M = 1280, 1280, 7
     dw = prepared(10, N, K, seed=91)
@@ -4801,6 +5621,8 @@ def s_worker(label: str) -> int:
         _s_refuse(*P_REFUSE[label], local)
     elif label == "streams":
         _s_two_streams(local)
+    elif label == "mwg":
+        _s_multiwg(local, stats)
     else:
         if label in P_SPLIT:
             cells = [(M, N, K) for (N, K) in S_SHAPES for M in S_SPLIT_MS]
@@ -4857,10 +5679,11 @@ def case_s(major: int) -> None:
     runs.update(P_SPLIT)
     runs.update({k: {"FSO_FORCE_TILE": v[0]} for k, v in P_REFUSE.items()})
     runs["streams"] = {"FSO_FORCE_TILE": "128,128,9"}
+    runs["mwg"] = {}
     runs["natural"] = {}
     nopdl = {"rules": "rules/nopdl", "9": "9/nopdl"}
     digests = {}
-    s_re = re.compile(r"^\[fso sm100 tile\] quantized (\d+x\d+x\d+) cluster=\(\d+,\d+\) nosmem=(\d)")
+    s_re = re.compile(r"^\[fso sm100 tile\] quantized (\d+x\d+x\d+) cluster=\(\d+,\d+\) nosmem=(\d) .* warpgroups=(\d)")
     for label, env in list(runs.items()) + [(v, {**runs[k], "FSO_DISABLE_PDL": "1"}) for k, v in nopdl.items()]:
         worker = label.split("/nopdl")[0]
         r, summary = _s_spawn(worker, env)
@@ -4871,21 +5694,33 @@ def case_s(major: int) -> None:
         note = ""
         if worker in P_FORCED:
             _, tile, ns = P_FORCED[worker]
-            cov = set(ran) == {(tile, str(ns))}
+            # the quantized output's epilogue warpgroups (dense_epilogue_gemm.cuh, kDenseQuantGeluEpiWarpgroups): on
+            # the TMA epilogue of the tiles narrower than 256 the erf-GELU calls run two and the identity / bias calls
+            # one (CUTLASS's own class); every other tile runs one for every call
+            two = ns == 0 and tile.split("x")[1] != "256"
+            want = {(tile, str(ns), "1"), (tile, str(ns), "2")} if two else {(tile, str(ns), "1")}
+            cov = set(ran) == want
             ok = ok and cov
-            note = f"; ran {['%s nosmem=%s' % e for e in ran]}{'' if cov else ' (expected ' + tile + ')'}"
+            note = (f"; ran {['%s nosmem=%s warpgroups=%s' % e for e in ran]}"
+                    f"{'' if cov else ' (expected ' + str(sorted(want)) + ')'}")
         elif worker in P_SPLIT:
             ok = ok and split_ran
             note = f"; split-K ran {split_ran}"
         elif worker == "rules":
             ok = ok and split_ran and len(ran) > 0
-            note = f"; rules ran {len(ran)} quantized kernels {['%s ns=%s' % e for e in ran]}, split-K {split_ran}"
+            note = f"; rules ran {len(ran)} quantized kernels {['%s ns=%s wg=%s' % e for e in ran]}, split-K {split_ran}"
         elif worker == "streams":
             caps = re.findall(r"\[fso sm100 splitk\] captured on stream (0x[0-9a-f]+): workspace (0x[0-9a-f]+)",
                               r.stderr)
             two = len(caps) == 2 and caps[0][0] != caps[1][0] and caps[0][1] != caps[1][1]
             ok = ok and two
             note = f"; captures {caps} (two streams, two workspaces: {two})"
+        elif worker == "mwg":
+            two = len(ran) > 0 and all(e[2] == "2" for e in ran)
+            ok = ok and two
+            n_rep = summary.get("mwg_replayed") if summary else None
+            note = (f"; the cascade's picks ran {['%s ns=%s wg=%s' % e for e in ran]} (two warpgroups on each: {two}), "
+                    f"{n_rep} captured calls replayed 200 x bit-identically, two of them concurrently on two streams")
         elif worker == "natural" and summary is not None:
             tiers = summary.get("bf16_tiers", {})
             want = {"sm100.smm"} | ({"sm100.decode"} if summary.get("decode_enabled") else set()) \
@@ -4894,7 +5729,7 @@ def case_s(major: int) -> None:
             ran_q = len(ran) > 0
             ok = ok and seen and ran_q
             note = (f"; bf16 calls planned on {tiers} (needs {sorted(want)}: {seen}), every quantized call planned "
-                    f"on and ran on the cascade ({len(ran)} quantized kernels {['%s ns=%s' % e for e in ran]})")
+                    f"on and ran on the cascade ({len(ran)} quantized kernels {['%s ns=%s wg=%s' % e for e in ran]})")
             for row in summary.get("natural", []):
                 M, N, K, var, tier, n_bf16, n_codes, n_words, n_el = row
                 print(f"  s  natural M={M} N={N} K={K} {var:15s} bf16 route {tier:13s}: vs quantize_activation("
@@ -4936,8 +5771,9 @@ def case_s(major: int) -> None:
 
 # Candidate cells (M, N, K); the ones a rule routes (the 2b call's R1 or the bf16-x call's R2) are run: the issue's
 # RTX 5090 TP2 shards qkv [2560 x 2048] and o [2048 x 2048] across the decode band, the tower shapes of case r at
-# decode M, and K = 9728 at M <= 8, where the cascade splits K (Stream-K) and rounds its slices' partials (on the RTX
-# 5090 the rules route none of the K = 9728 cells; they run where a rule takes them).
+# decode M, and K = 9728 at M <= 8, where the cascade runs the single launch of the 6-stage (16, 64) tile (a Stream-K
+# split that rounded its slices' partials before issue #12 F5B; on the RTX 5090 the rules route none of the K = 9728
+# cells; they run where a rule takes them).
 S120_CANDIDATES = tuple((M, N, K) for (N, K) in ((2560, 2048), (2048, 2048)) for M in (1, 4, 8, 16, 32, 48, 64)) \
     + tuple((M, N, K) for (N, K) in ((5120, 1280), (1280, 1280), (2048, 1280), (1280, 5120)) for M in (1, 7, 16)) \
     + ((1, 2560, 9728), (4, 2560, 9728), (8, 2560, 9728))
@@ -5066,6 +5902,204 @@ def _case_s_sm120() -> None:
           f"scale words; on the cascade (route off) it equals quantize_activation(linear()) bit for bit")
 
 
+# --- (x) sm_100/sm_103: the weight handle is complete before the next launch (issue #12, FB1) ------------------------
+#
+# The GEMMs of the sm_100/sm_103 decode row read the weight and its scale before their PDL wait (the weights-first
+# prologue, fish_scales_ops.gemm._sm100_decode._WEIGHTS_FIRST); the other routes read nothing before it. A weight
+# written by the kernel launched right before a decode-row GEMM would therefore be read before it is complete, and
+# prepare_weight ends with one plain launch (fso.dense._complete_handle). The producer in front of each call below is
+# the probe of case (m): it releases its programmatic dependents at entry and finishes 2 ms later, so a programmatic
+# launch behind it can start at once.
+
+def _x_dst_handle(dw):
+    """A handle of dw's shapes, strides and dtypes with zeroed tensors (the destination the producer fills)."""
+    w2 = torch.zeros_like(dw.weight)
+    s2 = torch.zeros_like(dw.scale)
+    return type(dw)(dw.kind, dw.format, dw.arch, dw.in_features, dw.out_features, w2, s2)
+
+
+def case_x(major: int) -> None:
+    """sm_100/sm_103 (issue #12, FB1): the weight handle and the weights-first GEMMs.
+      x1  prepare_weight -> linear back to back, both entries (a bf16 x: quantize + GEMM; the pre-quantized x), behind
+          a producer that releases its dependents at once and finishes 2 ms later (the weight quantize, a
+          programmatic dependent of it, runs only then): every call equals the same call made after a device
+          synchronization. prepare_weight ends with one plain launch, which starts only when the weight quantize has
+          completed, so neither entry's GEMM can start before the handle is complete.
+      x2  a weight written by the kernel launched right before a pre-quantized call (the producer copies the codes
+          and the scale words into a zeroed handle 2 ms after releasing its dependents). On the decode row with
+          weights first, the control: the weight is read before it is written, and the call differs from the call on
+          the final handle (the overlap the plain launch closes). On every other route, and with weights first off,
+          the guard: the GEMM reads nothing before its wait, and the call equals the call on the final handle. The
+          bf16-x entry behind the same writer is printed (its activation quantize stands between the writer and the
+          GEMM; whether the GEMM can overlap the writer depends on where the quantize releases it).
+      x2b prepare_weight with the plain launch dropped (fso.dense._complete_handle patched to the identity), behind the
+          producer, both entries, eight trials each: the calls that differ from the synchronized call are counted and
+          printed (data; how wide this window is depends on where the activation and weight quantizes release their
+          dependents).
+      x3  a captured graph of linear (both entries) whose weight bytes are rewritten in place by an ordinary torch copy
+          (a copy-engine memcpy, and a gather kernel), then replayed: equals the eager call on the new weight. A graph
+          launch depends on everything launched before it on the stream (a full dependency: a programmatic edge exists
+          only between kernel nodes inside a graph), so the GEMM's early weight reads come after the copy.
+      x4  fso.compat.linear_fp8 with FP32 scales, which it packs inside the call (both FP32, and each of the two
+          mixes with a pre-packed scale), behind the producer: equal to the call on scales packed beforehand. The
+          call writes the weight side first and keeps a plain launch between that write and the GEMM.
+    Skipped with FSO_DISABLE_PDL=1 for x1 / x2 / x2b / x4 (nothing overlaps then)."""
+    if major != 10:
+        print(f"  x  sm_100/sm_103 only; skipped on {_arch_label()}")
+        return
+    from fish_scales_ops.gemm import _sm100_decode, _sm100_dispatch
+    pdl = os.environ.get("FSO_DISABLE_PDL") != "1"
+    ext = _pdl_probe() if pdl else None
+    spin = 2_000_000  # ns
+    if pdl:
+        t0, t1 = torch.ones(256, dtype=torch.int16, device="cuda"), torch.zeros(256, dtype=torch.int16, device="cuda")
+        ext.slow_copy2(t0, t1, t0, t1, 1, 1000)
+        torch.cuda.synchronize()
+    tiny_s, tiny_d = torch.ones(64, dtype=torch.int16, device="cuda"), torch.zeros(64, dtype=torch.int16, device="cuda")
+    # (N, K, M): the decode row's split-K and persistent forms and its two-CTA tile at M = 64 (the kernels that read
+    # the weight before their wait), and short-K cells with a bias: the 1280 x 1280 ones on the row's narrow short-K
+    # split-K form, the 5120 x 1280 one on tier 1 (cuBLAS scaled_mm, a plain launch, which reads nothing before the
+    # kernel in front has finished). Each cell's route is asked from the router, so the case follows the routes.
+    cells = ((5120, 2048, 1), (2048, 4096, 16), (5120, 2048, 64), (1280, 5120, 78), (1280, 1280, 78),
+             (1280, 1280, 182), (5120, 1280, 182))
+    for N, K, M in cells:
+        w = make_w(N, K, seed=1301 + N + K)
+        x = make_x(M, K, seed=1302 + M)
+        b = (torch.randn(N, device="cuda") * 0.1).bfloat16() if K == 1280 else None
+        dw_ref = D.prepare_weight(w, format="mxfp8")
+        xq, sx = D.quantize_activation(x)
+        torch.cuda.synchronize()
+        want = {"bf16-x": D.linear(x, dw_ref, bias=b), "2b": D.linear(xq, dw_ref, x_scale=sx, bias=b)}
+        torch.cuda.synchronize()
+        calls = {"bf16-x": lambda d: D.linear(x, d, bias=b), "2b": lambda d: D.linear(xq, d, x_scale=sx, bias=b)}
+        route = _sm100_dispatch.plan(M, N, K, _q_epilogue(M, N, bias=b) if b is not None else None)
+        # the decode row builds its weights-first prologue only for a K slice of at least WF_MIN_K_BLOCKS mainloop
+        # blocks (128 wide): k / 128 / split_k of the tactic it picks
+        cfg = _sm100_decode.pick_config(M, N, K) if route == "sm100.decode" else None
+        k_blocks = K // 128 // (cfg[3] if cfg else 1)
+        reads_early = route == "sm100.decode" and pdl and _sm100_decode._weights_first(k_blocks)
+        tag = f"N={N:5d} K={K:5d} M={M:5d} {route}{' wf' if reads_early else ''}"
+        if pdl:
+            # x1: producer -> prepare_weight -> linear
+            for entry, call in calls.items():
+                ok = True
+                for _ in range(4):
+                    torch.cuda.synchronize()
+                    ext.slow_copy2(tiny_s, tiny_d, tiny_s, tiny_d, 1, spin)
+                    dw = D.prepare_weight(w, format="mxfp8")
+                    got = call(dw)
+                    torch.cuda.synchronize()
+                    ok &= bytes_equal(got, want[entry])
+                _check(ok, f"x1 {tag} {entry}: prepare_weight -> linear behind a late producer != the synchronized call")
+                print(f"  x1 {tag} {entry:6s}: producer -> prepare_weight -> linear == synchronized call {_ok(ok)}")
+            # x2: a weight written by the kernel right before the call
+            for entry, call in calls.items():
+                dst = _x_dst_handle(dw_ref)
+                call(dst)  # warm with the destination handle (descriptors, JIT)
+                dst.weight.zero_(), dst.scale.zero_()
+                torch.cuda.synchronize()
+                ext.slow_copy2(dw_ref.weight.view(torch.int16), dst.weight.view(torch.int16),
+                               dw_ref.scale.view(torch.int16), dst.scale.view(torch.int16), 8, spin)
+                got = call(dst)
+                torch.cuda.synchronize()
+                differs = not bytes_equal(got, want[entry])
+                if entry == "2b" and reads_early:
+                    _check(differs, f"x2 {tag} 2b: a weight written by the kernel right before the call was read after "
+                                    f"it was complete (the control saw no overlap)")
+                    print(f"  x2 {tag} 2b    : weight written 2 ms after its writer released the GEMM: the call "
+                          f"differs from the call on the final weight {_ok(differs)} (the overlap is real)")
+                elif entry == "2b":
+                    _check(not differs, f"x2 {tag} 2b: a GEMM that reads nothing before its wait read a weight written "
+                                        f"by the kernel right before the call before it was complete")
+                    print(f"  x2 {tag} 2b    : weight written 2 ms after its writer released the GEMM: the call "
+                          f"equals the call on the final weight {_ok(not differs)} (nothing read before the wait)")
+                else:
+                    print(f"  x2 {tag} bf16-x: the same writer in front of the activation quantize: the call "
+                          f"{'differs' if differs else 'equals the call on the final weight'} (data)")
+            # x2b: prepare_weight without its plain launch
+            saved = getattr(D, "_complete_handle", None)
+            if saved is None:
+                print(f"  x2b {tag}: prepare_weight has no trailing plain launch in this build; skipped")
+            else:
+                D._complete_handle = lambda dw_: dw_
+                try:
+                    for entry, call in calls.items():
+                        n_diff = 0
+                        for _ in range(8):
+                            torch.cuda.synchronize()
+                            ext.slow_copy2(tiny_s, tiny_d, tiny_s, tiny_d, 1, spin)
+                            dw = D.prepare_weight(w, format="mxfp8")
+                            got = call(dw)
+                            torch.cuda.synchronize()
+                            n_diff += 0 if bytes_equal(got, want[entry]) else 1
+                        print(f"  x2b {tag} {entry:6s}: prepare_weight WITHOUT its plain launch -> linear: {n_diff} "
+                              f"of 8 calls differ from the synchronized call (data)")
+                finally:
+                    D._complete_handle = saved
+        # x3: in-place rewrite, then graph replay
+        w2 = make_w(N, K, seed=1303 + N + K)
+        dw2 = D.prepare_weight(w2, format="mxfp8")
+        torch.cuda.synchronize()
+        want2 = {"bf16-x": D.linear(x, dw2, bias=b), "2b": D.linear(xq, dw2, x_scale=sx, bias=b)}
+        for entry, call in calls.items():
+            dw = D.prepare_weight(w, format="mxfp8")
+            call(dw)
+            torch.cuda.synchronize()
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                call(dw)
+            torch.cuda.current_stream().wait_stream(s)
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, stream=s):
+                out = call(dw)
+            g.replay()
+            torch.cuda.synchronize()
+            ok0 = bytes_equal(out, want[entry])
+            dw.weight.copy_(dw2.weight)  # same dtype, contiguous: a copy-engine memcpy
+            dw.scale.copy_(dw2.scale)
+            g.replay()
+            torch.cuda.synchronize()
+            ok1 = bytes_equal(out, want2[entry])
+            src_w, dst_w = dw.weight.view(torch.uint8).view(-1), dw.weight.view(torch.uint8).view(-1)
+            idx = torch.arange(dw_ref.weight.numel(), device="cuda")
+            torch.index_select(dw_ref.weight.view(torch.uint8).view(-1), 0, idx, out=dst_w)  # a gather kernel
+            idx_s = torch.arange(dw_ref.scale.numel(), device="cuda")
+            torch.index_select(dw_ref.scale.view(-1), 0, idx_s, out=dw.scale.view(-1))
+            g.replay()
+            torch.cuda.synchronize()
+            ok2 = bytes_equal(out, want[entry])
+            del src_w
+            ok = ok0 and ok1 and ok2
+            _check(ok, f"x3 {tag} {entry}: graph replay after an in-place weight rewrite != eager on the new weight "
+                       f"(capture {ok0}, memcpy {ok1}, gather kernel {ok2})")
+            print(f"  x3 {tag} {entry:6s}: graph replay after an in-place rewrite (memcpy, then a gather kernel) == "
+                  f"eager on the new weight {_ok(ok)}")
+            del g
+        # x4: linear_fp8 packing FP32 scales inside the call, behind the producer
+        if pdl:
+            wq, sw32 = C.quantize_128x128_fp8(w)
+            xq1, sx32 = C.quantize_1x128_fp8(x)
+            # the reference packs with the kernels linear_fp8 itself runs (the unchecked torch ops), ahead of the call
+            ops = torch.ops.fish_scales_ops
+            sxp, swp = ops.repack_fp8_act_scales(sx32.contiguous(), False), ops.repack_fp8_wgt_scales(sw32, False)
+            torch.cuda.synchronize()
+            ref = C.linear_fp8(xq1, wq, sxp, swp)
+            torch.cuda.synchronize()
+            ok = True
+            for sx_, sw_ in ((sx32, sw32), (sxp, sw32), (sx32, swp)):
+                for _ in range(3):
+                    torch.cuda.synchronize()
+                    ext.slow_copy2(tiny_s, tiny_d, tiny_s, tiny_d, 1, spin)
+                    got = C.linear_fp8(xq1, wq, sx_, sw_)
+                    torch.cuda.synchronize()
+                    ok &= bytes_equal(got, ref)
+            _check(ok, f"x4 {tag}: linear_fp8 with scales packed inside the call != the call on pre-packed scales")
+            print(f"  x4 {tag}: linear_fp8 packing its FP32 scales in the call (three scale mixes) == pre-packed "
+                  f"{_ok(ok)}")
+
+
 def _finish(ok_line: str) -> int:
     if failures:
         print("\nFAILURES:")
@@ -5091,6 +6125,10 @@ def main() -> int:
         return _s120_worker(sys.argv[2])
     if len(sys.argv) > 2 and sys.argv[1] == "--w-worker":  # a worker of case (w)
         return _w_worker(sys.argv[2])
+    if len(sys.argv) > 2 and sys.argv[1] == "--t-worker":  # a worker of case (t)
+        return _t_worker(sys.argv[2])
+    if len(sys.argv) > 2 and sys.argv[1] == "--u-worker":  # a worker of case (u)
+        return _u_worker(sys.argv[2])
     # --case X runs one case alone (a shared card whose lock windows are bounded; the default runs every case).
     only = sys.argv[sys.argv.index("--case") + 1] if "--case" in sys.argv else None
 
@@ -5156,6 +6194,14 @@ def main() -> int:
         case_m(major, mode)
         print("== (n) sm_90 epilogue: bias / residual at an odd element offset ==")
         case_n(major, mode)
+    if wanted("t"):
+        print("== (t) sm_90 in-cluster split-K route: routes, section-10 exactness, bf16-x == 2b, determinism, the "
+              "one-slice kernel, the split route against the one-CTA route (subprocesses per knob) ==")
+        case_t(major)
+    if wanted("u"):
+        print("== (u) sm_90 two-warp-group split-K route: routes, section-10 exactness, bf16-x == 2b, determinism, "
+              "forced slice counts, the split route against the routes it replaces (subprocesses per knob) ==")
+        case_u(major)
     if wanted("o"):
         print("== (o) the sm_120/sm_121 dense epilogue on every route (one subprocess per route) ==")
         case_o(major)
@@ -5176,6 +6222,9 @@ def main() -> int:
         print("== (s) linear_quantized beside another route: sm_100/sm_103 on the C++ cascade (every tile family "
               "forced, and the natural routing); sm_120/sm_121 on the cascade beside the small-M route ==")
         case_s(major)
+    if wanted("x"):
+        print("== (x) sm_100/sm_103: the weight handle is complete before the next launch; weights-first GEMMs ==")
+        case_x(major)
     return _finish("fso.dense interface v1: ALL PASS")
 
 

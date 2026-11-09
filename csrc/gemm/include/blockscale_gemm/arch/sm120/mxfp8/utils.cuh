@@ -183,9 +183,15 @@ struct SM120MxFP8BlockScaledBuilder
     // Identical to the 1×128 path → kernel pipeline structure unchanged.
     static constexpr int kNumTileKPerSF = (4 * kSFVecSize * kTileSF) / kTileK;
     static_assert(kNumTileKPerSF * kTileK == 4 * kSFVecSize * kTileSF, "kTileK must divide SF transaction K span");
+    // The ring mainloop (issue #12 F5B; SM120BlockScaledKernel in fp8/gemm_1d1d.cuh): a dense instance whose A/B
+    // stage count does not divide the scale span (3 stages, or more than 4) runs its A/B stages as a ring of any depth.
+    // Every other instance, every grouped (MoE) one included, keeps the original loop, whose stages come in rounds of
+    // AB_Stages that divide the span (2 or 4 stages), and its machine code.
+    static constexpr bool kRingMainloop = !GroupedLayoutSmem_ && (kNumTileKPerSF % AB_Stages != 0);
     static constexpr int kNumStagePerSF = kNumTileKPerSF / AB_Stages;
-    static_assert(kNumStagePerSF > 0 && kNumStagePerSF <= 2, "kNumStagePerSF must be 1 or 2 ");
-    static_assert(kNumTileKPerSF % AB_Stages == 0, "kNumTileKPerSF must be divisible by AB_Stages");
+    static_assert(kRingMainloop ? AB_Stages >= 2 : (kNumStagePerSF > 0 && kNumStagePerSF <= 2),
+        "the original mainloop needs 1 or 2 rounds of A/B stages per scale span, the ring mainloop 2 or more stages");
+    static_assert(kRingMainloop || kNumTileKPerSF % AB_Stages == 0, "kNumTileKPerSF must be divisible by AB_Stages");
 
     using TileShape = Shape<Int<kTileM>, Int<kTileN>, Int<kTileK>>;
     using ScaleTileShape = Shape<Int<kTileM>, Int<kTileN>, Int<kTileSF>>;

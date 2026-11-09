@@ -116,6 +116,14 @@ SLOT_MOE_TU = CSRC / "gemm" / "ops" / "mxfp8_sm100_slot_moe_kernel.cu"
 # its device code (run fso_issue12_20261028/R1); the same three generated headers.
 SLOT_MOE_LIST_TU = CSRC / "gemm" / "ops" / "mxfp8_sm100_slot_moe_list_kernel.cu"
 
+# The sm_100 dense-epilogue units (bias / erf-GELU / residual and the quantized output of linear_quantized, one
+# configuration group each, blockscale_gemm/arch/sm100/mxfp8/dense_common.cuh). All of them include
+# dense_epilogue_gemm.cuh, which includes the multi-warpgroup clone of CUTLASS's sm_100 TMA epilogue (issue #12 FB3;
+# only the quantized-output units instantiate it); the identity kernels' unit (mxfp8_sm100_kernel.cu) does not include
+# it, so its device code is untouched.
+DENSE_EPI_TUS = [CSRC / "gemm" / "ops" / f"mxfp8_sm100_epi{q}_kernel_{g}.cu"
+                 for q in ("", "_quant") for g in ("1sm", "2sm", "nosmem")]
+
 # (generator script, header path inside the generated-include root, the
 # translation unit that includes it[, extra generator arguments]). The TU column
 # is what scopes the include path; a second entry for the same TU would simply
@@ -157,6 +165,12 @@ GENERATED_HEADERS = [
     (CSRC / "gemm" / "tools" / "make_sm100_slot_kernel.py",
      Path("blockscale_gemm/arch/sm100/mxfp8/sm100_slot_moe_kernel.hpp"),
      SLOT_MOE_LIST_TU, ("--moe",)),
+] + [
+    # The dense epilogue's multi-warpgroup TMA epilogue (issue #12 FB3), one row per dense-epilogue unit.
+    (CSRC / "gemm" / "tools" / "make_sm100_dense_epi_multiwg.py",
+     Path("blockscale_gemm/arch/sm100/mxfp8/sm100_dense_epi_multiwg.hpp"),
+     tu)
+    for tu in DENSE_EPI_TUS
 ]
 
 

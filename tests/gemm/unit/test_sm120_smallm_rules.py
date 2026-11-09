@@ -1,6 +1,6 @@
 """The route rules and the configuration of the sm_120/sm_121 small-M dense MXFP8 route, on the host.
 
-The rules R1 (the 2b call) and R2 (the bf16-x call) and the kernel configuration of ``sm120.smallm``
+The rules R1 (the 2b call, with issue #12 F5C's ring-fill term) and R2 (the bf16-x call) and the kernel configuration of ``sm120.smallm``
 (csrc/gemm/include/blockscale_gemm/arch/sm120/mxfp8/smallm_route.h) are host arithmetic in (M, N, K). The extension
 exposes them as ``torch.ops.fish_scales_ops.sm120_smallm_rules(M, N, K, sms)`` -> ``[takes_2b, takes_bf16x, r1, r2,
 nc, rt, wk, cj, smem]`` for a device of ``sms`` multiprocessors (R1's one-round plan guard depends on it) without
@@ -42,7 +42,10 @@ SMS = 170                                   # the RTX 5090's SM count, the devic
 BUDGET_R1, N0_R1 = 73728.0, 16384.0
 R1_RESIDENT_ONLY, R1_NC_MAX = True, 5       # R1's plan guards (smallm_route.h kR1ResidentOnly, kR1NcMax)
 R1_ONE_ROUND = True                         # R1's plan guard kR1OneRound: N / (16 rt) tile groups <= sms
+R1_DRAM_TILE_GROUPS = 128                   # R1's ring-fill term applies from this many tile groups (kR1DramTileGroups)
+RING = 8                                    # the kernel's weight-ring depth in steps (kRing)
 BUDGET_R2, N0_R2 = 65536.0, 24576.0
+R2_TILE_GROUPS0 = 96.0                      # R2's budget grows in proportion to the tile groups above this many (F5A)
 R2_KEXP_QUARTERS, R2_K_MAX = 1, 1 << 30     # q = 1/4; no K cap
 
 failures: list[str] = []
@@ -59,20 +62,26 @@ def shape_served(M: int, N: int, K: int) -> bool:
     return 1 <= M <= K_MAX_M and K > 0 and K % 128 == 0 and N > 0 and N % 32 == 0
 
 
+def ring_fill(N: int, K: int, rt: int, wk: int) -> float:
+    """R1's ring-fill term (issue #12 F5C): the steps of the RING-step weight ring one tile group gives each warp,
+    (K / 32 / wk) * rt, over RING, at most 1; 1 below R1_DRAM_TILE_GROUPS tile groups."""
+    if N // (16 * rt) < R1_DRAM_TILE_GROUPS:
+        return 1.0
+    steps = (K // 32) / wk * rt
+    return steps / RING if steps < RING else 1.0
+
+
 def rule_r1(M: int, N: int, K: int, sms: int = SMS) -> bool:
     if not 1 <= M <= K_MAX_M:
         return False
-    if float((M + 7) // 8 * 8) * K * (1.0 + N / N0_R1) > BUDGET_R1:
+    nc, rt, wk, cj, _smem = config(M, N, K)
+    if R1_RESIDENT_ONLY and cj != 0:
         return False
-    if R1_RESIDENT_ONLY or R1_NC_MAX < 8 or R1_ONE_ROUND:
-        nc, rt, _wk, cj, _smem = config(M, N, K)
-        if R1_RESIDENT_ONLY and cj != 0:
-            return False
-        if nc > R1_NC_MAX:
-            return False
-        if R1_ONE_ROUND and N // (16 * rt) > sms:
-            return False
-    return True
+    if nc > R1_NC_MAX:
+        return False
+    if R1_ONE_ROUND and N // (16 * rt) > sms:
+        return False
+    return float((M + 7) // 8 * 8) * K * (1.0 + N / N0_R1) <= BUDGET_R1 * ring_fill(N, K, rt, wk)
 
 
 def r2_kq(K: int) -> float:
@@ -84,12 +93,20 @@ def r2_cost(m: int, N: int, K: int) -> float:
     return float(m) * K * (1.0 + N / N0_R2) * r2_kq(K)
 
 
+def r2_budget(M: int, N: int, K: int) -> float:
+    """BUDGET_R2 * max(1, T / R2_TILE_GROUPS0), T = N / (16 rt) the tile groups of the shape's configuration."""
+    _nc, rt, _wk, _cj, _smem = config(M, N, K)
+    t = float(N // (16 * rt))
+    return BUDGET_R2 * (t / R2_TILE_GROUPS0) if t > R2_TILE_GROUPS0 else BUDGET_R2
+
+
 def rule_r2(M: int, N: int, K: int, sms: int = SMS) -> bool:
     if not 1 <= M <= K_MAX_M or K > R2_K_MAX:
         return False
-    if r2_cost(M, N, K) > BUDGET_R2:
+    b = r2_budget(M, N, K)
+    if r2_cost(M, N, K) > b:
         return False
-    if M > 8 and r2_cost((M + 7) // 8 * 8, N, K) > BUDGET_R2:
+    if M > 8 and r2_cost((M + 7) // 8 * 8, N, K) > b:
         return False
     return rule_r1(M, N, K, sms)
 
@@ -142,12 +159,12 @@ Q120A_SHAPES = {  # tag: (N, K), the twelve Q120a decode shapes (issue-12 LLM ro
     "C_shared_down": (2048, 512),
 }
 # The fitted band at the RTX 5090's 170 SMs: (largest M R1 routes, largest M R2 routes) over every M = 1..64, with no
-# hole below the top (the refit on library timings of issue #12 Q120d, runs/Q120d/refit; the table is the refit tool's
-# own rule applied to every M, not the extension's). Shapes whose tile groups need more than one round of the
-# persistent grid on 170 SMs are never routed (0, 0).
+# hole below the top (the refit on library timings of issue #12 Q120d, runs/Q120d/refit, with R2's tile-group term of
+# issue #12 F5A, runs/F5A/refit; the table is the refit tool's own rule applied to every M, not the extension's).
+# Shapes whose tile groups need more than one round of the persistent grid on 170 SMs are never routed (0, 0).
 Q120A_BAND = {
-    "C_shared_down": (40, 40), "C_shared_gate_up": (32, 24), "llm_o_tp2": (32, 24), "llm_qkv_tp2": (24, 24),
-    "llm_o": (16, 8), "A_wo": (8, 8), "A_down": (0, 0), "A_gate_up": (0, 0), "A_wqkv": (0, 0),
+    "C_shared_down": (40, 40), "C_shared_gate_up": (32, 24), "llm_o_tp2": (32, 32), "llm_qkv_tp2": (24, 24),
+    "llm_o": (16, 16), "A_wo": (8, 8), "A_down": (0, 0), "A_gate_up": (0, 0), "A_wqkv": (0, 0),
     "C_gdn_in_proj": (0, 0), "C_wqkv_gated": (0, 0), "llm_qkv": (0, 0),
 }
 

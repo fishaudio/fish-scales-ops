@@ -227,9 +227,10 @@ void launch_sm120_mxfp8_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t 
     }
 
     cudaLaunchConfig_t launch_config;
-    cudaLaunchAttribute attrs[1];
+    cudaLaunchAttribute attrs[2];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attrs[0].val.programmaticStreamSerializationAllowed = fso_pdl_enabled() ? 1 : 0;
+    unsigned num_attrs = 1;
     // MinBlocksPerSm > 1 instances co-schedule that many CTAs per SM (the
     // persistent scheduler strides by gridDim.x, so a larger grid just
     // partitions the same tile queue). ncu on the grouped decode cells
@@ -249,12 +250,57 @@ void launch_sm120_mxfp8_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t 
         if (tiles < uint64_t(grid))
             grid = tiles > 0 ? int(tiles) : 1;
     }
+    else if (grouped_layout == nullptr)
+    {
+        // Dense launches (issue #12 F5B): where the CTAs of a launch run, by the number of tiles against the CTA slots
+        // (SMs x MinBlocksPerSm):
+        //   tiles <= 0.8 x slots: one CTA per tile, as a 1 x 1 x 1 cluster launch;
+        //   slots <= tiles < 4 x slots: the persistent grid of every slot, as a 1 x 1 x 1 cluster launch;
+        //   otherwise: the persistent grid of every slot without a cluster attribute (fp8-round's launch).
+        // None of the three changes which CTA computes which tile or how (the scheduler gives CTA b the tiles b,
+        // b + grid, ...; with grid >= tiles that is tile b alone either way), so the kernel and the bytes are the
+        // same. Why: the CTA dispatcher places consecutive CTAs of a launch without a cluster attribute on the SMs of
+        // one GPC before it moves to the next, so the tile CTAs of an under-filled launch run packed on a few GPCs (up
+        // to 14 per GPC for 80 tiles on the RTX 5090), where they share each GPC's path to L2, and a multi-wave launch
+        // runs the tiles of its partial last wave on the first GPCs alone. Any cluster launch, even of size 1,
+        // spreads consecutive CTAs across GPCs (the mechanism issue #12 FH6 found on the H200), and a grid of the tile
+        // count leaves no idle CTA on the GPCs it fills first. The CuTe DSL kernel of issue #12 R040 (the same tile,
+        // stages and data) launches this way, and the per-tile gap to it (16-38 %) was this placement. Between the two
+        // bounds nearly every GPC already holds tile CTAs, and the cluster launch only cost time: on the DRAM-bound
+        // gate_up 19456 x 2560 decode cells (152 tiles) 1.0-1.3 % with PDL off, with either grid, and on the tower proj2
+        // 2048 x 1280 at M = 1079 (144 tiles, (128, 128, 2), bias epilogue) 2.5 % on the pre-quantized call (18.89 ->
+        // 19.36 us; the bf16-x call 22.48 -> 21.81 us). From 4 waves up, the cluster launch made the bf16-x call's step
+        // from the activation quantize into the GEMM slower in proportion to the size of the call, which ate the
+        // pre-quantized call's gain: the bf16-x call minus the pre-quantized call took 6.0 -> 10.6 us on gate_up at M =
+        // 1024 (7 waves, +1.7 % on that call), 32.6 -> 84.7 us at M = 8192 (46 waves); below 4 waves it took the same or
+        // less (5120 x 2048 at M = 512: 3.4 -> 2.1 us). Measured on the RTX
+        // 5090 (2407 MHz, cold weights, graph replay, the launches interleaved in one process, PDL on / off): wo 2560 x
+        // 4096 at M = 64 on (32, 64, 4), 80 tiles, 11.75 -> 10.16 us; at M = 128 on (64, 64, 4) 14.72 -> 12.23 us;
+        // 1280 x 7680 at M = 364, 120 tiles, 28.98 -> 27.73 / 28.85 -> 23.71 us; 2048 x 512 at M = 2048, 1.5 waves,
+        // 15.92 -> 15.51 / 16.25 -> 15.07 us; gate_up at M = 2, 152 tiles, 35.91 -> 35.96 / 36.45 -> 36.92 us as a
+        // cluster launch. In the calls of fso.dense.linear the 43 cells of 1 to 4 waves of the final A/B took 0.965-1.004
+        // of fp8-round's time on the pre-quantized call and 0.937-1.000 on the bf16-x call. The cubin's TMA copies are shared::cta, so a cluster launch adds no driver syscall buffer (no
+        // __cuda_syscall in the cubin; the free device memory at the first cluster launch does not move).
+        uint64_t const tiles
+            = uint64_t(num_problems) * ((shape_m + TileM - 1) / TileM) * ((shape_n + TileN - 1) / TileN);
+        bool const one_cta_per_tile = 5 * tiles <= 4 * uint64_t(grid);
+        if (one_cta_per_tile || (tiles >= uint64_t(grid) && tiles < 4 * uint64_t(grid)))
+        {
+            if (one_cta_per_tile)
+                grid = tiles > 0 ? int(tiles) : 1;
+            attrs[1].id = cudaLaunchAttributeClusterDimension;
+            attrs[1].val.clusterDim.x = 1;
+            attrs[1].val.clusterDim.y = 1;
+            attrs[1].val.clusterDim.z = 1;
+            num_attrs = 2;
+        }
+    }
     launch_config.gridDim = dim3(grid, 1, 1);
     launch_config.blockDim = GemmKernel::get_block_shape();
     launch_config.dynamicSmemBytes = GemmKernel::kSmemSize;
     launch_config.stream = stream;
     launch_config.attrs = attrs;
-    launch_config.numAttrs = 1;
+    launch_config.numAttrs = num_attrs;
     cudaLaunchKernelEx(&launch_config, kernel_ptr, kernel_params);
     // The post-launch cudaGetLastError check was removed (was ~0.5 µs/launch).
     // Kernel runtime errors surface on next cudaStreamSynchronize.
@@ -360,8 +406,8 @@ void launch_sm120_mxfp8_smallm_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, i
 
 // The single launch of the dense-epilogue instance (tile_m, tile_n, stages) of a dense MXFP8 tile: the kernel over
 // SM120DenseEpiBuilder<SM120MxFP8BlockScaledBuilder<tile_m, tile_n, stages>> with `epilogue`'s fields. False when the
-// tile has no such instance. Defined in ops/mxfp8_dense_epi_kernel.cu, the translation unit that holds the ten
-// instantiations (one per single-launch tile of the cascade), so that they compile in parallel with the identity
+// tile has no such instance. Defined in ops/mxfp8_dense_epi_kernel.cu, the translation unit that holds the
+// instantiations (one per single-launch instance of the route), so that they compile in parallel with the identity
 // instances of ops/mxfp8_kernel.cu.
 bool launch_sm120_mxfp8_dense_epi_single(int tile_m, int tile_n, int stages, __nv_fp8_e4m3* mat_a,
     __nv_fp8_e4m3* mat_b, __nv_bfloat16* mat_d, int32_t* scales_a, int32_t* scales_b, uint32_t shape_m,
@@ -430,13 +476,14 @@ namespace kernels::blockscale_gemm
 // (160,128,2)) fit unchanged — verified at TileM=160 N=128 ST=2:
 // 40+32+2.5+2 = 76 KB.
 //
-// The cascade is sm120_mxfp8_dense_route below: it returns the instance and the K split a call runs, and
-// gemm_dispatch_sm120_mxfp8 (further down) launches it. The rules are the ones this dispatcher has always applied, in
+// The cascade is sm120_mxfp8_dense_route_cascade below, and sm120_mxfp8_dense_route after it applies the wave-fill rule
+// to the cascade's pick: the route returns the instance and the K split a call runs, and gemm_dispatch_sm120_mxfp8
+// (further down) launches it. The cascade's rules are the ones this dispatcher has always applied, in
 // the same order, with each launch statement replaced by the route it launched; the launcher's own clamps of the
 // Stream-K split (sm120_streamk_effective_split) are applied here, so that the route states what runs. One source of
 // truth serves the launch, the Stream-K scratch size the op body allocates (Sm120DenseRoute::streamk_scratch_bytes)
 // and the host-side route query (sm120_mxfp8_dense_route_query in ops/mxfp8_kernel.cu).
-inline Sm120DenseRoute sm120_mxfp8_dense_route(
+inline Sm120DenseRoute sm120_mxfp8_dense_route_cascade(
     uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_device_sms)
 {
     // The route of instance (tm, tn, st) with the given MinBlocksPerSm / SchedGroup, K split and SmallM flag; the
@@ -525,6 +572,12 @@ inline Sm120DenseRoute sm120_mxfp8_dense_route(
             else if (forced.tm == 128 && forced.tn == 128 && forced.st == 2) return mx_route(128, 128, 2);
             else if (forced.tm == 128 && forced.tn ==  64 && forced.st == 2) return mx_route(128,  64, 2);
             else if (forced.tm == 160 && forced.tn == 128 && forced.st == 2) return mx_route(160, 128, 2);
+            // The 3-stage instances of the stage rule (issue #12 F5B).
+            else if (forced.tm ==  64 && forced.tn == 128 && forced.st == 3) return mx_route( 64, 128, 3);
+            else if (forced.tm ==  96 && forced.tn == 128 && forced.st == 3) return mx_route( 96, 128, 3);
+            // The 6-stage decode instances (issue #12 F5B).
+            else if (forced.tm ==  16 && forced.tn ==  64 && forced.st == 6) return mx_route( 16,  64, 6);
+            else if (forced.tm ==  32 && forced.tn ==  64 && forced.st == 6) return mx_route( 32,  64, 6);
         }
         else
         {
@@ -687,12 +740,22 @@ inline Sm120DenseRoute sm120_mxfp8_dense_route(
         // Gate on shape_k >= 8192 to keep the route inside the validated
         // (K=9728 only so far) regime; K < 8192 narrow-N small-M is owned
         // by E27 immediately below (TileM=16, TileN=64 single launch).
+        //
+        // Issue #12 F5B (2026-11-06): this band runs one launch of the 6-stage (16, 64) instance (ring mainloop), 40 CTAs
+        // for N = 2560, instead of the Stream-K split. With one CTA per tile, spread as a cluster launch (see
+        // launch_sm120_mxfp8_gemm_kernel), the single launch streams the weights faster than the four slices, their
+        // bf16 partials and the reduce; it also runs on the caller's stream alone (the Stream-K slices run on the
+        // StreamKPool's side streams, outside a green-context partition), and it sums K in fp32 in one pass instead of
+        // through bf16 partial sums, so the bytes move toward the fp32 result. Measured on the RTX 5090 (2407 MHz, cold
+        // weights, graph replay, the routes interleaved in one process, both with the new launch), down 2560 x 9728:
+        // M = 1 / 4 / 16 Stream-K 21.44 / 21.07 / 21.15 us against 20.17 / 20.16 / 20.17 us (PDL off: 21.71 / 21.46 /
+        // 21.48 against 20.89 / 20.72 / 20.74). 6 stages beat 9 (20.64-20.69 us) and 4 (21.72-21.75 us).
         bool const tilem16_narrow_streamk = shape_k >= 8192
                                          && shape_m <= 16
                                          && tiles_n >= 3 && tiles_n < 32;
         if (tilem16_narrow_streamk)
         {
-            return mx_route(16, 128, 4, 1, 16, /*k_split=*/4);
+            return mx_route(16, 64, 6);
         }
 
         // E27 (2026-05-11): narrow-N + short-K small-M → TileM=16, TileN=64.
@@ -791,8 +854,21 @@ inline Sm120DenseRoute sm120_mxfp8_dense_route(
         // M ≤ 8 the trend reverses ((32,128,4) k=4 wins by 1-3 µs) —
         // each (32,64,4) k=4 side stream gets less work per slice and
         // the launch+reduce overhead dominates. Crossover at M ≈ 16.
+        //
+        // Issue #12 F5B (2026-11-06): the mid-N Stream-K splits of this branch (32 <= tiles_n < 96, where the K-split
+        // chooser returns 2 or 4 at M <= 32) are replaced by single launches of (16, 128, 4) (see E26's note above for
+        // why a single launch now wins and what it changes in the bytes). Measured (as for E26): wqkv 6144 x 2560 at
+        // M = 32, (32, 128, 4) Stream-K 2 16.13 us against (16, 128, 4) 12.80 us (PDL off 16.09 / 13.26); gate 9728 x
+        // 2560 at M = 32, 22.61 against 18.99 us (PDL off 22.69 / 19.20); in the calls of fso.dense.linear the
+        // pre-quantized call 16.22 -> 12.91 us and the bf16-x call 17.72 -> 15.18 us at wqkv M = 32. Narrow N (reached
+        // only with K >= 9728) keeps the (32, 64, 4) Stream-K split: the single launch of (32, 64, 6) was faster on the
+        // pre-quantized call (down 2560 x 9728 at M = 32: 21.19 -> 20.73 us) but slower on the bf16-x call, where the
+        // activation quantize runs right before it (22.52 -> 22.97 us). A wide N (tiles_n >= 96) never split and keeps
+        // (32, 128, 4).
         if (tiles_n >= 3 && tiles_n < 32 && shape_m >= 16)
             DISPATCH_TILE_MX(32, 64, 4);
+        else if (tiles_n < 96)
+            return mx_route(16, 128, 4);
         else
             DISPATCH_TILE_MX(32, 128, 4);
     }
@@ -824,7 +900,10 @@ inline Sm120DenseRoute sm120_mxfp8_dense_route(
             // (64, 64, 4) tile fits 1 wave per Stream-K slice, while
             // (32, 128, 4) wastes 31/32 of the M dim per CTA at slice
             // boundaries.
-            DISPATCH_TILE_MX(64, 64, 4);
+            // Issue #12 F5B (2026-11-06): a single launch of the 6-stage (32, 64) instance instead (see E26's note
+            // above): down 2560 x 9728 at M = 64, (64, 64, 4) Stream-K 22.08 us against 20.88 us (PDL off 22.50 /
+            // 21.41).
+            return mx_route(32, 64, 6);
     }
     else if (shape_m <= 96)
     {
@@ -1019,6 +1098,198 @@ inline Sm120DenseRoute sm120_mxfp8_dense_route(
     // Every branch above returns (the compiler proves the end unreachable).
 }
 
+// The wave-fill rule over the cascade's pick (issue #12 F5A, 2026-11-05): above M = 128, when the pick above is a single
+// launch whose grid has fewer CTAs than the device has SMs, the route takes the existing cascade tile with the smallest
+// waves x (TileM + TileN), waves = ceil(CTAs / SMs), if that is strictly smaller than the pick's own (ties: see the
+// tie-break of issue #12 F5B in the function below). A tile of 32 rows is a candidate only when the
+// pick's last M-tile is partial (M is not a multiple of its TileM). FSO_DISABLE_OVERRIDES=1 and the forced diagnostic
+// configurations (FSO_FORCE_TILE / FSO_FORCE_KSPLIT, ...) bypass it, and a Stream-K pick is left alone: the rule only
+// ever exchanges one single-launch tile for another.
+//
+// Why: on the short-K and narrow-N shapes of this band one CTA's main loop takes a time close to proportional to the
+// operand bytes it streams per K step, (TileM + TileN) x 128, so the grid's time is about its waves times that. The
+// cascade's rules above were fitted on the dense families' shapes, and on 1280-wide to 2560-wide outputs at M from 129
+// to about 1100 their picks ran 60-100 CTAs on the RTX 5090's 170 SMs. Measured there (2407 MHz, cold weights,
+// CUDA-graph replay, each tile forced through fso.dense.linear, the issue #12 tower roles with their epilogues and the
+// dense families' shapes, two passes), the rule's tile was faster than the pick on both the 2b and the bf16-x call on
+// each of the 42 cells it moves, by 2-38 %: 1280 x 1280 at M = 1079 from 18.5 to 12.1 us, 1280 x 5120 at M = 364 from
+// 28.7 to 21.7 us, 1280 x 7680 at M = 364 from 41.0 to 28.9 us. A first form without the 32-row condition also moved
+// 1024 x 2048 at M = 192 and 256 from 64 to 32 rows, where the pick's M-tiles were all full and both grids fit one wave,
+// and measured 0.995 and 1.011 of the pick on the 2b call: splitting the rows finer then shortens no CTA's main loop,
+// and the 32-row tiles won only where the pick pads its last M-tile. A pick whose grid already fills the machine is
+// left alone, so the multi-wave tiles of the dense families' large-M cells keep their routes.
+//
+// Bytes: every tile has identity, epilogue and quantized-output instantiations, and the K accumulation order of a
+// single launch does not depend on the tile, so the route gives the bytes of the pick, on both entries and for
+// linear_quantized.
+// The multi-wave tile rule (issue #12 F5C). Above M = 128, when the route is a single launch with more tiles than the
+// device has SMs, its persistent grid runs ceil(tiles / SMs) rounds of tiles, and the last round holds only the
+// remainder: gate_up 19456 x 2560 at M = 1024 on (128, 128) runs 7.15 waves, so its eighth round keeps 26 of the 170
+// SMs busy for a whole tile time (14 % of the call), and o_tp2 2048 x 2048 at M = 1536 runs 1.13 waves, so half of the
+// call is a second round of 22 tiles. The rule estimates every existing single-launch tile's time on the shape as
+//     cost(tile) = t(tile, kt) x ceil(tiles(tile) / SMs),     kt = ceil(K / 128),
+// where t is the tile's measured time per tile in a launch that keeps every SM busy, from the table below: a line in
+// the k-tile count per tile, one for the 1 x 1 x 1 cluster launch of 1 to 4 waves and one for the plain launch from 4
+// waves (launch_sm120_mxfp8_gemm_kernel; the large tiles draw enough power in long plain launches to run at a lower
+// clock, which the second line carries). It takes the tile of least cost when that cost is below kMultiWaveMargin of
+// the route's own; the stage rules after it then apply to the new tile as to any route. The margin keeps the routes
+// whose candidates the table cannot separate: on the measured shapes the table's per-tile time of a 96-row tile in a
+// launch of 4 or more waves was up to 10 % below its time on the wide real shapes, and at a 5 % margin no moved cell
+// was slower. Only kt >= kMultiWaveKtMin is covered (the table's measured range).
+//
+// The table: t = a + b x kt microseconds at 2407 MHz on the RTX 5090, from calibration shapes whose tile count is an
+// exact number of waves (N = 17 x TileN, M = 10 x W x TileM; W = 2, 3 for the cluster line, W = 4, 8 for the plain
+// line; the slope of the call time over W, so the per-call part drops out), cold weights, graph replay, K = 1280,
+// 2560, 4096 and 9728 (issue #12 F5C, runs/F5C/report/table_*.md).
+//
+// Bytes: every tile of the table has identity, dense-epilogue and quantized-output instances, and the K accumulation
+// order of a single launch does not depend on the tile, so the rule gives the route's bytes on every call form.
+struct Sm120TileLine
+{
+    int tm, tn, st;
+    float a_cluster, b_cluster, a_plain, b_plain;
+};
+constexpr float kMultiWaveMargin = 0.95f;
+constexpr int kMultiWaveKtMin = 10;
+constexpr Sm120TileLine kSm120TileLines[] = {
+    {160, 128, 2, -0.384f, 1.4163f, 0.913f, 1.5325f},
+    {128, 128, 2, 0.476f, 1.1356f, 0.466f, 1.2665f},
+    {128, 64, 2, 0.620f, 0.7466f, -1.130f, 0.8338f},
+    {96, 128, 2, -0.020f, 0.9463f, -0.546f, 1.0002f},
+    {64, 128, 2, 0.601f, 0.7479f, 0.542f, 0.7346f},
+    {64, 64, 4, 1.465f, 0.4570f, 0.857f, 0.4565f},
+    {32, 128, 4, 1.993f, 0.5465f, 1.291f, 0.5495f},
+    {32, 64, 4, 0.946f, 0.3471f, 0.775f, 0.3370f},
+};
+
+inline void sm120_mxfp8_multiwave_tile(
+    Sm120DenseRoute& r, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int sms)
+{
+    int const kt = static_cast<int>((shape_k + 127) / 128);
+    if (kt < kMultiWaveKtMin)
+        return;
+    auto cost = [&](Sm120TileLine const& e)
+    {
+        long const tiles = static_cast<long>((shape_m + e.tm - 1) / e.tm) * static_cast<long>((shape_n + e.tn - 1) / e.tn);
+        bool const plain = tiles >= 4L * sms;
+        float const per_tile = plain ? e.a_plain + e.b_plain * kt : e.a_cluster + e.b_cluster * kt;
+        return per_tile * static_cast<float>((tiles + sms - 1) / sms);
+    };
+    float pick_cost = -1.0f;
+    for (auto const& e : kSm120TileLines)
+        if (e.tm == r.tile_m && e.tn == r.tile_n && e.st == r.stages)
+            pick_cost = cost(e);
+    if (pick_cost <= 0.0f)
+        return;   // a route outside the table keeps its tile
+    Sm120TileLine const* best = nullptr;
+    float best_cost = kMultiWaveMargin * pick_cost;
+    for (auto const& e : kSm120TileLines)
+    {
+        float const c = cost(e);
+        if (c < best_cost)
+        {
+            best_cost = c;
+            best = &e;
+        }
+    }
+    if (best != nullptr)
+    {
+        r.tile_m = best->tm;
+        r.tile_n = best->tn;
+        r.stages = best->st;
+    }
+}
+
+inline Sm120DenseRoute sm120_mxfp8_dense_route(
+    uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, int num_device_sms)
+{
+    Sm120DenseRoute r = sm120_mxfp8_dense_route_cascade(shape_m, shape_n, shape_k, num_device_sms);
+    if (r.forced_only_instance() || read_disable_overrides() || force_tile_applies(read_force_tile(), shape_k))
+        return r;
+    int const sms = std::max(1, num_device_sms);
+    auto ctas = [&](int tm, int tn)
+    { return static_cast<int>((shape_m + tm - 1) / tm) * static_cast<int>((shape_n + tn - 1) / tn); };
+    // The cascade's own pick decides which of the tile rules 1 and 1b applies: 1 to an under-filled single launch, 1b to
+    // one of more tiles than SMs (a tile rule 1 picks is not re-examined by 1b).
+    int const pick_ctas = ctas(r.tile_m, r.tile_n);
+    // 1. The wave-fill rule (F5A), with the tie-break of issue #12 F5B: among tiles of equal waves x (TileM + TileN),
+    // the one with the smaller 2 x TileM + TileN wins, the pick included (before F5B a tie kept the pick). 2 x TileM +
+    // TileN is in proportion to the shared-memory ldmatrix bytes a k-tile costs in the 2 x 4 math-warp layout of these
+    // tiles (the A rows are read by the 4 N-warps, the B rows by the 2 M-warps), so of two tiles that stream the same
+    // operand bytes per CTA in the same number of waves it takes the one that reads less shared memory: (64, 128)
+    // over (128, 64). Measured on the RTX 5090 (2407 MHz, cold weights, graph replay, the same process): wo 2560 x
+    // 4096 at M = 512, 160 CTAs either way, (64, 128, 2) 26.29 against the pick (128, 64, 2) 27.50 us. It moves none of
+    // the 42 cells F5A's rule moves; it moves 9 cells of (128, 64, 2) picks at M = 512-1079 to (64, 128).
+    if (shape_m > 128 && r.k_split <= 1 && pick_ctas < sms)
+    {
+        bool const pick_partial = shape_m % static_cast<uint32_t>(r.tile_m) != 0;
+        auto cost = [&](int tm, int tn) { return (ctas(tm, tn) + sms - 1) / sms * (tm + tn); };
+        auto smem_reads = [](int tm, int tn) { return 2 * tm + tn; };
+        constexpr int kTiles[8][3] = {
+            {32, 64, 4}, {32, 128, 4}, {64, 64, 4}, {64, 128, 2}, {96, 128, 2}, {128, 64, 2}, {128, 128, 2}, {160, 128, 2}};
+        int best = cost(r.tile_m, r.tile_n);
+        int best_reads = smem_reads(r.tile_m, r.tile_n);
+        for (auto const& t : kTiles)
+        {
+            if (t[0] == 32 && !pick_partial)
+                continue;
+            int const c = cost(t[0], t[1]);
+            int const rd = smem_reads(t[0], t[1]);
+            if (c < best || (c == best && rd < best_reads))
+            {
+                best = c;
+                best_reads = rd;
+                r.tile_m = t[0];
+                r.tile_n = t[1];
+                r.stages = t[2];
+            }
+        }
+    }
+    // 1b. The multi-wave tile rule (issue #12 F5C): see sm120_mxfp8_multiwave_tile below.
+    if (shape_m > 128 && r.k_split <= 1 && pick_ctas > sms)
+        sm120_mxfp8_multiwave_tile(r, shape_m, shape_n, shape_k, sms);
+    // 2. The stage rule (issue #12 F5B): a single-wave launch (no more tiles than SMs) of (64, 128) or (96, 128) runs
+    // the 3-stage instance (the ring mainloop of fp8/gemm_1d1d.cuh) instead of the 2-stage one when its tile has 3 or
+    // more M-tiles, or 2 M-tiles and no more tiles than 3/4 of the SMs. Why: with several M-tiles every weight panel is
+    // read by several CTAs, mostly from L2, so each CTA's main loop is bound by the latency of its own loads, and the
+    // third stage hides part of it. With 2 M-tiles on most of the SMs the grid already streams the weights at close
+    // to the DRAM rate, and in a multi-wave launch a CTA's next tile overlaps the previous one's tail; in both cases
+    // the third stage gained nothing and cost 1-2 %. Measured on the RTX 5090 (2407 MHz, cold weights, graph replay,
+    // 2 and 3 stages interleaved in one process, both on the cluster launch above, PDL on): wqkv 6144 x 2560 at M =
+    // 128 on (64, 128), 96 tiles, 16.01 -> 15.14 us; at M = 256 on (96, 128) 20.66 -> 19.70 us; 2048 x 2048 at M = 416
+    // 13.97 -> 13.14 us; 1280 x 7680 at M = 1079, 170 tiles, 47.43 -> 46.18 us. The cells the conditions exclude:
+    // 9216 x 2048 at M = 128 (2 M-tiles, 144 tiles) 15.34 -> 15.68 us, 12288 x 2048 at M = 192 (192 tiles) 33.44 ->
+    // 33.97 us, 5120 x 1280 at M = 533 (240 tiles) 22.55 -> 22.81 us. The MMAs and their order do not depend on the
+    // stage count, so the bytes are those of the 2-stage instance. (128, 64) has no 3-stage instance: after the
+    // tie-break above no single-wave route keeps a (128, 64) tile with more than one M-tile on the measured shapes.
+    if (r.k_split <= 1 && r.stages == 2 && (r.tile_m == 64 || r.tile_m == 96) && r.tile_n == 128)
+    {
+        int const m_tiles = static_cast<int>((shape_m + r.tile_m - 1) / r.tile_m);
+        int const tiles = ctas(r.tile_m, r.tile_n);
+        if (tiles <= sms && (m_tiles >= 3 || (m_tiles == 2 && 4 * tiles <= 3 * sms)))
+            r.stages = 3;
+    }
+    // 3. The small-tile stage rule (issue #12 F5B): a single launch of (32, 64, 4) runs the 6-stage instance (ring
+    // mainloop) when the k-tile count K / 128 is not a multiple of 4, or when M <= 64, K >= 2048 and the grid has at
+    // least 40 tiles. Why: the 4-stage instance runs the original loop, which pads the k-tiles to a multiple of its 4
+    // stages, so at K = 1280 it streams 12 k-tiles where the ring streams the 10 real ones (the padded k-tiles hold
+    // zeros, so the sums are the same); and at M <= 64 the grid's at most 2 M-tiles of 32 rows leave each CTA's main
+    // loop bound by its own load latency, which 2 more stages hide once the loop is long enough to use them. On fewer
+    // than 16 k-tiles, on more M-tiles (more CTAs share each weight panel) and on the smallest grids (1024 x 2048 at
+    // M = 64, 32 tiles) 6 stages were 1-4 % slower. Measured on the RTX 5090 (2407 MHz, cold weights, graph replay, 4
+    // and 6 stages interleaved in one process, both on the cluster launch above, PDL on / off): 1280 x 1280 at M = 117
+    // 4.90 -> 4.54 / 5.43 -> 5.03 us; 2048 x 1280 at M = 117 6.03 -> 5.66 / 6.13 -> 5.88 us; 2048 x 4096 at M = 64
+    // 9.51 -> 9.32 / 10.07 -> 9.64 us; 2560 x 2048 at M = 48 6.52 -> 6.33 / 7.03 -> 6.85 us. The MMAs and their order do
+    // not depend on the stage count, so the bytes are those of the 4-stage instance.
+    if (r.k_split <= 1 && r.tile_m == 32 && r.tile_n == 64 && r.stages == 4)
+    {
+        uint32_t const k_tiles = (shape_k + 127) / 128;
+        if (k_tiles % 4 != 0 || (shape_m <= 64 && k_tiles >= 16 && ctas(32, 64) >= 40))
+            r.stages = 6;
+    }
+    return r;
+}
+
 // A non-identity epilogue on a route whose instance exists only behind a diagnostic knob: refused, before anything
 // is launched or allocated. Those instances (the FSO_FORCE_SMALLM kernel, the FSO_FORCE_MIN_BLOCKS=2 and
 // FSO_FORCE_SCHED_GROUP={8,32} variants of the TileM = 16 tiles) have no dense-epilogue instantiation.
@@ -1103,10 +1374,21 @@ inline void gemm_dispatch_sm120_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b
     }
     if (!epilogue.is_identity())
     {
-        bool const launched = launch_sm120_mxfp8_dense_epi_single(route.tile_m, route.tile_n, route.stages, mat_a,
+        // Issue #12 F5B: a dense epilogue that adds a residual runs the 2-stage instance of a 3-stage route (the stage
+        // rule of sm120_mxfp8_dense_route; the route query reports the identity call's route) when the main loop has
+        // fewer than 16 k-tiles. Measured on the RTX 5090 (2407 MHz, cold weights, graph replay, each build in its own
+        // fresh process): tower out_proj 1280 x 1280 at M = 1079 with bias + residual, 10 k-tiles, took 13.52 us with 3
+        // stages and 13.13 us with 2 (fp8-round 13.14), while the same shape with the bias alone took 11.78 us with 3
+        // stages against 12.12 (fp8-round), and fc2 1280 x 5120 with bias + residual (40 k-tiles) gained 0.9 % with 3.
+        // The forced diagnostic configurations keep the stage count they name. The bytes are the same either way.
+        int stages = route.stages;
+        if (epilogue.residual != nullptr && stages == 3 && (shape_k + 127) / 128 < 16
+            && !force_tile_applies(read_force_tile(), shape_k))
+            stages = 2;
+        bool const launched = launch_sm120_mxfp8_dense_epi_single(route.tile_m, route.tile_n, stages, mat_a,
             mat_b, mat_d, scales_a, scales_b, shape_m, shape_n, shape_k, stream, num_device_sms, epilogue);
         TLLM_CHECK_WITH_INFO(launched, "gemm_dispatch_sm120_mxfp8: no dense-epilogue instance (%d, %d, %d)",
-            route.tile_m, route.tile_n, route.stages);
+            route.tile_m, route.tile_n, stages);
         return;
     }
 #define ONE_MX(TM_, TN_, ST_, MB_, SG_)                                                                                \
@@ -1121,6 +1403,9 @@ inline void gemm_dispatch_sm120_mxfp8(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b
     ONE_MX(16, 64, 4, 1, 16) ONE_MX(16, 64, 4, 1, 8) ONE_MX(16, 64, 4, 1, 32)
     ONE_MX(32, 128, 4, 1, 16) ONE_MX(32, 64, 4, 1, 16) ONE_MX(64, 128, 2, 1, 16) ONE_MX(64, 64, 4, 1, 16)
     ONE_MX(96, 128, 2, 1, 16) ONE_MX(128, 128, 2, 1, 16) ONE_MX(128, 64, 2, 1, 16) ONE_MX(160, 128, 2, 1, 16)
+    // The 3-stage instances of the stage rule and the 6-stage decode instances (issue #12 F5B; ring mainloop).
+    ONE_MX(64, 128, 3, 1, 16) ONE_MX(96, 128, 3, 1, 16)
+    ONE_MX(16, 64, 6, 1, 16) ONE_MX(32, 64, 6, 1, 16)
 #undef ONE_MX
     TLLM_THROW("gemm_dispatch_sm120_mxfp8: no instance (%d, %d, %d, min_blocks %d, sched_group %d)", route.tile_m,
         route.tile_n, route.stages, route.min_blocks, route.sched_group);

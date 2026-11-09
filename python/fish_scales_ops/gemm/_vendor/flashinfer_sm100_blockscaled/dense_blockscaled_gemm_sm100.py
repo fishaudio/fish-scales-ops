@@ -88,6 +88,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         use_prefetch: bool = False,
         enable_pdl: bool = True,
         fso_epilogue: Optional[Tuple[bool, int, bool]] = None,
+        fso_weights_first: bool = False,
+        fso_wf_cap: Optional[int] = None,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -107,16 +109,21 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
             cluster_shape_mn (Tuple[int, int]): Cluster dimensions (M, N) for parallel processing.
             fso_epilogue: fso-epilogue, None (today's kernel) or (has_bias, act, has_residual);
                 see _Sm100BlockScaledGemmCommon.
+            fso_weights_first: fso-pdl, False (today's kernel) or True (the weight stages before the
+                griddepcontrol.wait); see _Sm100BlockScaledGemmCommon._fso_set_weights_first.
         """
 
         self.acc_dtype = cutlass.Float32
         self._fso_set_epilogue(fso_epilogue)  # fso-epilogue
+        self._fso_set_weights_first(fso_weights_first, fso_wf_cap)  # fso-pdl
         self.sf_vec_size = sf_vec_size
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
         self.use_prefetch = use_prefetch
+        if self.fso_wf and use_prefetch:  # fso-pdl: the peeled first tile issues no prefetch
+            raise ValueError("fso_weights_first does not support use_prefetch=True")
         self.enable_pdl = enable_pdl
         self.cta_group = (
             tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
@@ -792,7 +799,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         # behavior is controlled by use_pdl= in .launch(). The griddepcontrol
         # instructions are effectively no-ops when PDL is not enabled at
         # the driver level.
-        griddepcontrol_wait()
+        if cutlass.const_expr(self.fso_wf):
+            # fso-pdl: weights first. Every warp but the TMA warp waits here, as in today's kernel; the TMA warp
+            # waits inside its branch below, after the weight stages of its first tile.
+            if warp_idx != self.tma_warp_id:
+                griddepcontrol_wait()
+        else:
+            griddepcontrol_wait()
 
         #
         # Specialized TMA load warp
@@ -809,6 +822,116 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
             ab_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
             )
+
+            if cutlass.const_expr(self.fso_wf):
+                # fso-pdl: the CTA's first tile, peeled out of the loop below. (1) Before the wait: acquire up to
+                # _fso_wf_stages() stages and issue only the weight (A) and weight-scale (SFA) copies; each acquire
+                # arms the stage's full barrier with the whole stage's bytes, so no stage completes before its
+                # activation lands. (2) griddepcontrol_wait. (3) The activation (B) and activation-scale (SFB)
+                # copies of the same stages, into the same stages and barriers. (4) The tile's remaining k-blocks,
+                # as the loop does them. Then the scheduler advances once, as at the end of a loop iteration, and
+                # the loop serves the CTA's later tiles unchanged. A CTA whose first tile is not valid (none is
+                # launched today: the grid never exceeds the tile count) issues nothing and only waits.
+                fso_coord = work_tile.tile_idx
+                fso_mnl = (
+                    fso_coord[0] // cute.size(tiled_mma.thr_id.shape),
+                    fso_coord[1],
+                    fso_coord[2],
+                )
+                fso_tAgA = tAgA[(None, fso_mnl[0], None, fso_mnl[2])]
+                fso_tBgB = tBgB[(None, fso_mnl[1], None, fso_mnl[2])]
+                fso_tAgSFA = tAgSFA[(None, fso_mnl[0], None, fso_mnl[2])]
+                fso_slice_n = fso_mnl[1]
+                if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
+                    fso_slice_n = fso_mnl[1] // 2
+                fso_tBgSFB = tBgSFB[(None, fso_slice_n, None, fso_mnl[2])]
+                fso_cnt = cutlass.Int32(0)
+                if work_tile.is_valid_tile:
+                    fso_cnt = k_block_cnt
+                fso_pre = fso_cnt
+                if fso_pre > self._fso_wf_stages():
+                    fso_pre = cutlass.Int32(self._fso_wf_stages())
+                ab_producer_state.reset_count()
+                fso_act_state = ab_producer_state.clone()
+                fso_peek = cutlass.Boolean(1)
+                if ab_producer_state.count < fso_pre:
+                    fso_peek = ab_pipeline.producer_try_acquire(ab_producer_state)
+                for _fso_k in cutlass.range(0, fso_pre, 1, unroll=1):
+                    ab_pipeline.producer_acquire(ab_producer_state, fso_peek)
+                    cute.copy(
+                        tma_atom_a,
+                        fso_tAgA[(None, ab_producer_state.count)],
+                        tAsA[(None, ab_producer_state.index)],
+                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                        mcast_mask=a_full_mcast_mask,
+                    )
+                    cute.copy(
+                        tma_atom_sfa,
+                        fso_tAgSFA[(None, ab_producer_state.count)],
+                        tAsSFA[(None, ab_producer_state.index)],
+                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                        mcast_mask=sfa_full_mcast_mask,
+                    )
+                    ab_producer_state.advance()
+                    fso_peek = cutlass.Boolean(1)
+                    if ab_producer_state.count < fso_pre:
+                        fso_peek = ab_pipeline.producer_try_acquire(ab_producer_state)
+                griddepcontrol_wait()
+                for _fso_k in cutlass.range(0, fso_pre, 1, unroll=1):
+                    cute.copy(
+                        tma_atom_b,
+                        fso_tBgB[(None, fso_act_state.count)],
+                        tBsB[(None, fso_act_state.index)],
+                        tma_bar_ptr=ab_pipeline.producer_get_barrier(fso_act_state),
+                        mcast_mask=b_full_mcast_mask,
+                    )
+                    cute.copy(
+                        tma_atom_sfb,
+                        fso_tBgSFB[(None, fso_act_state.count)],
+                        tBsSFB[(None, fso_act_state.index)],
+                        tma_bar_ptr=ab_pipeline.producer_get_barrier(fso_act_state),
+                        mcast_mask=sfb_full_mcast_mask,
+                    )
+                    fso_act_state.advance()
+                fso_peek = cutlass.Boolean(1)
+                if ab_producer_state.count < fso_cnt:
+                    fso_peek = ab_pipeline.producer_try_acquire(ab_producer_state)
+                for _fso_k in cutlass.range(fso_pre, fso_cnt, 1, unroll=1):
+                    ab_pipeline.producer_acquire(ab_producer_state, fso_peek)
+                    cute.copy(
+                        tma_atom_a,
+                        fso_tAgA[(None, ab_producer_state.count)],
+                        tAsA[(None, ab_producer_state.index)],
+                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                        mcast_mask=a_full_mcast_mask,
+                    )
+                    cute.copy(
+                        tma_atom_b,
+                        fso_tBgB[(None, ab_producer_state.count)],
+                        tBsB[(None, ab_producer_state.index)],
+                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                        mcast_mask=b_full_mcast_mask,
+                    )
+                    cute.copy(
+                        tma_atom_sfa,
+                        fso_tAgSFA[(None, ab_producer_state.count)],
+                        tAsSFA[(None, ab_producer_state.index)],
+                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                        mcast_mask=sfa_full_mcast_mask,
+                    )
+                    cute.copy(
+                        tma_atom_sfb,
+                        fso_tBgSFB[(None, ab_producer_state.count)],
+                        tBsSFB[(None, ab_producer_state.index)],
+                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                        mcast_mask=sfb_full_mcast_mask,
+                    )
+                    ab_producer_state.advance()
+                    fso_peek = cutlass.Boolean(1)
+                    if ab_producer_state.count < fso_cnt:
+                        fso_peek = ab_pipeline.producer_try_acquire(ab_producer_state)
+                tile_sched.advance_to_next_work()
+                work_tile = tile_sched.get_current_work()
 
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler

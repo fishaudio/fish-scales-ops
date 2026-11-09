@@ -580,7 +580,15 @@ __global__ void fp8bs_quantize_1x32_packed_kernel(
 // PDL: launched with programmatic stream serialization unless FSO_DISABLE_PDL=1. Every thread waits on the
 // parent grid (cudaGridDependencySynchronize) before its first global access, read or write, and thread 0 of
 // every CTA then releases the dependent launch, so the GEMM that consumes the output can be created and run
-// its prologue while this kernel still runs; that GEMM waits for this grid's completion before it reads.
+// its prologue (and, on the sm_100 decode row, issue its weight stages) while this kernel still runs; that GEMM
+// waits for this grid's completion before it reads what this kernel writes. The release stays after the wait
+// (issue #12, FB1b): a release at entry, which would also let the GEMM overlap the kernel in front of this one,
+// made a chain of these quantizes pile up on the B300, because every quantize then launched its successor the
+// moment it became resident: up to 14 grids resident at once, each sitting in its wait for 5-21 us while holding
+// thread slots, the next grid placed in drain order on 54-122 of the 148 SMs; the isolated quantize chain measured
+// 3-55 % slower than with the release after the wait (run fso_issue12_20261028/FB1b, holds S and B1). A release by
+// rounds of one CTA per SM, and no explicit release (the dependent launched at completion), were measured and not
+// taken either (runs FB1 hold S, FB1b hold S).
 namespace
 {
 
