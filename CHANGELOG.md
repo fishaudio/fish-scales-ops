@@ -2,6 +2,73 @@
 
 Performance figures are in `docs/perf/`, not here.
 
+## 0.3.0 — 2026-11-09
+
+Faster dense routes on every card for issue #12 (the realtime ASR tower at serving M and the LLM decode step), a
+batch-invariance switch for sm_90, and a faster B300 MoE layer when few experts are live (#13). Seventeen changes on
+top of 0.2.3; the bytes of every call are unchanged except where a route is listed below as a split-K route.
+
+### New
+
+- **`FSO_BATCH_INVARIANT=1`.** On sm_90 it turns off every dense route whose summation order depends on M (today the
+  in-cluster split-K routes), so a row's output is the same at every M; `FSO_SM90_DENSE_SPLITK` is then ignored with
+  one line on stderr. On sm_100/sm_103 and sm_120/sm_121 the switch warns once and changes nothing: their dense routes
+  include split-K and Stream-K forms chosen by M, and batch invariance is not guaranteed there in this release.
+  `docs/api/dense.md` gains the section "Determinism and batch invariance"; `tests/gemm/unit/test_batch_invariance.py`
+  checks the sm_90 guarantee with a negative control.
+- **The weight-handle rule** (`docs/api/dense.md`, `docs/api/compat.md`): a PDL kernel launched immediately before a
+  dense call with a pre-quantized activation must not write the weight or its scale, because the sm_100 decode row
+  fetches its first weight stages before its `griddepcontrol.wait`; `prepare_weight` ends with a plain launch.
+- sm_90 raw switches: `FSO_SM90_DENSE_SPLITK={1,0,force}` and `FSO_SM90_SPLITK_S=<1..4>` for the split-K routes,
+  the DeepGEMM v2 co-scheduling and tile rules' switches (`docs/api/compat.md`).
+
+### Faster
+
+- **sm_90 dense (H200), the decode band.** An in-cluster split-K route for narrow weights (`fp8_gemm_kernel_swapAB_splitk`):
+  each 64-row weight tile gets a thread-block cluster of 2 to 4 CTAs that split K and reduce through distributed
+  shared memory, with the dense epilogue on the route. Its bytes differ from the single-CTA routes by the rank-order
+  slice sum (at most one rounding step; see dense.md's determinism section).
+- **sm_90 dense (H200), 56 < M <= 128 at K >= 4096.** A second split-K kernel with two math warp-groups per CTA
+  (`fp8_gemm_kernel_swapAB_splitk2`) for narrow long-K weights: 1024- and 1280-wide weights over the whole band, 2048-
+  and 2560-wide ones up to M = 104 (2560 only at K >= 8192). Same byte statement as the decode-band route.
+- **sm_90 dense routing.** One-wave and fewer-wave DeepGEMM v2 tiles, two swap-AB bands and 64-row swap-AB weight
+  tiles; the 160-wide DeepGEMM v2 main loop unrolled four times and its one-wave tile taken up to M = 128; the M blocks
+  of single-CTA DeepGEMM v2 launches co-scheduled in one GPC, which removes the placement penalty of a GEMM launched
+  early behind its activation quantize; a wide-output band at M = 256.
+- **sm_90 dense kernels.** The DeepGEMM v2 1D2D loop and the v1 128 x 128 and single-CTA 64 x 128 tiles promote one K
+  block while the next block's WGMMAs run (two accumulator sets); the narrow v1 tiles get deeper rings where the stage
+  count divides K/128.
+- **sm_90 activation quantize** (`quantize_activation`, `compat.quantize_1x128_fp8`): the loads are issued before the
+  index division and the amax is reduced as a tree.
+- **sm_100 dense (B300).** Four B300 cell classes routed to the swap-AB row's existing split-K and persistent kernels;
+  the erf-GELU epilogue of `linear_quantized` runs in two warpgroups; the decode row fetches two weight stages before
+  its PDL wait (one on the two-CTA tile).
+- **sm_100 MoE layer (B300, #13).** The fused FC1 + FC2 kernel no longer lets a CTA whose first tile is an unready FC2
+  tile take a second-round tile ahead of the others (few-live calls end about 1.5 us earlier; bytes identical).
+- **sm_120 dense MXFP8 (RTX 5090).** Spread CTA placement for under-filled persistent launches (a 1x1x1 cluster
+  attribute and a grid of min(tiles, SMs)); ring-mainloop stage rules (as many stages as fit); the decode Stream-K
+  cells of `down` run as single launches with fp32 partial sums (bytes move toward the fp32 result there); the bf16-x
+  call takes the in-kernel quantize form G2 on 2048 x 2048 at M 25-32; a wave-fill tile rule above M = 128 and a
+  multi-wave tile rule from a measured per-tile table (K >= 1280); the small-M rule R1 gets a ring-fill term.
+
+### Changed
+
+- **sm_100 activation quantize and PDL.** The 1x32 wide quantize releases its dependent after its own
+  `griddepcontrol.wait` (0.2.3's position). Releasing at entry made chains of quantizes pile up (every grid launched
+  the moment its predecessor became resident), which slowed the isolated quantize by up to 50 % and the fc2 serving
+  chain by 1-2 %; the served LLM decode step gives up 6-9 % at M <= 64 for a form that is within 1 % of 0.2.3 on
+  every arm. The sm_120 quantize keeps its plain launch: every PDL release form measured slower somewhere.
+- **Batch invariance on sm_90 is no longer the default behaviour**: the split-K routes above change a row's bytes
+  between an M inside their band and one outside it (about 0.01 % of elements by one unit in the last place).
+  `FSO_BATCH_INVARIANT=1` restores it.
+
+### Known cases (measured, not fixed)
+
+- sm_90: wo 2560 x 4096 at M = 64 / 128 and down 2560 x 9728 above M = 104 keep their single-CTA routes; qkv
+  5120 x 2048 at M = 48 runs its 8-stage tile about 3 % slower on the pre-quantized call than 0.2.3's 6 stages and
+  faster on the served call.
+- sm_120: the bf16-x call on 2048 x 2048 at M = 32 keeps G2, about 5 % slower than the quantize + cascade chain there.
+
 ## 0.2.3 — 2026-11-05
 
 The dense linear interface for issue #12, the B300 MoE layer work of issue #13, faster sm_90, sm_100 and sm_120 dense

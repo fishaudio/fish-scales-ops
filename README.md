@@ -2,7 +2,7 @@
 
 Block-scaled FP8 / MXFP8 GEMM, MoE layer and FlashAttention kernels for LLM
 serving on NVIDIA Hopper (H200, sm_90) and Blackwell (B200 / B300, sm_100 /
-sm_103; RTX 5090, sm_120), as a PyTorch extension. Current version: 0.2.0.
+sm_103; RTX 5090, sm_120), as a PyTorch extension. Current version: 0.3.0.
 The changes of each release are in [`CHANGELOG.md`](CHANGELOG.md); a serving
 engine starts with the integration guide, [`docs/guide.md`](docs/guide.md).
 
@@ -28,7 +28,7 @@ built against it and its import refuses another torch), glibc 2.35 or newer,
 and an NVIDIA driver for CUDA 13.0 (the tables were measured with driver 595).
 
 ```bash
-pip install --no-deps fish_scales_ops-0.2.0-cp312-cp312-linux_x86_64.whl   # the wheel of the GitHub release
+pip install --no-deps fish_scales_ops-0.3.0-cp312-cp312-linux_x86_64.whl   # the wheel of the GitHub release
 python -c "import fish_scales_ops as fso; print(fso.__version__, fso.build_info()['commit'])"
 ```
 
@@ -108,9 +108,9 @@ Rules worth knowing up front:
      comparison against any other library. -->
 
 CUDA-graph replay medians with cold weights: the H200 rows measured with the
-0.2.3 release wheel at the card's natural clock, the RTX 5090 dense rows with
-the 0.2.3 release candidate on card C1 and its MoE rows with the 0.2.2 build,
-both under the card's clock lock
+0.3.0 release candidate at the card's natural clock, the RTX 5090 dense and
+MLP rows with the 0.3.0 release candidate on card C1 under the card's clock
+lock, and its MoE rows with the 0.2.2 build on card 21
 ([`docs/perf/README.md`](docs/perf/README.md), Runs behind the tables). The
 B300 tables, the comparisons against vLLM, SGLang, TensorRT-LLM and
 torch/cuBLAS, and a per-machine summary of where fso is faster or slower are
@@ -141,10 +141,22 @@ in [`docs/perf/`](docs/perf/README.md).
 
 ## TODO
 
-Open items after 0.2.3: the known issues of [`CHANGELOG.md`](CHANGELOG.md),
+Open items after 0.3.0: the known cases of [`CHANGELOG.md`](CHANGELOG.md),
 whose measured gaps are in the summaries of [`docs/perf/`](docs/perf/README.md),
-the cost of the two stage-release fences (#11 on sm_120, the H200 race fix on sm_90), the next round's dense FP8
-work on the B300, planned items, and two build items.
+the dense cells of the 0.3.0 round that still miss the 2x-over-bf16 criterion, the cost of the two stage-release
+fences (#11 on sm_120, the H200 race fix on sm_90), planned items, and two build items.
+
+- **sm_90 dense cells still slower than half of bf16's variable cost** (the issue-12 round's acceptance,
+  `T_fp8 <= a + (T_bf16 - a) / 2`): wo 2560x4096 at M = 64 / 128 and down 2560x9728 above M = 104 keep their
+  single-CTA routes (the two-warp-group split-K route loses there: at 128 tokens per warp-group the promotion per K
+  block costs more than the shorter chain saves); the served call of conv_out 1280x7680 at M = 117 and of down at
+  M = 64 misses by 14-22 %. Candidates: a three-warp-group form, or a shorter promotion on the 128-token tile.
+- **sm_120 bf16-input decode calls** (gate_up / down / wqkv at M = 1): the quantize launch sits in series with the
+  GEMM; every PDL release form of the quantize measured slower somewhere (CHANGELOG 0.3.0 Changed), so the lever is
+  a producer-side quantize (the norm or attention kernel writing the MXFP8 activation), outside this library.
+- **sm_100 decode row at 6-8 K blocks per slice on the 8-token tile**: the weights-first prologue costs 1.0-1.4 %
+  there (a synthetic 2048x1536 at M <= 8 and shared_gate_up 1024x2048 at M = 16 on the bf16-input call); a token-tile
+  term in its rule was not added.
 
 - **Win back the sm_120 fence cost elsewhere.** The `fence.proxy.async.shared::cta` that 0.2.2 issues before every
   stage release of the sm_120 block-scaled GEMM (the #11 fix) costs the narrow-N decode GEMMs of the RTX 5090 tables
