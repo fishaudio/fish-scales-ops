@@ -124,3 +124,6 @@ docs/design/
 # but not part of the public source tree). Production kernels live one
 # level up in csrc/attention/kernels/sm120/.
 csrc/attention/kernels/sm120/experiments/
+
+# Local technical report
+docs/audio_tower_extreme_opt_report.md
