@@ -6,16 +6,154 @@
 Uses clean fish_scales_ops.audio.* APIs with ZERO global dec.WF_PRE_WAIT_STAGES_* mutation!
 """
 import math
+import os
+import subprocess
+import time
 import sys
-sys.path.insert(0, "/home/aniya/fso-audio-extreme-opt/bench/audio")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
 import torch.nn.functional as F
 import fish_scales_ops as fso
 import fish_scales_ops.audio as audio
 import fish_scales_ops.gemm._sm100_decode as dec
-from probe_baseline import make_tower_weights, run_bf16, run_fso030_fused_qkv, cudnn_attn, capture
-from bench_p2_ablation import time_graphs_clocked
+def make_tower_weights(n_layers=32, d=1280, d_ff=5120, d_out=2048, k_conv=7680, seed=42):
+    torch.manual_seed(seed)
+    dev, dt = "cuda", torch.bfloat16
+
+    def mk_lin(n, k, bias=True):
+        w = (torch.randn(n, k, device=dev, dtype=dt) / math.sqrt(k)).contiguous()
+        b = (torch.randn(n, device=dev, dtype=dt) * 0.1).contiguous() if bias else None
+        return w, b
+
+    def mk_ln(dim):
+        g = (torch.ones(dim, device=dev, dtype=dt) + 0.05 * torch.randn(dim, device=dev, dtype=dt)).contiguous()
+        b = (0.05 * torch.randn(dim, device=dev, dtype=dt)).contiguous()
+        return g, b
+
+    conv_w, _ = mk_lin(d, k_conv, bias=False)
+    layers = []
+    for _ in range(n_layers):
+        ln1 = mk_ln(d)
+        wq, bq = mk_lin(d, d, True)
+        wk, bk = mk_lin(d, d, True)
+        wv, bv = mk_lin(d, d, True)
+        wqkv = torch.cat([wq, wk, wv], dim=0).contiguous()
+        bqkv = torch.cat([bq, bk, bv], dim=0).contiguous()
+        wo, bo = mk_lin(d, d, True)
+        ln2 = mk_ln(d)
+        w1, b1 = mk_lin(d_ff, d, True)
+        w2, b2 = mk_lin(d, d_ff, True)
+        layers.append({
+            "ln1": ln1, "q": (wq, bq), "k": (wk, bk), "v": (wv, bv),
+            "qkv": (wqkv, bqkv), "o": (wo, bo), "ln2": ln2,
+            "fc1": (w1, b1), "fc2": (w2, b2),
+            "dqkv": fso.dense.prepare_weight(wqkv, format="mxfp8"),
+            "do": fso.dense.prepare_weight(wo, format="mxfp8"),
+            "dfc1": fso.dense.prepare_weight(w1, format="mxfp8"),
+            "dfc2": fso.dense.prepare_weight(w2, format="mxfp8"),
+        })
+    ln_post = mk_ln(d)
+    wp1, bp1 = mk_lin(d, d, True)
+    wp2, bp2 = mk_lin(d_out, d, True)
+    return {
+        "conv": (conv_w, fso.dense.prepare_weight(conv_w, format="mxfp8")),
+        "layers": layers,
+        "ln_post": ln_post,
+        "p1": (wp1, bp1, fso.dense.prepare_weight(wp1, format="mxfp8")),
+        "p2": (wp2, bp2, fso.dense.prepare_weight(wp2, format="mxfp8")),
+    }
+
+
+def run_bf16(x_conv, W, attn_fn):
+    x = F.linear(x_conv, W["conv"][0])
+    M, D = x.shape
+    for L in W["layers"]:
+        h = F.layer_norm(x, (D,), L["ln1"][0], L["ln1"][1], 1e-5)
+        q = F.linear(h, L["q"][0], L["q"][1]).view(1, M, 20, 64).transpose(1, 2)
+        k = F.linear(h, L["k"][0], L["k"][1]).view(1, M, 20, 64).transpose(1, 2)
+        v = F.linear(h, L["v"][0], L["v"][1]).view(1, M, 20, 64).transpose(1, 2)
+        a = attn_fn(q, k, v).transpose(1, 2).reshape(M, D)
+        x = F.linear(a, L["o"][0], L["o"][1]) + x
+        h2 = F.layer_norm(x, (D,), L["ln2"][0], L["ln2"][1], 1e-5)
+        u = F.gelu(F.linear(h2, L["fc1"][0], L["fc1"][1]), approximate="none")
+        x = F.linear(u, L["fc2"][0], L["fc2"][1]) + x
+    x = F.layer_norm(x, (D,), W["ln_post"][0], W["ln_post"][1], 1e-5)
+    x = F.gelu(F.linear(x, W["p1"][0], W["p1"][1]), approximate="none")
+    return F.linear(x, W["p2"][0], W["p2"][1])
+
+
+def run_fso030_fused_qkv(x_conv, W, attn_fn):
+    x = fso.dense.linear(x_conv, W["conv"][1])
+    M, D = x.shape
+    for L in W["layers"]:
+        h = F.layer_norm(x, (D,), L["ln1"][0], L["ln1"][1], 1e-5)
+        qkv = fso.dense.linear(h, L["dqkv"], bias=L["qkv"][1])
+        q, k, v = qkv.view(M, 3, 20, 64).unbind(1)
+        a = attn_fn(q.unsqueeze(0).transpose(1, 2), k.unsqueeze(0).transpose(1, 2), v.unsqueeze(0).transpose(1, 2))
+        a = a.transpose(1, 2).reshape(M, D)
+        x = fso.dense.linear(a, L["do"], bias=L["o"][1], residual=x)
+        h2 = F.layer_norm(x, (D,), L["ln2"][0], L["ln2"][1], 1e-5)
+        uq, us = fso.dense.linear_quantized(h2, L["dfc1"], bias=L["fc1"][1], activation="gelu_erf")
+        x = fso.dense.linear(uq, L["dfc2"], x_scale=us, bias=L["fc2"][1], residual=x)
+    x = F.layer_norm(x, (D,), W["ln_post"][0], W["ln_post"][1], 1e-5)
+    xq, xs = fso.dense.linear_quantized(x, W["p1"][2], bias=W["p1"][1], activation="gelu_erf")
+    return fso.dense.linear(xq, W["p2"][2], x_scale=xs, bias=W["p2"][1])
+
+
+def cudnn_attn(q, k, v):
+    with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.CUDNN_ATTENTION):
+        return F.scaled_dot_product_attention(q, k, v)
+
+
+def capture(fn):
+    for _ in range(5):
+        fn()
+    torch.cuda.synchronize()
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        for _ in range(2):
+            fn()
+    s.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=s):
+        y = fn()
+    s.synchronize()
+    g.replay()
+    torch.cuda.synchronize()
+    return g, y
+
+
+def time_graphs_clocked(graphs, iters=40, rounds=4):
+    a = torch.randn(4096, 4096, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(4096, 4096, dtype=torch.bfloat16, device="cuda")
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 0.4:
+        c = a @ b
+    torch.cuda.synchronize()
+    del a, b, c
+    def _clk():
+        return subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=clocks.sm,power.draw,temperature.gpu", "--format=csv,noheader,nounits"],
+            text=True,
+        ).strip()
+    clk0 = _clk()
+    res = {k: [] for k in graphs}
+    for r in range(rounds):
+        keys = list(graphs.keys()) if r % 2 == 0 else list(reversed(graphs.keys()))
+        for k in keys:
+            g = graphs[k]
+            for _ in range(5):
+                g.replay()
+            st = torch.cuda.Event(enable_timing=True)
+            en = torch.cuda.Event(enable_timing=True)
+            st.record()
+            for _ in range(iters):
+                g.replay()
+            en.record()
+            torch.cuda.synchronize()
+            res[k].append(st.elapsed_time(en) * 1000.0 / iters)
+    return {k: sorted(v)[len(v) // 2] for k, v in res.items()}, clk0, _clk()
 
 
 def make_stem_weights(seed=777):

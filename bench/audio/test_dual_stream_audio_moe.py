@@ -9,16 +9,16 @@ Verifies:
   - Zero mutation of global dec.WF_PRE_WAIT_STAGES_* (stays 2/1)
 """
 import math
+import os
 import sys
-sys.path.insert(0, "/home/aniya/fso-audio-extreme-opt/bench/audio")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
 import torch.nn.functional as F
 import fish_scales_ops as fso
 import fish_scales_ops.audio as audio
 import fish_scales_ops.gemm._sm100_decode as dec
-from probe_baseline import make_tower_weights
-from bench_stem_and_e2e import make_stem_weights
+from bench_stem_and_e2e import make_tower_weights, make_stem_weights
 
 
 def run_full_audio_tower(mel_nhwc, pos, S, W, dw_co_perm):

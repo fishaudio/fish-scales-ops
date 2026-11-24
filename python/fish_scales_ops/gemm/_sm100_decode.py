@@ -957,8 +957,7 @@ def _epi_flags(epilogue) -> _EpiFlagsT:
 
 
 def _get_compiled(st: dict, cfg: _ConfigT, sf_m: int, sf_n: int, sf_k: int,
-                  epi: _EpiFlagsT = None, k: Optional[int] = None,
-                  wf_cap: Optional[int] = None, early_pdl: bool = False):
+                  epi: _EpiFlagsT = None, k: Optional[int] = None):
     """One ``cute.compile`` per (tactic, epilogue); the problem shape stays symbolic.
 
     The compiled entry takes the three operands as CuTe tensors with dynamic
@@ -985,10 +984,8 @@ def _get_compiled(st: dict, cfg: _ConfigT, sf_m: int, sf_n: int, sf_k: int,
     # The weights-first form is a compile-time variant; ``k`` is the call's K, so one tactic has at most two
     # compiled entries, one per side of WF_MIN_K_BLOCKS (the problem shape itself stays symbolic).
     wf = _weights_first(None if k is None else k // 128 // split_k)
-    cap = (wf_cap if wf_cap is not None else _wf_pre_wait_stages(cluster)) if wf else None
-    epdl = bool(early_pdl and pdl)
-    key = (tile, cluster, swap_ab, split_k, pdl, epi, wf, cap) if not epdl else (
-        tile, cluster, swap_ab, split_k, pdl, epi, wf, cap, True)
+    cap = _wf_pre_wait_stages(cluster) if wf else None
+    key = (tile, cluster, swap_ab, split_k, pdl, epi, wf, cap)
     fn = st["compiled"].get(key)
     if fn is not None:
         return fn
@@ -1000,8 +997,6 @@ def _get_compiled(st: dict, cfg: _ConfigT, sf_m: int, sf_n: int, sf_k: int,
         kw["fso_weights_first"] = True
     if cap is not None:
         kw["fso_wf_cap"] = int(cap)
-    if epdl:
-        kw["fso_early_pdl"] = True
     if split_k > 1:
         gemm = st["SK"](32, tile, split_k, pdl, **kw)
     else:
@@ -1126,9 +1121,7 @@ def _alpha(st: dict, device: torch.device):
 
 def linear_mxfp8_decode(x_fp8: torch.Tensor, w_fp8: torch.Tensor,
                         sx: torch.Tensor, sw: torch.Tensor,
-                        config: _ConfigT, epilogue=None,
-                        wf_cap: Optional[int] = None,
-                        early_pdl: bool = False) -> Optional[torch.Tensor]:
+                        config: _ConfigT, epilogue=None) -> Optional[torch.Tensor]:
     """Run one decode-band MXFP8 GEMM. None → the caller falls through.
 
     ``epilogue`` (``_epilogue.Epilogue`` or None): bias, residual and erf-GELU
@@ -1176,8 +1169,7 @@ def linear_mxfp8_decode(x_fp8: torch.Tensor, w_fp8: torch.Tensor,
     sf_n = (kernel_n + 127) // 128
     sf_k = (k // 32 + 3) // 4
 
-    fn = _get_compiled(st, config, sf_m, sf_n, sf_k, epi, k,
-                       wf_cap=wf_cap, early_pdl=early_pdl)
+    fn = _get_compiled(st, config, sf_m, sf_n, sf_k, epi, k)
     cutlass, make_ptr = st["cutlass"], st["make_ptr"]
     gmem = st["cute"].AddressSpace.gmem
     ct_a = _operand_tensor(st, kernel_a, cutlass.Float8E4M3FN, 1)

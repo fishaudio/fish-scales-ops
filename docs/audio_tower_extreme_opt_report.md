@@ -294,10 +294,9 @@ flowchart LR
   - `python/fish_scales_ops/audio/fa4_mxfp8.py` — FlashAttention-4 SM100 融合 `Attention → MXFP8` + Early PDL + 单波 `q_stage=1`
   - `python/fish_scales_ops/audio/unified_gemm_sm100.py` — 单一统一 Cluster-DSMEM SM100 MXFP8 GEMM（`S ∈ {4, 2, 1}`、`sA` SMEM 复用、动态 weights-first、自适应光栅化、零 Host 路由）
   - `python/fish_scales_ops/audio/__init__.py` — 完整 Audio Tower 公共算子封装（默认零 Host 侧 shape 路由表）
-- **极简 Opt-In 底层扩展（默认 100% 兼容上游）**：
-  - `python/setup.py` — 编译接入 `csrc/audio/{layernorm_mxfp8,stem_mxfp8}.cu`
-  - `python/fish_scales_ops/gemm/_sm100_decode.py` & `_vendor/flashinfer_sm100_blockscaled/*.py` — 仅 +27/−7 行纯 opt-in `wf_cap` 与 `fso_early_pdl` 支持
+- **上游原有文件改动（极简零侵入）**：
+  - `python/setup.py`（仅 `+6 / −1` 行）— 编译接入 `csrc/audio/{layernorm_mxfp8,stem_mxfp8}.cu`；上游 GEMM 与 `_vendor/` 代码保持 **0 改动**。
 - **测试、基准与文档**：
   - `tests/audio/test_audio_tower_sm100.py`
-  - `bench/audio/{probe_baseline.py, bench_phase1.py, bench_phase2.py, bench_p2_ablation.py, bench_phase3_full_routing.py, bench_stem_and_e2e.py, bench_unified_gemm.py, test_dual_stream_audio_moe.py}`
+  - `bench/audio/{bench_stem_and_e2e.py, bench_unified_gemm.py, test_dual_stream_audio_moe.py}`
   - `docs/audio_tower_extreme_opt_report.md`

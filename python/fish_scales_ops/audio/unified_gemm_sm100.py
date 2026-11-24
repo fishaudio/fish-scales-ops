@@ -70,8 +70,8 @@ class Sm100AudioClusterUnifiedGemmKernel(Sm100BlockScaledSplitKGemmKernel):
             fso_epilogue=fso_epilogue,
             fso_weights_first=True,
             fso_wf_cap=fso_wf_cap,
-            fso_early_pdl=fso_early_pdl,
         )
+        self.fso_early_pdl = bool(fso_early_pdl)
 
     def _setup_attributes(self):
         """Same as SplitK setup, except reduce_mailbox overlays sA (0 extra mailbox SMEM bytes!)."""
@@ -1160,7 +1160,7 @@ def _get_compiled(
     return fn
 
 
-def linear_mxfp8_unified(
+def linear_mxfp8_cluster_dsmem(
     x_fp8: torch.Tensor,
     w_fp8: torch.Tensor,
     sx: torch.Tensor,
@@ -1170,7 +1170,11 @@ def linear_mxfp8_unified(
     early_pdl: bool = True,
     mma_tiler_mn: Tuple[int, int] = (128, 64),
 ) -> torch.Tensor:
-    """Run the single unified cluster-DSMEM SM100 MXFP8 GEMM (zero host shape routing!)."""
+    """Run the single unified Cluster-DSMEM SM100 MXFP8 GEMM (zero host shape routing!).
+
+    Dedicated to Audio Tower narrow-N / long-K / fused bias+residual / Early-PDL workloads
+    (distinct from `torch.ops.fish_scales_ops.linear_mxfp8_unified` for general LLM dense).
+    """
     m, k = int(x_fp8.shape[0]), int(x_fp8.shape[1])
     n = int(w_fp8.shape[0])
     pdl = os.environ.get("FSO_DISABLE_PDL", "0") != "1"

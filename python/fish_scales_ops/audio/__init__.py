@@ -12,7 +12,7 @@ default unified path):
   - gelu_nhwc_to_mxfp8:      Single PDL CUDA kernel: Conv3 NHWC exact erf-GELU + (F, C) permute -> MXFP8.
   - gelu_erf_bf16_pdl:       Single PDL CUDA kernel: packed f32x2 exact erf-GELU on BF16.
   - prepare_conv_out_weight: Static load-time (C, F) -> (F, C) column reorder for NHWC stem fusion.
-  - linear_mxfp8_unified / linear_audio_dense / linear_audio_conv_out / linear_audio_qkv /
+  - linear_mxfp8_cluster_dsmem / linear_audio_dense / linear_audio_conv_out / linear_audio_qkv /
     linear_audio_out_proj / linear_audio_fc2 / linear_audio_proj2:
                              Single unified Cluster-DSMEM SM100 MXFP8 GEMM kernel (`cluster=(1,1,4)`,
                              zero global workspace, zero atomics, zero host shape routing!):
@@ -27,7 +27,7 @@ import torch
 
 from .. import dense as _dense
 from .fa4_mxfp8 import attn_fa4_mxfp8
-from .unified_gemm_sm100 import linear_mxfp8_unified
+from .unified_gemm_sm100 import linear_mxfp8_cluster_dsmem
 
 _AUDIO_DEFAULT_EARLY_PDL = True
 
@@ -76,7 +76,7 @@ def linear_audio_dense(
 ) -> torch.Tensor:
     """Run the single unified in-kernel adaptive Cluster-DSMEM SM100 MXFP8 GEMM (zero host shape routing)."""
     epdl = _AUDIO_DEFAULT_EARLY_PDL if early_pdl is None else bool(early_pdl)
-    return linear_mxfp8_unified(
+    return linear_mxfp8_cluster_dsmem(
         xq, dw.weight, xs, dw.scale, bias=bias, residual=residual, early_pdl=epdl
     )
 
@@ -143,7 +143,7 @@ __all__ = [
     "gelu_nhwc_to_mxfp8",
     "gelu_erf_bf16_pdl",
     "prepare_conv_out_weight",
-    "linear_mxfp8_unified",
+    "linear_mxfp8_cluster_dsmem",
     "linear_audio_dense",
     "linear_audio_conv_out",
     "linear_audio_qkv",
