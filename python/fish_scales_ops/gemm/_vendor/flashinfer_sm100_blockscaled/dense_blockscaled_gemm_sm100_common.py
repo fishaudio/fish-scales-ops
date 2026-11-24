@@ -180,6 +180,8 @@ class _Sm100BlockScaledGemmCommon:
 
     # fso-pdl: the most stages filled before the wait (None: every stage but one).
     fso_wf_cap = None
+    # fso-pdl: release dependents from TMA warp once all A/B copies are issued.
+    fso_early_pdl: bool = False
 
     def _fso_set_weights_first(self, weights_first: bool, cap=None) -> None:
         """fso-pdl: `weights_first` False is today's kernel, byte for byte. True builds the weights-first variant:

@@ -263,6 +263,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
         fso_epilogue: Optional[Tuple[bool, int, bool]] = None,
         fso_weights_first: bool = False,
         fso_wf_cap: Optional[int] = None,
+        fso_early_pdl: bool = False,
     ):
         """Configure one low-M split-K tactic.
 
@@ -282,6 +283,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
         self.acc_dtype = cutlass.Float32
         self._fso_set_epilogue(fso_epilogue)  # fso-epilogue
         self._fso_set_weights_first(fso_weights_first, fso_wf_cap)  # fso-pdl
+        self.fso_early_pdl = bool(fso_early_pdl)  # fso-pdl
         if sf_vec_size != 32:
             raise ValueError(
                 f"MXFP8 split-K requires sf_vec_size=32, got {sf_vec_size}"
@@ -1227,6 +1229,8 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                 work_tile = tile_sched.get_current_work()
 
             #
+            if cutlass.const_expr(self.fso_early_pdl):
+                griddepcontrol_launch_dependents()
             # Wait A/B buffer empty
             #
             ab_pipeline.producer_tail(ab_producer_state)
@@ -1768,7 +1772,8 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
             #
             c_pipeline.producer_tail()
 
-        griddepcontrol_launch_dependents()
+        if cutlass.const_expr(not self.fso_early_pdl):
+            griddepcontrol_launch_dependents()
 
     def _compute_grid(
         self,

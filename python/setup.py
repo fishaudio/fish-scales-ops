@@ -272,6 +272,11 @@ def _gemm_sources() -> list[str]:
     ]
 
 
+
+def _audio_sources() -> list[str]:
+    base = CSRC / "audio"
+    return [_rel(base / "layernorm_mxfp8.cu"), _rel(base / "stem_mxfp8.cu")]
+
 def _attention_sources() -> list[str]:
     base = CSRC / "attention"
     cpp = [_rel(base / "csrc" / "flash_attn_ext.cpp")]
@@ -365,7 +370,7 @@ cxx_flags = ["-O3", "-std=c++17", "-Wno-psabi", "-Wno-deprecated-declarations"]
 # libnvrtc would bind every NVRTC call to whichever libnvrtc.so.13 the process loaded first, which is torch's.
 ext = CUDAExtension(
     name="fish_scales_ops._C",
-    sources=_gemm_sources() + _attention_sources(),
+    sources=_gemm_sources() + _attention_sources() + _audio_sources(),
     include_dirs=include_dirs,
     extra_compile_args={"cxx": cxx_flags, "nvcc": nvcc_flags},
     libraries=["cuda"],
