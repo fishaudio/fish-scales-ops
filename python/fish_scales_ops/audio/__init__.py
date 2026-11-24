@@ -1,18 +1,23 @@
-"""Blackwell (sm_100 / sm_103) Audio Tower fused operators and pipeline-optimal dispatch.
+"""Blackwell (sm_100 / sm_103) Audio Tower fused operators with in-kernel adaptive routing.
 
 Provides end-to-end fused operators for realtime ASR Audio Tower (32-layer Transformer Encoder,
-d_model=1280, n_heads=20, head_dim=64, d_ff=5120, exact erf-GELU, 3x Conv2d Stem):
+d_model=1280, n_heads=20, head_dim=64, d_ff=5120, exact erf-GELU, 3x Conv2d Stem) while keeping
+routing decisions INSIDE the GPU kernels (zero host-side `if M <= ...` kernel tables on the
+default unified path):
 
-  - layernorm_mxfp8:         Fused PDL LayerNorm -> MXFP8 1x32 (SM100 atom layout, zero padded scales)
-  - attn_fa4_mxfp8:          FlashAttention-4 SM100 fused Attention -> MXFP8 1x32 + Early PDL + single-wave q_stage=1
-  - gelu_nhwc_to_mxfp8:      Fused PDL Conv3 NHWC exact erf-GELU + (F, C) permute + MXFP8 1x32 quantize
-  - gelu_erf_bf16_pdl:       Packed f32x2 exact erf-GELU on BF16 with PDL
-  - prepare_conv_out_weight: Static load-time (C, F) -> (F, C) column reorder for NHWC stem fusion
-  - linear_audio_dense / linear_audio_conv_out / linear_audio_qkv / linear_audio_out_proj /
-    linear_audio_fc2 / linear_audio_proj2:
-                             Pipeline-aware MXFP8 GEMM dispatch for pre-quantized Audio Tower roles
-                             using per-call wf_cap=3/5 and TMA-warp early PDL (never mutating global
-                             fso.dense defaults).
+  - layernorm_mxfp8:         Single unified PDL CUDA kernel (`ln_mxfp8_unified_kernel`):
+                             in-kernel D==1280 register-resident fast path + general D%128==0 path,
+                             SM100 atom layout, zero padded scales. Zero host D/M/variant routing.
+  - attn_fa4_mxfp8:          FlashAttention-4 SM100 fused Attention -> MXFP8 1x32 + Early PDL.
+  - gelu_nhwc_to_mxfp8:      Single PDL CUDA kernel: Conv3 NHWC exact erf-GELU + (F, C) permute -> MXFP8.
+  - gelu_erf_bf16_pdl:       Single PDL CUDA kernel: packed f32x2 exact erf-GELU on BF16.
+  - prepare_conv_out_weight: Static load-time (C, F) -> (F, C) column reorder for NHWC stem fusion.
+  - linear_mxfp8_unified / linear_audio_dense / linear_audio_conv_out / linear_audio_qkv /
+    linear_audio_out_proj / linear_audio_fc2 / linear_audio_proj2:
+                             Single unified Cluster-DSMEM SM100 MXFP8 GEMM kernel (`cluster=(1,1,4)`,
+                             zero global workspace, zero atomics, zero host shape routing!):
+                             dynamically selects `S in {4, 2, 1}` Cluster-DSMEM Split-K vs Data-Parallel,
+                             weights-first prefetch depth, and L2/GPC rasterization INSIDE the GPU kernel.
 """
 from __future__ import annotations
 
@@ -21,17 +26,9 @@ from typing import Optional, Tuple
 import torch
 
 from .. import dense as _dense
-from ..gemm import _epilogue as _ep
-from ..gemm import _sm100_decode as _dec
-from ..gemm import _sm100_dispatch as _disp
 from .fa4_mxfp8 import attn_fa4_mxfp8
+from .unified_gemm_sm100 import linear_mxfp8_unified
 
-# Audio Tower all-prequantized GEMMs follow long (3-15 us) early-PDL producers
-# (LN_MXFP8, FA4_MXFP8, fc1_q), so deeper weights-first prefetch (3 stages for
-# 1-CTA split-K, 5 stages for 2-CTA persistent) beats the 2/1 global default
-# (which protects LLM bf16-x quantize->GEMM). Passed per-call via wf_cap.
-_AUDIO_WF_CAP_ONE_CTA = 3
-_AUDIO_WF_CAP_TWO_CTA = 5
 _AUDIO_DEFAULT_EARLY_PDL = True
 
 
@@ -42,8 +39,8 @@ def layernorm_mxfp8(
     eps: float = 1e-5,
     round_bf16: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Fused PDL LayerNorm -> MXFP8 1x32 returning (xq [M, D] fp8, sx [align(M,128)*(D/128)] int32)."""
-    return torch.ops.fish_scales_ops.layernorm_mxfp8_sm100(x, gamma, beta, float(eps), bool(round_bf16), 1)
+    """Single unified PDL LayerNorm -> MXFP8 1x32 returning (xq [M, D] fp8, sx int32)."""
+    return torch.ops.fish_scales_ops.layernorm_mxfp8_sm100(x, gamma, beta, float(eps), bool(round_bf16), 0)
 
 
 def gelu_nhwc_to_mxfp8(x_nhwc: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -75,29 +72,13 @@ def linear_audio_dense(
     xs: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     residual: Optional[torch.Tensor] = None,
-    cfg_override=None,
     early_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """Dispatch a pre-quantized Audio Tower MXFP8 GEMM with per-call wf_cap=3/5 and early PDL."""
-    m, k = int(xq.shape[0]), int(xq.shape[1])
-    n = int(dw.weight.shape[0])
-    epi = _ep.Epilogue(bias=bias, residual=residual) if (bias is not None or residual is not None) else None
-    cfg = cfg_override
-    if cfg is None:
-        for key, cand_cfg in _disp._candidates(m, n, k, epi):
-            if key == _disp.DECODE:
-                cfg = cand_cfg
-            break
-    if cfg is not None and _dec.enabled() and (epi is None or _dec.epilogue_available()):
-        cluster = cfg[1]
-        wf_cap = _AUDIO_WF_CAP_TWO_CTA if cluster[0] * cluster[1] > 1 else _AUDIO_WF_CAP_ONE_CTA
-        epdl = _AUDIO_DEFAULT_EARLY_PDL if early_pdl is None else bool(early_pdl)
-        y = _dec.linear_mxfp8_decode(
-            xq, dw.weight, xs, dw.scale, cfg, epi, wf_cap=wf_cap, early_pdl=epdl
-        )
-        if y is not None:
-            return y
-    return _dense.linear(xq, dw, x_scale=xs, bias=bias, residual=residual)
+    """Run the single unified in-kernel adaptive Cluster-DSMEM SM100 MXFP8 GEMM (zero host shape routing)."""
+    epdl = _AUDIO_DEFAULT_EARLY_PDL if early_pdl is None else bool(early_pdl)
+    return linear_mxfp8_unified(
+        xq, dw.weight, xs, dw.scale, bias=bias, residual=residual, early_pdl=epdl
+    )
 
 
 def linear_audio_conv_out(
@@ -107,7 +88,7 @@ def linear_audio_conv_out(
     residual: Optional[torch.Tensor] = None,
     early_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """Pipeline-optimal MXFP8 conv_out [1280x7680] (+ optional positional embedding residual)."""
+    """Unified in-kernel MXFP8 conv_out [1280x7680] (+ optional positional embedding residual)."""
     return linear_audio_dense(xq, dw_conv_out, xs, residual=residual, early_pdl=early_pdl)
 
 
@@ -118,29 +99,8 @@ def linear_audio_qkv(
     bias: Optional[torch.Tensor] = None,
     early_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """Pipeline-optimal MXFP8 QKV [3840x1280] dispatch between early-PDL LN1 and PDL-waiting FA4.
-
-    Across all 6 ASR serving rungs (M=78..1079), routing QKV to weights-first + early-PDL CuTe-DSL
-    persistent tactics keeps the 32-layer PDL chain unbroken (avoiding non-PDL cublasLt at M>=364
-    and non-weights-first C++ cascade at M<=182), saving -8.3 to -45.5 us across 32 layers:
-      - M <= 128:      128x64 (1-CTA, wf_cap=3)
-      - 128 < M <= 256: 256x64 (2-CTA, wf_cap=5)
-      - 256 < M <= 384: 256x128 (2-CTA, wf_cap=5; 90 CTAs = 1 wave)
-      - 384 < M <= 576: 256x64 (2-CTA, wf_cap=5; avoids 150-CTA 2-CTA spill on 148 SMs)
-      - M > 576:       256x128 (2-CTA, wf_cap=5)
-    """
-    m = int(hq.shape[0])
-    if m <= 128:
-        cfg = ((128, 64), (1, 1), True, 1)
-    elif m <= 256:
-        cfg = ((256, 64), (2, 1), True, 1)
-    elif m <= 384:
-        cfg = ((256, 128), (2, 1), True, 1)
-    elif m <= 576:
-        cfg = ((256, 64), (2, 1), True, 1)
-    else:
-        cfg = ((256, 128), (2, 1), True, 1)
-    return linear_audio_dense(hq, dw_qkv, hs, bias=bias, cfg_override=cfg, early_pdl=early_pdl)
+    """Unified in-kernel MXFP8 QKV [3840x1280] between early-PDL LN1 and PDL-waiting FA4."""
+    return linear_audio_dense(hq, dw_qkv, hs, bias=bias, early_pdl=early_pdl)
 
 
 def linear_audio_out_proj(
@@ -151,10 +111,8 @@ def linear_audio_out_proj(
     residual: Optional[torch.Tensor] = None,
     early_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """Pipeline-optimal MXFP8 out_proj [1280x1280] dispatch behind early-PDL FA4_MXFP8."""
-    m = int(aq.shape[0])
-    cfg = ((256, 64), (2, 1), True, 1) if 384 < m <= 640 else None
-    return linear_audio_dense(aq, dw_o, as_, bias=bias, residual=residual, cfg_override=cfg, early_pdl=early_pdl)
+    """Unified in-kernel MXFP8 out_proj [1280x1280] behind early-PDL FA4_MXFP8."""
+    return linear_audio_dense(aq, dw_o, as_, bias=bias, residual=residual, early_pdl=early_pdl)
 
 
 def linear_audio_fc2(
@@ -165,7 +123,7 @@ def linear_audio_fc2(
     residual: Optional[torch.Tensor] = None,
     early_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """Pipeline-optimal MXFP8 fc2 [1280x5120] dispatch with per-call wf_cap=3/5."""
+    """Unified in-kernel MXFP8 fc2 [1280x5120] (in-kernel S=4/2/1 Cluster-DSMEM Split-K)."""
     return linear_audio_dense(uq, dw_fc2, us, bias=bias, residual=residual, early_pdl=early_pdl)
 
 
@@ -175,7 +133,7 @@ def linear_audio_proj2(
     xs: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Pipeline-optimal MXFP8 tail proj2 [2048x1280] dispatch with per-call wf_cap=3/5."""
+    """Unified in-kernel MXFP8 tail proj2 [2048x1280]."""
     return linear_audio_dense(xq, dw_proj2, xs, bias=bias, early_pdl=False)
 
 
@@ -185,6 +143,7 @@ __all__ = [
     "gelu_nhwc_to_mxfp8",
     "gelu_erf_bf16_pdl",
     "prepare_conv_out_weight",
+    "linear_mxfp8_unified",
     "linear_audio_dense",
     "linear_audio_conv_out",
     "linear_audio_qkv",

@@ -245,17 +245,59 @@ flowchart LR
 
 ---
 
-## 8. 交付资产清单（分支 `feat/audio-tower-extreme-opt`）
+## 8. Kernel 内部自适应路由统一化（消除 Host 侧 Shape 路由表）
+
+在 Phase 1–5 取得全档极值的基础上，针对工程可维护性与 CUDA Graph 零 Host 分支诉求，我们进一步将原先位于 CPU/Host 侧的尺寸与形态路由逻辑（如 `if D == 1280`、`if M <= 128 ... elif M <= 256 ... elif M <= 576`、`split_k = 4/2/1`、`WF_MIN_K_BLOCKS` 等）**彻底下沉到 GPU Kernel 内部**，实现默认生产路径（`fish_scales_ops.audio.*`）的**零 Host 侧 shape 路由表**。
+
+### 8.1 统一单 Kernel `LayerNorm → MXFP8`（`csrc/audio/layernorm_mxfp8.cu`）
+
+- 删除全部 Host 侧 `if (D == 1280)`、`if (M <= 256)`、`if (variant == ...)` 分发逻辑（源码从 622 行精简至 300 行）。
+- 合并为唯一模板 Kernel `ln_mxfp8_unified_kernel<kRoundBf16>`（固定 `block = 160` = 5 warps）：**在 Kernel 内部**按运行时 `D == 1280` 走寄存器驻留快路径 vs 通用 `D % 128 == 0` 路径，并在末尾 CTA（`blockIdx.x == M`）内嵌 `[M, align(M, 128))` 填充行清零。
+- 实测不仅覆盖 `D ∈ {512, 1280, 2048}` 与 `M ∈ {1..1079}` 契约单测 100% 通过，还为 32L 主干带来额外收益（`M=364: 1057→1042 µs`、`M=533: 1312→1286 µs`、`M=1079: 1858→1841 µs`）。
+
+### 8.2 单一统一 Cluster-DSMEM SM100 MXFP8 GEMM（`Sm100AudioClusterUnifiedGemmKernel`）
+
+- **实现位置**：`python/fish_scales_ops/audio/unified_gemm_sm100.py`（继承 `Sm100BlockScaledSplitKGemmKernel`，零 `_vendor/` 修改），已作为 `fish_scales_ops.audio.linear_audio_{dense,conv_out,qkv,out_proj,fc2,proj2}` 默认实现。
+- **核心微架构设计（零 Host 路由、零全局 Workspace、零 GPU-Scope 原子操作、零 `cudaMemsetAsync`）**：
+  1. **固定满卡 Cluster Grid 启动**：对任意 `(M, N, K)` 永远只发射**同一枚编译好的 Kernel**（按 epilogue 形态区分），固定 `grid = (37, 1, 4)`（148 CTAs = 100% 铺满 B300 全部 SM）、`cluster = (1, 1, 4)`。
+  2. **Kernel 内部自适应三态路由 `S ∈ {4, 2, 1}`**：在 GPU 内由运行时 `base_tiles = num_m_tiles * num_n_tiles` 与 `k_block_cnt` 动态决定并行拓扑：
+     - **`S = 4`（小批量长 K，`base_tiles <= 37 && k_block_cnt >= 16`）**：Cluster 内 4 个 CTA 协作执行 Blackwell 硬件异步 **Cluster DSMEM**（`st.async.shared::cluster`，~0.2 µs，零全局显存）4 路 Split-K 归约。
+     - **`S = 2`（中等批量，`base_tiles <= 74 && k_block_cnt >= 8`）**：单个 4-CTA Cluster 内部逻辑劈分为两对独立 DSMEM Split-K 组 `(0, 1)` 与 `(2, 3)`（~0.1 µs），将有效 tile 并行度翻倍。
+     - **`S = 1`（大批量）**：Cluster 内 4 个 CTA 退化为 4 个完全独立的持久化数据并行 CTA，**零 Cluster 屏障与零 DSMEM 归约开销**。
+  3. **零额外 SMEM 的 `sA` 复用覆盖（SMEM Union Overlay）**：由于 `S > 1` 时每个活跃 CTA 最多执行 1 个 tile，主循环结束并经一次 20 ns Cluster 握手后 `sA` 已完全释放；直接将 48 KB `reduce_mailbox` 叠加映射至 `sA` 的 1024B 对齐共享内存，无偿回收 **+2 级 mainloop `ab_stage`**（`128×64`: `6→8` 级、`128×128`: `4→6` 级），在大档直接提速 **−38 ~ −98 µs**。
+  4. **Kernel 内部动态 Weights-First 预取 + 自适应光栅化 + 空闲 CTA 快退**：在 TMA Warp 内部按运行时 `k_cnt` 动态决定 `fso_pre`（彻底消除 Host `WF_MIN_K_BLOCKS` 路由）；以统一谓词 `use_n_inner = (num_n_tiles >= 8)` 在小 M 走 `m_idx` 内层、大 M 走 `n_idx` 内层复用 GPC 权重条带；完全空闲的 CTA（`my_group_id >= base_tiles`）跳过 TMEM 分配/释放并在 PDL 握手后立刻退出。
+- **负对比实验（为何放弃全局显存 L2 Dynamic Split-K）**：早期原型尝试在 2-CTA `256×128` 持久化 Kernel 内通过 L2 FP32 Workspace + 自清零 `fence.acq_rel.gpu + atom.add` 实现内部动态 Split-K；虽然 30/30 形状精度全过且 `M=1079`（`S=1`）仅 `1894.2 µs`，但在 `M=78..533`（`S>1`）单 SM 顺序回读 `S × 64 KB` 局部和加 GPU-Scope 栅栏耗时 `4–6 µs/GEMM`，导致 32L 暴涨至 `1576–1778 µs`。切换至硬件 **Cluster-DSMEM** 后 `M=78` 从 `1689.7 µs` 骤降至 **`873–886 µs`（立省 −800+ µs）**。
+
+### 8.3 零 Host 路由统一版（v2.2）2032 MHz 实测总览（单位：µs）
+
+| Token 数 `M` | PyTorch BF16 | `0.3.0 fqkv` | **统一单 Kernel `128×64` (v2.2)** | **vs 0.3.0** | **vs BF16** | 统一单 Kernel `128×128` | Host 多 Kernel 极值参考 | **含 Stem 全链路 E2E (统一版)** | **E2E vs 0.3.0** | **E2E vs BF16** | **32L cos(BF16)** |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **78** | 1567.5 | 1301.1 | **886.1** | **−31.9%** | **−43.5% (1.77×)** | 969.5 | 835.1 | **999.3** | **−29.5%** | **−35.8%** | 0.993882 |
+| **117** | 1607.6 | 1312.4 | **886.9** | **−32.4%** | **−44.8% (1.81×)** | 983.9 | 842.6 | **1029.4** | **−29.5%** | **−36.6%** | 0.993464 |
+| **182** | 1650.0 | 1377.8 | **975.9** | **−29.2%** | **−40.9% (1.69×)** | 1068.3 | 938.9 | **1183.5** | **−25.7%** | **−32.4%** | 0.993677 |
+| **364** | 1814.1 | 1471.5 | **1092.0** | **−25.8%** | **−39.8% (1.66×)** | 1140.9 | 1042.0 | **1455.6** | **−21.4%** | **−32.2%** | 0.993612 |
+| **533** | 2057.6 | 1778.2 | **1366.2** | **−23.2%** | **−33.6% (1.51×)** | **1357.5** | 1286.0 | **1891.0** | **−18.5%** | **−27.7%** | 0.993697 |
+| **1079** | 2795.5 | 2340.1 | **2060.7** | **−11.9%** | **−26.3% (1.36×)** | **2002.3** | 1841.0 | **3101.0** | **−9.3%** | **−20.8%** | 0.992985 |
+
+> [!NOTE]
+> **Blackwell 硬件启动期不变量的诚实边界**：
+> - 所有可在运行时调度的维度（LayerNorm `D==1280` 快路径 vs 通用路径、GEMM `S ∈ {4, 2, 1}` Cluster-DSMEM Split-K vs 数据并行、动态 weights-first 预取深度、自适应光栅化与空闲 CTA 快退）现已 **100% 收敛至单 Kernel 内部**，默认 `fish_scales_ops.audio` 路径**零 Host 侧 `if M <= ...` 路由表**，且 `M=78` 含 3×Conv2d Stem 完整端到端仍保持 **1 ms 以内（999.3 µs）**，全部 600 轮 Audio+MoE 双流并发 **0 误差**。
+> - `M=1079` 处统一单 Kernel（`2002–2061 µs`）与多 Kernel 极值（`1841 µs`）之间的 ~160–220 µs 差距源于 Blackwell 物理硬件启动期不变量：`tcgen05.mma.cta_group::1`（1-CTA）与 `cta_group::2`（2-CTA 激活组播，大 M 下激活 HBM 流量减半）固化在 SASS 指令编码与 CUDA Cluster 启动维度中，无法在同一枚 Kernel 运行中途切换；同理，FA4 的 `q_stage=1` 与 `q_stage=2` 改变编译期 warp-group 数量与 SMEM 布局（实测强制单 `q_stage=1` 在 `M=1079` 需额外付 `+89.4 µs` 两波尾开销）。
+
+---
+
+## 9. 交付资产清单（分支 `feat/audio-tower-extreme-opt`）
 
 - **新增 CUDA / CuTe-DSL 生产算子**：
-  - `csrc/audio/layernorm_mxfp8.cu` — 融合 PDL `LayerNorm1280 → MXFP8 1×32`（`v1 cta160` + 通用 fallback）
+  - `csrc/audio/layernorm_mxfp8.cu` — 统一单 Kernel 融合 PDL `LayerNorm → MXFP8 1×32`（Kernel 内部 `D==1280` 快路径 + 通用 `D%128==0` 路径）
   - `csrc/audio/stem_mxfp8.cu` — `gelu_erf_bf16_pdl_sm100` & `gelu_nhwc_to_mxfp8_sm100`
   - `python/fish_scales_ops/audio/fa4_mxfp8.py` — FlashAttention-4 SM100 融合 `Attention → MXFP8` + Early PDL + 单波 `q_stage=1`
-  - `python/fish_scales_ops/audio/__init__.py` — 完整 Audio Tower 公共算子与全 6 档流水线路由封装
+  - `python/fish_scales_ops/audio/unified_gemm_sm100.py` — 单一统一 Cluster-DSMEM SM100 MXFP8 GEMM（`S ∈ {4, 2, 1}`、`sA` SMEM 复用、动态 weights-first、自适应光栅化、零 Host 路由）
+  - `python/fish_scales_ops/audio/__init__.py` — 完整 Audio Tower 公共算子封装（默认零 Host 侧 shape 路由表）
 - **极简 Opt-In 底层扩展（默认 100% 兼容上游）**：
   - `python/setup.py` — 编译接入 `csrc/audio/{layernorm_mxfp8,stem_mxfp8}.cu`
   - `python/fish_scales_ops/gemm/_sm100_decode.py` & `_vendor/flashinfer_sm100_blockscaled/*.py` — 仅 +27/−7 行纯 opt-in `wf_cap` 与 `fso_early_pdl` 支持
 - **测试、基准与文档**：
   - `tests/audio/test_audio_tower_sm100.py`
-  - `bench/audio/{probe_baseline.py, bench_phase1.py, bench_phase2.py, bench_p2_ablation.py, bench_phase3_full_routing.py, bench_stem_and_e2e.py, test_dual_stream_audio_moe.py}`
+  - `bench/audio/{probe_baseline.py, bench_phase1.py, bench_phase2.py, bench_p2_ablation.py, bench_phase3_full_routing.py, bench_stem_and_e2e.py, bench_unified_gemm.py, test_dual_stream_audio_moe.py}`
   - `docs/audio_tower_extreme_opt_report.md`

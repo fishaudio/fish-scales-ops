@@ -57,8 +57,8 @@ def test_public_surface_preserved():
 
 def test_layernorm_mxfp8_contract():
     torch.manual_seed(101)
-    for M in [1, 78, 117, 128, 182, 364, 533, 1079]:
-        D = 1280
+    # Test BOTH in-kernel D==1280 fast path AND in-kernel general D%128==0 path (512, 2048)
+    for M, D in [(1, 1280), (78, 1280), (117, 1280), (128, 1280), (182, 1280), (364, 1280), (533, 1280), (1079, 1280), (78, 512), (182, 2048)]:
         x = (torch.randn(M, D, device="cuda", dtype=torch.bfloat16) * 0.7).contiguous()
         g = (torch.randn(D, device="cuda", dtype=torch.bfloat16) * 0.2 + 1.0).contiguous()
         b = (torch.randn(D, device="cuda", dtype=torch.bfloat16) * 0.1).contiguous()
