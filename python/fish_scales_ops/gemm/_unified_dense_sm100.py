@@ -1,30 +1,34 @@
-"""Single Unified Blackwell (sm_100 / sm_103) Cluster-DSMEM MXFP8 GEMM Kernel (v2).
+"""Shared Unified Blackwell (sm_100 / sm_103) Cluster-DSMEM Dense MXFP8 GEMM Kernel.
 
-Eliminates ALL host-side shape/size kernel routing (no `if M <= 128 / 256 / 384 / 576`,
-no host `split_k = 4 / 2 / 1` dispatch, no host `WF_MIN_K_BLOCKS` split, ZERO global
-memory reduction workspace, ZERO atomics, ZERO extra SMEM overhead!):
+Shared by BOTH `fish_scales_ops.drama3_unified` (Qwen3.5-35B-A3B / s3-drama) and
+`fish_scales_ops.audio` (32L ASR Audio Tower) — ZERO duplicated C++ or Python dense
+kernels, ZERO host-side `if M <= X` shape routing, ZERO global L2 reduction workspace,
+ZERO GPU-scope atomics, ZERO extra SMEM overhead:
 
   - Host ALWAYS launches ONE single compiled kernel (per epilogue flavor) with fixed
     hardware cluster grid `grid = (max_clusters, 1, 4)` (`(37, 1, 4)` = 148 CTAs = 100%
     of B300 SMs), `cluster = (1, 1, 4)`.
-  - Key micro-architectural innovations:
-      1. **100% In-Kernel Cluster-DSMEM Adaptive Routing (`S in {4, 2, 1}`)**:
+  - 100% In-Kernel Adaptive Scheduling & Microarchitecture:
+      1. **Cluster-DSMEM Adaptive Split-K (`S in {4, 2, 1}`)**:
          Reads runtime `(M, N, K)` inside the GPU kernel and dynamically selects:
            - `S = 4` (full-cluster 4-way DSMEM Split-K): `base_tiles <= 37` and `k_blocks >= 16`.
            - `S = 2` (dual independent DSMEM Split-K pairs `(0,1)` & `(2,3)` per cluster):
-             (`base_tiles <= 37` and `k_blocks >= 8`) or (`base_tiles <= 74` and `k_blocks >= 20`).
+             `base_tiles <= 74` and `k_blocks >= 8`.
            - `S = 1` (4 independent persistent data-parallel CTAs per cluster): otherwise.
       2. **Zero-SMEM-Cost `sA` Union Overlay for `reduce_mailbox`**:
-         Because `S > 1` executes at most 1 tile per CTA, `sA` is 100% dead when the
-         epilogue reduction begins. After a 20 ns cluster handshake across all warps,
-         `reduce_mailbox` overlays directly onto `sA`'s 1024B-aligned SMEM buffer—reclaiming
-         +2 full mainloop `ab_stage`s (`128x64`: 8 stages, `128x128`: 6 stages) for FREE!
-      3. **GPC-Local Weight-Strip Rasterization (`n_idx` inner)**:
-         Adjacent CTAs in the same 4-CTA GPC cluster process consecutive token tiles of the
-         SAME 128-row weight strip `W[m_idx]`, maximizing L2/GPC weight reuse in `S = 1`.
-      4. **In-Kernel Dynamic Weights-First (`fso_pre`) + Early PDL + Fast Idle-CTA Exit**:
-         Idle CTAs (`my_group_id >= base_tiles`) skip TMEM alloc/dealloc completely and exit
-         immediately after PDL handshakes, freeing SMs for the next PDL-overlapped kernel.
+         Because `S > 1` runs at most 1 tile per CTA, `sA` is 100% dead at epilogue. After
+         a 20 ns cluster handshake across all warps, `reduce_mailbox` overlays directly onto
+         `sA`'s 1024B-aligned SMEM—reclaiming +2 mainloop `ab_stage`s (`128x64`: 8 stages,
+         `128x128`: 6 stages) for FREE.
+      3. **In-Kernel Adaptive Rasterization (1× HBM Weight Read)**:
+         Small M (`num_n_tiles < 8`) walks `m_idx` inner; wider M (`num_n_tiles >= 8`) walks
+         `n_idx` inner so concurrent CTAs share each 128-row weight strip across all token
+         tiles (reading `W` from HBM once while activations stay hot in B300's 126 MiB L2).
+      4. **In-Kernel Dynamic Weights-First (`fso_pre`) + TMA Early PDL + Fast Idle-CTA Exit**:
+         Idle CTAs skip TMEM alloc/dealloc and exit immediately after PDL handshakes.
+      5. **Full Fused Epilogue**:
+         Supports identity, bias (`zero_bias == no_bias` bitwise), exact `erf`-GELU (`act=1`),
+         and residual add via the vendored `_Sm100BlockScaledGemmCommon` hooks (zero `_vendor/` edits).
 """
 from __future__ import annotations
 
@@ -45,13 +49,13 @@ from cutlass.pipeline import PipelineTmaUmma, PipelineUmmaAsync
 from cutlass.cute.runtime import from_dlpack, make_ptr
 import cuda.bindings.driver as cuda_drv
 
-from ..gemm._vendor.flashinfer_sm100_blockscaled.dense_blockscaled_gemm_sm100_splitk import (
+from ._vendor.flashinfer_sm100_blockscaled.dense_blockscaled_gemm_sm100_splitk import (
     Sm100BlockScaledSplitKGemmKernel,
     _store_shared_remote_v4,
 )
 
 
-class Sm100AudioClusterUnifiedGemmKernel(Sm100BlockScaledSplitKGemmKernel):
+class Sm100ClusterUnifiedDenseKernel(Sm100BlockScaledSplitKGemmKernel):
     """Single 1-CTA cluster=(1,1,4) SM100 MXFP8 GEMM with zero-SMEM-overlay DSMEM S in {1,2,4}."""
 
     def __init__(
@@ -358,6 +362,19 @@ class Sm100AudioClusterUnifiedGemmKernel(Sm100BlockScaledSplitKGemmKernel):
             use_pdl=self.enable_pdl,
         )
 
+    @cute.jit
+    def _tile_coords(
+        self,
+        tile_id: Int32,
+        num_m_tiles: Int32,
+        num_n_tiles: Int32,
+        use_n_inner: cutlass.Boolean,
+    ):
+        """In-kernel adaptive rasterization: m_idx inner for small M, n_idx inner for wide M (1x HBM weight read)."""
+        n_idx = (tile_id % num_n_tiles) if use_n_inner else (tile_id // num_m_tiles)
+        m_idx = (tile_id // num_n_tiles) if use_n_inner else (tile_id % num_m_tiles)
+        return m_idx, n_idx
+
     @cute.kernel
     def kernel_unified(
         self,
@@ -435,7 +452,7 @@ class Sm100AudioClusterUnifiedGemmKernel(Sm100BlockScaledSplitKGemmKernel):
         # Fast-exit for completely idle CTAs (CTA-uniform: skips TMEM alloc/dealloc!)
         # When split_k > 1, we still participate in the two cluster barriers cleanly.
         is_active_cta = my_group_id < base_tiles
-        # In-kernel adaptive rasterization: n_idx inner when >= 8 activation tiles share each weight strip
+        # In-kernel adaptive rasterization: n_idx inner when >= 8 token tiles share each weight strip
         use_n_inner = num_n_tiles >= Int32(8)
 
         if warp_idx == self.tma_warp_id and is_active_cta:
@@ -604,8 +621,7 @@ class Sm100AudioClusterUnifiedGemmKernel(Sm100BlockScaledSplitKGemmKernel):
                 tile_id = my_group_id
 
                 # First tile peeled for IN-KERNEL dynamic weights-first prefetch
-                n_idx = (tile_id % num_n_tiles) if use_n_inner else (tile_id // num_m_tiles)
-                m_idx = (tile_id // num_n_tiles) if use_n_inner else (tile_id % num_m_tiles)
+                m_idx, n_idx = self._tile_coords(tile_id, num_m_tiles, num_n_tiles, use_n_inner)
                 sfb_n_idx = n_idx // Int32(2) if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64) else n_idx
 
                 fso_tAgA = tAgA[(None, m_idx, None, Int32(0))]
@@ -692,8 +708,7 @@ class Sm100AudioClusterUnifiedGemmKernel(Sm100BlockScaledSplitKGemmKernel):
                 tile_id = tile_id + total_groups
 
                 while tile_id < base_tiles:
-                    n_idx = (tile_id % num_n_tiles) if use_n_inner else (tile_id // num_m_tiles)
-                    m_idx = (tile_id // num_n_tiles) if use_n_inner else (tile_id % num_m_tiles)
+                    m_idx, n_idx = self._tile_coords(tile_id, num_m_tiles, num_n_tiles, use_n_inner)
                     sfb_n_idx = n_idx // Int32(2) if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64) else n_idx
 
                     tAgA_slice = tAgA[(None, m_idx, None, Int32(0))]
@@ -791,7 +806,7 @@ class Sm100AudioClusterUnifiedGemmKernel(Sm100BlockScaledSplitKGemmKernel):
 
                 tile_id = my_group_id
                 while tile_id < base_tiles:
-                    n_idx = (tile_id % num_n_tiles) if use_n_inner else (tile_id // num_m_tiles)
+                    _, n_idx = self._tile_coords(tile_id, num_m_tiles, num_n_tiles, use_n_inner)
                     acc_stage_index = acc_producer_state.index
                     tCtAcc = tCtAcc_base[(None, None, None, acc_stage_index)]
 
@@ -905,8 +920,7 @@ class Sm100AudioClusterUnifiedGemmKernel(Sm100BlockScaledSplitKGemmKernel):
 
                 tile_id = my_group_id
                 while tile_id < base_tiles:
-                    n_idx = (tile_id % num_n_tiles) if use_n_inner else (tile_id // num_m_tiles)
-                    m_idx = (tile_id // num_n_tiles) if use_n_inner else (tile_id % num_m_tiles)
+                    m_idx, n_idx = self._tile_coords(tile_id, num_m_tiles, num_n_tiles, use_n_inner)
                     mma_tile_coord_mnl = (m_idx, n_idx, Int32(0))
 
                     bSG_gC = bSG_gC_partitioned[(None, None, None, *mma_tile_coord_mnl)]
@@ -1118,7 +1132,7 @@ def _get_compiled(
 
     mac4 = _get_mac4()
     wf_cap = 5 if mma_tiler_mn[1] >= 128 else 3
-    gemm = Sm100AudioClusterUnifiedGemmKernel(
+    gemm = Sm100ClusterUnifiedDenseKernel(
         mma_tiler_mn=mma_tiler_mn,
         enable_pdl=pdl,
         fso_epilogue=epi_flags,
@@ -1160,27 +1174,38 @@ def _get_compiled(
     return fn
 
 
-def linear_mxfp8_cluster_dsmem(
+def linear_mxfp8_unified_sm100(
     x_fp8: torch.Tensor,
     w_fp8: torch.Tensor,
     sx: torch.Tensor,
     sw: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     residual: Optional[torch.Tensor] = None,
+    act: int = 0,
     early_pdl: bool = True,
     mma_tiler_mn: Tuple[int, int] = (128, 64),
 ) -> torch.Tensor:
-    """Run the single unified Cluster-DSMEM SM100 MXFP8 GEMM (zero host shape routing!).
+    """Shared unified Cluster-DSMEM SM100 MXFP8 Dense GEMM (zero host shape routing!).
 
-    Dedicated to Audio Tower narrow-N / long-K / fused bias+residual / Early-PDL workloads
-    (distinct from `torch.ops.fish_scales_ops.linear_mxfp8_unified` for general LLM dense).
+    Serves both LLM Dense projections (s3-drama / Qwen3.5-35B-A3B) and ASR Audio Tower
+    with one single compiled CuTe-DSL kernel per epilogue flavor (bias, exact erf-GELU,
+    residual) and zero global L2 reduction workspace.
     """
     m, k = int(x_fp8.shape[0]), int(x_fp8.shape[1])
     n = int(w_fp8.shape[0])
+    if m == 0:
+        return torch.empty((0, n), dtype=torch.bfloat16, device=x_fp8.device)
+
+    act_i = int(act)
+    if bias is not None and not bias.is_contiguous():
+        bias = bias.contiguous()
+    if residual is not None and not residual.is_contiguous():
+        residual = residual.contiguous()
+
     pdl = os.environ.get("FSO_DISABLE_PDL", "0") != "1"
     epi_flags = None
-    if bias is not None or residual is not None:
-        epi_flags = (bias is not None, 0, residual is not None)
+    if bias is not None or residual is not None or act_i != 0:
+        epi_flags = (bias is not None, act_i, residual is not None)
 
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x_fp8.device)
     launch_out = out.as_strided(out.shape, (1, out.shape[0]))

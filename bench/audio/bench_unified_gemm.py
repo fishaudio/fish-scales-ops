@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 import fish_scales_ops as fso
 import fish_scales_ops.audio as audio
-from fish_scales_ops.audio.unified_gemm_sm100 import linear_mxfp8_cluster_dsmem
+from fish_scales_ops.gemm._unified_dense_sm100 import linear_mxfp8_unified_sm100
 from bench_stem_and_e2e import (
     make_tower_weights,
     run_bf16,
@@ -23,20 +23,20 @@ from bench_stem_and_e2e import (
 
 def run_unified_tower(x_conv, W, tile=(128, 64), early_pdl=True):
     xc_q, xc_s = fso.dense.quantize_activation(x_conv)
-    x = linear_mxfp8_cluster_dsmem(xc_q, W["conv"][1].weight, xc_s, W["conv"][1].scale, early_pdl=early_pdl, mma_tiler_mn=tile)
+    x = linear_mxfp8_unified_sm100(xc_q, W["conv"][1].weight, xc_s, W["conv"][1].scale, early_pdl=early_pdl, mma_tiler_mn=tile)
     M, _ = x.shape
     for L in W["layers"]:
         hq, hs = audio.layernorm_mxfp8(x, L["ln1"][0], L["ln1"][1])
-        qkv = linear_mxfp8_cluster_dsmem(hq, L["dqkv"].weight, hs, L["dqkv"].scale, bias=L["qkv"][1], early_pdl=early_pdl, mma_tiler_mn=tile)
+        qkv = linear_mxfp8_unified_sm100(hq, L["dqkv"].weight, hs, L["dqkv"].scale, bias=L["qkv"][1], early_pdl=early_pdl, mma_tiler_mn=tile)
         q, k, v = qkv.view(M, 3, 20, 64).unbind(1)
         aq, as_ = audio.attn_fa4_mxfp8(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0))
-        x = linear_mxfp8_cluster_dsmem(aq, L["do"].weight, as_, L["do"].scale, bias=L["o"][1], residual=x, early_pdl=early_pdl, mma_tiler_mn=tile)
+        x = linear_mxfp8_unified_sm100(aq, L["do"].weight, as_, L["do"].scale, bias=L["o"][1], residual=x, early_pdl=early_pdl, mma_tiler_mn=tile)
         h2q, h2s = audio.layernorm_mxfp8(x, L["ln2"][0], L["ln2"][1])
         uq, us = fso.dense.linear_quantized(h2q, L["dfc1"], x_scale=h2s, bias=L["fc1"][1], activation="gelu_erf")
-        x = linear_mxfp8_cluster_dsmem(uq, L["dfc2"].weight, us, L["dfc2"].scale, bias=L["fc2"][1], residual=x, early_pdl=early_pdl, mma_tiler_mn=tile)
+        x = linear_mxfp8_unified_sm100(uq, L["dfc2"].weight, us, L["dfc2"].scale, bias=L["fc2"][1], residual=x, early_pdl=early_pdl, mma_tiler_mn=tile)
     xq, xs = audio.layernorm_mxfp8(x, W["ln_post"][0], W["ln_post"][1])
     xq2, xs2 = fso.dense.linear_quantized(xq, W["p1"][2], x_scale=xs, bias=W["p1"][1], activation="gelu_erf")
-    return linear_mxfp8_cluster_dsmem(xq2, W["p2"][2].weight, xs2, W["p2"][2].scale, bias=W["p2"][1], early_pdl=False, mma_tiler_mn=tile)
+    return linear_mxfp8_unified_sm100(xq2, W["p2"][2].weight, xs2, W["p2"][2].scale, bias=W["p2"][1], early_pdl=False, mma_tiler_mn=tile)
 
 
 def main():
