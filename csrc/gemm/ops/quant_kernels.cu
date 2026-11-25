@@ -2995,6 +2995,7 @@ __global__ void __launch_bounds__(256, 4) fp8bs_quantize_1x32_grouped_scatter_un
     __nv_bfloat16 const* __restrict__ input, int32_t const* __restrict__ slot_of_flat,
     int32_t const* __restrict__ blk0, int shared_id, int M, int topk, int K, bool pdl)
 {
+#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 1000)
     if (pdl)
     {
         cudaGridDependencySynchronize();
@@ -3121,6 +3122,10 @@ __global__ void __launch_bounds__(256, 4) fp8bs_quantize_1x32_grouped_scatter_un
         if (shared_base >= 0)
             scatter_one(shared_base + t);
     }
+#else
+    (void) out_fp8; (void) out_packed; (void) input; (void) slot_of_flat;
+    (void) blk0; (void) shared_id; (void) M; (void) topk; (void) K; (void) pdl;
+#endif
 }
 
 void fp8bs_quantize_1x32_grouped_gather_unified(__nv_fp8_e4m3* x_q, int32_t* packed_scales,

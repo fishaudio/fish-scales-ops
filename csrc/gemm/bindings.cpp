@@ -166,8 +166,8 @@ void quantize_1x32_grouped_gather_unified_out(at::Tensor x, at::Tensor slot_of_f
     std::optional<at::Tensor> blk0, int64_t shared_id, bool use_ue8m0, at::Tensor x_q, at::Tensor packed_scales);
 void linear_mxfp8_unified_moe(at::Tensor a, at::Tensor w13, at::Tensor sa, at::Tensor sw13, at::Tensor w2,
     at::Tensor sw2, at::Tensor masked_m, at::Tensor blk0, at::Tensor slot_sched, at::Tensor dq, at::Tensor sd,
-    at::Tensor dn, at::Tensor slot_tiles, at::Tensor chunk_list);
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_build_routing_compact_unified(
+    at::Tensor dn, at::Tensor slot_tiles);
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_build_routing_compact_unified(
     at::Tensor topk_ids, int64_t num_routed, int64_t num_blocks, bool has_shared);
 at::Tensor moe_combine_unified(at::Tensor dn, at::Tensor slot_of_flat, at::Tensor topk_w,
     std::optional<at::Tensor> blk0, int64_t shared_id, std::optional<at::Tensor> shared_gate,
@@ -323,11 +323,11 @@ TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
           "Tensor? blk0, int shared_id, bool use_ue8m0, Tensor(a!) x_q, Tensor(b!) packed_scales) -> ()");
     m.def("linear_mxfp8_unified_moe(Tensor a, Tensor w13, Tensor sa, Tensor sw13, Tensor w2, Tensor sw2, "
           "Tensor masked_m, Tensor blk0, Tensor(a!) slot_sched, Tensor(b!) dq, Tensor(c!) sd, Tensor(d!) dn, "
-          "Tensor slot_tiles, Tensor chunk_list) -> ()");
+          "Tensor slot_tiles) -> ()");
     m.def("moe_build_routing_compact_unified(Tensor topk_ids, int num_routed, int num_blocks, bool has_shared) "
-          "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
+          "-> (Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def("moe_combine_unified(Tensor dn, Tensor slot_of_flat, Tensor topk_w, Tensor? blk0=None, int shared_id=-1, "
-          "Tensor? shared_gate=None, Tensor? bias=None, Tensor? bias_scale=None, Tensor(a!)? out=None) -> Tensor");
+          "Tensor? shared_gate=None, Tensor? bias=None, Tensor? bias_scale=None, Tensor? out=None) -> Tensor");
     m.def("moe_combine_sorted(Tensor dn, Tensor flat_to_sorted, Tensor topk_w) -> Tensor");
 }
 

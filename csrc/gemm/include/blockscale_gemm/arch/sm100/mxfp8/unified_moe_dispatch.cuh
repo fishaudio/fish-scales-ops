@@ -6,7 +6,7 @@
  * Shared Expert (expert E). Zero host-side `if M > X` / `if expected_m > X` dispatch:
  *   - 8/16/32/64/128 row-bounded TMA activation loading (selected on device)
  *   - Live-guarded epilogue subtile 1 (skips tcgen05.ld + store when rows <= 64)
- *   - Vectorized 2 KiB SMEM transpose -> STG.128 FC2 store when rows > 4
+ *   - Zero-SMEM, zero-barrier direct 64B-warp coalesced BF16 FC2 store
  *   - Block-list persistent scheduler with Shared Expert first, register list cache,
  *     device-gated L2 prefetch, and device-gated 2-panel grouping.
  */
@@ -174,14 +174,13 @@ inline int unified_moe_sm_count() noexcept
 
 } // namespace unified_moe_detail
 
-// Note: `slot_tiles` carries the compact v2 `block_list[blocks_cap + 1]`,
-// `tiles_cap` = `blocks_cap` (= num_blocks). `chunk_list` / `chunks_cap` kept
-// in signature for ABI/op compatibility and unused in v2.
+// Note: `block_list` carries the compact v2 `block_list[blocks_cap + 1]` with
+// `blocks_cap == num_blocks`.
 inline cudaError_t gemm_dispatch_sm100_mxfp8_unified_moe(__nv_fp8_e4m3 const* a, int32_t const* sa,
     __nv_fp8_e4m3 const* w13, int32_t const* sw13, __nv_fp8_e4m3 const* w2, int32_t const* sw2, __nv_fp8_e4m3* dq,
     int32_t* sd, __nv_bfloat16* dn, int32_t const* masked_m, int32_t const* blk0, int const* slot_to_expert,
-    int* counters, int const* block_list, int blocks_cap, int const* /*chunk_list*/, int /*chunks_cap*/, int groups,
-    int b_alloc, int n1, int k1, int n2, int k2, cudaStream_t stream)
+    int* counters, int const* block_list, int blocks_cap, int groups, int b_alloc, int n1, int k1, int n2, int k2,
+    cudaStream_t stream)
 {
     using Config = unified_moe_detail::Sm100MxFP8UnifiedMoeConfig;
     using GemmKernel = typename Config::GemmKernel;

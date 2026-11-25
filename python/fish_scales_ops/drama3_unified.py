@@ -44,8 +44,10 @@ def prepare_moe_unified(
     shared_w2: Optional[torch.Tensor] = None,
 ) -> UnifiedMoeExperts:
     """Offline preparation of routed experts (+ optional fused Shared Expert as expert E)."""
+    if (shared_w13 is None) != (shared_w2 is None):
+        raise ValueError("prepare_moe_unified: shared_w13 and shared_w2 must be provided together or both omitted")
     num_routed = int(w13.shape[0])
-    has_shared = shared_w13 is not None and shared_w2 is not None
+    has_shared = shared_w13 is not None
     if has_shared:
         w13_all = torch.cat([w13, shared_w13.unsqueeze(0)], dim=0).contiguous()
         w2_all = torch.cat([w2, shared_w2.unsqueeze(0)], dim=0).contiguous()
@@ -69,8 +71,16 @@ def prepare_moe_unified(
 
 
 def prepare_dense_weight_unified(w_bf16: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Offline MXFP8 1x32 weight quantization in SM1xx atom layout."""
-    return quantize_1x32_fp8(w_bf16.contiguous())
+    """Offline MXFP8 1x32 weight quantization in SM1xx atom layout.
+
+    Ends with a 1-word plain (non-PDL) fill on sm_100/sm_103 (matching
+    `fish_scales_ops.dense._complete_handle`) so immediately following the call
+    with a weights-first PDL `linear_unified` on the same stream cannot race.
+    """
+    w_fp8, sw = quantize_1x32_fp8(w_bf16.contiguous())
+    if w_fp8.is_cuda and torch.cuda.get_device_capability(w_fp8.device)[0] == 10:
+        torch.zeros(1, dtype=torch.int32, device=w_fp8.device)
+    return w_fp8, sw
 
 
 def linear_unified(
@@ -90,6 +100,8 @@ def linear_unified(
         # Use the fast SM100 PDL activation quantizer (matches fso.dense.linear's exact quantizer!).
         x_fp8, sx = _quantize_activation_dense(x)
     else:
+        if x_scales is None:
+            raise ValueError("linear_unified: x_scales is required when x is pre-quantized FP8")
         x_fp8 = x
         sx = x_scales
     return linear_mxfp8_unified_sm100(
@@ -138,7 +150,7 @@ def moe_layer_unified(
     sd = torch.empty(1, r * (inter // 128), device=dev, dtype=torch.int32)
     dn = torch.empty(1, r, hsz, device=dev, dtype=torch.bfloat16)
 
-    masked_m, blk0, slot_of_flat, slot_sched, block_list, dummy_chunk = (
+    masked_m, blk0, slot_of_flat, slot_sched, block_list = (
         ops.moe_build_routing_compact_unified(topk_ids, num_routed, num_blocks, has_shared)
     )
 
@@ -161,7 +173,6 @@ def moe_layer_unified(
         sd,
         dn,
         block_list,
-        dummy_chunk,
     )
 
     return ops.moe_combine_unified(

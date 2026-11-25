@@ -1,9 +1,40 @@
 #!/usr/bin/env python3
 """Unit tests for s3-drama (Family C) kernel-internal unified SM100 kernels."""
+import importlib.util
+import sys
+
 import torch
 import torch.nn.functional as F
 import fish_scales_ops as fso
 from fish_scales_ops import drama3_unified as d3u
+
+
+def _sm100_skip_reason() -> str | None:
+    if not torch.cuda.is_available():
+        return "CUDA not available"
+    major = torch.cuda.get_device_capability(0)[0]
+    if major != 10:
+        return f"drama3 unified kernels are sm_100/sm_103-only (found sm_{major}x)"
+    return None
+
+
+def _dense_dsl_skip_reason() -> str | None:
+    reason = _sm100_skip_reason()
+    if reason is not None:
+        return reason
+    if importlib.util.find_spec("cutlass") is None:
+        return "optional nvidia-cutlass-dsl is not installed"
+    return None
+
+
+def _require_or_skip(reason: str | None) -> bool:
+    if reason is None:
+        return True
+    if "pytest" in sys.modules:
+        import pytest
+        pytest.skip(reason)
+    print(f"SKIP: {reason}")
+    return False
 
 
 def cos_sim(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -14,12 +45,24 @@ def cos_sim(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 def test_unified_dense_all_m_and_epilogues():
+    if not _require_or_skip(_dense_dsl_skip_reason()):
+        return
     torch.manual_seed(123)
     shapes = [(1024, 2048), (2048, 512), (2048, 4096), (9216, 2048), (12288, 2048)]
     ms = [1, 2, 3, 7, 8, 9, 16, 31, 32, 33, 64, 65, 96, 127, 128, 129, 255, 256, 512, 1024, 2048]
     for N, K in shapes:
         w = (torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.05).contiguous()
         wf, sw = d3u.prepare_dense_weight_unified(w)
+        # Immediate back-to-back pre-quantized linear after prepare_dense_weight_unified
+        # verifies the non-PDL completion barrier prevents weights-first PDL races.
+        x0 = (torch.randn(16, K, device="cuda", dtype=torch.bfloat16) * 0.2).contiguous()
+        xf0, sx0 = fso.compat.quantize_1x32_fp8(x0)
+        wf_imm, sw_imm = d3u.prepare_dense_weight_unified(w)
+        y_imm = d3u.linear_unified(xf0, wf_imm, sw_imm, x_scales=sx0)
+        torch.cuda.synchronize()
+        y_sync = d3u.linear_unified(xf0, wf_imm, sw_imm, x_scales=sx0)
+        assert torch.equal(y_imm, y_sync), f"prepare->linear PDL race {(N, K)}"
+
         bias = (torch.randn(N, device="cuda", dtype=torch.bfloat16) * 0.1).contiguous()
         zero_bias = torch.zeros(N, device="cuda", dtype=torch.bfloat16)
         for M in ms:
@@ -42,6 +85,8 @@ def test_unified_dense_all_m_and_epilogues():
 
 
 def test_unified_dense_cudagraph_and_multistream():
+    if not _require_or_skip(_dense_dsl_skip_reason()):
+        return
     torch.manual_seed(7)
     w = (torch.randn(2048, 4096, device="cuda", dtype=torch.bfloat16) * 0.05).contiguous()
     wf, sw = d3u.prepare_dense_weight_unified(w)
@@ -78,6 +123,8 @@ def test_unified_dense_cudagraph_and_multistream():
 
 
 def test_unified_moe_all_regimes():
+    if not _require_or_skip(_sm100_skip_reason()):
+        return
     torch.manual_seed(99)
     E, TOPK, H, I = 256, 8, 2048, 512
     w13 = (torch.randn(E, 2 * I, H, device="cuda", dtype=torch.bfloat16) * 0.05).contiguous()
@@ -135,6 +182,10 @@ def test_unified_moe_all_regimes():
 
 
 if __name__ == "__main__":
+    reason = _sm100_skip_reason()
+    if reason is not None:
+        print(f"SKIP: {reason}")
+        sys.exit(0)
     test_unified_dense_all_m_and_epilogues()
     test_unified_dense_cudagraph_and_multistream()
     test_unified_moe_all_regimes()

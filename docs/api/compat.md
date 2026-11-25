@@ -1082,6 +1082,10 @@ linear_mxfp8_grouped_compact_fc1_fc2(Tensor a, Tensor w13, Tensor sa, Tensor sw1
 silu_chunk_mul_quantize_1x32_grouped_out(Tensor gu, Tensor slot_of_flat, bool use_ue8m0, bool pairwise, Tensor(a!) dq, Tensor(b!) sd) -> ()
 moe_topk_from_logits(Tensor logits, int topk, bool renormalize=True, bool with_shared_gate=False, Tensor? num_token_non_padded=None, Tensor? expert_map=None) -> (Tensor, Tensor, Tensor)
 moe_build_sorted(Tensor topk_ids, int num_groups, int block_m) -> (Tensor, Tensor, Tensor)
+quantize_1x32_grouped_gather_unified_out(Tensor x, Tensor slot_of_flat, int topk, Tensor? blk0, int shared_id, bool use_ue8m0, Tensor(a!) x_q, Tensor(b!) packed_scales) -> ()
+linear_mxfp8_unified_moe(Tensor a, Tensor w13, Tensor sa, Tensor sw13, Tensor w2, Tensor sw2, Tensor masked_m, Tensor blk0, Tensor(a!) slot_sched, Tensor(b!) dq, Tensor(c!) sd, Tensor(d!) dn, Tensor slot_tiles) -> ()
+moe_build_routing_compact_unified(Tensor topk_ids, int num_routed, int num_blocks, bool has_shared) -> (Tensor, Tensor, Tensor, Tensor, Tensor)
+moe_combine_unified(Tensor dn, Tensor slot_of_flat, Tensor topk_w, Tensor? blk0=None, int shared_id=-1, Tensor? shared_gate=None, Tensor? bias=None, Tensor? bias_scale=None, Tensor? out=None) -> Tensor
 moe_combine_sorted(Tensor dn, Tensor flat_to_sorted, Tensor topk_w) -> Tensor
 ```
 

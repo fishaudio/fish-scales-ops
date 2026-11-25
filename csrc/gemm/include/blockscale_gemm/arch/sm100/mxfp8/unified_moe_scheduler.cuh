@@ -173,7 +173,11 @@ public:
     // Called on ALL threads immediately after `wait_on_dependent_grids()`.
     CUTLASS_DEVICE void fso_resolve_first(WorkTileInfo&)
     {
-        int32_t const live_blocks = params_.block_list[params_.blocks_cap];
+        int32_t live_blocks = params_.block_list[params_.blocks_cap];
+        if (live_blocks < 0)
+            live_blocks = 0;
+        else if (live_blocks > params_.blocks_cap)
+            live_blocks = params_.blocks_cap;
         live_blocks_ = live_blocks;
         int32_t const cta = static_cast<int32_t>(blockIdx.x);
         int32_t const t1 = params_.tiles_m1;
@@ -187,33 +191,43 @@ public:
 
         // Device-gated first-panel L2 prefetch: ONLY when live_blocks >= 48 (hides cold weight
         // DRAM latency on medium/large launches without adding TMA queue pressure on decode!).
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030)
         if (live_blocks >= kPrefetchMinBlocks && guess_idx < live_blocks && params_.first_panel_w != nullptr
             && threadIdx.x == 128)
         {
             int32_t const expert = static_cast<int32_t>((entry >> 13) & 0x3ffu);
-            int32_t const panel = cta - guess_idx * t1;
-            int64_t const k = static_cast<int64_t>(params_.first_panel_k);
-            int64_t const w_expert_bytes = static_cast<int64_t>(t1) * 128 * k;
-            int64_t const w_panel_bytes = static_cast<int64_t>(128) * k;
-            char const* const wp = reinterpret_cast<char const*>(params_.first_panel_w)
-                + static_cast<int64_t>(expert) * w_expert_bytes + static_cast<int64_t>(panel) * w_panel_bytes;
-            constexpr uint32_t kChunk = 16384u;
-            for (int64_t off = 0; off < w_panel_bytes; off += kChunk)
+            if (expert < params_.num_groups)
             {
-                uint32_t const rem = static_cast<uint32_t>(
-                    (w_panel_bytes - off) < kChunk ? (w_panel_bytes - off) : kChunk);
-                fso_prefetch_l2_bulk(wp + off, rem);
-            }
-            if (params_.first_panel_sf != nullptr)
-            {
-                int64_t const sf_panel_bytes = static_cast<int64_t>(128) * (k >> 7) * 4;
-                int64_t const sf_expert_bytes = static_cast<int64_t>(t1) * sf_panel_bytes;
-                char const* const sfp = reinterpret_cast<char const*>(params_.first_panel_sf)
-                    + static_cast<int64_t>(expert) * sf_expert_bytes + static_cast<int64_t>(panel) * sf_panel_bytes;
-                fso_prefetch_l2_bulk(sfp, static_cast<uint32_t>(sf_panel_bytes));
+                int32_t const panel = cta - guess_idx * t1;
+                int64_t const k = static_cast<int64_t>(params_.first_panel_k);
+                int64_t const w_expert_bytes = static_cast<int64_t>(t1) * 128 * k;
+                int64_t const w_panel_bytes = static_cast<int64_t>(128) * k;
+                char const* const wp = reinterpret_cast<char const*>(params_.first_panel_w)
+                    + static_cast<int64_t>(expert) * w_expert_bytes + static_cast<int64_t>(panel) * w_panel_bytes;
+                constexpr uint32_t kChunk = 16384u;
+                for (int64_t off = 0; off < w_panel_bytes; off += kChunk)
+                {
+                    uint32_t const rem = static_cast<uint32_t>(
+                        (w_panel_bytes - off) < kChunk ? (w_panel_bytes - off) : kChunk);
+                    fso_prefetch_l2_bulk(wp + off, rem);
+                }
+                if (params_.first_panel_sf != nullptr)
+                {
+                    int64_t const sf_panel_bytes = static_cast<int64_t>(128) * (k >> 7) * 4;
+                    int64_t const sf_expert_bytes = static_cast<int64_t>(t1) * sf_panel_bytes;
+                    char const* const sfp = reinterpret_cast<char const*>(params_.first_panel_sf)
+                        + static_cast<int64_t>(expert) * sf_expert_bytes + static_cast<int64_t>(panel) * sf_panel_bytes;
+                    for (int64_t off = 0; off < sf_panel_bytes; off += kChunk)
+                    {
+                        uint32_t const rem = static_cast<uint32_t>(
+                            (sf_panel_bytes - off) < kChunk ? (sf_panel_bytes - off) : kChunk);
+                        fso_prefetch_l2_bulk(sfp + off, rem);
+                    }
+                }
             }
         }
         else
+#endif
         {
             // Keep L1 line warm for small/decode launches so scheduler warp's first lookup hits L1.
             fso_keep_facts(entry, params_.block_list + clamped_idx);

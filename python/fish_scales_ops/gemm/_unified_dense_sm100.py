@@ -66,6 +66,10 @@ class Sm100ClusterUnifiedDenseKernel(Sm100BlockScaledSplitKGemmKernel):
         fso_wf_cap: int = 3,
         fso_early_pdl: bool = True,
     ):
+        if mma_tiler_mn not in ((128, 64), (128, 128)):
+            raise ValueError(
+                f"Sm100ClusterUnifiedDenseKernel: mma_tiler_mn must be (128, 64) or (128, 128), got {mma_tiler_mn}"
+            )
         super().__init__(
             sf_vec_size=32,
             mma_tiler_mn=mma_tiler_mn,
@@ -1191,12 +1195,24 @@ def linear_mxfp8_unified_sm100(
     with one single compiled CuTe-DSL kernel per epilogue flavor (bias, exact erf-GELU,
     residual) and zero global L2 reduction workspace.
     """
+    if not x_fp8.is_cuda or torch.cuda.get_device_capability(x_fp8.device)[0] != 10:
+        raise NotImplementedError("linear_mxfp8_unified_sm100: requires sm_100 / sm_103 CUDA device")
+    if x_fp8.ndim != 2 or w_fp8.ndim != 2:
+        raise ValueError("linear_mxfp8_unified_sm100: x_fp8 and w_fp8 must be 2D tensors")
+    if not (x_fp8.is_contiguous() and w_fp8.is_contiguous() and sx.is_contiguous() and sw.is_contiguous()):
+        raise ValueError("linear_mxfp8_unified_sm100: x_fp8, w_fp8, sx, and sw must be contiguous")
     m, k = int(x_fp8.shape[0]), int(x_fp8.shape[1])
     n = int(w_fp8.shape[0])
+    if int(w_fp8.shape[1]) != k or k == 0 or (k % 128) != 0 or n == 0 or (n % 128) != 0:
+        raise ValueError(f"linear_mxfp8_unified_sm100: invalid shape M={m}, N={n}, K={k} (require N%128==0, K%128==0)")
+    if (x_fp8.data_ptr() & 15) or (w_fp8.data_ptr() & 15) or (sx.data_ptr() & 15) or (sw.data_ptr() & 15):
+        raise ValueError("linear_mxfp8_unified_sm100: x_fp8, w_fp8, sx, and sw must be 16-byte aligned")
     if m == 0:
         return torch.empty((0, n), dtype=torch.bfloat16, device=x_fp8.device)
 
     act_i = int(act)
+    if act_i not in (0, 1):
+        raise ValueError(f"linear_mxfp8_unified_sm100: unsupported act={act_i} (expected 0=identity or 1=gelu)")
     if bias is not None and not bias.is_contiguous():
         bias = bias.contiguous()
     if residual is not None and not residual.is_contiguous():

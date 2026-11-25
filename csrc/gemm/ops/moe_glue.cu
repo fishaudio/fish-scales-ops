@@ -3401,7 +3401,8 @@ __global__ void __launch_bounds__(256, 4) moe_combine_unified_kernel(__nv_bfloat
         asm volatile("ld.global.u32 %0, [%1];\n" : "=r"(b_sh) : "l"(blk0 + shared_id) : "memory");
         shared_base = b_sh << kCompactRowShift;
     }
-    bool const fast8 = (topk == 8) && ((reinterpret_cast<uintptr_t>(topk_w) & 15u) == 0u);
+    bool const fast8 = (topk == 8) && ((reinterpret_cast<uintptr_t>(topk_w) & 15u) == 0u)
+        && ((reinterpret_cast<uintptr_t>(slot_of_flat) & 15u) == 0u);
 
     for (int tid = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
          tid < total; tid += stride)
@@ -3523,7 +3524,7 @@ __global__ void __launch_bounds__(256, 4) moe_combine_unified_kernel(__nv_bfloat
     (void) kVec;
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 moe_build_routing_compact_unified(at::Tensor topk_ids, int64_t num_routed, int64_t num_blocks, bool has_shared)
 {
     TORCH_CHECK(topk_ids.is_cuda() && topk_ids.dtype() == at::kInt && topk_ids.dim() == 2 && topk_ids.is_contiguous(),
@@ -3546,7 +3547,6 @@ moe_build_routing_compact_unified(at::Tensor topk_ids, int64_t num_routed, int64
     at::Tensor slot_of_flat = at::empty({pairs}, opts);
     at::Tensor slot_sched = at::empty({kCompactSlotSchedWords + num_blocks}, opts);
     at::Tensor block_list = at::empty({num_blocks + 1}, opts);
-    at::Tensor dummy_chunk = at::empty({2}, opts);
 
     UnifiedCompactRoutingArgs a{};
     a.topk_ids = reinterpret_cast<int32_t const*>(topk_ids.data_ptr());
@@ -3570,39 +3570,70 @@ moe_build_routing_compact_unified(at::Tensor topk_ids, int64_t num_routed, int64
     bool const pdl = fso_pdl_enabled();
     cudaError_t err = compact_launch(moe_routing_compact_unified_kernel, kCompactMaxCluster, threads, 0, stream, pdl, a);
     TORCH_CHECK(err == cudaSuccess, "moe_routing_compact_unified_kernel launch failed: ", cudaGetErrorString(err));
-    return {masked_m, blk0, slot_of_flat, slot_sched, block_list, dummy_chunk};
+    return {masked_m, blk0, slot_of_flat, slot_sched, block_list};
 }
 
 at::Tensor moe_combine_unified(at::Tensor dn, at::Tensor slot_of_flat, at::Tensor topk_w,
     std::optional<at::Tensor> blk0, int64_t shared_id, std::optional<at::Tensor> shared_gate,
     std::optional<at::Tensor> bias, std::optional<at::Tensor> bias_scale, std::optional<at::Tensor> out)
 {
-    TORCH_CHECK(dn.is_cuda() && dn.dtype() == at::kBFloat16 && dn.is_contiguous(), "dn must be contiguous CUDA bf16");
+    TORCH_CHECK(dn.is_cuda() && dn.dtype() == at::kBFloat16 && dn.dim() >= 2 && dn.is_contiguous(),
+        "moe_combine_unified: dn must be contiguous CUDA bf16");
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(dn.data_ptr()) & 15u) == 0u,
+        "moe_combine_unified: dn must be 16-byte aligned");
     TORCH_CHECK(slot_of_flat.is_cuda() && slot_of_flat.dtype() == at::kInt && slot_of_flat.is_contiguous(),
-        "slot_of_flat must be contiguous CUDA int32");
+        "moe_combine_unified: slot_of_flat must be contiguous CUDA int32");
     TORCH_CHECK(topk_w.is_cuda() && topk_w.dtype() == at::kFloat && topk_w.dim() == 2 && topk_w.is_contiguous(),
-        "topk_w must be contiguous CUDA fp32 [M, topk]");
+        "moe_combine_unified: topk_w must be contiguous CUDA fp32 [M, topk]");
     int64_t const M = topk_w.size(0);
     int64_t const topk = topk_w.size(1);
     int64_t const H = dn.size(-1);
-    TORCH_CHECK(H % 8 == 0, "moe_combine_unified: H must be multiple of 8");
+    TORCH_CHECK(M >= 1 && topk >= 1 && H > 0 && H % 8 == 0,
+        "moe_combine_unified: M>=1, topk>=1, and H must be positive multiple of 8");
+    TORCH_CHECK(slot_of_flat.numel() == M * topk,
+        "moe_combine_unified: slot_of_flat numel must equal M * topk");
 
-    at::Tensor res = out.has_value() ? *out : at::empty({M, H}, dn.options());
-    TORCH_CHECK(res.is_cuda() && res.dtype() == at::kBFloat16 && res.is_contiguous() && res.size(0) == M
-            && res.size(1) == H,
+    at::Tensor res = (out.has_value() && out->defined()) ? *out : at::empty({M, H}, dn.options());
+    TORCH_CHECK(res.is_cuda() && res.dtype() == at::kBFloat16 && res.dim() == 2 && res.is_contiguous()
+            && res.size(0) == M && res.size(1) == H
+            && (reinterpret_cast<uintptr_t>(res.data_ptr()) & 15u) == 0u,
         "moe_combine_unified: invalid out tensor");
 
-    int32_t const* blk0_p = (blk0.has_value() && blk0->defined()) ? reinterpret_cast<int32_t const*>(blk0->data_ptr())
-                                                                   : nullptr;
-    float const* sg_p
-        = (shared_gate.has_value() && shared_gate->defined()) ? reinterpret_cast<float const*>(shared_gate->data_ptr())
-                                                              : nullptr;
-    __nv_bfloat16 const* bias_p = (bias.has_value() && bias->defined())
-        ? reinterpret_cast<__nv_bfloat16 const*>(bias->data_ptr())
-        : nullptr;
-    float const* bs_p
-        = (bias_scale.has_value() && bias_scale->defined()) ? reinterpret_cast<float const*>(bias_scale->data_ptr())
-                                                            : nullptr;
+    int32_t const* blk0_p = nullptr;
+    if (blk0.has_value() && blk0->defined())
+    {
+        TORCH_CHECK(blk0->is_cuda() && blk0->dtype() == at::kInt && blk0->is_contiguous(),
+            "moe_combine_unified: blk0 must be contiguous CUDA int32");
+        if (shared_id >= 0)
+            TORCH_CHECK(shared_id < blk0->numel(), "moe_combine_unified: shared_id out of range for blk0");
+        blk0_p = reinterpret_cast<int32_t const*>(blk0->data_ptr());
+    }
+    float const* sg_p = nullptr;
+    if (shared_gate.has_value() && shared_gate->defined())
+    {
+        TORCH_CHECK(shared_gate->is_cuda() && shared_gate->dtype() == at::kFloat && shared_gate->is_contiguous()
+                && shared_gate->numel() == M,
+            "moe_combine_unified: shared_gate must be contiguous CUDA fp32 [M]");
+        sg_p = reinterpret_cast<float const*>(shared_gate->data_ptr());
+    }
+    __nv_bfloat16 const* bias_p = nullptr;
+    if (bias.has_value() && bias->defined())
+    {
+        TORCH_CHECK(bias->is_cuda() && bias->dtype() == at::kBFloat16 && bias->dim() == 2 && bias->is_contiguous()
+                && bias->size(0) == M && bias->size(1) == H
+                && (reinterpret_cast<uintptr_t>(bias->data_ptr()) & 15u) == 0u,
+            "moe_combine_unified: bias must be 16-byte aligned contiguous CUDA bf16 [M, H]");
+        bias_p = reinterpret_cast<__nv_bfloat16 const*>(bias->data_ptr());
+    }
+    float const* bs_p = nullptr;
+    if (bias_scale.has_value() && bias_scale->defined())
+    {
+        TORCH_CHECK(bias_p != nullptr, "moe_combine_unified: bias_scale requires bias");
+        TORCH_CHECK(bias_scale->is_cuda() && bias_scale->dtype() == at::kFloat && bias_scale->is_contiguous()
+                && bias_scale->numel() == M,
+            "moe_combine_unified: bias_scale must be contiguous CUDA fp32 [M]");
+        bs_p = reinterpret_cast<float const*>(bias_scale->data_ptr());
+    }
 
     int const total = static_cast<int>(M * (H / 8));
     constexpr int kThreads = 256;
