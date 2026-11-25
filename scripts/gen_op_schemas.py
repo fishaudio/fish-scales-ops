@@ -83,6 +83,9 @@ GEMM_MEMBERS = {
         # internal: the MoE layer's fused FC1 + FC2 slot kernel (sm_100/103, issue #13 lever 5)
         "linear_mxfp8_grouped_compact_fc1_fc2",
         "silu_chunk_mul_quantize_1x32_grouped_out",
+        # unified kernel-internal SM100/103 MoE pipeline (s3-drama)
+        "quantize_1x32_grouped_gather_unified_out", "linear_mxfp8_unified_moe",
+        "moe_build_routing_compact_unified", "moe_combine_unified",
     },
     "moe_sm90": {
         "linear_fp8_grouped_masked", "quantize_1x128_grouped_gather_sm90",

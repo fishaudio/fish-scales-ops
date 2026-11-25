@@ -161,6 +161,17 @@ void linear_mxfp8_grouped_compact_combine(at::Tensor a, at::Tensor b, at::Tensor
 // Internal (the MoE layer's own call, sm_100/103; ops/mxfp8.cu): FC1 + FC2 on the compact slot route as one
 // persistent kernel (issue #13 lever 5), in slot mode or, with the routing op's token-tile list, token-tile mode.
 // Writes what linear_mxfp8_grouped_compact_swiglu + linear_mxfp8_grouped_compact write, bit for bit.
+// === FSO_DRAMA3_UNIFIED_BINDINGS ===
+void quantize_1x32_grouped_gather_unified_out(at::Tensor x, at::Tensor slot_of_flat, int64_t topk,
+    std::optional<at::Tensor> blk0, int64_t shared_id, bool use_ue8m0, at::Tensor x_q, at::Tensor packed_scales);
+void linear_mxfp8_unified_moe(at::Tensor a, at::Tensor w13, at::Tensor sa, at::Tensor sw13, at::Tensor w2,
+    at::Tensor sw2, at::Tensor masked_m, at::Tensor blk0, at::Tensor slot_sched, at::Tensor dq, at::Tensor sd,
+    at::Tensor dn, at::Tensor slot_tiles);
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_build_routing_compact_unified(
+    at::Tensor topk_ids, int64_t num_routed, int64_t num_blocks, bool has_shared);
+at::Tensor moe_combine_unified(at::Tensor dn, at::Tensor slot_of_flat, at::Tensor topk_w,
+    std::optional<at::Tensor> blk0, int64_t shared_id, std::optional<at::Tensor> shared_gate,
+    std::optional<at::Tensor> bias, std::optional<at::Tensor> bias_scale, std::optional<at::Tensor> out);
 void linear_mxfp8_grouped_compact_fc1_fc2(at::Tensor a, at::Tensor w13, at::Tensor sa, at::Tensor sw13, at::Tensor w2,
     at::Tensor sw2, at::Tensor masked_m, at::Tensor blk0, int64_t m_cap, int64_t expected_m, int64_t max_active_groups,
     at::Tensor slot_to_expert, at::Tensor slot_sched, at::Tensor dq, at::Tensor sd, at::Tensor dn,
@@ -308,6 +319,15 @@ TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
                                 "Tensor? expert_map=None) -> (Tensor, Tensor, Tensor)");
     m.def("moe_build_sorted(Tensor topk_ids, int num_groups, int block_m) "
           "-> (Tensor, Tensor, Tensor)");
+    m.def("quantize_1x32_grouped_gather_unified_out(Tensor x, Tensor slot_of_flat, int topk, "
+          "Tensor? blk0, int shared_id, bool use_ue8m0, Tensor(a!) x_q, Tensor(b!) packed_scales) -> ()");
+    m.def("linear_mxfp8_unified_moe(Tensor a, Tensor w13, Tensor sa, Tensor sw13, Tensor w2, Tensor sw2, "
+          "Tensor masked_m, Tensor blk0, Tensor(a!) slot_sched, Tensor(b!) dq, Tensor(c!) sd, Tensor(d!) dn, "
+          "Tensor slot_tiles) -> ()");
+    m.def("moe_build_routing_compact_unified(Tensor topk_ids, int num_routed, int num_blocks, bool has_shared) "
+          "-> (Tensor, Tensor, Tensor, Tensor, Tensor)");
+    m.def("moe_combine_unified(Tensor dn, Tensor slot_of_flat, Tensor topk_w, Tensor? blk0=None, int shared_id=-1, "
+          "Tensor? shared_gate=None, Tensor? bias=None, Tensor? bias_scale=None, Tensor? out=None) -> Tensor");
     m.def("moe_combine_sorted(Tensor dn, Tensor flat_to_sorted, Tensor topk_w) -> Tensor");
 }
 
@@ -357,4 +377,8 @@ TORCH_LIBRARY_IMPL(fish_scales_ops, CUDA, m)
     m.impl("moe_topk_from_logits", &blockscale_gemm::moe_topk_from_logits);
     m.impl("moe_build_sorted", &blockscale_gemm::moe_build_sorted);
     m.impl("moe_combine_sorted", &blockscale_gemm::moe_combine_sorted);
+    m.impl("quantize_1x32_grouped_gather_unified_out", &blockscale_gemm::quantize_1x32_grouped_gather_unified_out);
+    m.impl("linear_mxfp8_unified_moe", &blockscale_gemm::linear_mxfp8_unified_moe);
+    m.impl("moe_build_routing_compact_unified", &blockscale_gemm::moe_build_routing_compact_unified);
+    m.impl("moe_combine_unified", &blockscale_gemm::moe_combine_unified);
 }

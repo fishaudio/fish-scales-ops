@@ -115,6 +115,7 @@ SLOT_MOE_TU = CSRC / "gemm" / "ops" / "mxfp8_sm100_slot_moe_kernel.cu"
 # The same kernel's token-tile mode (issue #13 lever 5 step 3), in a unit of its own so that the slot mode's unit keeps
 # its device code (run fso_issue12_20261028/R1); the same three generated headers.
 SLOT_MOE_LIST_TU = CSRC / "gemm" / "ops" / "mxfp8_sm100_slot_moe_list_kernel.cu"
+UNIFIED_MOE_TU = CSRC / "gemm" / "ops" / "mxfp8_sm100_unified_moe_kernel.cu"
 
 # The sm_100 dense-epilogue units (bias / erf-GELU / residual and the quantized output of linear_quantized, one
 # configuration group each, blockscale_gemm/arch/sm100/mxfp8/dense_common.cuh). All of them include
@@ -165,6 +166,15 @@ GENERATED_HEADERS = [
     (CSRC / "gemm" / "tools" / "make_sm100_slot_kernel.py",
      Path("blockscale_gemm/arch/sm100/mxfp8/sm100_slot_moe_kernel.hpp"),
      SLOT_MOE_LIST_TU, ("--moe",)),
+    (CSRC / "gemm" / "tools" / "make_sm100_slot_kernel.py",
+     Path("blockscale_gemm/arch/sm100/mxfp8/sm100_slot_gemm_kernel.hpp"),
+     UNIFIED_MOE_TU),
+    (CSRC / "gemm" / "tools" / "make_sm100_unified_moe128_epilogue.py",
+     Path("blockscale_gemm/arch/sm100/mxfp8/sm100_unified_moe128_epilogue.hpp"),
+     UNIFIED_MOE_TU),
+    (CSRC / "gemm" / "tools" / "make_sm100_slot_kernel.py",
+     Path("blockscale_gemm/arch/sm100/mxfp8/sm100_slot_moe_kernel.hpp"),
+     UNIFIED_MOE_TU, ("--moe",)),
 ] + [
     # The dense epilogue's multi-warpgroup TMA epilogue (issue #12 FB3), one row per dense-epilogue unit.
     (CSRC / "gemm" / "tools" / "make_sm100_dense_epi_multiwg.py",
@@ -266,6 +276,7 @@ def _gemm_sources() -> list[str]:
         _rel(SLOT_ROWS_TU),
         _rel(SLOT_MOE_TU),
         _rel(SLOT_MOE_LIST_TU),
+        _rel(UNIFIED_MOE_TU),
         _rel(base / "ops" / "quant_kernels.cu"),
         _rel(base / "ops" / "moe_glue.cu"),
         _rel(base / "src" / "runner.cu"),
