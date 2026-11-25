@@ -26,10 +26,57 @@ from typing import Optional, Tuple
 import torch
 
 from .. import dense as _dense
-from ..gemm._unified_dense_sm100 import linear_mxfp8_unified_sm100
-from .fa4_mxfp8 import attn_fa4_mxfp8
 
 _AUDIO_DEFAULT_EARLY_PDL = True
+_UNIFIED_DENSE_FN = None
+_FA4_MXFP8_FN = None
+
+
+def _get_unified_dense_fn():
+    global _UNIFIED_DENSE_FN
+    if _UNIFIED_DENSE_FN is None:
+        try:
+            from ..gemm._unified_dense_sm100 import linear_mxfp8_unified_sm100 as _fn
+        except ImportError as exc:
+            raise ImportError(
+                "fish_scales_ops.audio unified SM100 dense GEMM requires the optional sm100 dependency "
+                "(nvidia-cutlass-dsl)"
+            ) from exc
+        _UNIFIED_DENSE_FN = _fn
+    return _UNIFIED_DENSE_FN
+
+
+def _get_fa4_mxfp8_fn():
+    global _FA4_MXFP8_FN
+    if _FA4_MXFP8_FN is None:
+        try:
+            from .fa4_mxfp8 import attn_fa4_mxfp8 as _fn
+        except ImportError as exc:
+            raise ImportError(
+                "fish_scales_ops.audio.attn_fa4_mxfp8 requires optional sm100 FA4 dependencies "
+                "(nvidia-cutlass-dsl, flash_attn.cute, quack)"
+            ) from exc
+        _FA4_MXFP8_FN = _fn
+    return _FA4_MXFP8_FN
+
+
+def linear_mxfp8_unified_sm100(*args, **kwargs):
+    """Lazy wrapper around fish_scales_ops.gemm._unified_dense_sm100.linear_mxfp8_unified_sm100."""
+    return _get_unified_dense_fn()(*args, **kwargs)
+
+
+def attn_fa4_mxfp8(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    out_q: Optional[torch.Tensor] = None,
+    out_scale: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Lazy wrapper around SM100 FlashAttention-4 fused Attention -> MXFP8 1x32."""
+    return _get_fa4_mxfp8_fn()(
+        q, k, v, softmax_scale=softmax_scale, out_q=out_q, out_scale=out_scale
+    )
 
 
 def layernorm_mxfp8(
@@ -40,7 +87,7 @@ def layernorm_mxfp8(
     round_bf16: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Single unified PDL LayerNorm -> MXFP8 1x32 returning (xq [M, D] fp8, sx int32)."""
-    return torch.ops.fish_scales_ops.layernorm_mxfp8_sm100(x, gamma, beta, float(eps), bool(round_bf16), 0)
+    return torch.ops.fish_scales_ops.layernorm_mxfp8_sm100(x, gamma, beta, float(eps), bool(round_bf16))
 
 
 def gelu_nhwc_to_mxfp8(x_nhwc: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -57,6 +104,10 @@ def prepare_conv_out_weight(
     w_conv_out: torch.Tensor, channels: int = 480, freq: int = 16
 ) -> _dense.DenseWeight:
     """Reorder conv_out input columns (C, F) -> (F, C) once at load time for zero-copy NHWC stem fusion."""
+    if w_conv_out.ndim != 2:
+        raise ValueError(f"Expected 2-D conv_out weight [N, C*F], got {w_conv_out.ndim}-D")
+    if channels <= 0 or freq <= 0:
+        raise ValueError(f"channels and freq must be positive, got channels={channels}, freq={freq}")
     n = int(w_conv_out.shape[0])
     if int(w_conv_out.shape[1]) != channels * freq:
         raise ValueError(

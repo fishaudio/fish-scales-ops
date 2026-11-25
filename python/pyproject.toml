@@ -38,6 +38,7 @@ packages = [
     "fish_scales_ops.moe",
     "fish_scales_ops.attention",
     "fish_scales_ops.attention.backends",
+    "fish_scales_ops.audio",
 ]
 
 [tool.setuptools.package-data]

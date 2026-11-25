@@ -405,24 +405,29 @@ def _patch_launch_pdl(fa_fwd: FlashAttentionForwardSm100MxFP8):
     fa_fwd.kernel = kernel_with_pdl
 
 
-_SM_COUNT: Optional[int] = None
+_SM_COUNT_BY_DEV: dict[int, int] = {}
 
 
-def _get_sm_count() -> int:
-    global _SM_COUNT
-    if _SM_COUNT is None:
-        _SM_COUNT = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-    return _SM_COUNT
+def _get_sm_count(device: Optional[torch.device] = None) -> int:
+    idx = torch.cuda.current_device() if device is None else (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    sms = _SM_COUNT_BY_DEV.get(idx)
+    if sms is None:
+        sms = torch.cuda.get_device_properties(idx).multi_processor_count
+        _SM_COUNT_BY_DEV[idx] = sms
+    return sms
 
 
-def _make_config(M: int, nheads: int = 20, q_stage_override: Optional[int] = None):
+def _make_config(M: int, nheads: int = 20, q_stage_override: Optional[int] = None,
+                 device: Optional[torch.device] = None):
     # Pipeline-optimal SM100/SM103 config for H=20, D=64:
     # - Use q_stage=1 whenever ceil(M/128)*H fits in one SM wave (doubles CTA parallelism
     #   and cuts padded rows at M=182/364/533: saves -28 to -54 us across 32 layers!).
     # - Disable static persistent scheduler when grid fits in one wave (-5 us at M=78/117).
     # - Match stock FA4 kv_stage (12 for q_stage=1 + ping-pong, 10 for q_stage=2),
     #   Sm100Registers(softmax=200, correction=64, other=48), sm_stats_cross_stage=False.
-    sms = _get_sm_count()
+    sms = _get_sm_count(device)
     ctas_q1 = ((M + 127) // 128) * nheads
     q_stage = (1 if ctas_q1 <= sms else 2) if q_stage_override is None else q_stage_override
     ctas = ((M + 128 * q_stage - 1) // (128 * q_stage)) * nheads
@@ -471,9 +476,26 @@ def attn_fa4_mxfp8(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     q, k, v: BF16 [1, M, H, 64] (may be strided views of fused [M, 3, H, 64] QKV!).
     Returns: (xq [M, H*64] float8_e4m3fn, sx [align(M, 128) * (H*64/128)] int32).
     """
-    assert q.dim() == 4 and q.shape[0] == 1 and q.shape[3] == 64
-    M = q.shape[1]
-    H = q.shape[2]
+    if not q.is_cuda or torch.cuda.get_device_capability(q.device)[0] != 10:
+        raise NotImplementedError("attn_fa4_mxfp8: requires sm_100 / sm_103 CUDA device")
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise ValueError("attn_fa4_mxfp8: q, k, v must be 4-D tensors [1, M, H, 64]")
+    if q.shape != k.shape or q.shape != v.shape or q.shape[0] != 1 or q.shape[3] != 64:
+        raise ValueError(
+            f"attn_fa4_mxfp8: expected matching [1, M, H, 64] shapes, got q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}"
+        )
+    if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16 or v.dtype != torch.bfloat16:
+        raise ValueError("attn_fa4_mxfp8: q, k, v must be bfloat16")
+    if k.device != q.device or v.device != q.device:
+        raise ValueError("attn_fa4_mxfp8: q, k, v must reside on the same CUDA device")
+    if q.stride(3) != 1 or k.stride(3) != 1 or v.stride(3) != 1:
+        raise ValueError("attn_fa4_mxfp8: q, k, v must be contiguous along head_dim (stride(3) == 1)")
+    if (q.data_ptr() & 15) or (k.data_ptr() & 15) or (v.data_ptr() & 15):
+        raise ValueError("attn_fa4_mxfp8: q, k, v must be 16-byte aligned")
+    M = int(q.shape[1])
+    H = int(q.shape[2])
+    if H <= 0 or (H % 2) != 0:
+        raise ValueError(f"attn_fa4_mxfp8: nheads must be a positive even integer, got {H}")
     D = H * 64
     M_pad = (M + 127) // 128 * 128
     num_kp = D // 128
@@ -481,14 +503,24 @@ def attn_fa4_mxfp8(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     if out_q is None:
         out_q = torch.empty((1, M, H, 64), dtype=torch.float8_e4m3fn, device=q.device)
     else:
+        if (not out_q.is_cuda or out_q.device != q.device or out_q.dtype != torch.float8_e4m3fn
+                or not out_q.is_contiguous() or out_q.numel() != M * D or (out_q.data_ptr() & 15)):
+            raise ValueError("attn_fa4_mxfp8: out_q must be 16-byte aligned contiguous CUDA float8_e4m3fn [M, H*64]")
         out_q = out_q.view(1, M, H, 64)
     if out_scale is None:
         out_scale = torch.empty((M_pad * num_kp,), dtype=torch.int32, device=q.device)
+    else:
+        if (not out_scale.is_cuda or out_scale.device != q.device or out_scale.dtype != torch.int32
+                or not out_scale.is_contiguous() or out_scale.numel() != M_pad * num_kp
+                or (out_scale.data_ptr() & 15)):
+            raise ValueError("attn_fa4_mxfp8: out_scale must be 16-byte aligned contiguous CUDA int32 [M_pad*(D/128)]")
+    if M == 0:
+        return out_q.view(0, D), out_scale
 
     sx_u16 = out_scale.view(torch.uint16).view(1, 1, M_pad * num_kp * 2)
     scale = Float32((1.0 / math.sqrt(64.0)) if softmax_scale is None else float(softmax_scale))
     pdl = not env_flag("FSO_DISABLE_PDL")
-    sms = _get_sm_count()
+    sms = _get_sm_count(q.device)
     ctas_q1 = ((M + 127) // 128) * H
     q_stage_key = 1 if ctas_q1 <= sms else 2
     ctas = ((M + 128 * q_stage_key - 1) // (128 * q_stage_key)) * H
@@ -501,10 +533,10 @@ def attn_fa4_mxfp8(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     v_ct = _to_cute(v, leading_dim=3, align=16)
     o_ct = _to_cute(out_q, leading_dim=3, align=16)
     sf_ct = _to_cute(sx_u16, leading_dim=2, align=16)
-    stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = cuda_drv.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
 
     if fn is None:
-        cfg = _make_config(M, H)
+        cfg = _make_config(M, H, device=q.device)
         fa_fwd = FlashAttentionForwardSm100MxFP8(
             64,
             64,

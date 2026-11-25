@@ -25,6 +25,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 
@@ -32,6 +33,12 @@ namespace fso_audio
 {
 namespace
 {
+
+static inline bool is_sm100_device(c10::Device dev)
+{
+    auto const* prop = at::cuda::getDeviceProperties(dev.index());
+    return prop != nullptr && prop->major == 10;
+}
 
 static inline bool pdl_enabled()
 {
@@ -43,7 +50,7 @@ static inline bool pdl_enabled()
 }
 
 template <typename KernelT, typename... Args>
-static inline void launch_pdl(
+static inline cudaError_t launch_pdl(
     KernelT kernel, dim3 grid, dim3 block, size_t smem, cudaStream_t stream, bool pdl, Args... args)
 {
     cudaLaunchConfig_t cfg{};
@@ -56,7 +63,7 @@ static inline void launch_pdl(
     cfg.stream = stream;
     cfg.attrs = attrs;
     cfg.numAttrs = 1;
-    cudaLaunchKernelEx(&cfg, kernel, args..., pdl);
+    return cudaLaunchKernelEx(&cfg, kernel, args..., pdl);
 }
 
 // Fast division-free UE8M0 helper bit-identical to fso_e8m0_from_amax
@@ -338,19 +345,28 @@ std::tuple<at::Tensor, at::Tensor> layernorm_mxfp8_sm100(
     at::Tensor gamma,
     at::Tensor beta,
     double eps,
-    bool round_bf16,
-    int64_t /*variant*/)
+    bool round_bf16)
 {
     TORCH_CHECK(x.is_cuda() && x.dtype() == at::kBFloat16 && x.is_contiguous() && x.dim() == 2,
-        "x must be contiguous CUDA bf16 [M, D]");
-    TORCH_CHECK(gamma.is_cuda() && gamma.dtype() == at::kBFloat16 && gamma.is_contiguous() && gamma.dim() == 1,
-        "gamma must be contiguous CUDA bf16 [D]");
-    TORCH_CHECK(beta.is_cuda() && beta.dtype() == at::kBFloat16 && beta.is_contiguous() && beta.dim() == 1,
-        "beta must be contiguous CUDA bf16 [D]");
-    int const M = static_cast<int>(x.size(0));
-    int const D = static_cast<int>(x.size(1));
-    TORCH_CHECK(gamma.size(0) == D && beta.size(0) == D, "gamma/beta size mismatch");
-    TORCH_CHECK(D % 128 == 0, "D must be a multiple of 128");
+        "layernorm_mxfp8_sm100: x must be contiguous CUDA bf16 [M, D]");
+    TORCH_CHECK(is_sm100_device(x.device()), "layernorm_mxfp8_sm100: requires sm_100 / sm_103");
+    TORCH_CHECK(gamma.is_cuda() && gamma.device() == x.device() && gamma.dtype() == at::kBFloat16
+            && gamma.is_contiguous() && gamma.dim() == 1,
+        "layernorm_mxfp8_sm100: gamma must be contiguous CUDA bf16 [D] on same device as x");
+    TORCH_CHECK(beta.is_cuda() && beta.device() == x.device() && beta.dtype() == at::kBFloat16
+            && beta.is_contiguous() && beta.dim() == 1,
+        "layernorm_mxfp8_sm100: beta must be contiguous CUDA bf16 [D] on same device as x");
+    int64_t const M64 = x.size(0);
+    int64_t const D64 = x.size(1);
+    TORCH_CHECK(D64 > 0 && D64 % 128 == 0, "layernorm_mxfp8_sm100: D must be a positive multiple of 128");
+    TORCH_CHECK(gamma.size(0) == D64 && beta.size(0) == D64, "layernorm_mxfp8_sm100: gamma/beta size mismatch");
+    TORCH_CHECK(std::isfinite(eps) && eps >= 0.0, "layernorm_mxfp8_sm100: eps must be finite and non-negative");
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(x.data_ptr()) & 15u) == 0u
+            && (reinterpret_cast<uintptr_t>(gamma.data_ptr()) & 15u) == 0u
+            && (reinterpret_cast<uintptr_t>(beta.data_ptr()) & 15u) == 0u,
+        "layernorm_mxfp8_sm100: x, gamma, and beta must be 16-byte aligned");
+    int const M = static_cast<int>(M64);
+    int const D = static_cast<int>(D64);
 
     int const M_pad = (M + 127) / 128 * 128;
     auto x_q = at::empty({M, D}, x.options().dtype(at::kFloat8_e4m3fn));
@@ -369,26 +385,15 @@ std::tuple<at::Tensor, at::Tensor> layernorm_mxfp8_sm100(
     auto const* g_ptr = reinterpret_cast<__nv_bfloat16 const*>(gamma.data_ptr());
     auto const* b_ptr = reinterpret_cast<__nv_bfloat16 const*>(beta.data_ptr());
 
-    // Single unified launch: zero host-side D / M / variant kernel routing.
+    // Single unified launch: zero host-side D / M kernel routing.
     dim3 grid(M + (M_pad > M ? 1 : 0), 1, 1);
-    if (round_bf16)
-        launch_pdl(ln_mxfp8_unified_kernel<true>, grid, dim3(160), 0, stream, pdl,
+    cudaError_t err = round_bf16
+        ? launch_pdl(ln_mxfp8_unified_kernel<true>, grid, dim3(160), 0, stream, pdl,
+            q_ptr, s_ptr, x_ptr, g_ptr, b_ptr, M, D, M_pad, eps_f)
+        : launch_pdl(ln_mxfp8_unified_kernel<false>, grid, dim3(160), 0, stream, pdl,
             q_ptr, s_ptr, x_ptr, g_ptr, b_ptr, M, D, M_pad, eps_f);
-    else
-        launch_pdl(ln_mxfp8_unified_kernel<false>, grid, dim3(160), 0, stream, pdl,
-            q_ptr, s_ptr, x_ptr, g_ptr, b_ptr, M, D, M_pad, eps_f);
+    TORCH_CHECK(err == cudaSuccess, "layernorm_mxfp8_sm100 launch failed: ", cudaGetErrorString(err));
     return {x_q, x_scale};
-}
-
-TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
-{
-    m.def("layernorm_mxfp8_sm100(Tensor x, Tensor gamma, Tensor beta, float eps=1e-5, "
-          "bool round_bf16=False, int variant=0) -> (Tensor, Tensor)");
-}
-
-TORCH_LIBRARY_IMPL(fish_scales_ops, CUDA, m)
-{
-    m.impl("layernorm_mxfp8_sm100", &layernorm_mxfp8_sm100);
 }
 
 } // namespace fso_audio

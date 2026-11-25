@@ -8,7 +8,12 @@ Covers:
   - linear_audio_qkv / out_proj / fc2 / proj2 (no global WF mutation, fp32 cosine, CUDA graph)
   - Public API surface preservation (fish_scales_ops.__all__ unchanged)
 """
+import importlib.util
 import math
+import os
+import subprocess
+import sys
+
 import torch
 import torch.nn.functional as F
 
@@ -18,6 +23,44 @@ import fish_scales_ops.gemm._sm100_decode as dec
 
 
 RUNGS = [78, 117, 182, 364, 533, 1079]
+
+
+def _sm100_skip_reason() -> str | None:
+    if not torch.cuda.is_available():
+        return "CUDA not available"
+    major = torch.cuda.get_device_capability(0)[0]
+    if major != 10:
+        return f"audio tower SM100 kernels are sm_100/sm_103-only (found sm_{major}x)"
+    return None
+
+
+def _dense_dsl_skip_reason() -> str | None:
+    reason = _sm100_skip_reason()
+    if reason is not None:
+        return reason
+    if importlib.util.find_spec("cutlass") is None:
+        return "optional nvidia-cutlass-dsl is not installed"
+    return None
+
+
+def _fa4_skip_reason() -> str | None:
+    reason = _dense_dsl_skip_reason()
+    if reason is not None:
+        return reason
+    for pkg in ("flash_attn", "quack"):
+        if importlib.util.find_spec(pkg) is None:
+            return f"optional FA4 dependency {pkg!r} is not installed"
+    return None
+
+
+def _require_or_skip(reason: str | None) -> bool:
+    if reason is None:
+        return True
+    if "pytest" in sys.modules:
+        import pytest
+        pytest.skip(reason)
+    print(f"SKIP: {reason}")
+    return False
 
 
 def _check_padded_scales_zero(sx: torch.Tensor, M: int, K: int) -> int:
@@ -53,9 +96,23 @@ def test_public_surface_preserved():
     assert list(fso.__all__) == ["dense", "moe", "attention", "compat", "build_info"]
     assert dec.WF_PRE_WAIT_STAGES_ONE_CTA == 2
     assert dec.WF_PRE_WAIT_STAGES_TWO_CTA == 1
+    # Importing fish_scales_ops.audio in a fresh CPU-only process must not raise DeprecationWarning
+    # and must keep optional CuTe-DSL / FA4 dependencies lazy.
+    env = dict(os.environ)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    code = (
+        "import sys, fish_scales_ops.audio as a; "
+        "assert hasattr(a, 'layernorm_mxfp8') and hasattr(a, 'attn_fa4_mxfp8'); "
+        "assert 'cutlass' not in sys.modules and 'flash_attn' not in sys.modules and 'quack' not in sys.modules"
+    )
+    r = subprocess.run([sys.executable, "-W", "error::DeprecationWarning", "-c", code],
+                       env=env, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, f"lazy audio import check failed: {r.stderr}"
 
 
 def test_layernorm_mxfp8_contract():
+    if not _require_or_skip(_sm100_skip_reason()):
+        return
     torch.manual_seed(101)
     # Test BOTH in-kernel D==1280 fast path AND in-kernel general D%128==0 path (512, 2048)
     for M, D in [(1, 1280), (78, 1280), (117, 1280), (128, 1280), (182, 1280), (364, 1280), (533, 1280), (1079, 1280), (78, 512), (182, 2048)]:
@@ -91,6 +148,8 @@ def test_layernorm_mxfp8_contract():
 
 
 def test_attn_fa4_mxfp8_contract():
+    if not _require_or_skip(_fa4_skip_reason()):
+        return
     torch.manual_seed(202)
     w_o = (torch.randn(1280, 1280, device="cuda", dtype=torch.bfloat16) / math.sqrt(1280)).contiguous()
     dw_o = fso.dense.prepare_weight(w_o, format="mxfp8")
@@ -118,6 +177,8 @@ def test_attn_fa4_mxfp8_contract():
 
 
 def test_stem_fused_kernels_contract():
+    if not _require_or_skip(_dense_dsl_skip_reason()):
+        return
     torch.manual_seed(303)
     # 1. gelu_erf_bf16_pdl exact erf (NOT tanh)
     x = torch.linspace(-6.0, 6.0, 14 * 480 * 32 * 25, device="cuda", dtype=torch.bfloat16).view(14, 480, 32, 25)
@@ -150,6 +211,8 @@ def test_stem_fused_kernels_contract():
 
 
 def test_role_dispatch_no_global_mutation():
+    if not _require_or_skip(_dense_dsl_skip_reason()):
+        return
     torch.manual_seed(404)
     w_qkv = (torch.randn(3840, 1280, device="cuda", dtype=torch.bfloat16) / math.sqrt(1280)).contiguous()
     b_qkv = (torch.randn(3840, device="cuda", dtype=torch.bfloat16) * 0.1).contiguous()
@@ -177,6 +240,27 @@ def test_role_dispatch_no_global_mutation():
     assert dec.WF_PRE_WAIT_STAGES_TWO_CTA == 1
 
 
+def test_audio_input_validation():
+    if not _require_or_skip(_sm100_skip_reason()):
+        return
+    # Misaligned input slice (offset by 1 bf16 = 2 bytes) must be rejected before launch.
+    raw = torch.randn(4 * 1280 + 1, device="cuda", dtype=torch.bfloat16)
+    x_mis = raw[1:].view(4, 1280)
+    g = torch.ones(1280, device="cuda", dtype=torch.bfloat16)
+    b = torch.zeros(1280, device="cuda", dtype=torch.bfloat16)
+    for call in (
+        lambda: audio.layernorm_mxfp8(x_mis, g, b),
+        lambda: audio.gelu_erf_bf16_pdl(x_mis),
+        lambda: audio.gelu_erf_bf16_pdl(torch.randn(16, 128, device="cuda", dtype=torch.bfloat16).t()),
+    ):
+        raised = False
+        try:
+            call()
+        except (RuntimeError, ValueError):
+            raised = True
+        assert raised, "expected input validation error"
+
+
 if __name__ == "__main__":
     for fn in [
         test_public_surface_preserved,
@@ -184,6 +268,7 @@ if __name__ == "__main__":
         test_attn_fa4_mxfp8_contract,
         test_stem_fused_kernels_contract,
         test_role_dispatch_no_global_mutation,
+        test_audio_input_validation,
     ]:
         fn()
         print(f"PASS: {fn.__name__}", flush=True)

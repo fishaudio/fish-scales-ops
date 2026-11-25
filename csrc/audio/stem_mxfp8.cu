@@ -28,6 +28,12 @@ namespace fso_audio
 namespace
 {
 
+static inline bool stem_is_sm100_device(c10::Device dev)
+{
+    auto const* prop = at::cuda::getDeviceProperties(dev.index());
+    return prop != nullptr && prop->major == 10;
+}
+
 static inline bool stem_pdl_enabled()
 {
     static bool const v = [] {
@@ -38,7 +44,7 @@ static inline bool stem_pdl_enabled()
 }
 
 template <typename KernelT, typename... Args>
-static inline void launch_stem_pdl(
+static inline cudaError_t launch_stem_pdl(
     KernelT kernel, dim3 grid, dim3 block, cudaStream_t stream, bool pdl, Args... args)
 {
     cudaLaunchConfig_t cfg{};
@@ -51,7 +57,7 @@ static inline void launch_stem_pdl(
     cfg.stream = stream;
     cfg.attrs = attrs;
     cfg.numAttrs = 1;
-    cudaLaunchKernelEx(&cfg, kernel, args..., pdl);
+    return cudaLaunchKernelEx(&cfg, kernel, args..., pdl);
 }
 
 // One CTA (256 threads = 16 groups of 16 threads = 16 kp groups per iter) per output row m = b*T + t.
@@ -187,16 +193,20 @@ __global__ void __launch_bounds__(256) gelu_erf_bf16_pdl_kernel(
 std::tuple<at::Tensor, at::Tensor> gelu_nhwc_to_mxfp8_sm100(at::Tensor x_nhwc)
 {
     TORCH_CHECK(x_nhwc.is_cuda() && x_nhwc.dtype() == at::kBFloat16 && x_nhwc.dim() == 4,
-        "x_nhwc must be 4-D CUDA bf16 [B, C, F, T] in channels_last memory format");
+        "gelu_nhwc_to_mxfp8_sm100: x_nhwc must be 4-D CUDA bf16 [B, C, F, T] in channels_last memory format");
+    TORCH_CHECK(stem_is_sm100_device(x_nhwc.device()), "gelu_nhwc_to_mxfp8_sm100: requires sm_100 / sm_103");
     TORCH_CHECK(x_nhwc.is_contiguous(at::MemoryFormat::ChannelsLast),
-        "x_nhwc must be channels_last contiguous");
+        "gelu_nhwc_to_mxfp8_sm100: x_nhwc must be channels_last contiguous");
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(x_nhwc.data_ptr()) & 15u) == 0u,
+        "gelu_nhwc_to_mxfp8_sm100: x_nhwc must be 16-byte aligned");
     int const B = static_cast<int>(x_nhwc.size(0));
     int const C = static_cast<int>(x_nhwc.size(1));
     int const F_dim = static_cast<int>(x_nhwc.size(2));
     int const T_dim = static_cast<int>(x_nhwc.size(3));
     int const M = B * T_dim;
     int const K = F_dim * C;
-    TORCH_CHECK(C % 8 == 0 && K % 128 == 0, "C must be multiple of 8 and F*C multiple of 128");
+    TORCH_CHECK(C > 0 && F_dim > 0 && C % 8 == 0 && K % 128 == 0,
+        "gelu_nhwc_to_mxfp8_sm100: C>0 (multiple of 8), F>0, and F*C multiple of 128 required");
 
     int const M_pad = (M + 127) / 128 * 128;
     auto out_q = at::empty({M, K}, x_nhwc.options().dtype(at::kFloat8_e4m3fn));
@@ -208,43 +218,40 @@ std::tuple<at::Tensor, at::Tensor> gelu_nhwc_to_mxfp8_sm100(at::Tensor x_nhwc)
     auto stream = at::cuda::getCurrentCUDAStream();
     bool const pdl = stem_pdl_enabled();
     dim3 grid(M + (M_pad > M ? 1 : 0), 1, 1);
-    launch_stem_pdl(gelu_nhwc_to_mxfp8_kernel, grid, dim3(256), stream, pdl,
+    cudaError_t err = launch_stem_pdl(gelu_nhwc_to_mxfp8_kernel, grid, dim3(256), stream, pdl,
         reinterpret_cast<__nv_fp8_e4m3*>(out_q.data_ptr()),
         reinterpret_cast<int32_t*>(out_scale.data_ptr()),
         reinterpret_cast<__nv_bfloat16 const*>(x_nhwc.data_ptr()),
         B, F_dim, T_dim, C, M, M_pad);
+    TORCH_CHECK(err == cudaSuccess, "gelu_nhwc_to_mxfp8_sm100 launch failed: ", cudaGetErrorString(err));
     return {out_q, out_scale};
 }
 
 at::Tensor gelu_erf_bf16_pdl_sm100(at::Tensor x)
 {
     TORCH_CHECK(x.is_cuda() && x.dtype() == at::kBFloat16 && x.numel() % 8 == 0,
-        "x must be CUDA bf16 with numel % 8 == 0");
+        "gelu_erf_bf16_pdl_sm100: x must be CUDA bf16 with numel % 8 == 0");
+    TORCH_CHECK(stem_is_sm100_device(x.device()), "gelu_erf_bf16_pdl_sm100: requires sm_100 / sm_103");
+    bool const is_contig = x.is_contiguous() || (x.dim() == 4 && x.is_contiguous(at::MemoryFormat::ChannelsLast));
+    TORCH_CHECK(is_contig, "gelu_erf_bf16_pdl_sm100: x must be contiguous or 4-D channels_last contiguous");
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(x.data_ptr()) & 15u) == 0u,
+        "gelu_erf_bf16_pdl_sm100: x must be 16-byte aligned");
     auto out = at::empty_like(x);
     int64_t const n8 = x.numel() / 8;
     if (n8 == 0)
         return out;
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(out.data_ptr()) & 15u) == 0u,
+        "gelu_erf_bf16_pdl_sm100: out must be 16-byte aligned");
     c10::cuda::CUDAGuard guard(x.device());
     auto stream = at::cuda::getCurrentCUDAStream();
     bool const pdl = stem_pdl_enabled();
     dim3 grid(static_cast<unsigned int>((n8 + 255) / 256), 1, 1);
-    launch_stem_pdl(gelu_erf_bf16_pdl_kernel, grid, dim3(256), stream, pdl,
+    cudaError_t err = launch_stem_pdl(gelu_erf_bf16_pdl_kernel, grid, dim3(256), stream, pdl,
         reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
         reinterpret_cast<__nv_bfloat16 const*>(x.data_ptr()),
         n8);
+    TORCH_CHECK(err == cudaSuccess, "gelu_erf_bf16_pdl_sm100 launch failed: ", cudaGetErrorString(err));
     return out;
-}
-
-TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
-{
-    m.def("gelu_nhwc_to_mxfp8_sm100(Tensor x_nhwc) -> (Tensor, Tensor)");
-    m.def("gelu_erf_bf16_pdl_sm100(Tensor x) -> Tensor");
-}
-
-TORCH_LIBRARY_IMPL(fish_scales_ops, CUDA, m)
-{
-    m.impl("gelu_nhwc_to_mxfp8_sm100", &gelu_nhwc_to_mxfp8_sm100);
-    m.impl("gelu_erf_bf16_pdl_sm100", &gelu_erf_bf16_pdl_sm100);
 }
 
 } // namespace fso_audio
