@@ -3151,4 +3151,472 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_topk_from_logits(at::Tensor l
     return {ids, weights, shared_gate};
 }
 
+
+// === FSO_DRAMA3_UNIFIED_ROUTING_AND_COMBINE ===
+// V2: ONE unified cluster(8, 1, 1) routing kernel for ALL M = 1..8192+ (ZERO host
+// `if pairs > X` routing), emitting 128-row `block_list` (Shared Expert FIRST ->
+// zero padded-bucket straggler!) + ONE high-bandwidth streaming combine kernel.
+struct UnifiedCompactRoutingArgs
+{
+    int32_t const* topk_ids;
+    int32_t* masked_m;
+    int32_t* blk0;
+    int32_t* slot_of_flat;
+    int32_t* slot_sched;  // [2 + num_blocks], zeroed by this kernel
+    int32_t* block_list;  // [num_blocks + 1]: b | (e << 13) | ((r - 1) << 23), tail = live_blocks
+    int M;
+    int topk;
+    int num_pairs;
+    int num_routed;       // E (without shared expert)
+    int num_groups;       // G = E + (has_shared ? 1 : 0)
+    int blocks_cap;       // num_blocks
+    bool has_shared;
+};
+
+__global__ void __launch_bounds__(1024) moe_routing_compact_unified_kernel(UnifiedCompactRoutingArgs a, bool pdl)
+{
+    if (pdl)
+    {
+        cudaGridDependencySynchronize();
+        if (threadIdx.x == 0)
+            cudaTriggerProgrammaticLaunchCompletion();
+    }
+
+    __shared__ int32_t s_cnt[kMaxGroups];
+    __shared__ int32_t s_base[kMaxGroups];
+    __shared__ int32_t s_blk0[kMaxGroups];
+    __shared__ int32_t s_wsum[32];
+
+    int const tid = static_cast<int>(threadIdx.x);
+    int const nthr = static_cast<int>(blockDim.x);
+    int const E = a.num_routed;
+    int const P = a.num_pairs;
+
+    int crank = 0;
+    int ncta = 1;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    {
+        cg::cluster_group cl = cg::this_cluster();
+        crank = static_cast<int>(cl.block_rank());
+        ncta = static_cast<int>(cl.num_blocks());
+    }
+#endif
+
+    if (tid < E)
+        s_cnt[tid] = 0;
+
+    int const stride = ncta * nthr;
+    int const i0 = crank * nthr + tid;
+    constexpr int kReg = 8;
+    int ev[kReg];
+    int rk[kReg];
+
+#pragma unroll
+    for (int k = 0; k < kReg; ++k)
+    {
+        int const i = i0 + k * stride;
+        int const id = i < P ? a.topk_ids[i] : -1;
+        ev[k] = (static_cast<unsigned>(id) < static_cast<unsigned>(E)) ? id : -1;
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int k = 0; k < kReg; ++k)
+        rk[k] = ev[k] >= 0 ? atomicAdd(&s_cnt[ev[k]], 1) : 0;
+
+    for (int ib = i0 + kReg * stride; ib < P; ib += kReg * stride)
+    {
+        int eb[kReg];
+#pragma unroll
+        for (int k = 0; k < kReg; ++k)
+        {
+            int const i = ib + k * stride;
+            int const id = i < P ? a.topk_ids[i] : -1;
+            eb[k] = (static_cast<unsigned>(id) < static_cast<unsigned>(E)) ? id : -1;
+        }
+#pragma unroll
+        for (int k = 0; k < kReg; ++k)
+        {
+            if (eb[k] >= 0)
+                a.slot_of_flat[ib + k * stride] = atomicAdd(&s_cnt[eb[k]], 1);
+        }
+    }
+
+    int cnt = 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if (ncta > 1)
+    {
+        cg::cluster_group cl = cg::this_cluster();
+        cl.sync();
+        if (tid < E)
+        {
+            int v[kCompactMaxCluster];
+#pragma unroll
+            for (int c = 0; c < kCompactMaxCluster; ++c)
+                v[c] = c < ncta ? *cl.map_shared_rank(&s_cnt[tid], c) : 0;
+            int base = 0;
+#pragma unroll
+            for (int c = 0; c < kCompactMaxCluster; ++c)
+            {
+                base += c < crank ? v[c] : 0;
+                cnt += v[c];
+            }
+            s_base[tid] = base;
+        }
+        compact_cluster_arrive();
+    }
+    else
+#endif
+    {
+        __syncthreads();
+        if (tid < E)
+        {
+            cnt = s_cnt[tid];
+            s_base[tid] = 0;
+        }
+    }
+
+    // Exclusive prefix sum of 128-row blocks across routed experts 0..E-1.
+    int const nb = (tid < E && cnt > 0) ? ((cnt + kCompactRows - 1) >> kCompactRowShift) : 0;
+    int b0_routed = 0;
+    int routed_blocks = 0;
+    compact_block_scan1(nb, s_wsum, b0_routed, routed_blocks);
+
+    // Place Shared Expert FIRST at blocks [0 .. nb_shared - 1] so Wave 0 starts it
+    // immediately alongside routed experts (zero padded-bucket straggler!).
+    int const nb_shared = a.has_shared ? ((a.M + kCompactRows - 1) >> kCompactRowShift) : 0;
+    int const blocks_total = nb_shared + routed_blocks;
+
+    if (tid < E)
+    {
+        int const b0 = nb_shared + b0_routed;
+        s_blk0[tid] = b0;
+        if ((tid % ncta) == crank)
+        {
+            a.masked_m[tid] = cnt;
+            a.blk0[tid] = b0;
+            for (int k = 0; k < nb; ++k)
+            {
+                int const b = b0 + k;
+                int const rem = cnt - (k << kCompactRowShift);
+                int const r = rem < kCompactRows ? rem : kCompactRows;
+                a.block_list[b] = b | (tid << 13) | ((r - 1) << 23);
+            }
+        }
+    }
+
+    if (a.has_shared)
+    {
+        if (crank == 0 && tid == 0)
+        {
+            a.masked_m[E] = a.M;
+            a.blk0[E] = 0;
+        }
+        for (int k = i0; k < nb_shared; k += stride)
+        {
+            int const rem = a.M - (k << kCompactRowShift);
+            int const r = rem < kCompactRows ? rem : kCompactRows;
+            a.block_list[k] = k | (E << 13) | ((r - 1) << 23);
+        }
+    }
+
+    if (crank == 0 && tid == 0)
+    {
+        a.blk0[a.num_groups] = blocks_total;
+        a.block_list[a.blocks_cap] = blocks_total < a.blocks_cap ? blocks_total : a.blocks_cap;
+    }
+
+    // Zero counter[0..1] + per-block done counters [2 .. 2 + blocks_total - 1] in parallel.
+    int const n_zero = kCompactSlotSchedWords + blocks_total;
+    for (int z = i0; z < n_zero; z += stride)
+        a.slot_sched[z] = 0;
+
+    __syncthreads();
+
+#pragma unroll
+    for (int k = 0; k < kReg; ++k)
+    {
+        int const i = i0 + k * stride;
+        if (i < P)
+        {
+            int const e = ev[k];
+            a.slot_of_flat[i] = (e < 0) ? -1 : ((s_blk0[e] << kCompactRowShift) + s_base[e] + rk[k]);
+        }
+    }
+    for (int ib = i0 + kReg * stride; ib < P; ib += kReg * stride)
+    {
+        int eb[kReg];
+        int rb[kReg];
+#pragma unroll
+        for (int k = 0; k < kReg; ++k)
+        {
+            int const i = ib + k * stride;
+            int const id = i < P ? a.topk_ids[i] : -1;
+            eb[k] = (static_cast<unsigned>(id) < static_cast<unsigned>(E)) ? id : -1;
+            rb[k] = eb[k] >= 0 ? a.slot_of_flat[i] : 0;
+        }
+#pragma unroll
+        for (int k = 0; k < kReg; ++k)
+        {
+            int const i = ib + k * stride;
+            if (i < P)
+            {
+                int const e = eb[k];
+                a.slot_of_flat[i] = (e < 0) ? -1 : ((s_blk0[e] << kCompactRowShift) + s_base[e] + rb[k]);
+            }
+        }
+    }
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if (ncta > 1)
+        compact_cluster_wait();
+#endif
+}
+
+// ONE unified high-bandwidth streaming combine kernel (256 threads/CTA, low register
+// pressure, skips dead padded slots without touching dn[0], optional fused Shared Expert).
+__global__ void __launch_bounds__(256, 4) moe_combine_unified_kernel(__nv_bfloat16 const* __restrict__ dn,
+    int32_t const* __restrict__ slot_of_flat, float const* __restrict__ topk_w, int32_t const* __restrict__ blk0,
+    int shared_id, float const* __restrict__ shared_gate, __nv_bfloat16 const* __restrict__ bias,
+    float const* __restrict__ bias_scale, __nv_bfloat16* __restrict__ out, int M, int topk, int H, bool pdl)
+{
+    if (pdl)
+    {
+        cudaGridDependencySynchronize();
+        if (threadIdx.x == 0)
+            cudaTriggerProgrammaticLaunchCompletion();
+    }
+    // Compiler barrier: prevent ptxas/nvcc from hoisting blk0/slot_of_flat LDG.CONSTANT above ACQBULK!
+    asm volatile("" ::: "memory");
+
+    constexpr int kVec = 8;
+    constexpr int kMaxTopk = 8;
+    int const num_hvec = H >> 3;
+    int const total = M * num_hvec;
+    int const stride = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
+    int shared_base = -1;
+    if (shared_id >= 0 && blk0 != nullptr)
+    {
+        int32_t b_sh = 0;
+        asm volatile("ld.global.u32 %0, [%1];\n" : "=r"(b_sh) : "l"(blk0 + shared_id) : "memory");
+        shared_base = b_sh << kCompactRowShift;
+    }
+    bool const fast8 = (topk == 8) && ((reinterpret_cast<uintptr_t>(topk_w) & 15u) == 0u);
+
+    for (int tid = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
+         tid < total; tid += stride)
+    {
+        int const t = tid / num_hvec;
+        int const h = (tid - t * num_hvec) << 3;
+
+        float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+        float acc4 = 0.f, acc5 = 0.f, acc6 = 0.f, acc7 = 0.f;
+
+        if (fast8)
+        {
+            int4 const s0123 = *reinterpret_cast<int4 const*>(&slot_of_flat[t * 8 + 0]);
+            int4 const s4567 = *reinterpret_cast<int4 const*>(&slot_of_flat[t * 8 + 4]);
+            float4 const w0123 = *reinterpret_cast<float4 const*>(&topk_w[t * 8 + 0]);
+            float4 const w4567 = *reinterpret_cast<float4 const*>(&topk_w[t * 8 + 4]);
+            int const slots[8] = {s0123.x, s0123.y, s0123.z, s0123.w, s4567.x, s4567.y, s4567.z, s4567.w};
+            float const ws[8] = {w0123.x, w0123.y, w0123.z, w0123.w, w4567.x, w4567.y, w4567.z, w4567.w};
+
+            // Stream 2 experts per step: overlaps 2 HBM loads in flight while keeping register count tiny!
+#pragma unroll
+            for (int j = 0; j < 8; j += 2)
+            {
+                int const s0 = slots[j];
+                int const s1 = slots[j + 1];
+                float4 r0, r1;
+                if (s0 >= 0)
+                    r0 = *reinterpret_cast<float4 const*>(&dn[static_cast<int64_t>(s0) * H + h]);
+                if (s1 >= 0)
+                    r1 = *reinterpret_cast<float4 const*>(&dn[static_cast<int64_t>(s1) * H + h]);
+                if (s0 >= 0)
+                {
+                    __nv_bfloat162 const* bp = reinterpret_cast<__nv_bfloat162 const*>(&r0);
+                    float const w = ws[j];
+                    float2 f0 = __bfloat1622float2(bp[0]);
+                    float2 f1 = __bfloat1622float2(bp[1]);
+                    float2 f2 = __bfloat1622float2(bp[2]);
+                    float2 f3 = __bfloat1622float2(bp[3]);
+                    acc0 = __fmaf_rn(w, f0.x, acc0); acc1 = __fmaf_rn(w, f0.y, acc1);
+                    acc2 = __fmaf_rn(w, f1.x, acc2); acc3 = __fmaf_rn(w, f1.y, acc3);
+                    acc4 = __fmaf_rn(w, f2.x, acc4); acc5 = __fmaf_rn(w, f2.y, acc5);
+                    acc6 = __fmaf_rn(w, f3.x, acc6); acc7 = __fmaf_rn(w, f3.y, acc7);
+                }
+                if (s1 >= 0)
+                {
+                    __nv_bfloat162 const* bp = reinterpret_cast<__nv_bfloat162 const*>(&r1);
+                    float const w = ws[j + 1];
+                    float2 f0 = __bfloat1622float2(bp[0]);
+                    float2 f1 = __bfloat1622float2(bp[1]);
+                    float2 f2 = __bfloat1622float2(bp[2]);
+                    float2 f3 = __bfloat1622float2(bp[3]);
+                    acc0 = __fmaf_rn(w, f0.x, acc0); acc1 = __fmaf_rn(w, f0.y, acc1);
+                    acc2 = __fmaf_rn(w, f1.x, acc2); acc3 = __fmaf_rn(w, f1.y, acc3);
+                    acc4 = __fmaf_rn(w, f2.x, acc4); acc5 = __fmaf_rn(w, f2.y, acc5);
+                    acc6 = __fmaf_rn(w, f3.x, acc6); acc7 = __fmaf_rn(w, f3.y, acc7);
+                }
+            }
+        }
+        else
+        {
+            for (int j = 0; j < topk; ++j)
+            {
+                int const s = slot_of_flat[t * topk + j];
+                if (s < 0)
+                    continue;
+                float const w = topk_w[t * topk + j];
+                float4 const r0 = *reinterpret_cast<float4 const*>(&dn[static_cast<int64_t>(s) * H + h]);
+                __nv_bfloat162 const* bp = reinterpret_cast<__nv_bfloat162 const*>(&r0);
+                float2 f0 = __bfloat1622float2(bp[0]);
+                float2 f1 = __bfloat1622float2(bp[1]);
+                float2 f2 = __bfloat1622float2(bp[2]);
+                float2 f3 = __bfloat1622float2(bp[3]);
+                acc0 = __fmaf_rn(w, f0.x, acc0); acc1 = __fmaf_rn(w, f0.y, acc1);
+                acc2 = __fmaf_rn(w, f1.x, acc2); acc3 = __fmaf_rn(w, f1.y, acc3);
+                acc4 = __fmaf_rn(w, f2.x, acc4); acc5 = __fmaf_rn(w, f2.y, acc5);
+                acc6 = __fmaf_rn(w, f3.x, acc6); acc7 = __fmaf_rn(w, f3.y, acc7);
+            }
+        }
+
+        if (shared_base >= 0)
+        {
+            float const sg = shared_gate != nullptr ? shared_gate[t] : 1.0f;
+            float4 const sraw = *reinterpret_cast<float4 const*>(&dn[static_cast<int64_t>(shared_base + t) * H + h]);
+            __nv_bfloat162 const* bp = reinterpret_cast<__nv_bfloat162 const*>(&sraw);
+            float2 f0 = __bfloat1622float2(bp[0]);
+            float2 f1 = __bfloat1622float2(bp[1]);
+            float2 f2 = __bfloat1622float2(bp[2]);
+            float2 f3 = __bfloat1622float2(bp[3]);
+            acc0 = __fmaf_rn(sg, f0.x, acc0); acc1 = __fmaf_rn(sg, f0.y, acc1);
+            acc2 = __fmaf_rn(sg, f1.x, acc2); acc3 = __fmaf_rn(sg, f1.y, acc3);
+            acc4 = __fmaf_rn(sg, f2.x, acc4); acc5 = __fmaf_rn(sg, f2.y, acc5);
+            acc6 = __fmaf_rn(sg, f3.x, acc6); acc7 = __fmaf_rn(sg, f3.y, acc7);
+        }
+
+        if (bias != nullptr)
+        {
+            float const bs = bias_scale != nullptr ? bias_scale[t] : 1.0f;
+            float4 const braw = *reinterpret_cast<float4 const*>(&bias[static_cast<int64_t>(t) * H + h]);
+            __nv_bfloat162 const* bp = reinterpret_cast<__nv_bfloat162 const*>(&braw);
+            float2 f0 = __bfloat1622float2(bp[0]);
+            float2 f1 = __bfloat1622float2(bp[1]);
+            float2 f2 = __bfloat1622float2(bp[2]);
+            float2 f3 = __bfloat1622float2(bp[3]);
+            acc0 = __fmaf_rn(bs, f0.x, acc0); acc1 = __fmaf_rn(bs, f0.y, acc1);
+            acc2 = __fmaf_rn(bs, f1.x, acc2); acc3 = __fmaf_rn(bs, f1.y, acc3);
+            acc4 = __fmaf_rn(bs, f2.x, acc4); acc5 = __fmaf_rn(bs, f2.y, acc5);
+            acc6 = __fmaf_rn(bs, f3.x, acc6); acc7 = __fmaf_rn(bs, f3.y, acc7);
+        }
+
+        float4 out_raw;
+        __nv_bfloat162* op = reinterpret_cast<__nv_bfloat162*>(&out_raw);
+        op[0] = __float22bfloat162_rn(make_float2(acc0, acc1));
+        op[1] = __float22bfloat162_rn(make_float2(acc2, acc3));
+        op[2] = __float22bfloat162_rn(make_float2(acc4, acc5));
+        op[3] = __float22bfloat162_rn(make_float2(acc6, acc7));
+        *reinterpret_cast<float4*>(&out[static_cast<int64_t>(t) * H + h]) = out_raw;
+    }
+    (void) kMaxTopk;
+    (void) kVec;
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+moe_build_routing_compact_unified(at::Tensor topk_ids, int64_t num_routed, int64_t num_blocks, bool has_shared)
+{
+    TORCH_CHECK(topk_ids.is_cuda() && topk_ids.dtype() == at::kInt && topk_ids.dim() == 2 && topk_ids.is_contiguous(),
+        "moe_build_routing_compact_unified: topk_ids must be contiguous CUDA int32 [M, topk]");
+    int64_t const M = topk_ids.size(0);
+    int64_t const topk = topk_ids.size(1);
+    int64_t const G = num_routed + (has_shared ? 1 : 0);
+    TORCH_CHECK(M >= 1 && topk >= 1 && num_routed >= 1 && G <= kMaxGroups,
+        "moe_build_routing_compact_unified: invalid M/topk/G");
+    int64_t const pairs = M * topk;
+    int64_t const pairs_eff = pairs + (has_shared ? M : 0);
+    int64_t const bound = std::max<int64_t>(1, (pairs_eff + 127 * std::min<int64_t>(G, pairs_eff)) / kCompactRows);
+    TORCH_CHECK(num_blocks >= bound && num_blocks <= kCompactTileMaxBlocks,
+        "moe_build_routing_compact_unified: num_blocks=", num_blocks, " out of [", bound, ", ",
+        kCompactTileMaxBlocks, "]");
+
+    auto opts = topk_ids.options().dtype(at::kInt);
+    at::Tensor masked_m = at::empty({G}, opts);
+    at::Tensor blk0 = at::empty({G + 1}, opts);
+    at::Tensor slot_of_flat = at::empty({pairs}, opts);
+    at::Tensor slot_sched = at::empty({kCompactSlotSchedWords + num_blocks}, opts);
+    at::Tensor block_list = at::empty({num_blocks + 1}, opts);
+    at::Tensor dummy_chunk = at::empty({2}, opts);
+
+    UnifiedCompactRoutingArgs a{};
+    a.topk_ids = reinterpret_cast<int32_t const*>(topk_ids.data_ptr());
+    a.masked_m = reinterpret_cast<int32_t*>(masked_m.data_ptr());
+    a.blk0 = reinterpret_cast<int32_t*>(blk0.data_ptr());
+    a.slot_of_flat = reinterpret_cast<int32_t*>(slot_of_flat.data_ptr());
+    a.slot_sched = reinterpret_cast<int32_t*>(slot_sched.data_ptr());
+    a.block_list = reinterpret_cast<int32_t*>(block_list.data_ptr());
+    a.M = static_cast<int>(M);
+    a.topk = static_cast<int>(topk);
+    a.num_pairs = static_cast<int>(pairs);
+    a.num_routed = static_cast<int>(num_routed);
+    a.num_groups = static_cast<int>(G);
+    a.blocks_cap = static_cast<int>(num_blocks);
+    a.has_shared = has_shared;
+
+    // Architecture-static threads (depends only on model expert count G, never on M) and
+    // ONE unified cluster(8, 1, 1) launch across ALL M = 1..8192+ (zero host size routing!).
+    int const threads = (G <= 512) ? 512 : 1024;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    bool const pdl = fso_pdl_enabled();
+    cudaError_t err = compact_launch(moe_routing_compact_unified_kernel, kCompactMaxCluster, threads, 0, stream, pdl, a);
+    TORCH_CHECK(err == cudaSuccess, "moe_routing_compact_unified_kernel launch failed: ", cudaGetErrorString(err));
+    return {masked_m, blk0, slot_of_flat, slot_sched, block_list, dummy_chunk};
+}
+
+at::Tensor moe_combine_unified(at::Tensor dn, at::Tensor slot_of_flat, at::Tensor topk_w,
+    std::optional<at::Tensor> blk0, int64_t shared_id, std::optional<at::Tensor> shared_gate,
+    std::optional<at::Tensor> bias, std::optional<at::Tensor> bias_scale, std::optional<at::Tensor> out)
+{
+    TORCH_CHECK(dn.is_cuda() && dn.dtype() == at::kBFloat16 && dn.is_contiguous(), "dn must be contiguous CUDA bf16");
+    TORCH_CHECK(slot_of_flat.is_cuda() && slot_of_flat.dtype() == at::kInt && slot_of_flat.is_contiguous(),
+        "slot_of_flat must be contiguous CUDA int32");
+    TORCH_CHECK(topk_w.is_cuda() && topk_w.dtype() == at::kFloat && topk_w.dim() == 2 && topk_w.is_contiguous(),
+        "topk_w must be contiguous CUDA fp32 [M, topk]");
+    int64_t const M = topk_w.size(0);
+    int64_t const topk = topk_w.size(1);
+    int64_t const H = dn.size(-1);
+    TORCH_CHECK(H % 8 == 0, "moe_combine_unified: H must be multiple of 8");
+
+    at::Tensor res = out.has_value() ? *out : at::empty({M, H}, dn.options());
+    TORCH_CHECK(res.is_cuda() && res.dtype() == at::kBFloat16 && res.is_contiguous() && res.size(0) == M
+            && res.size(1) == H,
+        "moe_combine_unified: invalid out tensor");
+
+    int32_t const* blk0_p = (blk0.has_value() && blk0->defined()) ? reinterpret_cast<int32_t const*>(blk0->data_ptr())
+                                                                   : nullptr;
+    float const* sg_p
+        = (shared_gate.has_value() && shared_gate->defined()) ? reinterpret_cast<float const*>(shared_gate->data_ptr())
+                                                              : nullptr;
+    __nv_bfloat16 const* bias_p = (bias.has_value() && bias->defined())
+        ? reinterpret_cast<__nv_bfloat16 const*>(bias->data_ptr())
+        : nullptr;
+    float const* bs_p
+        = (bias_scale.has_value() && bias_scale->defined()) ? reinterpret_cast<float const*>(bias_scale->data_ptr())
+                                                            : nullptr;
+
+    int const total = static_cast<int>(M * (H / 8));
+    constexpr int kThreads = 256;
+    constexpr int kMaxBlocks = 65535;
+    int const blocks = std::min(kMaxBlocks, std::max(1, (total + kThreads - 1) / kThreads));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    bool const pdl = fso_pdl_enabled();
+    fso_pdl_launch(moe_combine_unified_kernel, dim3(blocks), dim3(kThreads), stream, pdl,
+        reinterpret_cast<__nv_bfloat16 const*>(dn.data_ptr()),
+        reinterpret_cast<int32_t const*>(slot_of_flat.data_ptr()),
+        reinterpret_cast<float const*>(topk_w.data_ptr()), blk0_p, static_cast<int>(shared_id), sg_p, bias_p, bs_p,
+        reinterpret_cast<__nv_bfloat16*>(res.data_ptr()), static_cast<int>(M), static_cast<int>(topk),
+        static_cast<int>(H));
+    return res;
+}
+
 } // namespace blockscale_gemm

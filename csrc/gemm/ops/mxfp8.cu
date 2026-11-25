@@ -142,6 +142,16 @@ void fp8bs_silu_chunk_mul_quantize_1x32_packed_grouped(__nv_fp8_e4m3* x_q, int32
 // (input_alignment.h), before anything is allocated or launched.
 int fp8bs_quantize_1x32_packed_grouped_gather_x_vector_bytes();
 int fp8bs_silu_chunk_mul_quantize_1x32_packed_grouped_x_vector_bytes(bool pairwise);
+// === FSO_DRAMA3_UNIFIED_OPS ===
+cudaError_t launch_sm100_mxfp8_unified_moe(__nv_fp8_e4m3 const* a, int32_t const* sa, __nv_fp8_e4m3 const* w13,
+    int32_t const* sw13, __nv_fp8_e4m3 const* w2, int32_t const* sw2, __nv_fp8_e4m3* dq, int32_t* sd,
+    __nv_bfloat16* dn, int32_t const* masked_m, int32_t const* blk0, int const* slot_to_expert, int* counters,
+    int const* slot_tiles, int tiles_cap, int const* chunk_list, int chunks_cap, int groups, int b_alloc, int n1,
+    int k1, int n2, int k2, cudaStream_t stream);
+void fp8bs_quantize_1x32_grouped_gather_unified(__nv_fp8_e4m3* x_q, int32_t* packed_scales,
+    __nv_bfloat16 const* x, int32_t const* slot_of_flat, int32_t const* blk0, int shared_id, int M, int topk, int K,
+    cudaStream_t stream, bool use_ue8m0);
+
 } // namespace detail
 
 namespace
@@ -1979,6 +1989,65 @@ std::tuple<at::Tensor, at::Tensor> silu_chunk_mul_quantize_1x32_grouped(
         reinterpret_cast<int32_t const*>(slot_of_flat.data_ptr()),
         static_cast<int>(slot_of_flat.numel()), m_cap, INTER, stream, use_ue8m0, sm1xx, pairwise);
     return {x_q, packed};
+}
+
+
+// === FSO_DRAMA3_UNIFIED_OPS ===
+void quantize_1x32_grouped_gather_unified_out(at::Tensor x, at::Tensor slot_of_flat, int64_t topk,
+    std::optional<at::Tensor> blk0, int64_t shared_id, bool use_ue8m0, at::Tensor x_q, at::Tensor packed_scales)
+{
+    TORCH_CHECK(is_sm100_family(), "quantize_1x32_grouped_gather_unified_out: requires sm_100 / sm_103");
+    TORCH_CHECK(x.is_cuda() && x.dtype() == at::kBFloat16 && x.dim() == 2 && x.is_contiguous(),
+        "x must be contiguous CUDA bf16 [M, K]");
+    TORCH_CHECK(slot_of_flat.is_cuda() && slot_of_flat.dtype() == at::kInt && slot_of_flat.is_contiguous(),
+        "slot_of_flat must be contiguous CUDA int32");
+    int const M = static_cast<int>(x.size(0));
+    int const K = static_cast<int>(x.size(1));
+    TORCH_CHECK(K % 128 == 0, "K must be multiple of 128");
+    int32_t const* blk0_p = (blk0.has_value() && blk0->defined()) ? reinterpret_cast<int32_t const*>(blk0->data_ptr())
+                                                                   : nullptr;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    detail::fp8bs_quantize_1x32_grouped_gather_unified(reinterpret_cast<__nv_fp8_e4m3*>(x_q.data_ptr()),
+        reinterpret_cast<int32_t*>(packed_scales.data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(x.data_ptr()),
+        reinterpret_cast<int32_t const*>(slot_of_flat.data_ptr()), blk0_p, static_cast<int>(shared_id), M,
+        static_cast<int>(topk), K, stream, use_ue8m0);
+}
+
+void linear_mxfp8_unified_moe(at::Tensor a, at::Tensor w13, at::Tensor sa, at::Tensor sw13, at::Tensor w2,
+    at::Tensor sw2, at::Tensor masked_m, at::Tensor blk0, at::Tensor slot_sched, at::Tensor dq, at::Tensor sd,
+    at::Tensor dn, at::Tensor slot_tiles, at::Tensor chunk_list)
+{
+    TORCH_CHECK(is_sm100_family(), "linear_mxfp8_unified_moe: requires sm_100 / sm_103");
+    int const G = static_cast<int>(w13.size(0));
+    int const n1 = static_cast<int>(w13.size(1));
+    int const k1 = static_cast<int>(w13.size(2));
+    int const n2 = static_cast<int>(w2.size(1));
+    int const k2 = static_cast<int>(w2.size(2));
+    int const R = static_cast<int>(a.size(1));
+    TORCH_CHECK(R % 128 == 0, "R must be multiple of 128");
+    int const b_alloc = R / 128;
+    int const tiles_cap = static_cast<int>(slot_tiles.numel()) - 1;
+    int const chunks_cap = static_cast<int>(chunk_list.numel()) - 2;
+    TORCH_CHECK(tiles_cap > 0, "invalid block_list capacity");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaError_t err = detail::launch_sm100_mxfp8_unified_moe(
+        reinterpret_cast<__nv_fp8_e4m3 const*>(a.data_ptr()),
+        reinterpret_cast<int32_t const*>(sa.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3 const*>(w13.data_ptr()),
+        reinterpret_cast<int32_t const*>(sw13.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3 const*>(w2.data_ptr()),
+        reinterpret_cast<int32_t const*>(sw2.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3*>(dq.data_ptr()),
+        reinterpret_cast<int32_t*>(sd.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(dn.data_ptr()),
+        reinterpret_cast<int32_t const*>(masked_m.data_ptr()),
+        reinterpret_cast<int32_t const*>(blk0.data_ptr()),
+        nullptr,
+        reinterpret_cast<int*>(slot_sched.data_ptr()),
+        reinterpret_cast<int const*>(slot_tiles.data_ptr()), tiles_cap,
+        reinterpret_cast<int const*>(chunk_list.data_ptr()), chunks_cap,
+        G, b_alloc, n1, k1, n2, k2, stream);
+    TORCH_CHECK(err == cudaSuccess, "linear_mxfp8_unified_moe failed: ", cudaGetErrorString(err));
 }
 
 } // namespace blockscale_gemm
