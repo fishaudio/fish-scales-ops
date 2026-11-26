@@ -1057,6 +1057,9 @@ mxfp8_dense_route_sm120(int M, int N, int K) -> int[]
 mxfp8_dense_smallm_route_sm120(int M, int N, int K, bool bf16x) -> int[]
 sm120_smallm_rules(int M, int N, int K, int sms) -> int[]
 linear_mxfp8_bf16x(Tensor x, Tensor w_fp8, Tensor sw_int32, Tensor? bias=None, Tensor? residual=None, int act=0) -> Tensor
+layernorm_mxfp8_sm100(Tensor x, Tensor gamma, Tensor beta, float eps=1e-5, bool round_bf16=False) -> (Tensor, Tensor)
+gelu_nhwc_to_mxfp8_sm100(Tensor x_nhwc) -> (Tensor, Tensor)
+gelu_erf_bf16_pdl_sm100(Tensor x) -> Tensor
 ```
 
 MoE: the MXFP8 grouped GEMMs of sm_100/103 and sm_120/121, their route queries, and the router, routing builders and combines of both layouts, registered in `csrc/gemm/bindings.cpp`:

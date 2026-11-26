@@ -67,6 +67,8 @@ GEMM_MEMBERS = {
         "linear_mxfp8_raw", "linear_mxfp8_quantized_raw", "mxfp8_dense_route_sm120",
         # the sm_120/sm_121 small-M route (issue #12 decision 3)
         "linear_mxfp8_bf16x", "mxfp8_dense_smallm_route_sm120", "sm120_smallm_rules",
+        # sm_100/sm_103 fused audio-tower MXFP8 LayerNorm & Conv2d-stem erf-GELU ops (issue #12)
+        "layernorm_mxfp8_sm100", "gelu_nhwc_to_mxfp8_sm100", "gelu_erf_bf16_pdl_sm100",
     },
     "moe_mxfp8": {
         "linear_mxfp8_grouped_masked", "linear_mxfp8_grouped_masked_swiglu",

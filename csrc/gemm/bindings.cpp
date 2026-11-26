@@ -25,6 +25,14 @@
 #include <tuple>
 #include <vector>
 
+namespace fso_audio
+{
+std::tuple<at::Tensor, at::Tensor> layernorm_mxfp8_sm100(
+    at::Tensor x, at::Tensor gamma, at::Tensor beta, double eps, bool round_bf16);
+std::tuple<at::Tensor, at::Tensor> gelu_nhwc_to_mxfp8_sm100(at::Tensor x_nhwc);
+at::Tensor gelu_erf_bf16_pdl_sm100(at::Tensor x);
+} // namespace fso_audio
+
 namespace blockscale_gemm
 {
 at::Tensor linear_bf16(at::Tensor x, at::Tensor w);
@@ -261,6 +269,11 @@ TORCH_LIBRARY_FRAGMENT(fish_scales_ops, m)
     m.def("sm120_smallm_rules(int M, int N, int K, int sms) -> int[]", &blockscale_gemm::sm120_smallm_rules);
     m.def("linear_mxfp8_bf16x(Tensor x, Tensor w_fp8, Tensor sw_int32, Tensor? bias=None, Tensor? residual=None, "
           "int act=0) -> Tensor");
+    // Audio-tower fused SM100/103 MXFP8 LayerNorm and Conv2d-stem erf-GELU ops (issue #12).
+    m.def("layernorm_mxfp8_sm100(Tensor x, Tensor gamma, Tensor beta, float eps=1e-5, "
+          "bool round_bf16=False) -> (Tensor, Tensor)");
+    m.def("gelu_nhwc_to_mxfp8_sm100(Tensor x_nhwc) -> (Tensor, Tensor)");
+    m.def("gelu_erf_bf16_pdl_sm100(Tensor x) -> Tensor");
     m.def("mxfp8_grouped_slot_possible(int m_cap, int n_w, int k, int num_groups, "
                                        "int max_active_groups, bool fused_swiglu=False, bool compact=False, "
                                        "int expected_m=0) -> bool",
@@ -340,6 +353,9 @@ TORCH_LIBRARY_IMPL(fish_scales_ops, CUDA, m)
     m.impl("linear_mxfp8_raw", &blockscale_gemm::linear_mxfp8_raw);
     m.impl("linear_mxfp8_quantized_raw", &blockscale_gemm::linear_mxfp8_quantized_raw);
     m.impl("linear_mxfp8_bf16x", &blockscale_gemm::linear_mxfp8_bf16x);
+    m.impl("layernorm_mxfp8_sm100", &fso_audio::layernorm_mxfp8_sm100);
+    m.impl("gelu_nhwc_to_mxfp8_sm100", &fso_audio::gelu_nhwc_to_mxfp8_sm100);
+    m.impl("gelu_erf_bf16_pdl_sm100", &fso_audio::gelu_erf_bf16_pdl_sm100);
     m.impl("linear_mxfp8_grouped_masked", &blockscale_gemm::linear_mxfp8_grouped_masked);
     m.impl("quantize_1x32_grouped_gather", &blockscale_gemm::quantize_1x32_grouped_gather);
     m.impl("silu_chunk_mul_quantize_1x32_grouped", &blockscale_gemm::silu_chunk_mul_quantize_1x32_grouped);
